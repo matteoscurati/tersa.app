@@ -185,6 +185,8 @@ fn check_architecture() -> TaskResult {
             {
                 violations.push(format!("{package_name} -> {dependency_name}"));
             }
+
+            check_slint_dependency(&package_name, dependency, &mut violations);
         }
     }
 
@@ -194,15 +196,45 @@ fn check_architecture() -> TaskResult {
     }
 
     Err(io::Error::other(format!(
-        "disallowed workspace dependencies: {}",
+        "architecture dependency violations: {}",
         violations.join(", ")
     ))
     .into())
 }
 
+fn check_slint_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const SLINT_SPIKE: &str = "tersa-slint-spike";
+    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
+
+    let dependency_name = dependency.name.as_str();
+    let is_slint = matches!(dependency_name, "slint" | "slint-build")
+        || dependency_name.starts_with("i-slint-");
+    if !is_slint {
+        return;
+    }
+
+    if package_name != SLINT_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} (Slint is exclusive to {SLINT_SPIKE})"
+        ));
+    }
+
+    let target = dependency.target.as_ref().map(ToString::to_string);
+    if target.as_deref() != Some(APPLE_TARGET) {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
+        ));
+    }
+}
+
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         ("tersa-apple-bridge", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),

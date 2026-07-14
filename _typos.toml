@@ -1,5 +1,9 @@
 [files]
-extend-exclude = ["Cargo.lock", "LICENSE"]
+extend-exclude = [
+    "Cargo.lock",
+    "LICENSE",
+    "apple/licenses/THIRD_PARTY_NOTICES-*.txt",
+]
 
 [default.extend-words]
 Gmail = "Gmail"

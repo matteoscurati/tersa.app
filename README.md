@@ -42,3 +42,5 @@ workflow.
 - Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
 - Repository artifacts follow the [English language policy](docs/governance/language-policy.md).
 - Source code is licensed under the [Mozilla Public License 2.0](LICENSE).
+
+<a href="https://slint.dev"><img src="docs/assets/made-with-slint.svg" alt="Made with Slint" width="120"></a>

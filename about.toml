@@ -1,0 +1,83 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "LicenseRef-Slint-Royalty-free-2.0",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+[private]
+ignore = true
+
+# Slint publishes the selected royalty-free terms inside every package, but its
+# Cargo license expression also contains two unselected alternatives. These
+# checksum-bound clarifications record this repository's explicit election and
+# make cargo-about include the exact selected text.
+[i-slint-backend-selector.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-backend-selector.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-backend-winit.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-backend-winit.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-common.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-common.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-compiler.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-compiler.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-core.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-core.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-core-macros.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-core-macros.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[i-slint-renderer-skia.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[i-slint-renderer-skia.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[slint.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[slint.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"
+
+[slint-macros.clarify]
+license = "LicenseRef-Slint-Royalty-free-2.0"
+[[slint-macros.clarify.files]]
+path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
+checksum = "5167f5056e850419106ab6265efbdca7cba4d99c849d1445ca0bbf6a1e2315fe"

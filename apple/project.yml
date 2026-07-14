@@ -84,3 +84,63 @@ targets:
         script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" ios "${CONFIGURATION}"'
     scheme:
       testTargets: []
+  TersaSlintMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES-macos.txt
+        buildPhase: resources
+    info:
+      path: slint-macos/Info.plist
+      properties:
+        NSHighResolutionCapable: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.slint-spike.mac
+        PRODUCT_NAME: Tersa Slint Spike
+        EXECUTABLE_NAME: tersa-slint-spike
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. This
+        # exception is restricted to the target that packages the Rust binary.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    postCompileScripts:
+      - name: Build Rust Slint executable
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-slint-executable.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
+  TersaSlintIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES-ios.txt
+        buildPhase: resources
+    info:
+      path: slint-ios/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.slint-spike.ios
+        PRODUCT_NAME: Tersa Slint Spike
+        EXECUTABLE_NAME: tersa-slint-spike
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. This
+        # exception is restricted to the target that packages the Rust binary.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    postCompileScripts:
+      - name: Build Rust Slint executable
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-slint-executable.sh" ios "${CONFIGURATION}"'
+    scheme:
+      testTargets: []

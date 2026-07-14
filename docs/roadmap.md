@@ -5,9 +5,15 @@ the architecture or stops dependent work; it is not accepted as temporary debt.
 
 ## M0 — Feasibility and governance
 
-Validate Apple distribution, Slint on physical devices, OAuth PKCE, encrypted
-storage, search, hostile MIME/HTML handling, licenses, security policy, and
-Google API compliance.
+Validate Apple distribution, the selected UI candidate on physical devices,
+OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
+security policy, and Google API compliance.
+
+The Slint diagnostic packages successfully, but its production gate failed
+because the locked Winit accessibility adapter is a no-op on iOS. M0 therefore
+continues with the planned Dioxus WebView fallback. Physical-device input,
+accessibility, lifecycle, and WKWebView composition remain required gates for
+the replacement candidate.
 
 ## M1 — Vertical slice
 

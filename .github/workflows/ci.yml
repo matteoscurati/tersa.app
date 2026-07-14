@@ -81,6 +81,33 @@ jobs:
             | grep -F '_tersa_apple_bridge_version'
           nm -gU apple/build/TersaIOS.xcarchive/Products/Applications/Tersa.app/Tersa \
             | grep -F '_tersa_apple_bridge_version'
+      - name: Build and archive unsigned macOS Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
+          -configuration Release -destination 'generic/platform=macOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaSlintMac.xcarchive
+      - name: Build unsigned iOS simulator Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Archive unsigned iOS Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaSlintIOS.xcarchive
+      - name: Verify and capture Slint spike evidence
+        run: sh apple/scripts/capture-slint-evidence.sh
+      - name: Upload Slint spike screenshots and metrics
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: slint-spike-evidence
+          path: apple/build/slint-evidence
+          if-no-files-found: error
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -94,6 +121,11 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Prepare verified rust-skia archive
+        if: runner.os == 'macOS'
+        run: |
+          skia_url=$(sh apple/scripts/prepare-verified-skia.sh aarch64-apple-darwin)
+          printf 'SKIA_BINARIES_URL=%s\n' "$skia_url" >> "$GITHUB_ENV"
       - name: Run baseline verification
         run: cargo run --locked --package xtask -- verify
 
@@ -110,11 +142,29 @@ jobs:
       - name: Install policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
-          tool: cargo-audit@0.22.1,cargo-deny@0.20.2,cargo-hack@0.6.45,typos-cli@1.48.0
+          tool: cargo-about@0.9.1,cargo-audit@0.22.1,cargo-deny@0.20.2,cargo-hack@0.6.45,typos-cli@1.48.0
+      - name: Fetch locked dependencies for offline policy checks
+        run: cargo fetch --locked
+      - name: Check target-specific third-party notices
+        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories
-        run: cargo audit
+        # cargo-audit cannot derive target reachability from Cargo.lock. These
+        # time-bounded ignores cover three Apple-reachable unmaintained notices,
+        # one build-time compiler notice, and two non-Apple Wayland findings.
+        run: >-
+          cargo audit
+          --deny warnings
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2026-0192
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0206
+      - name: Enforce temporary Slint advisory review deadline
+        shell: bash
+        run: '[[ "$(date -u +%F)" < "2026-08-15" ]]'
       - name: Check feature combinations
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling
