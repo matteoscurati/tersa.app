@@ -46,17 +46,20 @@ CSS safe-area insets. Tao `Resumed` and `Suspended` events emit fixed diagnostic
 markers without content.
 
 The diagnostic contains no anchors, URLs, remote assets, server functions,
-Gmail code, credentials, or persistence. A navigation callback rejects schemes
-that Dioxus delegates to the application. Dioxus handles HTTP, HTTPS, and
-mailto links before that callback and opens them in the system browser, so the
-spike prevents those paths by never rendering a link. This is not sufficient
-for untrusted production email content.
+Gmail code, or credentials, and the application does not explicitly save its
+synthetic UI state. Wry nevertheless uses the default persistent WebKit data
+store. A navigation callback rejects schemes that Dioxus delegates to the
+application. Dioxus handles HTTP, HTTPS, and mailto links before that callback
+and opens them in the system browser, so the spike prevents those paths by
+never rendering a link. This is not sufficient for untrusted production email
+content.
 
-CI verifies the resolved feature set, the absence of Manganis and Dioxus
-devtools, the exact loopback bind expression, the 256-byte mutual WebSocket
-keys, the source navigation policy, target-specific notices, packaged
-resources, linked WebKit frameworks, live loopback-only listeners, lifecycle
-markers, screenshots, and stable OCR text.
+CI verifies every Apple target's resolved feature set, the absence of Manganis
+and Dioxus devtools, the exact loopback bind expression, independent CSPRNG
+creation and constant-time validation of the 256-byte mutual WebSocket keys,
+the source navigation policy, target-specific notices, packaged resources,
+linked WebKit frameworks, repeated live loopback-only listener snapshots,
+lifecycle markers, screenshots, and stable OCR text.
 
 Wry also adds 13 informational or unsoundness advisories through its non-Apple
 lockfile graph. `cargo audit` cannot evaluate target reachability, so CI uses
@@ -83,7 +86,11 @@ Production adoption remains blocked because:
    needs a complete deny-by-default interception boundary.
 3. The diagnostic macOS target is deliberately unsandboxed. App Sandbox would
    require testing and accepting the `com.apple.security.network.server`
-   entitlement for the loopback listener, or replacing the transport.
+   entitlement for the loopback listener, or replacing the transport. The
+   single accept loop also performs each unauthenticated WebSocket handshake
+   synchronously without a deadline before spawning its connection thread, so
+   a local client can block startup or reconnection. Production requires a
+   bounded concurrent handshake or a replacement transport.
 4. The minimal runtime still creates a Tokio runtime because of the upstream
    0.7.9 build defect. A feature-minimal macOS Release build separately fails
    on unguarded devtools calls, while Debug exposes the Web inspector. Its

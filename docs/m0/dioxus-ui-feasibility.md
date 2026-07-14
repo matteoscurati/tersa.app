@@ -27,9 +27,9 @@ The current verdict is:
 | `#M0-DIOXUS-001` | Locked dx-free Apple build | Exact Dioxus 0.7.9; direct Cargo; no `dx`, Manganis, Dioxus devtools package, backend, or remote assets | **PASS locally; required CI gate** |
 | `#M0-DIOXUS-002` | Unsigned Apple packages | Debug macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives | **PASS locally; required CI gate; Release blocked** |
 | `#M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | **Required CI gate** |
-| `#M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; visible range plus fixed overscan only; live rendered-row counter | **PASS by code; CI must prove at most 100 DOM rows before and after a synthetic scroll** |
+| `#M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; measured viewport plus fixed overscan; computed range and independent DOM count | **PASS by code; CI must independently query and prove at most 100 DOM rows before and after a synthetic scroll** |
 | `#M0-DIOXUS-005` | Semantic structure | Landmarks, labels, list/listitem positions, focus treatment, live status, reduced motion | **PASS by code; VoiceOver unverified** |
-| `#M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, character status, no persistence | **CI must prove DOM input propagation; physical input remains unverified** |
+| `#M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, derived character status, and no explicit application save | **CI must prove Dioxus state propagation; physical input remains unverified** |
 | `#M0-DIOXUS-007` | Safe-area and lifecycle diagnostics | CSS environment insets plus Tao resumed/suspended markers | **CI must prove a notched simulator inset and active/inactive markers; rotations and lifecycle edges remain unverified** |
 | `#M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | **PASS locally; required CI gate** |
 | `#M0-DIOXUS-009` | Navigation boundary | No link surface in the mock; non-Dioxus schemes rejected; hostile production navigation fully interceptable | **FAIL for production** |
@@ -65,16 +65,18 @@ The diagnostic Mac target does not claim App Sandbox compatibility.
 
 ## Evidence interpretation
 
-Launch measurements in `metrics.json` cover time until a window or simulator
-launch command is observed. They are not time-to-interactive claims. The
-evidence-only script activates one Dioxus list-position control, aligns the DOM
-scroll offset, and performs one programmatic textarea input. OCR before and
-after those actions proves that Dioxus propagated both state changes and kept
-the sampled rendered-row count bounded. It does not prove the native scroll
-event path, scrolling frame rate, bounds throughout arbitrary scrolling,
-operating system keyboard behavior, accessibility quality, or physical input
-behavior. Tao lifecycle markers are required from iOS transitions; the macOS
-path does not emit a reliable initial `Resumed` event.
+Launch measurements in `metrics.json` cover time until the Mac window/listener
+harness or simulator launch command reports success. They include harness and
+process-spawn overhead and are not time-to-interactive or cold-versus-warm
+product comparisons. The evidence-only script activates one Dioxus
+list-position control, performs its real DOM scroll, and injects one
+programmatic textarea input. OCR before and after those actions verifies both
+the computed range and a separate DOM query, and the derived character count
+proves that Dioxus processed the input event. It does not prove scrolling frame
+rate, bounds throughout arbitrary scrolling, operating system keyboard
+behavior, accessibility quality, or physical input behavior. Tao lifecycle
+markers are required from iOS transitions; the macOS path does not emit a
+reliable initial `Resumed` event.
 
 The simulator and Mac evidence use only synthetic content. No diagnostic log
 contains message data, addresses, credentials, paths, or user-generated text.

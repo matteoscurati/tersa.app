@@ -19,7 +19,6 @@ mod apple {
 
     const INBOX_ROWS: usize = 10_000;
     const ROW_HEIGHT_PX: f64 = 76.0;
-    const VISIBLE_ROWS: usize = 9;
     const OVERSCAN_ROWS: usize = 6;
     const STYLE: &str = include_str!("style.css");
     const INDEX: &str = r#"<!doctype html>
@@ -32,18 +31,59 @@ mod apple {
   <div id="main"></div>
 </body>
 </html>"#;
+    const VIRTUALIZER_SCRIPT: &str = r#"
+        (() => {
+            const install = () => {
+                const list = document.querySelector('[data-evidence="virtual-list"]');
+                if (!list) {
+                    window.setTimeout(install, 0);
+                    return;
+                }
+
+                window.__tersaVirtualizerResizeObserver?.disconnect();
+                const updateActualRows = () => window.requestAnimationFrame(() => {
+                    window.requestAnimationFrame(() => {
+                        const output = document.querySelector(
+                            '[data-evidence="actual-dom-rows"]'
+                        );
+                        if (output) {
+                            output.textContent = `ACTUAL DOM ROWS ${
+                                document.querySelectorAll('.mail-row').length
+                            }`;
+                        }
+                    });
+                });
+                const notify = () => {
+                    list.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    updateActualRows();
+                };
+                const observer = new ResizeObserver(notify);
+                observer.observe(list);
+                list.addEventListener('scroll', updateActualRows, { passive: true });
+                window.__tersaVirtualizerResizeObserver = observer;
+                notify();
+            };
+            install();
+        })();
+    "#;
+    const JUMP_SCRIPT: &str = r#"
+        (() => {
+            const list = document.querySelector('[data-evidence="virtual-list"]');
+            if (!list) {
+                throw new Error('Dioxus virtual list is missing');
+            }
+            list.scrollTo({ top: 7600, behavior: 'auto' });
+        })();
+    "#;
     const EVIDENCE_SCRIPT: &str = r#"
         window.setTimeout(() => {
-            const list = document.querySelector('[data-evidence="virtual-list"]');
             const editor = document.querySelector('[data-evidence="composer"]');
             const advance = document.querySelector('[data-evidence="advance-list"]');
-            if (!list || !editor || !advance) {
+            if (!editor || !advance) {
                 throw new Error('Dioxus evidence controls are missing');
             }
             advance.click();
             window.setTimeout(() => {
-                list.scrollTop = 7600;
-
                 const setter = Object.getOwnPropertyDescriptor(
                     HTMLTextAreaElement.prototype,
                     'value'
@@ -53,7 +93,6 @@ mod apple {
                     'TERSA DIOXUS INPUT ONE\nTERSA DIOXUS INPUT TWO'
                 );
                 editor.dispatchEvent(new Event('input', { bubbles: true }));
-                editor.focus();
             }, 250);
         }, 5000);
     "#;
@@ -102,8 +141,14 @@ mod apple {
         let mut focus_state = use_signal(|| String::from("active — initial render"));
         let mut focus_events = use_signal(|| 0_u32);
         let mut safe_area_top = use_signal(|| -1_i32);
+        let mut viewport_height = use_signal(|| ROW_HEIGHT_PX * 9.0);
 
         use_effect(|| {
+            spawn(async move {
+                if let Err(error) = dioxus_document::eval(VIRTUALIZER_SCRIPT).await {
+                    eprintln!("TERSA-DIOXUS-VIRTUALIZER error: {error}");
+                }
+            });
             if std::env::var_os("TERSA_DIOXUS_EVIDENCE").is_some() {
                 spawn(async move {
                     if let Err(error) = dioxus_document::eval(EVIDENCE_SCRIPT).await {
@@ -115,7 +160,8 @@ mod apple {
 
         let first_visible = visible_row_index(scroll_top());
         let start = first_visible.saturating_sub(OVERSCAN_ROWS);
-        let end = (first_visible + VISIBLE_ROWS + OVERSCAN_ROWS).min(INBOX_ROWS);
+        let visible_rows = visible_row_count(viewport_height());
+        let end = (first_visible + visible_rows + OVERSCAN_ROWS).min(INBOX_ROWS);
         let rendered_rows = end.saturating_sub(start);
         let list_height = f64::from(u32::try_from(INBOX_ROWS).unwrap_or(u32::MAX)) * ROW_HEIGHT_PX;
         let protocol_version = tersa_presentation::presentation_protocol_version();
@@ -129,11 +175,11 @@ mod apple {
             main {
                 class: "app-shell",
                 tabindex: "-1",
-                onfocus: move |_| {
+                onfocusin: move |_| {
                     focus_state.set(String::from("active — WebView focus event"));
                     *focus_events.write() += 1;
                 },
-                onblur: move |_| {
+                onfocusout: move |_| {
                     focus_state.set(String::from("inactive — WebView blur event"));
                     *focus_events.write() += 1;
                 },
@@ -168,10 +214,10 @@ mod apple {
                         p { class: "eyebrow", "M0 FALLBACK CANDIDATE" }
                         h1 { "Inbox" }
                         ul {
-                            li { button { class: "nav-item selected", aria_current: "page", "Inbox", span { "10k" } } }
-                            li { button { class: "nav-item", "Starred", span { "24" } } }
-                            li { button { class: "nav-item", "Drafts", span { "3" } } }
-                            li { button { class: "nav-item", "Sent" } }
+                            li { button { class: "nav-item selected", aria_current: "page", disabled: true, "Inbox", span { "10k" } } }
+                            li { button { class: "nav-item", disabled: true, "Starred", span { "24" } } }
+                            li { button { class: "nav-item", disabled: true, "Drafts", span { "3" } } }
+                            li { button { class: "nav-item", disabled: true, "Sent" } }
                         }
                         section { class: "probe-card", aria_labelledby: "focus-title",
                             h2 { id: "focus-title", "WebView focus probe" }
@@ -199,21 +245,34 @@ mod apple {
                             output { role: "status", aria_live: "polite",
                                 "DOM ROWS {rendered_rows} / FIRST ROW {start} / END ROW {end}"
                             }
+                            output {
+                                "data-evidence": "actual-dom-rows",
+                                "ACTUAL DOM ROWS PENDING"
+                            }
                             button {
                                 r#type: "button",
                                 "data-evidence": "advance-list",
-                                onclick: move |_| scroll_top.set(7_600.0),
+                                onclick: move |_| {
+                                    spawn(async move {
+                                        if let Err(error) = dioxus_document::eval(JUMP_SCRIPT).await {
+                                            eprintln!("TERSA-DIOXUS-JUMP error: {error}");
+                                        }
+                                    });
+                                },
                                 "Jump to row 100"
                             }
                         }
                         div {
                             class: "virtual-list",
-                            role: "list",
-                            aria_label: "Synthetic inbox",
                             "data-evidence": "virtual-list",
-                            onscroll: move |event| scroll_top.set(event.data().scroll_top().max(0.0)),
+                            onscroll: move |event| {
+                                scroll_top.set(event.data().scroll_top().max(0.0));
+                                viewport_height.set(f64::from(event.data().client_height().max(1)));
+                            },
                             div {
                                 class: "virtual-spacer",
+                                role: "list",
+                                aria_label: "Synthetic inbox",
                                 style: "height: {list_height}px",
                                 for index in start..end {
                                     MailRow { key: "{index}", index }
@@ -238,11 +297,11 @@ mod apple {
                             }
                         }
                         output { class: "draft-status", aria_live: "polite",
-                            "{draft().chars().count()} characters — never persisted"
+                            "{draft().chars().count()} characters — not explicitly saved"
                         }
                         div { class: "composer-actions",
-                            button { class: "secondary", "Discard" }
-                            button { class: "primary", "Save synthetic draft" }
+                            button { class: "secondary", disabled: true, "Discard" }
+                            button { class: "primary", disabled: true, "Save synthetic draft" }
                         }
                         dl { class: "runtime-facts",
                             div { dt { "Runtime" } dd { "Dioxus 0.7.9 / WKWebView" } }
@@ -295,6 +354,31 @@ mod apple {
     )]
     fn visible_row_index(scroll_top: f64) -> usize {
         (scroll_top.max(0.0) / ROW_HEIGHT_PX).floor() as usize
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "The positive viewport height is intentionally converted to a bounded row count"
+    )]
+    fn visible_row_count(viewport_height: f64) -> usize {
+        (viewport_height.max(ROW_HEIGHT_PX) / ROW_HEIGHT_PX).ceil() as usize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ROW_HEIGHT_PX, visible_row_count};
+
+        #[test]
+        fn visible_rows_cover_the_complete_viewport() {
+            assert_eq!(visible_row_count(ROW_HEIGHT_PX * 9.0), 9);
+            assert_eq!(visible_row_count(ROW_HEIGHT_PX * 9.5), 10);
+        }
+
+        #[test]
+        fn visible_rows_never_become_empty() {
+            assert_eq!(visible_row_count(0.0), 1);
+        }
     }
 }
 

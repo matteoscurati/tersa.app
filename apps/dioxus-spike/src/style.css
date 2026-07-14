@@ -241,6 +241,7 @@ textarea:focus-visible,
 
 .virtual-diagnostics {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -260,6 +261,15 @@ textarea:focus-visible,
   color: #6d6961;
   background: #fff;
   font-size: 10px;
+}
+
+.virtual-diagnostics output {
+  white-space: nowrap;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .virtual-list {

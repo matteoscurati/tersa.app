@@ -216,8 +216,9 @@ jobs:
       - name: Check Rust security advisories
         # cargo-audit cannot derive target reachability from Cargo.lock. These
         # time-bounded ignores cover existing Apple-reachable findings plus
-        # Dioxus/Wry dependencies that cargo tree proves unreachable from both
-        # Apple targets. The Dioxus diagnostic remains rejected for production.
+        # Dioxus/Wry dependencies that the verifier proves unreachable from the
+        # macOS, iOS device, and iOS simulator graphs. The Dioxus diagnostic
+        # remains rejected for production.
         run: >-
           cargo audit
           --deny warnings

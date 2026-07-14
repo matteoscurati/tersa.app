@@ -9,6 +9,7 @@ set -eu
 
 apple_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${apple_dir}/build/dioxus-evidence"
+window_finder="${apple_dir}/build/find-process-window"
 mac_app="${apple_dir}/build/TersaDioxusMac.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
 ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Debug-iphonesimulator/Tersa Dioxus Spike.app"
 mkdir -p "$build_dir"
@@ -82,35 +83,24 @@ for observation in request.results ?? [] {
 SWIFT
 }
 
+xcrun swiftc "${apple_dir}/scripts/find-process-window.swift" -o "$window_finder"
+
 verify_virtualization_ocr() {
   ocr_file="$1"
-  dom_rows=$(sed -nE 's/.*DOM ROWS[^0-9]*([0-9]+).*/\1/p' "$ocr_file" | head -n 1)
+  dom_rows=$(sed -nE '/ACTUAL/!s/.*DOM ROWS[^0-9]*([0-9]+).*/\1/p' "$ocr_file" | head -n 1)
+  actual_rows=$(sed -nE 's/.*ACTUAL DOM ROWS[^0-9]*([0-9]+).*/\1/p' "$ocr_file" | head -n 1)
   first_row=$(sed -nE 's/.*FIRST ROW[^0-9]*([0-9]+).*/\1/p' "$ocr_file" | head -n 1)
   test -n "$dom_rows"
+  test -n "$actual_rows"
   test -n "$first_row"
   test "$dom_rows" -le 100
+  test "$actual_rows" -le 100
   printf '%s %s\n' "$dom_rows" "$first_row"
 }
 
 find_mac_window() {
   process_id="$1"
-  xcrun swift - "$process_id" <<'SWIFT'
-import CoreGraphics
-import Foundation
-
-let processIdentifier = Int32(CommandLine.arguments[1])!
-let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[CFString: Any]] ?? []
-for window in windows {
-    let owner = (window[kCGWindowOwnerPID] as? NSNumber)?.int32Value
-    let layer = (window[kCGWindowLayer] as? NSNumber)?.intValue
-    let number = (window[kCGWindowNumber] as? NSNumber)?.intValue
-    if owner == processIdentifier && layer == 0, let number {
-        print(number)
-        break
-    }
-}
-SWIFT
+  "$window_finder" "$process_id"
 }
 
 wait_for_mac_window() {
@@ -147,7 +137,12 @@ verify_loopback_listener() {
 }
 
 start_mac() {
-  TERSA_DIOXUS_EVIDENCE=1 "$mac_binary" >"${build_dir}/macos-process.log" 2>&1 &
+  evidence_mode="$1"
+  if [ "$evidence_mode" -eq 1 ]; then
+    TERSA_DIOXUS_EVIDENCE=1 "$mac_binary" >"${build_dir}/macos-process.log" 2>&1 &
+  else
+    "$mac_binary" >"${build_dir}/macos-process.log" 2>&1 &
+  fi
   mac_pid=$!
   wait_for_mac_window
   verify_loopback_listener "$mac_pid" "${build_dir}/macos-listeners.txt"
@@ -169,12 +164,12 @@ stop_mac() {
 }
 
 mac_cold_start=$(now_ns)
-start_mac
+start_mac 0
 mac_cold_end=$(now_ns)
 sleep 2
 stop_mac
 mac_warm_start=$(now_ns)
-start_mac
+start_mac 0
 mac_warm_end=$(now_ns)
 sleep 2
 screencapture -x -l "$mac_window" "${build_dir}/macos-initial.png"
@@ -185,24 +180,29 @@ grep -E '10.?000' "${build_dir}/macos-initial-ocr.txt"
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-initial-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -eq 0
-
-sleep 5
-screencapture -x -l "$mac_window" "${build_dir}/macos.png"
 stop_mac
+
+start_mac 1
+sleep 7
+screencapture -x -l "$mac_window" "${build_dir}/macos.png"
 test "$(stat -f '%z' "${build_dir}/macos.png")" -gt 10000
 recognize_text "${build_dir}/macos.png" > "${build_dir}/macos-ocr.txt"
 grep -E 'TERSA-DIOXUS-M[0O]-THREAD' "${build_dir}/macos-ocr.txt"
 grep -E '10.?000' "${build_dir}/macos-ocr.txt"
 grep -F 'TERSA DIOXUS INPUT ONE' "${build_dir}/macos-ocr.txt"
 grep -F 'TERSA DIOXUS INPUT TWO' "${build_dir}/macos-ocr.txt"
+grep -E '45 characters' "${build_dir}/macos-ocr.txt"
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -gt 0
+verify_loopback_listener "$mac_pid" "${build_dir}/macos-listeners.txt"
+stop_mac
 
 device=$(xcrun simctl list devices available \
-  | awk -F '[()]' '/iPhone (1[5-9]|Air).*Pro/ { print $2; exit }')
+  | awk -F '[()]' '/iPhone (1[5-9].*Pro|Air)/ { print $2; exit }')
 if [ -z "$device" ]; then
-  device=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')
+  device=$(xcrun simctl list devices available \
+    | awk -F '[()]' '/iPhone (1[5-9]|Air)/ { print $2; exit }')
 fi
 test -n "$device"
 xcrun simctl boot "$device" 2>/dev/null || true
@@ -225,7 +225,6 @@ xcrun simctl launch "$device" app.tersa.dioxus-spike.ios
 sleep 2
 xcrun simctl io "$device" screenshot "${build_dir}/ios-simulator.png"
 test "$(grep -c 'TERSA-DIOXUS-LIFECYCLE resumed' "${build_dir}/ios-process-stderr.log")" -ge 2
-xcrun simctl terminate "$device" app.tersa.dioxus-spike.ios
 test "$(stat -f '%z' "${build_dir}/ios-simulator.png")" -gt 10000
 recognize_text "${build_dir}/ios-simulator.png" > "${build_dir}/ios-simulator-ocr.txt"
 grep -F 'TERSA' "${build_dir}/ios-simulator-ocr.txt"
@@ -235,9 +234,11 @@ grep -E 'SAFE TOP[^0-9]*([4-9][0-9]|[1-9][0-9]{2,})' \
 virtualization=$(verify_virtualization_ocr "${build_dir}/ios-simulator-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -gt 0
+verify_loopback_listener "$ios_pid" "${build_dir}/ios-simulator-listeners.txt"
+xcrun simctl terminate "$device" app.tersa.dioxus-spike.ios
 
 debug_size=$(stat -f '%z' "$mac_binary")
-printf '{"mac_cold_window_observed_ns":%s,"mac_warm_window_observed_ns":%s,"ios_cold_launch_command_ns":%s,"mac_debug_binary_bytes":%s,"synthetic_rows":10000}\n' \
+printf '{"mac_cold_harness_ready_ns":%s,"mac_warm_harness_ready_ns":%s,"ios_cold_launch_command_ns":%s,"mac_debug_binary_bytes":%s,"synthetic_rows":10000}\n' \
   "$((mac_cold_end - mac_cold_start))" "$((mac_warm_end - mac_warm_start))" \
   "$((ios_cold_end - ios_cold_start))" "$debug_size" \
   > "${build_dir}/metrics.json"

@@ -212,10 +212,7 @@ fn check_dioxus_dependency(
     const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
 
     let dependency_name = dependency.name.as_str();
-    if !matches!(
-        dependency_name,
-        "dioxus" | "dioxus-desktop" | "dioxus-document"
-    ) {
+    if !is_dioxus_runtime_dependency(dependency_name) {
         return;
     }
 
@@ -231,6 +228,12 @@ fn check_dioxus_dependency(
             "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
         ));
     }
+}
+
+fn is_dioxus_runtime_dependency(dependency_name: &str) -> bool {
+    dependency_name == "dioxus"
+        || dependency_name.starts_with("dioxus-")
+        || matches!(dependency_name, "wry" | "tao" | "manganis")
 }
 
 fn check_slint_dependency(
@@ -349,7 +352,7 @@ fn parse_identity(identity: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_identity;
+    use super::{is_dioxus_runtime_dependency, parse_identity};
 
     #[test]
     fn parses_a_well_formed_identity() {
@@ -364,5 +367,14 @@ mod tests {
         assert_eq!(parse_identity("Example Contributor"), None);
         assert_eq!(parse_identity("<contributor@example.com>"), None);
         assert_eq!(parse_identity("Example <invalid>"), None);
+    }
+
+    #[test]
+    fn recognizes_the_complete_dioxus_runtime_boundary() {
+        assert!(is_dioxus_runtime_dependency("dioxus"));
+        assert!(is_dioxus_runtime_dependency("dioxus-core"));
+        assert!(is_dioxus_runtime_dependency("wry"));
+        assert!(is_dioxus_runtime_dependency("tao"));
+        assert!(!is_dioxus_runtime_dependency("tersa-domain"));
     }
 }
