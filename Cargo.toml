@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/dioxus-spike",
+    "apps/sqlcipher-spike",
     "apps/slint-spike",
     "apple/rust-bridge",
     "crates/application",
@@ -26,6 +27,7 @@ dioxus = { version = "=0.7.9", default-features = false, features = ["hooks", "h
 dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }
 dioxus-document = { version = "=0.7.9", default-features = false }
 getrandom = "0.3.4"
+rusqlite = { version = "=0.39.0", default-features = false }
 sha2 = "0.10.9"
 subtle = "2.6.1"
 tersa-application = { path = "crates/application", version = "=0.0.0" }

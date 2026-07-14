@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-sqlcipher-spike"
+description = "Diagnostic SQLCipher storage feasibility executable for Apple targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "tersa-sqlcipher-spike"
+path = "src/main.rs"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+getrandom = { workspace = true, features = ["std"] }
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true

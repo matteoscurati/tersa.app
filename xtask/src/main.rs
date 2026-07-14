@@ -188,6 +188,7 @@ fn check_architecture() -> TaskResult {
 
             check_slint_dependency(&package_name, dependency, &mut violations);
             check_dioxus_dependency(&package_name, dependency, &mut violations);
+            check_sqlcipher_dependency(&package_name, dependency, &mut violations);
         }
     }
 
@@ -265,6 +266,33 @@ fn check_slint_dependency(
     }
 }
 
+fn check_sqlcipher_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const SQLCIPHER_SPIKE: &str = "tersa-sqlcipher-spike";
+    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
+
+    let dependency_name = dependency.name.as_str();
+    if !matches!(dependency_name, "rusqlite" | "libsqlite3-sys") {
+        return;
+    }
+
+    if package_name != SQLCIPHER_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} (SQLCipher is exclusive to {SQLCIPHER_SPIKE})"
+        ));
+    }
+
+    let target = dependency.target.as_ref().map(ToString::to_string);
+    if target.as_deref() != Some(APPLE_TARGET) {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
+        ));
+    }
+}
+
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         (
@@ -273,6 +301,7 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-sqlcipher-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),

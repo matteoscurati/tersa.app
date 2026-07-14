@@ -63,6 +63,25 @@ The loopback peer check is not browser authentication. Any local process can
 connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
 against redirect injection and intercepted authorization codes.
 
+## SQLCipher feasibility
+
+The M0 encrypted-storage diagnostic is isolated from the shared application
+layers. It uses synthetic data to verify CommonCrypto-backed SQLCipher, WAL
+crash recovery, key rejection, integrity checks, in-memory temporary storage,
+and known-marker absence in controlled files.
+
+```sh
+rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+sh apple/scripts/verify-sqlcipher-feasibility.sh
+cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios
+cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
+```
+
+The committed result contains no key, sentinel, SQL, path, or raw database.
+Read [the SQLCipher feasibility record](m0/sqlcipher-feasibility.md) before
+changing the dependency, keying boundary, temporary-store policy, or evidence
+claims.
+
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
