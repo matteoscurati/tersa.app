@@ -1,0 +1,86 @@
+name: Tersa
+options:
+  bundleIdPrefix: app.tersa
+  deploymentTarget:
+    macOS: "15.0"
+    iOS: "18.0"
+  xcodeVersion: "26.0"
+settings:
+  base:
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: "NO"
+    SWIFT_VERSION: "6.0"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    DEVELOPMENT_TEAM: ""
+targets:
+  TersaMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: macos
+    info:
+      path: macos/Info.plist
+      properties:
+        LSApplicationCategoryType: public.app-category.productivity
+    entitlements:
+      path: macos/TersaMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
+        PRODUCT_NAME: Tersa
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: macos/TersaMac-Bridging-Header.h
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. Keep
+        # this exception scoped to the target that invokes the locked script.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_apple_bridge.a"
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
+  TersaIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: ios
+    info:
+      path: ios/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: ios/TersaIOS.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.ios
+        PRODUCT_NAME: Tersa
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_ENTITLEMENTS: ios/TersaIOS.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: ios/TersaIOS-Bridging-Header.h
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. Keep
+        # this exception scoped to the target that invokes the locked script.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_apple_bridge.a"
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" ios "${CONFIGURATION}"'
+    scheme:
+      testTargets: []

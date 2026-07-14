@@ -1,9 +1,11 @@
 # Rust
-/target/
+**/target/
 **/*.rs.bk
 
 # Apple and Xcode
 .DS_Store
+apple/Tersa.xcodeproj/
+apple/build/
 DerivedData/
 *.xcuserstate
 *.xcuserdata/

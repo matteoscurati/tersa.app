@@ -6,4 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+/// Returns the protocol version expected by platform presentation adapters.
+///
+/// This small stable surface lets platform bootstraps prove that they link the
+/// shared presentation crate before richer view models are introduced.
+#[must_use]
+pub const fn presentation_protocol_version() -> u32 {
+    1
+}
+
 // Rust guideline compliant 1.0.
