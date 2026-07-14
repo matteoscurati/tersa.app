@@ -67,11 +67,14 @@ The diagnostic Mac target does not claim App Sandbox compatibility.
 
 Launch measurements in `metrics.json` cover time until a window or simulator
 launch command is observed. They are not time-to-interactive claims. The
-evidence-only script performs one programmatic list scroll and one programmatic
-textarea input. OCR before and after those actions proves that Dioxus propagated
-both DOM events and kept the sampled rendered-row count bounded. It does not
-prove scrolling frame rate, bounds throughout arbitrary scrolling, operating
-system keyboard behavior, accessibility quality, or physical input behavior.
+evidence-only script activates one Dioxus list-position control, aligns the DOM
+scroll offset, and performs one programmatic textarea input. OCR before and
+after those actions proves that Dioxus propagated both state changes and kept
+the sampled rendered-row count bounded. It does not prove the native scroll
+event path, scrolling frame rate, bounds throughout arbitrary scrolling,
+operating system keyboard behavior, accessibility quality, or physical input
+behavior. Tao lifecycle markers are required from iOS transitions; the macOS
+path does not emit a reliable initial `Resumed` event.
 
 The simulator and Mac evidence use only synthetic content. No diagnostic log
 contains message data, addresses, credentials, paths, or user-generated text.

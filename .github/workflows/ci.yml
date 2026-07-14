@@ -135,8 +135,14 @@ jobs:
           unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
+      - name: Install notice generator
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+      - name: Check target-specific third-party notices
+        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Verify Dioxus runtime boundary
         run: python3 apple/scripts/verify-dioxus-runtime.py
       - name: Generate Apple project
@@ -205,8 +211,6 @@ jobs:
           tool: cargo-about@0.9.1,cargo-audit@0.22.1,cargo-deny@0.20.2,cargo-hack@0.6.45,typos-cli@1.48.0
       - name: Fetch locked dependencies for offline policy checks
         run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories

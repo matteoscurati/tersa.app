@@ -140,7 +140,7 @@ verify_loopback_listener() {
     sleep 0.1
   done
   grep -F '127.0.0.1:' "$output_file"
-  if grep -E 'TCP (\*|\[?::)' "$output_file" >/dev/null 2>&1; then
+  if ! awk 'NR > 1 && $9 !~ /^127[.]0[.]0[.]1:[0-9]+$/ { exit 1 }' "$output_file"; then
     echo "Dioxus opened a non-loopback TCP listener" >&2
     return 1
   fi
@@ -188,7 +188,6 @@ test "$first_row" -eq 0
 
 sleep 5
 screencapture -x -l "$mac_window" "${build_dir}/macos.png"
-grep -F 'TERSA-DIOXUS-LIFECYCLE resumed' "${build_dir}/macos-process.log"
 stop_mac
 test "$(stat -f '%z' "${build_dir}/macos.png")" -gt 10000
 recognize_text "${build_dir}/macos.png" > "${build_dir}/macos-ocr.txt"

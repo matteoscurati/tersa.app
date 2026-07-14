@@ -58,12 +58,15 @@ keys, the source navigation policy, target-specific notices, packaged
 resources, linked WebKit frameworks, live loopback-only listeners, lifecycle
 markers, screenshots, and stable OCR text.
 
-Wry also adds 13 informational or unsoundness advisories through its GTK-only
+Wry also adds 13 informational or unsoundness advisories through its non-Apple
 lockfile graph. `cargo audit` cannot evaluate target reachability, so CI uses
 time-bounded ignores through 2026-08-14. The Dioxus verifier independently
-fails if any affected package/version becomes reachable from either the macOS
-or iOS Cargo graph. The remaining Apple-reachable advisory exceptions predate
-this spike and remain subject to the same repository deadline.
+fails if any affected package/version becomes reachable from the macOS, iOS
+device, or iOS simulator Cargo graph. The remaining Apple-reachable advisory
+exceptions predate this spike and remain subject to the same repository
+deadline. Notice generation runs on macOS because `cargo-about` 0.9.1 does not
+produce byte-identical Apple-target output across host operating systems;
+`cargo-deny` and `cargo-audit` remain independent Linux gates.
 
 ## Diagnostic outcome
 

@@ -240,6 +240,10 @@ textarea:focus-visible,
 }
 
 .virtual-diagnostics {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 7px 22px;
   border-top: 1px solid #dedad1;
   border-bottom: 1px solid #dedad1;
@@ -247,6 +251,15 @@ textarea:focus-visible,
   background: #f8f6f1;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
+}
+
+.virtual-diagnostics button {
+  padding: 4px 7px;
+  border: 1px solid #cbc6bb;
+  border-radius: 7px;
+  color: #6d6961;
+  background: #fff;
+  font-size: 10px;
 }
 
 .virtual-list {

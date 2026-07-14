@@ -22,26 +22,39 @@ mod apple {
     const VISIBLE_ROWS: usize = 9;
     const OVERSCAN_ROWS: usize = 6;
     const STYLE: &str = include_str!("style.css");
+    const INDEX: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>tersa.app — Dioxus M0 diagnostic</title>
+</head>
+<body>
+  <div id="main"></div>
+</body>
+</html>"#;
     const EVIDENCE_SCRIPT: &str = r#"
         window.setTimeout(() => {
             const list = document.querySelector('[data-evidence="virtual-list"]');
             const editor = document.querySelector('[data-evidence="composer"]');
-            if (!list || !editor) {
+            const advance = document.querySelector('[data-evidence="advance-list"]');
+            if (!list || !editor || !advance) {
                 throw new Error('Dioxus evidence controls are missing');
             }
-            list.scrollTop = 7600;
-            list.dispatchEvent(new Event('scroll', { bubbles: true }));
+            advance.click();
+            window.setTimeout(() => {
+                list.scrollTop = 7600;
 
-            const setter = Object.getOwnPropertyDescriptor(
-                HTMLTextAreaElement.prototype,
-                'value'
-            ).set;
-            setter.call(
-                editor,
-                'TERSA DIOXUS INPUT ONE\nTERSA DIOXUS INPUT TWO'
-            );
-            editor.dispatchEvent(new Event('input', { bubbles: true }));
-            editor.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLTextAreaElement.prototype,
+                    'value'
+                ).set;
+                setter.call(
+                    editor,
+                    'TERSA DIOXUS INPUT ONE\nTERSA DIOXUS INPUT TWO'
+                );
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+                editor.focus();
+            }, 250);
         }, 5000);
     "#;
 
@@ -57,6 +70,7 @@ mod apple {
              <meta name=\"color-scheme\" content=\"light\"><style>{STYLE}</style>"
         );
         let config = Config::new()
+            .with_custom_index(INDEX.to_owned())
             .with_custom_head(head)
             .with_navigation_handler(|_| false)
             .with_disable_context_menu(true)
@@ -181,8 +195,16 @@ mod apple {
                                 }
                             }
                         }
-                        div { class: "virtual-diagnostics", role: "status", aria_live: "polite",
-                            "DOM ROWS {rendered_rows} / FIRST ROW {start} / END ROW {end}"
+                        div { class: "virtual-diagnostics",
+                            output { role: "status", aria_live: "polite",
+                                "DOM ROWS {rendered_rows} / FIRST ROW {start} / END ROW {end}"
+                            }
+                            button {
+                                r#type: "button",
+                                "data-evidence": "advance-list",
+                                onclick: move |_| scroll_top.set(7_600.0),
+                                "Jump to row 100"
+                            }
                         }
                         div {
                             class: "virtual-list",

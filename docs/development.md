@@ -111,8 +111,11 @@ python3 apple/scripts/verify-dioxus-runtime.py
 The Dioxus verifier pins the exact 0.7.9 graph, rejects Manganis and devtools,
 allows only the required `tokio_runtime` feature, and checks the private
 WebSocket's loopback bind and mutual-key invariants in the resolved source. The
-separate Apple evidence job also checks live listeners with `lsof`. This is
-diagnostic evidence, not a product backend or App Sandbox claim. See
+separate Apple evidence job also regenerates the Apple-target notices and
+checks live listeners with `lsof`. Notice comparison stays on macOS because
+`cargo-about` 0.9.1 is not byte-stable for Apple target selection across host
+operating systems. This is diagnostic evidence, not a product backend or App
+Sandbox claim. See
 [Dioxus UI feasibility](m0/dioxus-ui-feasibility.md) before changing this path.
 
 Create unsigned archives with:

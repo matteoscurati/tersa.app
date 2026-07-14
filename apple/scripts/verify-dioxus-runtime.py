@@ -20,7 +20,11 @@ LOOPBACK_URL = "ws://127.0.0.1:{port}/{webview_id}/{key_hex}"
 MUTUAL_KEY_SIZE = "const KEY_SIZE: usize = 256;"
 
 
-APPLE_TARGETS = ("aarch64-apple-darwin", "aarch64-apple-ios")
+APPLE_TARGETS = (
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+)
 NON_APPLE_ADVISORY_PACKAGES = {
     ("atk", "0.18.2"),
     ("atk-sys", "0.18.2"),
@@ -140,6 +144,9 @@ def main() -> None:
     )
     required_app_markers = (
         ".with_navigation_handler(|_| false)",
+        ".with_custom_index(INDEX.to_owned())",
+        '<html lang="en">',
+        "<title>tersa.app — Dioxus M0 diagnostic</title>",
         "TERSA-DIOXUS-M0-THREAD",
         "TERSA_DIOXUS_EVIDENCE",
         "viewport-fit=cover",
