@@ -82,8 +82,10 @@ executable only into the requested application bundle. XcodeGen installs the
 target-specific
 `apple/licenses/THIRD_PARTY_NOTICES-macos.txt` or
 `apple/licenses/THIRD_PARTY_NOTICES-ios.txt` resource; the evidence script
-compares each bundled copy byte-for-byte with the source. Regenerate or verify
-the complete Rust dependency license inventories with:
+compares each bundled copy byte-for-byte with the source. The supplemental
+inventory includes every native third-party component in the pinned Skia
+archive, with source revision, license path, and license SHA-256. Regenerate or
+verify the complete Rust and native dependency license inventories with:
 
 ```sh
 sh apple/scripts/generate-third-party-notices.sh --write

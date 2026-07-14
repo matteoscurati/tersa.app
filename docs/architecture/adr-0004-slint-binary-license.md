@@ -44,10 +44,13 @@ The macOS and iOS diagnostic bundles carry separate, target-specific
 `THIRD_PARTY_NOTICES-*.txt` resources. `cargo-about` 0.9.1 generates their
 complete linked Rust package inventory and available full license texts from
 the locked Slint spike graph. A deterministic renderer removes cargo cache
-state from the result and adds the pinned rust-skia and native Skia notices
-explicitly. Checksum-bound clarifications include the exact elected Slint
-license text. CI regenerates both inventories offline and requires a
-byte-for-byte match before distribution evidence can pass.
+state from the result and adds the pinned rust-skia, Skia, Expat, HarfBuzz,
+ICU, libjpeg-turbo, libpng, Wuffs, and zlib notices explicitly. The native
+component revisions come from the pinned Skia `DEPS` snapshot, and each copied
+license text records its source path and SHA-256. Checksum-bound clarifications
+also include the exact elected Slint license text. CI regenerates both
+inventories offline and requires a byte-for-byte match before distribution
+evidence can pass.
 
 Slint 1.16.1 also locks non-Apple packages that are absent from the macOS and
 iOS dependency graphs. `cargo-deny` therefore evaluates the three supported

@@ -43,6 +43,10 @@ ios_notice_source="${apple_dir}/licenses/THIRD_PARTY_NOTICES-ios.txt"
 cmp "$mac_notice_source" "${mac_app}/Contents/Resources/THIRD_PARTY_NOTICES-macos.txt"
 cmp "$ios_notice_source" "${ios_app}/THIRD_PARTY_NOTICES-ios.txt"
 cmp "$ios_notice_source" "${apple_dir}/build/TersaSlintIOS.xcarchive/Products/Applications/Tersa Slint Spike.app/THIRD_PARTY_NOTICES-ios.txt"
+for component in Expat HarfBuzz ICU libjpeg-turbo libpng Wuffs zlib; do
+  grep -Fx "$component" "$mac_notice_source"
+  grep -Fx "$component" "$ios_notice_source"
+done
 
 now_ns() {
   python3 -c 'import time; print(time.monotonic_ns())'

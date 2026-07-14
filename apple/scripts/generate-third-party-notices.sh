@@ -15,6 +15,8 @@ config="${workspace_dir}/about.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
 
+python3 "${script_dir}/verify-rust-skia-notices.py" "$supplemental"
+
 case "$mode" in
   --check)
     output_dir=$(mktemp -d "${TMPDIR:-/tmp}/tersa-notices.XXXXXX")
