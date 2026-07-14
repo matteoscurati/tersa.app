@@ -41,6 +41,7 @@ type PendingSession = AuthorizationSession<SystemMonotonicClock>;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static IOS_SESSIONS: OnceLock<Mutex<BTreeMap<u64, PendingSession>>> = OnceLock::new();
+static IOS_REAPER: OnceLock<()> = OnceLock::new();
 
 fn ios_sessions() -> &'static Mutex<BTreeMap<u64, PendingSession>> {
     IOS_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -97,6 +98,7 @@ pub unsafe extern "C" fn tersa_oauth_ios_begin(
             .lock()
             .map_err(|_error| STATUS_INTERNAL)?
             .insert(session_id, session);
+        ensure_ios_reaper();
         Ok(())
     })();
     result.map_or_else(|status| status, |()| STATUS_OK)
@@ -154,7 +156,9 @@ pub extern "C" fn tersa_oauth_cancel(session_id: u64) -> i32 {
     if let Ok(mut sessions) = ios_sessions().lock()
         && let Some(mut session) = sessions.remove(&session_id)
     {
-        return status_for_result(session.cancel());
+        return session
+            .cancel()
+            .map_or_else(status_for_error, |()| STATUS_CANCELLED);
     }
 
     #[cfg(target_os = "macos")]
@@ -210,20 +214,33 @@ fn ios_redirect_uri(scheme: &str) -> Result<Url, i32> {
     Url::parse(&format!("{scheme}:{IOS_CALLBACK_PATH}")).map_err(|_error| STATUS_INVALID_INPUT)
 }
 
-fn status_for_result(result: Result<(), OAuthError>) -> i32 {
-    match result {
-        Ok(()) => STATUS_OK,
-        Err(error) => status_for_error(error),
-    }
-}
-
 fn status_for_error(error: OAuthError) -> i32 {
     match error {
-        OAuthError::Cancelled => STATUS_CANCELLED,
         OAuthError::Expired => STATUS_EXPIRED,
         OAuthError::EntropyUnavailable => STATUS_INTERNAL,
         OAuthError::InvalidConfiguration => STATUS_CONFIGURATION_MISSING,
         _ => STATUS_REJECTED,
+    }
+}
+
+fn ensure_ios_reaper() {
+    IOS_REAPER.get_or_init(|| {
+        drop(std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                reap_expired_ios_sessions();
+            }
+        }));
+    });
+}
+
+fn reap_expired_ios_sessions() {
+    if let Ok(mut sessions) = ios_sessions().lock() {
+        sessions.retain(|_session_id, session| match session.expire() {
+            Ok(()) => false,
+            Err(OAuthError::NotExpired) => true,
+            Err(_terminal_error) => false,
+        });
     }
 }
 
@@ -285,8 +302,10 @@ mod macos {
     };
 
     const MAX_REQUEST_BYTES: usize = 8_192;
+    const REQUEST_READ_LIFETIME: Duration = Duration::from_secs(2);
     const CALLBACK_PATH: &str = "/";
-    const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 55\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nAuthorization received. Return to the tersa.app window.";
+    const HTTP_SUCCESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 55\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nAuthorization received. Return to the tersa.app window.";
+    const HTTP_ERROR_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 55\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nAuthorization rejected. Return to the tersa.app window.";
 
     #[derive(Debug)]
     pub(super) struct MacSessionEntry {
@@ -302,7 +321,13 @@ mod macos {
         InvalidMethod,
         WrongPath,
         MalformedRequest,
+        ReadDeadline,
         Io,
+    }
+
+    struct AcceptedCallback {
+        stream: TcpStream,
+        callback: Url,
     }
 
     pub(super) struct LoopbackReceiver {
@@ -329,7 +354,10 @@ mod macos {
             &self.redirect_uri
         }
 
-        fn try_accept(&mut self) -> Result<Option<Url>, LoopbackError> {
+        fn try_accept(
+            &mut self,
+            authorization_deadline: Instant,
+        ) -> Result<Option<AcceptedCallback>, LoopbackError> {
             if self.consumed {
                 return Err(LoopbackError::AlreadyConsumed);
             }
@@ -339,11 +367,21 @@ mod macos {
                 .ok_or(LoopbackError::AlreadyConsumed)?;
             match listener.accept() {
                 Ok((mut stream, peer)) => {
-                    self.consumed = true;
-                    self.listener.take();
-                    let callback = read_callback(&mut stream, peer, &self.redirect_uri);
-                    let _ = stream.write_all(HTTP_RESPONSE);
-                    callback.map(Some)
+                    let request_deadline = std::cmp::min(
+                        authorization_deadline,
+                        Instant::now() + REQUEST_READ_LIFETIME,
+                    );
+                    match read_callback(&mut stream, peer, &self.redirect_uri, request_deadline) {
+                        Ok(callback) => {
+                            self.consumed = true;
+                            self.listener.take();
+                            Ok(Some(AcceptedCallback { stream, callback }))
+                        }
+                        Err(_rejected_connection) => {
+                            write_response(&mut stream, HTTP_ERROR_RESPONSE);
+                            Ok(None)
+                        }
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 Err(_) => Err(LoopbackError::Io),
@@ -355,17 +393,31 @@ mod macos {
         stream: &mut TcpStream,
         peer: SocketAddr,
         redirect_uri: &Url,
+        deadline: Instant,
     ) -> Result<Url, LoopbackError> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|_error| LoopbackError::Io)?;
         let mut request = Zeroizing::new(Vec::with_capacity(1_024));
         let mut chunk = Zeroizing::new([0_u8; 1_024]);
         let mut complete = false;
         loop {
-            let count = stream
-                .read(&mut chunk[..])
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(LoopbackError::ReadDeadline)?;
+            stream
+                .set_read_timeout(Some(remaining))
                 .map_err(|_error| LoopbackError::Io)?;
+            let count = match stream.read(&mut chunk[..]) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(LoopbackError::ReadDeadline);
+                }
+                Err(_error) => return Err(LoopbackError::Io),
+            };
             if count == 0 {
                 break;
             }
@@ -382,6 +434,27 @@ mod macos {
             return Err(LoopbackError::MalformedRequest);
         }
         validate_request(peer, &request, redirect_uri)
+    }
+
+    fn write_response(stream: &mut TcpStream, response: &[u8]) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.write_all(response);
+    }
+
+    fn complete_callback(mut accepted: AcceptedCallback, session: &mut PendingSession) -> i32 {
+        let outcome = session.finish(&accepted.callback);
+        let status = outcome.map_or_else(status_for_error, |grant| {
+            drop(grant);
+            STATUS_SUCCEEDED
+        });
+        let response = if status == STATUS_SUCCEEDED {
+            HTTP_SUCCESS_RESPONSE
+        } else {
+            HTTP_ERROR_RESPONSE
+        };
+        write_response(&mut accepted.stream, response);
+        let _callback_bytes = Zeroizing::new(String::from(accepted.callback));
+        status
     }
 
     fn validate_request(
@@ -460,17 +533,10 @@ mod macos {
                     worker_status.store(STATUS_EXPIRED, Ordering::Release);
                     return;
                 }
-                match receiver.try_accept() {
-                    Ok(Some(callback)) => {
-                        let outcome = session.finish(&callback);
-                        let _callback_bytes = Zeroizing::new(String::from(callback));
-                        worker_status.store(
-                            outcome.map_or_else(status_for_error, |grant| {
-                                drop(grant);
-                                STATUS_SUCCEEDED
-                            }),
-                            Ordering::Release,
-                        );
+                match receiver.try_accept(deadline) {
+                    Ok(Some(accepted)) => {
+                        worker_status
+                            .store(complete_callback(accepted, &mut session), Ordering::Release);
                         return;
                     }
                     Ok(None) => thread::sleep(Duration::from_millis(10)),
@@ -525,15 +591,37 @@ mod macos {
         use std::io::{Read as _, Write as _};
         use std::net::TcpStream;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         use super::{
-            CALLBACK_PATH, HTTP_RESPONSE, LoopbackError, LoopbackReceiver, MAX_REQUEST_BYTES,
-            SocketAddr, Url, begin, validate_request,
+            AcceptedCallback, CALLBACK_PATH, HTTP_ERROR_RESPONSE, HTTP_SUCCESS_RESPONSE,
+            LoopbackError, LoopbackReceiver, MAX_REQUEST_BYTES, STATUS_REJECTED, STATUS_SUCCEEDED,
+            SocketAddr, Url, begin, complete_callback, validate_request,
         };
 
         fn redirect() -> Url {
             Url::parse("http://127.0.0.1:43123").unwrap()
+        }
+
+        fn deadline() -> Instant {
+            Instant::now() + Duration::from_secs(2)
+        }
+
+        fn state(authorization_url: &Url) -> String {
+            authorization_url
+                .query_pairs()
+                .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                .unwrap()
+        }
+
+        fn wait_for_callback(receiver: &mut LoopbackReceiver) -> AcceptedCallback {
+            let authorization_deadline = deadline();
+            loop {
+                if let Some(accepted) = receiver.try_accept(authorization_deadline).unwrap() {
+                    return accepted;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         #[test]
@@ -582,7 +670,10 @@ mod macos {
         fn a_receiver_rejects_a_second_connection_attempt() {
             let mut receiver = LoopbackReceiver::bind().unwrap();
             receiver.consumed = true;
-            assert_eq!(receiver.try_accept(), Err(LoopbackError::AlreadyConsumed));
+            assert!(matches!(
+                receiver.try_accept(deadline()),
+                Err(LoopbackError::AlreadyConsumed)
+            ));
         }
 
         #[test]
@@ -603,36 +694,100 @@ mod macos {
         }
 
         #[test]
-        fn fake_callback_is_one_shot_and_response_never_reflects_input() {
-            let mut receiver = LoopbackReceiver::bind().unwrap();
+        fn malformed_preconnect_is_discarded_before_a_valid_callback() {
+            let (authorization_url, mut session, mut receiver) =
+                begin("public-test-client").unwrap();
             let address = receiver.listener.as_ref().unwrap().local_addr().unwrap();
-            let client = thread::spawn(move || {
+            let preconnect = thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream.write_all(b"POST / HTTP/1.1\r\n\r\n").unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            });
+            let authorization_deadline = deadline();
+            while !preconnect.is_finished() {
+                assert!(
+                    receiver
+                        .try_accept(authorization_deadline)
+                        .unwrap()
+                        .is_none()
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            let rejected_response = preconnect.join().unwrap();
+            assert_eq!(rejected_response, HTTP_ERROR_RESPONSE);
+            assert!(!receiver.consumed);
+
+            let state = state(&authorization_url);
+            let browser = thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                write!(
+                    stream,
+                    "GET /?state={state}&code=secret-code HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                )
+                .unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            });
+            let accepted = wait_for_callback(&mut receiver);
+            assert_eq!(complete_callback(accepted, &mut session), STATUS_SUCCEEDED);
+            let response = browser.join().unwrap();
+            assert_eq!(response, HTTP_SUCCESS_RESPONSE);
+            assert!(!response.windows(6).any(|window| window == b"secret"));
+            assert!(matches!(
+                receiver.try_accept(deadline()),
+                Err(LoopbackError::AlreadyConsumed)
+            ));
+            assert!(TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err());
+        }
+
+        #[test]
+        fn state_mismatch_receives_a_static_error_response() {
+            let (_authorization_url, mut session, mut receiver) =
+                begin("public-test-client").unwrap();
+            let address = receiver.listener.as_ref().unwrap().local_addr().unwrap();
+            let browser = thread::spawn(move || {
                 let mut stream = TcpStream::connect(address).unwrap();
                 stream
-                    .write_all(
-                        b"GET /?state=secret-state&code=secret-code HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                    )
+                    .write_all(b"GET /?state=wrong&code=secret-code HTTP/1.1\r\n\r\n")
                     .unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).unwrap();
                 response
             });
-
-            let callback = loop {
-                if let Some(callback) = receiver.try_accept().unwrap() {
-                    break callback;
-                }
-                thread::sleep(Duration::from_millis(1));
-            };
-            let response = client.join().unwrap();
-            assert_eq!(
-                callback.query(),
-                Some("state=secret-state&code=secret-code")
-            );
-            assert_eq!(response, HTTP_RESPONSE);
+            let accepted = wait_for_callback(&mut receiver);
+            assert_eq!(complete_callback(accepted, &mut session), STATUS_REJECTED);
+            let response = browser.join().unwrap();
+            assert_eq!(response, HTTP_ERROR_RESPONSE);
             assert!(!response.windows(6).any(|window| window == b"secret"));
-            assert_eq!(receiver.try_accept(), Err(LoopbackError::AlreadyConsumed));
-            assert!(TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err());
+        }
+
+        #[test]
+        fn incomplete_request_has_an_absolute_deadline() {
+            let mut receiver = LoopbackReceiver::bind().unwrap();
+            let address = receiver.listener.as_ref().unwrap().local_addr().unwrap();
+            let mut client = TcpStream::connect(address).unwrap();
+            let drip = thread::spawn(move || {
+                for _ in 0..20 {
+                    if client.write_all(b"x").is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            thread::sleep(Duration::from_millis(5));
+            let started = Instant::now();
+            assert!(
+                receiver
+                    .try_accept(Instant::now() + Duration::from_millis(50))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(started.elapsed() < Duration::from_millis(150));
+            drip.join().unwrap();
+            assert!(!receiver.consumed);
         }
     }
 }
@@ -736,7 +891,12 @@ mod tests {
         reason = "redirect tests use compile-time constant schemes"
     )]
 
-    use super::{STATUS_CONFIGURATION_MISSING, ios_redirect_uri};
+    use std::time::Duration;
+
+    use super::{
+        AuthorizationConfig, STATUS_CONFIGURATION_MISSING, SystemMonotonicClock, Url,
+        ios_redirect_uri, ios_sessions, prepare_authorization, reap_expired_ios_sessions,
+    };
 
     #[test]
     fn ios_redirect_scheme_fails_closed() {
@@ -750,5 +910,23 @@ mod tests {
             ios_redirect_uri("app.tersa.oauth.test").unwrap().as_str(),
             "app.tersa.oauth.test:/oauth/callback"
         );
+    }
+
+    #[test]
+    fn ios_pending_session_is_removed_by_its_expiry_task() {
+        let config = AuthorizationConfig::new(
+            "public-test-client",
+            Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let prepared = prepare_authorization(config, SystemMonotonicClock::new()).unwrap();
+        let (_url, session) = prepared.into_parts();
+        let session_id = u64::MAX;
+        ios_sessions().lock().unwrap().insert(session_id, session);
+        std::thread::sleep(Duration::from_millis(2));
+        reap_expired_ios_sessions();
+
+        assert!(!ios_sessions().lock().unwrap().contains_key(&session_id));
     }
 }

@@ -191,7 +191,7 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
         self.consume()?;
         self.state.zeroize();
         self.verifier.zeroize();
-        Err(OAuthError::Cancelled)
+        Ok(())
     }
 
     /// Expires and consumes the session once its deadline has elapsed.
@@ -210,7 +210,7 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
         self.consume()?;
         self.state.zeroize();
         self.verifier.zeroize();
-        Err(OAuthError::Expired)
+        Ok(())
     }
 
     fn consume(&mut self) -> Result<(), OAuthError> {
@@ -309,8 +309,6 @@ pub enum OAuthError {
     RedirectMismatch,
     /// The returned state does not match the pending session.
     StateMismatch,
-    /// The user or platform cancelled the authorization session.
-    Cancelled,
     /// The authorization deadline elapsed.
     Expired,
     /// The session has not yet reached its deadline.
@@ -330,7 +328,6 @@ impl fmt::Display for OAuthError {
             Self::ProviderRejected => "the OAuth provider rejected the request",
             Self::RedirectMismatch => "the OAuth redirect does not match",
             Self::StateMismatch => "the OAuth state does not match",
-            Self::Cancelled => "the OAuth request was cancelled",
             Self::Expired => "the OAuth request expired",
             Self::NotExpired => "the OAuth request has not expired",
             Self::AlreadyConsumed => "the OAuth request was already consumed",
@@ -658,7 +655,7 @@ mod tests {
         let prepared = make_prepared(5);
         let callback = make_callback(prepared.authorization_url(), "code");
         let (_, mut cancelled) = prepared.into_parts();
-        assert_eq!(cancelled.cancel(), Err(OAuthError::Cancelled));
+        assert_eq!(cancelled.cancel(), Ok(()));
         assert!(matches!(
             cancelled.finish(&callback),
             Err(OAuthError::AlreadyConsumed)
@@ -675,6 +672,17 @@ mod tests {
         ));
         assert!(matches!(
             expired.finish(&callback),
+            Err(OAuthError::AlreadyConsumed)
+        ));
+
+        let prepared = make_prepared(7);
+        let callback = make_callback(prepared.authorization_url(), "code");
+        let clock = prepared.session.clock.clone();
+        let (_, mut explicitly_expired) = prepared.into_parts();
+        clock.advance(60);
+        assert_eq!(explicitly_expired.expire(), Ok(()));
+        assert!(matches!(
+            explicitly_expired.finish(&callback),
             Err(OAuthError::AlreadyConsumed)
         ));
     }

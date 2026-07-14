@@ -55,7 +55,8 @@ The verifier checks archived symbols and injected Info.plist values, ad-hoc
 signs the macOS archive with its production sandbox entitlements, then runs a
 fixed in-process loopback client/server probe. Rust tests exercise the
 deterministic callback, negative state machine, bounded HTTP parser, static
-response, and one-shot listener. No evidence file contains state, verifier,
+responses, speculative-connection recovery, absolute read deadline, and
+one-shot valid callback. No evidence file contains state, verifier,
 authorization code, token, or authorization URL.
 
 The loopback peer check is not browser authentication. Any local process can
