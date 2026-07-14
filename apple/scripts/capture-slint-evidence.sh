@@ -62,13 +62,24 @@ wait_for_mac_process() {
   done
 }
 
+wait_for_mac_exit() {
+  attempts=0
+  while pgrep -f "$mac_binary" >/dev/null; do
+    attempts=$((attempts + 1))
+    test "$attempts" -lt 100
+    sleep 0.1
+  done
+}
+
 pkill -f "$mac_binary" 2>/dev/null || true
+wait_for_mac_exit
 mac_cold_start=$(now_ns)
 open -n "$mac_app"
 wait_for_mac_process
 mac_cold_end=$(now_ns)
 sleep 2
 pkill -f "$mac_binary"
+wait_for_mac_exit
 mac_warm_start=$(now_ns)
 open -n "$mac_app"
 wait_for_mac_process
@@ -102,8 +113,8 @@ recognize_text "${build_dir}/ios-simulator.png" > "${build_dir}/ios-simulator-oc
 grep -F 'TERSA' "${build_dir}/ios-simulator-ocr.txt"
 grep -E '10.?000' "${build_dir}/ios-simulator-ocr.txt"
 
-debug_size=$(stat -f '%z' "$mac_binary")
-printf '{"mac_cold_process_observed_ns":%s,"mac_warm_process_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_debug_binary_bytes":%s}\n' \
+release_size=$(stat -f '%z' "$mac_binary")
+printf '{"mac_cold_process_observed_ns":%s,"mac_warm_process_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_release_binary_bytes":%s}\n' \
   "$((mac_cold_end - mac_cold_start))" "$((mac_warm_end - mac_warm_start))" \
-  "$((ios_cold_end - ios_cold_start))" "$((ios_warm_end - ios_warm_start))" "$debug_size" \
+  "$((ios_cold_end - ios_cold_start))" "$((ios_warm_end - ios_warm_start))" "$release_size" \
   > "${build_dir}/metrics.json"
