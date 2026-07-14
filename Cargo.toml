@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/dioxus-spike",
     "apps/slint-spike",
     "apple/rust-bridge",
     "crates/application",
@@ -20,6 +21,9 @@ authors = ["tersa.app contributors"]
 
 [workspace.dependencies]
 cargo_metadata = "0.23.1"
+dioxus = { version = "=0.7.9", default-features = false, features = ["hooks", "html", "macro", "signals"] }
+dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }
+dioxus-document = { version = "=0.7.9", default-features = false }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 
 [workspace.lints.rust]

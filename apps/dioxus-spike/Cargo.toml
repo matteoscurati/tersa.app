@@ -1,0 +1,25 @@
+[package]
+name = "tersa-dioxus-spike"
+description = "Diagnostic Dioxus WebView feasibility executable for Apple targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "tersa-dioxus-spike"
+path = "src/main.rs"
+
+[dependencies]
+tersa-presentation.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+dioxus.workspace = true
+dioxus-desktop.workspace = true
+dioxus-document.workspace = true
+
+[lints]
+workspace = true

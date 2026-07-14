@@ -10,10 +10,12 @@ OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
 security policy, and Google API compliance.
 
 The Slint diagnostic packages successfully, but its production gate failed
-because the locked Winit accessibility adapter is a no-op on iOS. M0 therefore
-continues with the planned Dioxus WebView fallback. Physical-device input,
-accessibility, lifecycle, and WKWebView composition remain required gates for
-the replacement candidate.
+because the locked Winit accessibility adapter is a no-op on iOS. The planned
+Dioxus 0.7.9 fallback also packages successfully and is suitable for continued
+diagnostic work, but it is not a production baseline: persistent WebKit state,
+navigation interception, sandboxed loopback transport, runtime footprint, and
+physical-device evidence are unresolved. M0 must resolve those blockers or
+reopen the UI constraint before M1 product screens begin.
 
 ## M1 — Vertical slice
 
