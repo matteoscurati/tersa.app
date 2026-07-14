@@ -20,6 +20,7 @@ mod apple {
     const INBOX_ROWS: usize = 10_000;
     const ROW_HEIGHT_PX: f64 = 76.0;
     const OVERSCAN_ROWS: usize = 6;
+    const MAX_RENDERED_ROWS: usize = 100;
     const STYLE: &str = include_str!("style.css");
     const INDEX: &str = r#"<!doctype html>
 <html lang="en">
@@ -160,7 +161,8 @@ mod apple {
 
         let first_visible = visible_row_index(scroll_top());
         let start = first_visible.saturating_sub(OVERSCAN_ROWS);
-        let visible_rows = visible_row_count(viewport_height());
+        let visible_rows = visible_row_count(viewport_height())
+            .min(MAX_RENDERED_ROWS.saturating_sub(OVERSCAN_ROWS.saturating_mul(2)));
         let end = (first_visible + visible_rows + OVERSCAN_ROWS).min(INBOX_ROWS);
         let rendered_rows = end.saturating_sub(start);
         let list_height = f64::from(u32::try_from(INBOX_ROWS).unwrap_or(u32::MAX)) * ROW_HEIGHT_PX;
@@ -367,7 +369,7 @@ mod apple {
 
     #[cfg(test)]
     mod tests {
-        use super::{ROW_HEIGHT_PX, visible_row_count};
+        use super::{MAX_RENDERED_ROWS, OVERSCAN_ROWS, ROW_HEIGHT_PX, visible_row_count};
 
         #[test]
         fn visible_rows_cover_the_complete_viewport() {
@@ -378,6 +380,14 @@ mod apple {
         #[test]
         fn visible_rows_never_become_empty() {
             assert_eq!(visible_row_count(0.0), 1);
+        }
+
+        #[test]
+        fn rendered_row_budget_can_never_exceed_the_evidence_limit() {
+            let visible_rows = visible_row_count(ROW_HEIGHT_PX * 10_000.0)
+                .min(MAX_RENDERED_ROWS.saturating_sub(OVERSCAN_ROWS.saturating_mul(2)));
+
+            assert_eq!(visible_rows + (OVERSCAN_ROWS * 2), MAX_RENDERED_ROWS);
         }
     }
 }
