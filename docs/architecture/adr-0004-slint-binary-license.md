@@ -32,11 +32,13 @@ are intentionally package-specific and must be reduced if the locked graph no
 longer requires an entry.
 
 Skia is bundled through `rust-skia` and `skia-bindings`. Their native archive
-and source-notice obligations remain applicable. `skia-bindings` downloads a
-prebuilt archive when its build cannot use a local build; its observed archive
-source URL and SHA-256 must be recorded in the feasibility evidence whenever
-an Apple build exposes them. This repository does not treat an unavailable
-download as evidence of provenance.
+and source-notice obligations remain applicable. The locked Skia BSD notice is
+stored in `apple/licenses/THIRD_PARTY_NOTICES.txt`, bundled as an application
+resource in both diagnostic packages, and verified in the packaging evidence
+gate. `skia-bindings` downloads a prebuilt archive when its build cannot use a
+local build; its observed archive source URL and SHA-256 must be recorded in
+the feasibility evidence whenever an Apple build exposes them. This repository
+does not treat an unavailable download as evidence of provenance.
 
 Slint 1.16.1 also locks non-Apple packages that are absent from the macOS and
 iOS dependency graphs. `cargo-deny` therefore evaluates the three supported

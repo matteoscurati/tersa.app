@@ -87,8 +87,13 @@ targets:
   TersaSlintMac:
     type: application
     platform: macOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES.txt
+        buildPhase: resources
     info:
       path: slint-macos/Info.plist
+      properties:
+        NSHighResolutionCapable: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.slint-spike.mac
@@ -107,6 +112,9 @@ targets:
   TersaSlintIOS:
     type: application
     platform: iOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES.txt
+        buildPhase: resources
     info:
       path: slint-ios/Info.plist
       properties:

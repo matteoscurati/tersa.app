@@ -76,7 +76,9 @@ application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while the locked build script
 writes intermediates exclusively below the ignored `apple/build` directory.
 The Slint scripts copy the executable only into Xcode's requested application
-bundle.
+bundle. XcodeGen also installs the locked
+`apple/licenses/THIRD_PARTY_NOTICES.txt` resource in both diagnostic bundles;
+the evidence script compares each bundled copy byte-for-byte with the source.
 
 Create unsigned archives with:
 

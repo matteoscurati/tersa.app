@@ -28,6 +28,10 @@ export component TersaSlintSpike inherits Window {
         background: #f4f3ee;
 
         HorizontalLayout {
+            padding-top: root.safe-area-insets.top;
+            padding-right: root.safe-area-insets.right;
+            padding-bottom: root.safe-area-insets.bottom;
+            padding-left: root.safe-area-insets.left;
             spacing: 0px;
 
             Rectangle {
