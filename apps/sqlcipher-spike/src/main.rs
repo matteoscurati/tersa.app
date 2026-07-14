@@ -12,6 +12,7 @@ mod apple {
     use std::error::Error;
     use std::fs::{self, File};
     use std::io::{Read, Write};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
@@ -51,15 +52,7 @@ mod apple {
         assert_absent(&files, &temp_sentinel).map_err(|_error| "P10")?;
 
         let status = child.kill_and_wait().map_err(|_error| "P11")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if status.signal() != Some(9) {
-                return Err("P12");
-            }
-        }
-        #[cfg(not(unix))]
-        if status.success() {
+        if status.signal() != Some(9) {
             return Err("P12");
         }
 
@@ -127,13 +120,22 @@ mod apple {
 
         let connection = open_encrypted(workspace.database(), key)?;
         configure(&connection)?;
-        let mut statement = connection.prepare("SELECT payload FROM records ORDER BY id")?;
+        let mut statement = connection.prepare("SELECT id, payload FROM records ORDER BY id")?;
         let recovered = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let expected = ["non-sensitive fixture", sentinel, "non-sensitive fixture"];
+        let expected = [
+            (1, "non-sensitive fixture"),
+            (2, sentinel),
+            (3, "non-sensitive fixture"),
+        ];
         if recovered.len() != usize::try_from(ROW_COUNT)?
-            || !recovered.iter().map(String::as_str).eq(expected)
+            || !recovered
+                .iter()
+                .map(|(id, payload)| (*id, payload.as_str()))
+                .eq(expected)
         {
             return Err("recovered committed rows differ from the expected values".into());
         }
