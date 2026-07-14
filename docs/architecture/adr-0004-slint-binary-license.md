@@ -38,17 +38,20 @@ source URL and SHA-256 must be recorded in the feasibility evidence whenever
 an Apple build exposes them. This repository does not treat an unavailable
 download as evidence of provenance.
 
-Slint 1.16.1 also locks non-Apple Winit/Wayland packages that are absent from
-the macOS and iOS dependency graphs. `cargo-deny` therefore evaluates the three
-supported Apple triples. `cargo-audit` cannot infer that reachability from the
-lockfile, so CI narrowly ignores `RUSTSEC-2026-0194` and
-`RUSTSEC-2026-0195`; both affect `quick-xml` through the non-shipping Wayland
-scanner. The target-aware `cargo-deny` policy records reasons for the three
-Apple-reachable unmaintained notices. The full-lockfile `cargo-audit` gate
-rejects all other warnings and vulnerabilities while listing the six temporary
-Slint-transitive exceptions explicitly. CI expires the complete exception set
-on 15 August 2026. Removing or renewing these exceptions requires explicit
-review and remains a production UI gate, not an accepted product risk.
+Slint 1.16.1 also locks non-Apple packages that are absent from the macOS and
+iOS dependency graphs. `cargo-deny` therefore evaluates the three supported
+Apple triples. The target-aware policy records reasons for three
+Apple-reachable unmaintained notices: `RUSTSEC-2024-0436`,
+`RUSTSEC-2026-0192`, and `RUSTSEC-2026-0206`. The full-lockfile `cargo-audit`
+gate duplicates those three exceptions. It also records
+`RUSTSEC-2025-0141` for build-time-only `bincode` through
+`i-slint-compiler`, plus `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` for
+`quick-xml` through the non-shipping Wayland scanner. These last three packages
+are absent from the supported Apple runtime graphs, but `cargo-audit` cannot
+apply target reachability to a lockfile. The gate rejects every other warning
+or vulnerability. CI expires all six exceptions on 15 August 2026. Removing or
+renewing an exception requires explicit review and remains a production UI
+gate, not an accepted product risk.
 
 ## Alternatives considered
 

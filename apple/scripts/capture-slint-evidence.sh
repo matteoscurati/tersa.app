@@ -102,8 +102,8 @@ recognize_text "${build_dir}/ios-simulator.png" > "${build_dir}/ios-simulator-oc
 grep -F 'TERSA' "${build_dir}/ios-simulator-ocr.txt"
 grep -E '10.?000' "${build_dir}/ios-simulator-ocr.txt"
 
-release_size=$(stat -f '%z' "$mac_binary")
-printf '{"mac_cold_process_observed_ns":%s,"mac_warm_process_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_release_binary_bytes":%s}\n' \
+debug_size=$(stat -f '%z' "$mac_binary")
+printf '{"mac_cold_process_observed_ns":%s,"mac_warm_process_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_debug_binary_bytes":%s}\n' \
   "$((mac_cold_end - mac_cold_start))" "$((mac_warm_end - mac_warm_start))" \
-  "$((ios_cold_end - ios_cold_start))" "$((ios_warm_end - ios_warm_start))" "$release_size" \
+  "$((ios_cold_end - ios_cold_start))" "$((ios_warm_end - ios_warm_start))" "$debug_size" \
   > "${build_dir}/metrics.json"

@@ -141,9 +141,9 @@ jobs:
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories
-        # cargo-audit cannot derive target reachability from Cargo.lock. The
-        # quick-xml advisories below are graph-pruned by cargo-deny for Apple,
-        # while these duplicate ignores keep cargo-audit useful for the rest.
+        # cargo-audit cannot derive target reachability from Cargo.lock. These
+        # time-bounded ignores cover three Apple-reachable unmaintained notices,
+        # one build-time compiler notice, and two non-Apple Wayland findings.
         run: >-
           cargo audit
           --deny warnings

@@ -7,8 +7,13 @@ data, a 10,000-row virtualized inbox, search input, and multiline composer.
 Stable screenshot markers are `TERSA-SLINT-M0-THREAD` and `INBOX / 10,000 ROWS`.
 It has no Gmail, OAuth, storage, network, HTML, WKWebView, or production claim.
 
-The M0 Slint gate remains **open**. WKWebView-over-Metal composition is the
-largest remaining architecture risk.
+The M0 Slint production gate is **failed on iOS accessibility**. Slint 1.16.1
+routes Winit accessibility through `accesskit_winit` 0.30.0, whose iOS platform
+adapter is a no-op. The diagnostic remains useful packaging evidence, but Slint
+cannot be selected for production unless an upstreamable iOS accessibility
+adapter passes the physical-device gate. Per the product plan, the next UI
+feasibility candidate is Dioxus WebView. WKWebView-over-Metal composition and
+the remaining physical-device checks are still open evidence.
 
 ## Evidence
 
@@ -19,7 +24,8 @@ largest remaining architecture risk.
 | Mac and simulator screenshots | **Required CI gate** | Per-commit OCR-verified evidence artifact; `#M0-SLINT-003` |
 | Skia archive source and SHA-256 | **PASS locally** | Recorded below; `#M0-SLINT-004` |
 | Physical-device IME, autocorrect, dictation, selection, copy/paste, hardware keyboard | **UNVERIFIED** | `#M0-SLINT-005` |
-| VoiceOver, Dynamic Type, Full Keyboard Access | **UNVERIFIED** | `#M0-SLINT-006` |
+| VoiceOver accessibility tree | **FAIL by dependency inspection** | `accesskit_winit` 0.30.0 selects its no-op platform adapter on iOS; physical-device confirmation remains `#M0-SLINT-006` |
+| Dynamic Type and Full Keyboard Access | **UNVERIFIED** | `#M0-SLINT-006` |
 | Lifecycle, memory warning, protected data | **UNVERIFIED** | `#M0-SLINT-007` |
 | Performance, RAM, scroll behavior | **UNVERIFIED** | `#M0-SLINT-008` |
 | OAuth callback | **UNVERIFIED** | `#M0-SLINT-009` |
