@@ -93,6 +93,9 @@ verify_virtualization_ocr() {
   test -n "$dom_rows"
   test -n "$actual_rows"
   test -n "$first_row"
+  test "$dom_rows" -gt 0
+  test "$actual_rows" -gt 0
+  test "$dom_rows" -eq "$actual_rows"
   test "$dom_rows" -le 100
   test "$actual_rows" -le 100
   printf '%s %s\n' "$dom_rows" "$first_row"
