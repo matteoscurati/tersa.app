@@ -33,11 +33,12 @@ longer requires an entry.
 
 Skia is bundled through `rust-skia` and `skia-bindings`. Their native archive
 and source-notice obligations remain applicable. Before Cargo runs,
-`build-slint-executable.sh` downloads the target's pinned rust-skia 0.90.0
+`prepare-verified-skia.sh` downloads the target's pinned rust-skia 0.90.0
 archive, verifies its SHA-256, and exposes only that verified file to
-`skia-bindings` through its supported local `file://` source. Unverified
-archive bytes never reach the extraction step. The source URL and all three
-Apple archive digests are recorded in the feasibility evidence.
+`skia-bindings` through its supported local `file://` source. Both Xcode and
+the workspace-wide macOS CI job use this helper, so unverified archive bytes
+never reach the extraction step. The source URL and all three Apple archive
+digests are recorded in the feasibility evidence.
 
 The macOS and iOS diagnostic bundles carry separate, target-specific
 `THIRD_PARTY_NOTICES-*.txt` resources. `cargo-about` 0.9.1 generates their

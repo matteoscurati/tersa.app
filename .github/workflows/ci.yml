@@ -121,6 +121,11 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Prepare verified rust-skia archive
+        if: runner.os == 'macOS'
+        run: >-
+          echo "SKIA_BINARIES_URL=$(sh apple/scripts/prepare-verified-skia.sh
+          aarch64-apple-darwin)" >> "$GITHUB_ENV"
       - name: Run baseline verification
         run: cargo run --locked --package xtask -- verify
 

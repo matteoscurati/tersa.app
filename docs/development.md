@@ -75,9 +75,11 @@ The Rust bridge and Slint spike are root workspace members and are therefore cov
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while the locked build script
 writes intermediates exclusively below the ignored `apple/build` directory.
-The Slint scripts verify the target's pinned Skia archive before making it
-available to `skia-bindings`, then copy the executable only into Xcode's
-requested application bundle. XcodeGen installs the target-specific
+The shared Slint archive helper verifies the target's pinned Skia archive
+before making it available to `skia-bindings`. Both Xcode builds and the
+workspace-wide macOS CI check use this helper. The Xcode build then copies the
+executable only into the requested application bundle. XcodeGen installs the
+target-specific
 `apple/licenses/THIRD_PARTY_NOTICES-macos.txt` or
 `apple/licenses/THIRD_PARTY_NOTICES-ios.txt` resource; the evidence script
 compares each bundled copy byte-for-byte with the source. Regenerate or verify

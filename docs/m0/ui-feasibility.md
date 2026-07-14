@@ -38,9 +38,10 @@ tracker is provisioned; they are stable names for the required follow-up work.
 
 ## Verified Skia archives
 
-The build script downloads `rust-skia` 0.90.0 archives from the official
-`rust-skia/skia-binaries` GitHub release path and verifies each archive before
-making it available to `skia-bindings`:
+The shared archive helper downloads `rust-skia` 0.90.0 archives from the
+official `rust-skia/skia-binaries` GitHub release path and verifies each
+archive before making it available to `skia-bindings`. Xcode and every
+workspace-wide macOS CI build call the same helper:
 
 - macOS: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `ffce3a615d922cb6358ec98cc3796541c350fbe0a67e1d46aaaa34d3483eee59`
 - iOS device: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-ios-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `dd62d2aeb55dffbdeedee9a2d095b7ac28e11ce0e86ec57e7c05e895bef267e2`
