@@ -32,11 +32,13 @@ test -x "$mac_binary"
 file "$mac_binary" | grep -F 'arm64'
 otool -L "$mac_binary" | grep -F 'AppKit.framework'
 strings -a "$mac_binary" | grep -F 'TERSA-SLINT-M0-THREAD'
+strings -a "$mac_binary" | grep -F 'INBOX / 10,000 ROWS'
 
 ios_archive_binary="${apple_dir}/build/TersaSlintIOS.xcarchive/Products/Applications/Tersa Slint Spike.app/tersa-slint-spike"
 test -x "$ios_archive_binary"
 file "$ios_archive_binary" | grep -F 'arm64'
 strings -a "$ios_archive_binary" | grep -F 'TERSA-SLINT-M0-THREAD'
+strings -a "$ios_archive_binary" | grep -F 'INBOX / 10,000 ROWS'
 
 mac_notice_source="${apple_dir}/licenses/THIRD_PARTY_NOTICES-macos.txt"
 ios_notice_source="${apple_dir}/licenses/THIRD_PARTY_NOTICES-ios.txt"
@@ -169,8 +171,8 @@ xcrun simctl io "$device" screenshot "${build_dir}/ios-simulator.png"
 xcrun simctl terminate "$device" app.tersa.slint-spike.ios
 test "$(stat -f '%z' "${build_dir}/ios-simulator.png")" -gt 10000
 recognize_text "${build_dir}/ios-simulator.png" > "${build_dir}/ios-simulator-ocr.txt"
-grep -F 'TERSA' "${build_dir}/ios-simulator-ocr.txt"
-grep -E '10.?000' "${build_dir}/ios-simulator-ocr.txt"
+grep -E 'TERSA-SLINT-M[0O]-THREAD' "${build_dir}/ios-simulator-ocr.txt"
+grep -Ei 'diagnostic thread 0*0[1-9]' "${build_dir}/ios-simulator-ocr.txt"
 
 release_size=$(stat -f '%z' "$mac_binary")
 printf '{"mac_cold_window_observed_ns":%s,"mac_warm_window_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_release_binary_bytes":%s}\n' \
