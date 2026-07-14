@@ -447,11 +447,14 @@ button:disabled {
   }
 
   .inbox-panel {
-    min-height: calc(100svh - 64px - env(safe-area-inset-top));
+    height: calc(
+      100svh - 64px - env(safe-area-inset-top) - env(safe-area-inset-bottom)
+    );
+    min-height: 0;
   }
 
   .virtual-list {
-    min-height: 55svh;
+    min-height: 0;
   }
 
   .composer {
