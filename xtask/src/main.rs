@@ -121,6 +121,10 @@ fn verify() -> TaskResult {
             "--all-features",
         ]),
     )?;
+    run_command(
+        "documentation tests",
+        cargo(["test", "--locked", "--workspace", "--doc", "--all-features"]),
+    )?;
 
     let mut documentation = cargo([
         "doc",
