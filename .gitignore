@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Apple and Xcode
+.DS_Store
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.ipa
+*.dSYM/
+*.dSYM.zip
+
+# Slint
+*.slint.cache
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.p12
+*.mobileprovision
+*.key
+*.pem
+secrets/
+local.xcconfig
+GoogleService-Info.plist
+
+# Diagnostics and local tooling
+diagnostics/
+coverage/
+.idea/
+.vscode/
+*.swp
+*.tmp
