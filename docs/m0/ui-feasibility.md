@@ -14,9 +14,9 @@ largest remaining architecture risk.
 
 | Check | Status | Evidence or follow-up |
 |---|---|---|
-| macOS unsigned Rust/Slint package | **PASS locally; CI archive pending** | Xcode 26.6 arm64 debug package; `#M0-SLINT-001` |
-| iOS device unsigned Rust/Slint package | **PASS locally; CI archive pending** | Xcode 26.6 arm64 device package; `#M0-SLINT-002` |
-| Mac and simulator screenshots | Pending CI run | `#M0-SLINT-003` |
+| macOS unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 debug package and per-commit Release archive; `#M0-SLINT-001` |
+| iOS device unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 device package and per-commit Release archive; `#M0-SLINT-002` |
+| Mac and simulator screenshots | **Required CI gate** | Per-commit OCR-verified evidence artifact; `#M0-SLINT-003` |
 | Skia archive source and SHA-256 | **PASS locally** | Recorded below; `#M0-SLINT-004` |
 | Physical-device IME, autocorrect, dictation, selection, copy/paste, hardware keyboard | **UNVERIFIED** | `#M0-SLINT-005` |
 | VoiceOver, Dynamic Type, Full Keyboard Access | **UNVERIFIED** | `#M0-SLINT-006` |
