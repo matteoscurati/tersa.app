@@ -55,9 +55,15 @@ jobs:
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling
         run: typos
-      - name: Check DCO sign-offs
+      - name: Check pull request DCO sign-offs
         if: github.event_name == 'pull_request'
         run: >-
           cargo run --locked --package xtask -- dco
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
+      - name: Check main push DCO sign-offs
+        if: github.event_name == 'push'
+        run: >-
+          cargo run --locked --package xtask -- dco
+          "${{ github.event.before }}"
+          "${{ github.sha }}"
