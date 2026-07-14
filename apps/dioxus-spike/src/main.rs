@@ -42,6 +42,7 @@ mod apple {
                 }
 
                 window.__tersaVirtualizerResizeObserver?.disconnect();
+                window.__tersaVirtualizerMutationObserver?.disconnect();
                 const updateActualRows = () => {
                     const generation = (window.__tersaActualRowsGeneration ?? 0) + 1;
                     window.__tersaActualRowsGeneration = generation;
@@ -78,8 +79,16 @@ mod apple {
                 };
                 const observer = new ResizeObserver(notify);
                 observer.observe(list);
+                const mutationObserver = new MutationObserver(updateActualRows);
+                mutationObserver.observe(list, {
+                    attributes: true,
+                    attributeFilter: ['data-expected-rows'],
+                    childList: true,
+                    subtree: true,
+                });
                 list.addEventListener('scroll', updateActualRows, { passive: true });
                 window.__tersaVirtualizerResizeObserver = observer;
+                window.__tersaVirtualizerMutationObserver = mutationObserver;
                 notify();
             };
             install();

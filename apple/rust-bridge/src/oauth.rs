@@ -395,6 +395,9 @@ mod macos {
         redirect_uri: &Url,
         deadline: Instant,
     ) -> Result<Url, LoopbackError> {
+        stream
+            .set_nonblocking(false)
+            .map_err(|_error| LoopbackError::Io)?;
         let mut request = Zeroizing::new(Vec::with_capacity(1_024));
         let mut chunk = Zeroizing::new([0_u8; 1_024]);
         let mut complete = false;
@@ -785,7 +788,9 @@ mod macos {
                     .unwrap()
                     .is_none()
             );
-            assert!(started.elapsed() < Duration::from_millis(150));
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(35));
+            assert!(elapsed < Duration::from_millis(150));
             drip.join().unwrap();
             assert!(!receiver.consumed);
         }
