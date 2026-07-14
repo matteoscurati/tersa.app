@@ -22,7 +22,7 @@ the remaining physical-device checks are still open evidence.
 | macOS unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 debug package and per-commit Release archive; `#M0-SLINT-001` |
 | iOS device unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 device package and per-commit Release archive; `#M0-SLINT-002` |
 | Mac and simulator screenshots | **Required CI gate** | Per-commit OCR-verified evidence artifact; `#M0-SLINT-003` |
-| Skia archive source and SHA-256 | **PASS locally** | Recorded below; `#M0-SLINT-004` |
+| Skia archive integrity | **PASS locally; required CI gate** | All supported Apple archives are verified before extraction; `#M0-SLINT-004` |
 | Physical-device IME, autocorrect, dictation, selection, copy/paste, hardware keyboard | **UNVERIFIED** | `#M0-SLINT-005` |
 | VoiceOver accessibility tree | **FAIL by dependency inspection** | `accesskit_winit` 0.30.0 selects its no-op platform adapter on iOS; physical-device confirmation remains `#M0-SLINT-006` |
 | Dynamic Type and Full Keyboard Access | **UNVERIFIED** | `#M0-SLINT-006` |
@@ -36,16 +36,22 @@ the remaining physical-device checks are still open evidence.
 Issue references are documented M0 placeholders until the repository issue
 tracker is provisioned; they are stable names for the required follow-up work.
 
-## Observed Skia archives
+## Verified Skia archives
 
-The local arm64 builds downloaded `rust-skia` 0.90.0 archives from the official
-`rust-skia/skia-binaries` GitHub release path:
+The build script downloads `rust-skia` 0.90.0 archives from the official
+`rust-skia/skia-binaries` GitHub release path and verifies each archive before
+making it available to `skia-bindings`:
 
 - macOS: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `ffce3a615d922cb6358ec98cc3796541c350fbe0a67e1d46aaaa34d3483eee59`
-- iOS: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-ios-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `dd62d2aeb55dffbdeedee9a2d095b7ac28e11ce0e86ec57e7c05e895bef267e2`
+- iOS device: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-ios-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `dd62d2aeb55dffbdeedee9a2d095b7ac28e11ce0e86ec57e7c05e895bef267e2`
+- iOS simulator: `skia-binaries-da4579b39b75fa2187c5-aarch64-apple-ios-sim-gl-metal-pdf-textlayout.tar.gz`, SHA-256 `9142067da699773e0cc042e27b8c90d8356db90203955be42a9bb27b4955e2d4`
 
 Both URLs use the prefix
 `https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/`.
+
+Target-specific third-party notices are generated from the locked diagnostic
+runtime graph with `cargo-about` 0.9.1. CI regenerates them offline and compares
+them byte-for-byte with the resources packaged by Xcode.
 
 CI treats screenshots as evidence only when Vision OCR finds both the product
 marker and the 10,000-row marker. Missing or blank evidence fails the job and

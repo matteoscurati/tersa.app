@@ -88,7 +88,7 @@ targets:
     type: application
     platform: macOS
     sources:
-      - path: licenses/THIRD_PARTY_NOTICES.txt
+      - path: licenses/THIRD_PARTY_NOTICES-macos.txt
         buildPhase: resources
     info:
       path: slint-macos/Info.plist
@@ -113,7 +113,7 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: licenses/THIRD_PARTY_NOTICES.txt
+      - path: licenses/THIRD_PARTY_NOTICES-ios.txt
         buildPhase: resources
     info:
       path: slint-ios/Info.plist

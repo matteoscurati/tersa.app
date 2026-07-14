@@ -32,13 +32,21 @@ are intentionally package-specific and must be reduced if the locked graph no
 longer requires an entry.
 
 Skia is bundled through `rust-skia` and `skia-bindings`. Their native archive
-and source-notice obligations remain applicable. The locked Skia BSD notice is
-stored in `apple/licenses/THIRD_PARTY_NOTICES.txt`, bundled as an application
-resource in both diagnostic packages, and verified in the packaging evidence
-gate. `skia-bindings` downloads a prebuilt archive when its build cannot use a
-local build; its observed archive source URL and SHA-256 must be recorded in
-the feasibility evidence whenever an Apple build exposes them. This repository
-does not treat an unavailable download as evidence of provenance.
+and source-notice obligations remain applicable. Before Cargo runs,
+`build-slint-executable.sh` downloads the target's pinned rust-skia 0.90.0
+archive, verifies its SHA-256, and exposes only that verified file to
+`skia-bindings` through its supported local `file://` source. Unverified
+archive bytes never reach the extraction step. The source URL and all three
+Apple archive digests are recorded in the feasibility evidence.
+
+The macOS and iOS diagnostic bundles carry separate, target-specific
+`THIRD_PARTY_NOTICES-*.txt` resources. `cargo-about` 0.9.1 generates their
+complete linked Rust package inventory and available full license texts from
+the locked Slint spike graph. A deterministic renderer removes cargo cache
+state from the result and adds the pinned rust-skia and native Skia notices
+explicitly. Checksum-bound clarifications include the exact elected Slint
+license text. CI regenerates both inventories offline and requires a
+byte-for-byte match before distribution evidence can pass.
 
 Slint 1.16.1 also locks non-Apple packages that are absent from the macOS and
 iOS dependency graphs. `cargo-deny` therefore evaluates the three supported
