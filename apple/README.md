@@ -21,9 +21,18 @@ Generate the project and use the reproducible build commands in
 
 `rust-bridge` and both UI spikes are part of the root Cargo workspace so the
 standard formatting, lint, test, documentation, dependency, and advisory
-checks cover them. The bridge
-depends on `tersa-presentation`, preserving the one-way rule that shared core
-layers never depend on Apple frameworks.
+checks cover them. The bridge depends inward on `tersa-application` and
+`tersa-presentation`, preserving the rule that shared core layers never depend
+on Apple frameworks.
+
+The base targets also contain the M0 OAuth Authorization Code + PKCE adapter.
+Rust owns S256 material, state, expiry, callback validation, and the macOS
+literal-loopback listener. macOS opens the system browser only after the
+listener is bound; iOS uses an ephemeral `ASWebAuthenticationSession` with an
+exact build-injected callback scheme. Neither path starts automatically. This
+slice does not exchange codes, store tokens, call Gmail, or claim a real Google
+authorization. Run the deterministic fake-callback and signed sandbox probe as
+documented in [Development](../docs/development.md#oauth-pkce-feasibility).
 
 The six Apple targets narrowly disable Xcode user-script sandboxing only for
 their Cargo build phases because Cargo and rustup read the compiler sysroot

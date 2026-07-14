@@ -32,6 +32,36 @@ and any relevant security or binary-size impact.
 See [Dependency rules](architecture/dependency-rules.md) before adding a new
 crate or changing an internal edge.
 
+## OAuth PKCE feasibility
+
+The M0 adapter proves authorization request generation and native callback
+transport without real Google credentials. Official builds inject public OAuth
+client identifiers and the registered iOS callback scheme as Xcode build
+settings; they are not secrets. An unconfigured build fails closed.
+
+```sh
+xcodebuild ... \
+  TERSA_OAUTH_CLIENT_ID=public-ci-client.apps.googleusercontent.com \
+  TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.ci
+```
+
+After creating the unsigned base archives, run:
+
+```sh
+sh apple/scripts/verify-oauth-feasibility.sh
+```
+
+The verifier checks archived symbols and injected Info.plist values, ad-hoc
+signs the macOS archive with its production sandbox entitlements, then runs a
+fixed in-process loopback client/server probe. Rust tests exercise the
+deterministic callback, negative state machine, bounded HTTP parser, static
+response, and one-shot listener. No evidence file contains state, verifier,
+authorization code, token, or authorization URL.
+
+The loopback peer check is not browser authentication. Any local process can
+connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
+against redirect injection and intercepted authorization codes.
+
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
@@ -91,6 +121,9 @@ the Apple application targets disable Xcode user-script sandboxing: Cargo and
 rustup must read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`
 directory.
+The base macOS target declares both sandbox network client and server
+entitlements: future Google token/API traffic needs outbound networking, while
+the desktop OAuth redirect requires the narrowly bound loopback listener.
 The shared Slint archive helper verifies the target's pinned Skia archive
 before making it available to `skia-bindings`. Both Xcode builds and the
 workspace-wide macOS CI check use this helper. The Xcode build then copies the

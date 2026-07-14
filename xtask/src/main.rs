@@ -267,7 +267,10 @@ fn check_slint_dependency(
 
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
-        ("tersa-apple-bridge", BTreeSet::from(["tersa-presentation"])),
+        (
+            "tersa-apple-bridge",
+            BTreeSet::from(["tersa-application", "tersa-presentation"]),
+        ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-domain", BTreeSet::new()),

@@ -9,5 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
 [lints]
 workspace = true

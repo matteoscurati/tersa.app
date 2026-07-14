@@ -23,6 +23,8 @@ jobs:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      TERSA_OAUTH_CLIENT_ID: public-ci-client.apps.googleusercontent.com
+      TERSA_OAUTH_REDIRECT_SCHEME: app.tersa.oauth.ci
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -49,31 +51,41 @@ jobs:
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
           -configuration Debug -destination 'platform=macOS,arch=arm64'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
+          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
       - name: Build unsigned iOS simulator debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
           -configuration Debug -sdk iphonesimulator
           -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
+          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
       - name: Build unsigned iOS device debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
           -configuration Debug -sdk iphoneos
           -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
+          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
       - name: Archive unsigned macOS debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
           -configuration Debug -destination 'generic/platform=macOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
+          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" archive
           -archivePath apple/build/TersaMac.xcarchive
       - name: Archive unsigned iOS debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
           -configuration Debug -sdk iphoneos
           -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
+          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" archive
           -archivePath apple/build/TersaIOS.xcarchive
       - name: Verify archived Rust bridge symbols
         run: |
@@ -81,6 +93,15 @@ jobs:
             | grep -F '_tersa_apple_bridge_version'
           nm -gU apple/build/TersaIOS.xcarchive/Products/Applications/Tersa.app/Tersa \
             | grep -F '_tersa_apple_bridge_version'
+      - name: Verify OAuth PKCE and sandbox feasibility
+        run: sh apple/scripts/verify-oauth-feasibility.sh
+      - name: Upload OAuth feasibility evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: oauth-pkce-feasibility-evidence
+          path: apple/build/oauth-evidence
+          if-no-files-found: error
       - name: Build and archive unsigned macOS Slint spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
