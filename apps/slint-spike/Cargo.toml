@@ -1,0 +1,26 @@
+[package]
+name = "tersa-slint-spike"
+description = "Diagnostic Slint feasibility executable for Apple targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "tersa-slint-spike"
+path = "src/main.rs"
+
+[dependencies]
+tersa-presentation.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+slint = { version = "=1.16.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "accessibility", "compat-1-2"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.build-dependencies]
+slint-build = "=1.16.1"
+
+[lints]
+workspace = true

@@ -81,6 +81,33 @@ jobs:
             | grep -F '_tersa_apple_bridge_version'
           nm -gU apple/build/TersaIOS.xcarchive/Products/Applications/Tersa.app/Tersa \
             | grep -F '_tersa_apple_bridge_version'
+      - name: Build and archive unsigned macOS Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
+          -configuration Release -destination 'generic/platform=macOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaSlintMac.xcarchive
+      - name: Build unsigned iOS simulator Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Archive unsigned iOS Slint spike
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaSlintIOS.xcarchive
+      - name: Verify and capture Slint spike evidence
+        run: sh apple/scripts/capture-slint-evidence.sh
+      - name: Upload Slint spike screenshots and metrics
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: slint-spike-evidence
+          path: apple/build/slint-evidence
+          if-no-files-found: warn
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -114,7 +141,16 @@ jobs:
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories
-        run: cargo audit
+        # quick-xml 0.39 is locked only through Winit's non-Apple Wayland
+        # backend. cargo-audit cannot derive target reachability from Cargo.lock;
+        # cargo-deny performs the Apple-target-aware advisory gate above.
+        run: >-
+          cargo audit
+          --target-os macos
+          --target-os ios
+          --target-arch aarch64
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
       - name: Check feature combinations
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling

@@ -9,6 +9,10 @@ Validate Apple distribution, Slint on physical devices, OAuth PKCE, encrypted
 storage, search, hostile MIME/HTML handling, licenses, security policy, and
 Google API compliance.
 
+The Slint diagnostic packaging gate remains open until the feasibility evidence
+is completed on physical hardware. WKWebView-over-Metal composition remains the
+largest architecture risk.
+
 ## M1 — Vertical slice
 
 Connect one account, sync a bounded recent mailbox, show an encrypted cached

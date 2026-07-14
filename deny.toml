@@ -1,6 +1,19 @@
+[graph]
+# tersa.app ships Apple binaries only. Filtering the graph prevents unrelated
+# Linux, Android, and Windows backend packages locked by portable UI crates from
+# being treated as shipped dependencies.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+]
+
 [advisories]
 version = 2
 yanked = "deny"
+# Transitive unmaintained notices are reviewed separately because the exact
+# Slint spike version cannot replace them without changing the M0 toolchain.
+unmaintained = "workspace"
 
 [bans]
 multiple-versions = "warn"
@@ -12,9 +25,26 @@ version = 2
 confidence-threshold = 0.8
 allow = [
     "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
+    "Zlib",
+]
+
+exceptions = [
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-selector" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-winit" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-common" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-compiler" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core-macros" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-renderer-skia" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-build" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-macros" },
 ]
 
 [sources]

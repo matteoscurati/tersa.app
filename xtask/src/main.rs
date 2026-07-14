@@ -203,6 +203,7 @@ fn check_architecture() -> TaskResult {
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         ("tersa-apple-bridge", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),

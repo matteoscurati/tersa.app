@@ -35,8 +35,9 @@ crate or changing an internal edge.
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
-arm64 macOS 15 and iOS/iPadOS 18. It intentionally contains no product UI or
-Slint integration yet.
+arm64 macOS 15 and iOS/iPadOS 18. The existing bridge targets intentionally
+contain no product UI. The separate `TersaSlintMac` and `TersaSlintIOS` schemes
+package the M0 diagnostic Slint executable and are not production targets.
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
 debug artifacts:
@@ -55,17 +56,27 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
   -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+
+xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac \
+  -configuration Debug -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS \
+  -configuration Debug -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
 ```
 
 The generated `apple/Tersa.xcodeproj` is intentionally ignored. The project
 build phase creates the Rust static library in `apple/build/rust`; it is also
 ignored with all local Apple build products.
 
-The Rust bridge is a root workspace member and is therefore covered by
+The Rust bridge and Slint spike are root workspace members and are therefore covered by
 `cargo xtask verify` and the repository supply-chain checks. Only the Apple
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while the locked build script
-writes exclusively below the ignored `apple/build` directory.
+writes intermediates exclusively below the ignored `apple/build` directory.
+The Slint scripts copy the executable only into Xcode's requested application
+bundle.
 
 Create unsigned archives with:
 

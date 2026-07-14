@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/slint-spike",
     "apple/rust-bridge",
     "crates/application",
     "crates/domain",
