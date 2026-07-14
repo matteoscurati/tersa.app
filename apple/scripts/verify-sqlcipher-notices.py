@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from pathlib import Path
 
@@ -19,12 +20,20 @@ LICENSE_START = "Copyright (c) 2008-2020 Zetetic LLC\n"
 EXPECTED_VERSION_LINE = (
     "SQLCipher 4.10.0 community source bundled by libsqlite3-sys 0.37.0"
 )
+EXPECTED_LIBSQLITE3_SYS_VERSION = "0.37.0"
 
 
 def main() -> None:
     notice = Path(sys.argv[1]).read_text(encoding="utf-8")
+    lockfile = Path(sys.argv[2]).read_text(encoding="utf-8")
     if EXPECTED_VERSION_LINE not in notice:
         raise SystemExit("SQLCipher supplemental notice has an unexpected version")
+    versions = re.findall(
+        r'\[\[package\]\]\nname = "libsqlite3-sys"\nversion = "([^"]+)"',
+        lockfile,
+    )
+    if versions != [EXPECTED_LIBSQLITE3_SYS_VERSION]:
+        raise SystemExit("Cargo.lock has an unexpected libsqlite3-sys version")
     start = notice.find(LICENSE_START)
     if start < 0:
         raise SystemExit("SQLCipher supplemental notice is missing its license text")

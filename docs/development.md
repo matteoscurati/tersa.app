@@ -73,8 +73,10 @@ and known-marker absence in controlled files.
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
 sh apple/scripts/verify-sqlcipher-feasibility.sh
-cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios
-cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --package tersa-sqlcipher-spike --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
 ```
 
 The committed result contains no key, sentinel, SQL, path, or raw database.

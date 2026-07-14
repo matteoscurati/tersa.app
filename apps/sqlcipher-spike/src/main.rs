@@ -22,12 +22,14 @@ mod apple {
     const ROW_COUNT: i64 = 3;
     const SENTINEL_LENGTH: usize = 80;
     const CIPHER_VERSION: &str = "4.10.0 community";
+    const SQLITE_VERSION: &str = "3.50.4";
     const PASS_LINE: &str = "SQLCipher M0 feasibility PASS";
 
     type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+    type DiagnosticResult = std::result::Result<(), &'static str>;
 
     /// Runs the parent or child half of the storage evidence protocol.
-    pub fn run() -> Result {
+    pub fn run() -> DiagnosticResult {
         if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("child")) {
             child()
         } else {
@@ -35,32 +37,34 @@ mod apple {
         }
     }
 
-    fn parent() -> Result {
-        let workspace = EvidenceWorkspace::new()?;
-        let key = random_bytes(32)?;
-        let sentinel = random_sentinel()?;
-        let temp_sentinel = random_sentinel()?;
-        let mut child = ChildGuard::new(spawn_child(&workspace)?);
-        send_protocol(child.child_mut(), &key, &sentinel, &temp_sentinel)?;
-        wait_for_ready(&mut child, &workspace)?;
-        assert_absent(&workspace.controlled_files()?, &sentinel)?;
-        assert_absent(&workspace.controlled_files()?, &temp_sentinel)?;
+    fn parent() -> DiagnosticResult {
+        let workspace = EvidenceWorkspace::new().map_err(|_error| "P01")?;
+        let key = random_bytes(32).map_err(|_error| "P02")?;
+        let sentinel = random_sentinel().map_err(|_error| "P03")?;
+        let temp_sentinel = random_sentinel().map_err(|_error| "P04")?;
+        let mut child = ChildGuard::new(spawn_child(&workspace).map_err(|_error| "P05")?);
+        send_protocol(child.child_mut(), &key, &sentinel, &temp_sentinel)
+            .map_err(|_error| "P06")?;
+        wait_for_ready(&mut child, &workspace).map_err(|_error| "P07")?;
+        let files = workspace.controlled_files().map_err(|_error| "P08")?;
+        assert_absent(&files, &sentinel).map_err(|_error| "P09")?;
+        assert_absent(&files, &temp_sentinel).map_err(|_error| "P10")?;
 
-        let status = child.kill_and_wait()?;
+        let status = child.kill_and_wait().map_err(|_error| "P11")?;
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             if status.signal() != Some(9) {
-                return Err("storage child was not terminated with SIGKILL".into());
+                return Err("P12");
             }
         }
         #[cfg(not(unix))]
         if status.success() {
-            return Err("storage child unexpectedly exited successfully".into());
+            return Err("P12");
         }
 
-        reopen_and_verify(&workspace, &key, &sentinel, &temp_sentinel)?;
-        plaintext_positive_control(&workspace)?;
+        reopen_and_verify(&workspace, &key, &sentinel, &temp_sentinel).map_err(|_error| "P13")?;
+        plaintext_positive_control(&workspace).map_err(|_error| "P14")?;
         println!("{PASS_LINE}");
         println!("SQLCipher provider commoncrypto");
         println!("SQLCipher version {CIPHER_VERSION}");
@@ -68,40 +72,47 @@ mod apple {
         Ok(())
     }
 
-    fn child() -> Result {
-        let (mut key, sentinel, temp_sentinel) = receive_protocol()?;
-        let workspace = EvidenceWorkspace::from_environment()?;
-        let connection = open_encrypted(workspace.database(), &key)?;
+    fn child() -> DiagnosticResult {
+        let (mut key, sentinel, temp_sentinel) = receive_protocol().map_err(|_error| "C01")?;
+        let workspace = EvidenceWorkspace::from_environment().map_err(|_error| "C02")?;
+        let connection = open_encrypted(workspace.database(), &key).map_err(|_error| "C03")?;
         key.zeroize();
-        configure(&connection)?;
-        verify_cipher(&connection)?;
-        connection.execute_batch(
-            "PRAGMA wal_autocheckpoint = 0; \
+        configure(&connection).map_err(|_error| "C04")?;
+        verify_cipher(&connection).map_err(|_error| "C05")?;
+        connection
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0; \
              CREATE TABLE records (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
-        )?;
-        let auto_checkpoint: i64 =
-            connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+            )
+            .map_err(|_error| "C06")?;
+        let auto_checkpoint: i64 = connection
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(|_error| "C07")?;
         if auto_checkpoint != 0 {
-            return Err("SQLCipher WAL auto-checkpoint is not disabled".into());
+            return Err("C08");
         }
-        {
-            let transaction = connection.unchecked_transaction()?;
-            for index in 0..ROW_COUNT {
-                let payload = if index == 1 {
-                    &sentinel
-                } else {
-                    "non-sensitive fixture"
-                };
-                transaction.execute("INSERT INTO records (payload) VALUES (?1)", [payload])?;
-            }
-            transaction.commit()?;
-        }
-        exercise_memory_temp_store(&connection, &workspace, &temp_sentinel)?;
-        let ready = File::create(workspace.ready())?;
-        ready.sync_all()?;
+        insert_records(&connection, &sentinel).map_err(|_error| "C09")?;
+        exercise_memory_temp_store(&connection, &workspace, &temp_sentinel)
+            .map_err(|_error| "C10")?;
+        let ready = File::create(workspace.ready()).map_err(|_error| "C11")?;
+        ready.sync_all().map_err(|_error| "C12")?;
         loop {
             std::thread::park();
         }
+    }
+
+    fn insert_records(connection: &Connection, sentinel: &str) -> Result {
+        let transaction = connection.unchecked_transaction()?;
+        for index in 0..ROW_COUNT {
+            let payload = if index == 1 {
+                sentinel
+            } else {
+                "non-sensitive fixture"
+            };
+            transaction.execute("INSERT INTO records (payload) VALUES (?1)", [payload])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn reopen_and_verify(
@@ -116,18 +127,17 @@ mod apple {
 
         let connection = open_encrypted(workspace.database(), key)?;
         configure(&connection)?;
-        let rows: i64 =
-            connection.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
-        if rows != ROW_COUNT {
-            return Err("recovered row count differs from the committed transaction".into());
-        }
-        let recovered: String =
-            connection.query_row("SELECT payload FROM records WHERE id = 2", [], |row| {
-                row.get(0)
-            })?;
-        if recovered != sentinel {
+        let mut statement = connection.prepare("SELECT payload FROM records ORDER BY id")?;
+        let recovered = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let expected = ["non-sensitive fixture", sentinel, "non-sensitive fixture"];
+        if recovered.len() != usize::try_from(ROW_COUNT)?
+            || !recovered.iter().map(String::as_str).eq(expected)
+        {
             return Err("recovered committed rows differ from the expected values".into());
         }
+        drop(statement);
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if integrity != "ok" {
@@ -199,6 +209,11 @@ mod apple {
         if version != CIPHER_VERSION {
             return Err("SQLCipher version is not the required community release".into());
         }
+        let sqlite_version: String =
+            connection.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
+        if sqlite_version != SQLITE_VERSION {
+            return Err("SQLite version is not the required bundled release".into());
+        }
         let journal: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if journal != "wal" {
             return Err("SQLCipher WAL mode is not enabled".into());
@@ -252,7 +267,7 @@ mod apple {
             .env("SQLITE_TMPDIR", workspace.temp())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(Into::into)
     }
@@ -495,8 +510,14 @@ mod apple {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    apple::run().map_err(|_error| "SQLCipher feasibility failed".into())
+fn main() -> std::process::ExitCode {
+    match apple::run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(code) => {
+            eprintln!("SQLCipher feasibility failed ({code})");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]

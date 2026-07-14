@@ -38,7 +38,9 @@ The macOS evidence executable uses only random synthetic values and proves:
 The parent sends the random key to its child over a private stdin pipe. Keys,
 sentinels, SQL, file paths, and raw database artifacts are never written to the
 evidence output. The output contains only fixed pass, provider, version, and
-journal-mode lines. Temporary probe files are removed on normal and error exits.
+journal-mode lines. Failures emit only a fixed parent or child stage code, which
+supports CI triage without exposing the underlying error or sensitive values.
+Temporary probe files are removed on normal and error exits.
 
 ## Security boundary and open work
 
@@ -69,8 +71,10 @@ Install the three Apple Rust targets, then run:
 
 ```sh
 sh apple/scripts/verify-sqlcipher-feasibility.sh
-cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios
-cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --package tersa-sqlcipher-spike --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
 ```
 
 CI also verifies the checksum-bound bundled SQLCipher BSD-3-Clause notice and

@@ -20,7 +20,8 @@ supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
 sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
 
 python3 "${script_dir}/verify-rust-skia-notices.py" "$supplemental"
-python3 "${script_dir}/verify-sqlcipher-notices.py" "$sqlcipher_supplemental"
+python3 "${script_dir}/verify-sqlcipher-notices.py" \
+  "$sqlcipher_supplemental" "${workspace_dir}/Cargo.lock"
 
 case "$mode" in
   --check)
