@@ -248,10 +248,11 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
     }
 
     fn validate_redirect(&self, callback: &Url) -> Result<(), OAuthError> {
-        let mut callback_identity = callback.clone();
-        callback_identity.set_query(None);
-        callback_identity.set_fragment(None);
-        if callback.fragment().is_some() || callback_identity != self.redirect_uri {
+        let callback_identity = callback
+            .as_str()
+            .split_once('?')
+            .map_or(callback.as_str(), |(identity, _query)| identity);
+        if callback.fragment().is_some() || callback_identity != self.redirect_uri.as_str() {
             return Err(OAuthError::RedirectMismatch);
         }
         Ok(())
