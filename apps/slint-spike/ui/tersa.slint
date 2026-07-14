@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { Button, ListView } from "std-widgets.slint";
+import { Button, LineEdit, ListView, TextEdit } from "std-widgets.slint";
 
 export struct InboxRow {
     sender: string,
@@ -39,10 +39,10 @@ export component TersaSlintSpike inherits Window {
                     padding-left: 12px;
                     padding-right: 12px;
                     spacing: 20px;
-                    Text { text: "T"; color: #f4f3ee; font-size: 24px; font-weight: 700; horizontal-alignment: center; }
-                    Text { text: "IN"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; }
-                    Text { text: "DQ"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; }
-                    Text { text: "AR"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; }
+                    Text { text: "T"; color: #f4f3ee; font-size: 24px; font-weight: 700; horizontal-alignment: center; accessible-role: none; }
+                    Text { text: "IN"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; accessible-role: none; }
+                    Text { text: "DQ"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; accessible-role: none; }
+                    Text { text: "AR"; color: #d6e4fb; font-size: 11px; horizontal-alignment: center; accessible-role: none; }
                 }
             }
 
@@ -55,12 +55,11 @@ export component TersaSlintSpike inherits Window {
                     padding: 18px;
                     spacing: 12px;
                     Text { text: "INBOX / 10,000 ROWS"; color: #14213a; font-size: 12px; font-weight: 700; }
-                    Rectangle {
+                    LineEdit {
                         height: 36px;
-                        background: #ffffff;
-                        border-color: #aeb5c0;
-                        border-width: 1px;
-                        TextInput { x: 10px; width: parent.width - 20px; height: parent.height; text: "Search diagnostic inbox"; color: #526071; font-size: 14px; vertical-alignment: center; accessible-label: "Search diagnostic inbox"; }
+                        text: "";
+                        placeholder-text: "Search diagnostic inbox";
+                        accessible-label: "Search diagnostic inbox";
                     }
                     ListView {
                         accessible-role: list;
@@ -101,12 +100,11 @@ export component TersaSlintSpike inherits Window {
                     Text { text: "Stable marker: TERSA-SLINT-M0-THREAD. This mock validates only layout, input, virtual scrolling, and native packaging."; color: #526071; font-size: 15px; wrap: word-wrap; }
                     Rectangle { height: 1px; background: #d4d5d1; }
                     Text { text: "No account is connected. No network, OAuth, storage, HTML, or WebView is present."; color: #14213a; font-size: 14px; wrap: word-wrap; vertical-stretch: 1; }
-                    Rectangle {
+                    TextEdit {
                         height: 170px;
-                        background: #f4f3ee;
-                        border-color: #aeb5c0;
-                        border-width: 1px;
-                        TextInput { x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px; text: "Compose diagnostic note\nMultiline input surface"; color: #14213a; font-size: 14px; single-line: false; accessible-label: "Diagnostic message composer"; }
+                        text: "";
+                        placeholder-text: "Compose diagnostic note";
+                        accessible-label: "Diagnostic message composer";
                     }
                     HorizontalLayout {
                         Text { text: "PROTOCOL " + root.protocol-version; color: #526071; font-size: 11px; horizontal-stretch: 1; }
@@ -129,12 +127,11 @@ export component TersaSlintSpike inherits Window {
                 Text { text: "M0 / 10,000"; color: #526071; font-size: 11px; }
             }
 
-            Rectangle {
+            LineEdit {
                 height: 38px;
-                background: #ffffff;
-                border-color: #aeb5c0;
-                border-width: 1px;
-                TextInput { x: 10px; width: parent.width - 20px; height: parent.height; text: "Search diagnostic inbox"; color: #526071; font-size: 14px; vertical-alignment: center; accessible-label: "Search diagnostic inbox"; }
+                text: "";
+                placeholder-text: "Search diagnostic inbox";
+                accessible-label: "Search diagnostic inbox";
             }
 
             ListView {
@@ -164,12 +161,11 @@ export component TersaSlintSpike inherits Window {
             }
 
             Text { text: "TERSA-SLINT-M0-THREAD / PROTOCOL " + root.protocol-version; color: #143e75; font-size: 10px; font-weight: 700; }
-            Rectangle {
+            TextEdit {
                 height: 108px;
-                background: #ffffff;
-                border-color: #aeb5c0;
-                border-width: 1px;
-                TextInput { x: 10px; y: 10px; width: parent.width - 20px; height: parent.height - 20px; text: "Compose diagnostic note\nMultiline input surface"; color: #14213a; font-size: 14px; single-line: false; accessible-label: "Diagnostic message composer"; }
+                text: "";
+                placeholder-text: "Compose diagnostic note";
+                accessible-label: "Diagnostic message composer";
             }
         }
     }

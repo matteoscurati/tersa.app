@@ -20,11 +20,13 @@ and a new decision.
 ## Consequences
 
 Distribution must retain the required Slint attribution and license notices.
-The repository elects the public-webpage attribution option by displaying the
-official Slint badge in the root README, which is the public project and future
-download page. If binary distribution moves elsewhere, that page must carry the
-same attribution or the application must expose Slint's `AboutSlint` widget in
-an About dialog reachable from the top-level menu. The M0 team must obtain legal
+The repository elects the public-webpage attribution option by displaying a
+vendored copy of Slint's official attribution badge in the root README, which
+is the public project and future download page. The vendored source is
+`slint-ui/slint/logo/MadeWithSlint-logo-light-whitebg.svg`. If binary
+distribution moves elsewhere, that page must carry the same attribution or the
+application must expose Slint's `AboutSlint` widget in an About dialog reachable
+from the top-level menu. The M0 team must obtain legal
 confirmation before any production distribution. The `cargo-deny` exceptions
 are intentionally package-specific and must be reduced if the locked graph no
 longer requires an entry.
@@ -41,8 +43,12 @@ the macOS and iOS dependency graphs. `cargo-deny` therefore evaluates the three
 supported Apple triples. `cargo-audit` cannot infer that reachability from the
 lockfile, so CI narrowly ignores `RUSTSEC-2026-0194` and
 `RUSTSEC-2026-0195`; both affect `quick-xml` through the non-shipping Wayland
-scanner. Removing these exceptions is a production UI gate, not an accepted
-product risk.
+scanner. The target-aware `cargo-deny` policy records reasons for the three
+Apple-reachable unmaintained notices. The full-lockfile `cargo-audit` gate
+rejects all other warnings and vulnerabilities while listing the six temporary
+Slint-transitive exceptions explicitly. CI expires the complete exception set
+on 15 August 2026. Removing or renewing these exceptions requires explicit
+review and remains a production UI gate, not an accepted product risk.
 
 ## Alternatives considered
 

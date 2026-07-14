@@ -27,6 +27,32 @@ now_ns() {
   python3 -c 'import time; print(time.monotonic_ns())'
 }
 
+recognize_text() {
+  image_path="$1"
+  xcrun swift - "$image_path" <<'SWIFT'
+import AppKit
+import Vision
+
+let path = CommandLine.arguments[1]
+guard let image = NSImage(contentsOfFile: path) else {
+    fatalError("Cannot load screenshot at \(path)")
+}
+var proposedRect = NSRect(origin: .zero, size: image.size)
+guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+    fatalError("Cannot create a CGImage for \(path)")
+}
+let request = VNRecognizeTextRequest()
+request.recognitionLevel = .accurate
+request.usesLanguageCorrection = false
+try VNImageRequestHandler(cgImage: cgImage).perform([request])
+for observation in request.results ?? [] {
+    if let candidate = observation.topCandidates(1).first {
+        print(candidate.string)
+    }
+}
+SWIFT
+}
+
 wait_for_mac_process() {
   attempts=0
   while ! pgrep -f "$mac_binary" >/dev/null; do
@@ -50,6 +76,10 @@ mac_warm_end=$(now_ns)
 sleep 2
 screencapture -x "${build_dir}/macos.png"
 pkill -f "$mac_binary"
+test "$(stat -f '%z' "${build_dir}/macos.png")" -gt 10000
+recognize_text "${build_dir}/macos.png" > "${build_dir}/macos-ocr.txt"
+grep -F 'TERSA' "${build_dir}/macos-ocr.txt"
+grep -E '10.?000' "${build_dir}/macos-ocr.txt"
 
 device=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')
 test -n "$device"
@@ -67,6 +97,10 @@ ios_warm_end=$(now_ns)
 sleep 2
 xcrun simctl io "$device" screenshot "${build_dir}/ios-simulator.png"
 xcrun simctl terminate "$device" app.tersa.slint-spike.ios
+test "$(stat -f '%z' "${build_dir}/ios-simulator.png")" -gt 10000
+recognize_text "${build_dir}/ios-simulator.png" > "${build_dir}/ios-simulator-ocr.txt"
+grep -F 'TERSA' "${build_dir}/ios-simulator-ocr.txt"
+grep -E '10.?000' "${build_dir}/ios-simulator-ocr.txt"
 
 release_size=$(stat -f '%z' "$mac_binary")
 printf '{"mac_cold_process_observed_ns":%s,"mac_warm_process_observed_ns":%s,"ios_cold_launch_command_ns":%s,"ios_warm_launch_command_ns":%s,"mac_release_binary_bytes":%s}\n' \
