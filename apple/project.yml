@@ -144,3 +144,63 @@ targets:
         script: 'sh "${SRCROOT}/scripts/build-slint-executable.sh" ios "${CONFIGURATION}"'
     scheme:
       testTargets: []
+  TersaDioxusMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES-dioxus-macos.txt
+        buildPhase: resources
+    info:
+      path: dioxus-macos/Info.plist
+      properties:
+        NSHighResolutionCapable: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.dioxus-spike.mac
+        PRODUCT_NAME: Tersa Dioxus Spike
+        EXECUTABLE_NAME: tersa-dioxus-spike
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. This
+        # exception is restricted to the target that packages the Rust binary.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    postCompileScripts:
+      - name: Build Rust Dioxus executable
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-dioxus-executable.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
+  TersaDioxusIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: licenses/THIRD_PARTY_NOTICES-dioxus-ios.txt
+        buildPhase: resources
+    info:
+      path: dioxus-ios/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.dioxus-spike.ios
+        PRODUCT_NAME: Tersa Dioxus Spike
+        EXECUTABLE_NAME: tersa-dioxus-spike
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. This
+        # exception is restricted to the target that packages the Rust binary.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    postCompileScripts:
+      - name: Build Rust Dioxus executable
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-dioxus-executable.sh" ios "${CONFIGURATION}"'
+    scheme:
+      testTargets: []

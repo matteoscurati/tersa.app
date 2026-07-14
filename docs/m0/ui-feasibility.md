@@ -12,8 +12,10 @@ routes Winit accessibility through `accesskit_winit` 0.30.0, whose iOS platform
 adapter is a no-op. The diagnostic remains useful packaging evidence, but Slint
 cannot be selected for production unless an upstreamable iOS accessibility
 adapter passes the physical-device gate. Per the product plan, the next UI
-feasibility candidate is Dioxus WebView. WKWebView-over-Metal composition and
-the remaining physical-device checks are still open evidence.
+feasibility candidate is Dioxus WebView. Its bounded spike is documented in
+[Dioxus UI feasibility](dioxus-ui-feasibility.md); that spike is also a
+production NO-GO until its listed blockers are resolved. WKWebView-over-Metal
+composition and the remaining physical-device checks are still open evidence.
 
 ## Evidence
 

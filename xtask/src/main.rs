@@ -187,6 +187,7 @@ fn check_architecture() -> TaskResult {
             }
 
             check_slint_dependency(&package_name, dependency, &mut violations);
+            check_dioxus_dependency(&package_name, dependency, &mut violations);
         }
     }
 
@@ -200,6 +201,36 @@ fn check_architecture() -> TaskResult {
         violations.join(", ")
     ))
     .into())
+}
+
+fn check_dioxus_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const DIOXUS_SPIKE: &str = "tersa-dioxus-spike";
+    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
+
+    let dependency_name = dependency.name.as_str();
+    if !matches!(
+        dependency_name,
+        "dioxus" | "dioxus-desktop" | "dioxus-document"
+    ) {
+        return;
+    }
+
+    if package_name != DIOXUS_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} (Dioxus is exclusive to {DIOXUS_SPIKE})"
+        ));
+    }
+
+    let target = dependency.target.as_ref().map(ToString::to_string);
+    if target.as_deref() != Some(APPLE_TARGET) {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
+        ));
+    }
 }
 
 fn check_slint_dependency(
@@ -234,6 +265,7 @@ fn check_slint_dependency(
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         ("tersa-apple-bridge", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),

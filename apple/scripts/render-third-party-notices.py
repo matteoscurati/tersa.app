@@ -89,7 +89,8 @@ def render(data: dict[str, Any], target: str, supplemental: str) -> str:
 
     lines.append(normalize_newlines(supplemental).rstrip())
     lines.append("")
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    return "\n".join(line.rstrip() for line in content.splitlines()).rstrip() + "\n"
 
 
 def main() -> None:
@@ -101,7 +102,11 @@ def main() -> None:
     args = parser.parse_args()
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
-    supplemental = args.supplemental.read_text(encoding="utf-8")
+    supplemental = (
+        ""
+        if str(args.supplemental) == "-"
+        else args.supplemental.read_text(encoding="utf-8")
+    )
     args.output.write_text(
         render(data, args.target, supplemental), encoding="utf-8", newline="\n"
     )
