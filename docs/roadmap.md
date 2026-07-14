@@ -9,6 +9,11 @@ Validate Apple distribution, the selected UI candidate on physical devices,
 OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
 security policy, and Google API compliance.
 
+The SQLCipher diagnostic now proves CommonCrypto linkage, encrypted main/WAL
+payloads, abrupt-exit recovery, wrong-key rejection, integrity checks, and an
+in-memory temporary-store policy on macOS. iOS runtime, Keychain, Data
+Protection, schema, migrations, and production key handling remain M0 work.
+
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. Real consumer and Workspace authorization, code
 exchange, Keychain persistence, revocation, and Google verification remain M0

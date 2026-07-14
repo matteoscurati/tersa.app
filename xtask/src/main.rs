@@ -12,7 +12,7 @@ use std::error::Error;
 use std::io;
 use std::process::{Command, ExitCode};
 
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{Metadata, MetadataCommand};
 
 // Rust guideline compliant 1.0.
 
@@ -188,8 +188,14 @@ fn check_architecture() -> TaskResult {
 
             check_slint_dependency(&package_name, dependency, &mut violations);
             check_dioxus_dependency(&package_name, dependency, &mut violations);
+            check_sqlcipher_dependency(&package_name, dependency, &mut violations);
         }
     }
+
+    let dependency_graph = MetadataCommand::new()
+        .other_options(vec!["--locked".to_owned()])
+        .exec()?;
+    check_sqlcipher_dependency_graph(&dependency_graph, &mut violations);
 
     if violations.is_empty() {
         println!("Architecture dependency boundaries passed.");
@@ -201,6 +207,79 @@ fn check_architecture() -> TaskResult {
         violations.join(", ")
     ))
     .into())
+}
+
+fn check_sqlcipher_dependency_graph(metadata: &Metadata, violations: &mut Vec<String>) {
+    const SQLCIPHER_SPIKE: &str = "tersa-sqlcipher-spike";
+
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let sqlite_packages: BTreeSet<String> = package_names
+        .iter()
+        .filter_map(|(id, name)| (name == "libsqlite3-sys").then_some(id.clone()))
+        .collect();
+    if sqlite_packages.is_empty() {
+        violations.push("resolved dependency graph is missing libsqlite3-sys".to_owned());
+        return;
+    }
+
+    for member in &metadata.workspace_members {
+        let member_id = member.to_string();
+        let Some(member_name) = package_names.get(&member_id) else {
+            violations.push(format!(
+                "workspace member `{member_id}` is absent from the resolved package graph"
+            ));
+            continue;
+        };
+        if member_name != SQLCIPHER_SPIKE
+            && dependency_reaches(&member_id, &sqlite_packages, &dependencies)
+        {
+            violations.push(format!(
+                "{member_name} reaches libsqlite3-sys outside {SQLCIPHER_SPIKE}"
+            ));
+        }
+    }
+}
+
+fn dependency_reaches(
+    start: &str,
+    targets: &BTreeSet<String>,
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let mut pending = vec![start.to_owned()];
+    let mut visited = BTreeSet::new();
+    while let Some(package) = pending.pop() {
+        if !visited.insert(package.clone()) {
+            continue;
+        }
+        if targets.contains(&package) {
+            return true;
+        }
+        if let Some(children) = dependencies.get(&package) {
+            pending.extend(children.iter().cloned());
+        }
+    }
+    false
 }
 
 fn check_dioxus_dependency(
@@ -265,6 +344,33 @@ fn check_slint_dependency(
     }
 }
 
+fn check_sqlcipher_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const SQLCIPHER_SPIKE: &str = "tersa-sqlcipher-spike";
+    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
+
+    let dependency_name = dependency.name.as_str();
+    if !matches!(dependency_name, "rusqlite" | "libsqlite3-sys") {
+        return;
+    }
+
+    if package_name != SQLCIPHER_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} (SQLCipher is exclusive to {SQLCIPHER_SPIKE})"
+        ));
+    }
+
+    let target = dependency.target.as_ref().map(ToString::to_string);
+    if target.as_deref() != Some(APPLE_TARGET) {
+        violations.push(format!(
+            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
+        ));
+    }
+}
+
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         (
@@ -273,6 +379,7 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-sqlcipher-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),

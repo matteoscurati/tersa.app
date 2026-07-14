@@ -3,8 +3,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Generates or verifies complete target-specific Rust license inventories for
-# the Apple UI diagnostic applications.
+# Generates or verifies complete target-specific license inventories for the
+# Apple diagnostic applications.
 set -eu
 
 mode=${1:---check}
@@ -14,10 +14,14 @@ workspace_dir=$(CDPATH='' cd -- "${apple_dir}/.." && pwd)
 slint_config="${workspace_dir}/about.toml"
 dioxus_config="${workspace_dir}/about-dioxus.toml"
 bridge_config="${workspace_dir}/about-bridge.toml"
+sqlcipher_config="${workspace_dir}/about-sqlcipher.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
+sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
 
 python3 "${script_dir}/verify-rust-skia-notices.py" "$supplemental"
+python3 "${script_dir}/verify-sqlcipher-notices.py" \
+  "$sqlcipher_supplemental" "${workspace_dir}/Cargo.lock"
 
 case "$mode" in
   --check)
@@ -79,6 +83,13 @@ generate_notice THIRD_PARTY_NOTICES-bridge-ios.txt \
   apple/rust-bridge/Cargo.toml - "$bridge_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
+generate_notice THIRD_PARTY_NOTICES-sqlcipher-macos.txt "macOS arm64" \
+  apps/sqlcipher-spike/Cargo.toml "$sqlcipher_supplemental" "$sqlcipher_config" \
+  --target aarch64-apple-darwin
+generate_notice THIRD_PARTY_NOTICES-sqlcipher-ios.txt "iOS arm64 device and simulator targets" \
+  apps/sqlcipher-spike/Cargo.toml "$sqlcipher_supplemental" "$sqlcipher_config" \
+  --target aarch64-apple-ios --target aarch64-apple-ios-sim
+
 if [ "$mode" = "--check" ]; then
   cmp "${output_dir}/THIRD_PARTY_NOTICES-macos.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-macos.txt"
@@ -92,4 +103,8 @@ if [ "$mode" = "--check" ]; then
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-ios.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-sqlcipher-macos.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-sqlcipher-macos.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-sqlcipher-ios.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-sqlcipher-ios.txt"
 fi
