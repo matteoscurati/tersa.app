@@ -130,6 +130,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-apple-bridge"
+version = "0.0.0"
+dependencies = [
+ "tersa-presentation",
+]
+
+[[package]]
 name = "tersa-application"
 version = "0.0.0"
 

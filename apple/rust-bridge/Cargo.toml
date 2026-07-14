@@ -1,0 +1,19 @@
+[package]
+name = "tersa-apple-bridge"
+description = "Static Rust bridge linked by the minimal Apple bootstrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+tersa-presentation.workspace = true
+
+[lints]
+workspace = true

@@ -18,6 +18,70 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  apple-bootstrap:
+    name: Apple bootstrap
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Verify Xcode 26
+        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
+      - name: Install XcodeGen 2.45.4
+        env:
+          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
+        run: |
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
+          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
+      - name: Generate Apple project
+        run: xcodegen generate --spec apple/project.yml --project apple
+      - name: Build unsigned macOS debug application
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
+          -configuration Debug -destination 'platform=macOS,arch=arm64'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Build unsigned iOS simulator debug application
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Build unsigned iOS device debug application
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
+          -configuration Debug -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Archive unsigned macOS debug application
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
+          -configuration Debug -destination 'generic/platform=macOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaMac.xcarchive
+      - name: Archive unsigned iOS debug application
+        run: >-
+          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
+          -configuration Debug -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
+          -archivePath apple/build/TersaIOS.xcarchive
+      - name: Verify archived Rust bridge symbols
+        run: |
+          nm -gU apple/build/TersaMac.xcarchive/Products/Applications/Tersa.app/Contents/MacOS/Tersa \
+            | grep -F '_tersa_apple_bridge_version'
+          nm -gU apple/build/TersaIOS.xcarchive/Products/Applications/Tersa.app/Tersa \
+            | grep -F '_tersa_apple_bridge_version'
+
   rust:
     name: Rust (${{ matrix.os }})
     strategy:
