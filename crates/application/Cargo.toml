@@ -1,0 +1,13 @@
+[package]
+name = "tersa-application"
+description = "Platform-independent application use cases for tersa.app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

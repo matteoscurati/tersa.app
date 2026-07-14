@@ -5,6 +5,9 @@ tersa.app is a privacy-first, open-source Gmail client for iOS and macOS.
 The project is currently in **M0 feasibility work**. It is not yet usable as an
 email client and has no published application builds.
 
+The repository currently contains the shared-core workspace and governance
+foundation. Product behavior is added only after its feasibility gate passes.
+
 ## Product boundaries
 
 - iOS 18 or later and macOS 15 or later on Apple Silicon
@@ -20,6 +23,18 @@ M0 validates the UI stack, Apple distribution, OAuth, encrypted storage,
 search, MIME handling, security policy, and Google API compliance before
 production feature development begins. See the [roadmap](docs/roadmap.md) for
 the milestone sequence and MVP exclusions.
+
+## Development
+
+The workspace pins Rust 1.91.1. Run its baseline verification suite with:
+
+```sh
+cargo xtask verify
+```
+
+See [Development](docs/development.md) and
+[Dependency rules](docs/architecture/dependency-rules.md) for the contributor
+workflow.
 
 ## Contributing and security
 
