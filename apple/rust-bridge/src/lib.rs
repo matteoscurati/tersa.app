@@ -6,6 +6,8 @@
 
 #![deny(unsafe_code)]
 
+mod oauth;
+
 /// Confirms that the Apple application linked the Rust static library.
 #[expect(
     unsafe_code,
@@ -15,5 +17,14 @@
 pub extern "C" fn tersa_apple_bridge_version() -> u32 {
     tersa_presentation::presentation_protocol_version()
 }
+
+#[doc(inline)]
+pub use oauth::{tersa_oauth_cancel, tersa_oauth_ios_begin, tersa_oauth_ios_finish};
+
+#[cfg(target_os = "macos")]
+#[doc(inline)]
+pub use oauth::{
+    tersa_oauth_macos_begin, tersa_oauth_macos_entitlement_probe, tersa_oauth_macos_poll,
+};
 
 // Rust guideline compliant 1.0.

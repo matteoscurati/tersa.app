@@ -9,6 +9,11 @@ Validate Apple distribution, the selected UI candidate on physical devices,
 OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
 security policy, and Google API compliance.
 
+The portable PKCE state machine and Apple callback transports are implemented
+with deterministic evidence. Real consumer and Workspace authorization, code
+exchange, Keychain persistence, revocation, and Google verification remain M0
+work and are not implied by the transport feasibility result.
+
 The Slint diagnostic packages successfully, but its production gate failed
 because the locked Winit accessibility adapter is a no-op on iOS. The planned
 Dioxus 0.7.9 fallback also packages successfully and is suitable for continued

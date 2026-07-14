@@ -5,12 +5,19 @@
 import UIKit
 
 @main
+@MainActor
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    private let oauthAuthorizationSession = OAuthAuthorizationSession()
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         _ = tersa_apple_bridge_version()
         return true
+    }
+
+    func startOAuthAuthorization() -> Bool {
+        oauthAuthorizationSession.start()
     }
 }

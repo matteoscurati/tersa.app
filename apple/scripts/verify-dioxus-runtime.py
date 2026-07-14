@@ -203,6 +203,8 @@ def main() -> None:
         "<title>tersa.app — Dioxus M0 diagnostic</title>",
         "TERSA-DIOXUS-M0-THREAD",
         "TERSA_DIOXUS_EVIDENCE",
+        '"data-expected-rows": "{rendered_rows}"',
+        "new MutationObserver(updateActualRows)",
         "viewport-fit=cover",
         "const INBOX_ROWS: usize = 10_000;",
     )

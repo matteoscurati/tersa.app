@@ -20,5 +20,7 @@
 	<string>1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
+	<key>TersaOAuthClientID</key>
+	<string>$(TERSA_OAUTH_CLIENT_ID)</string>
 </dict>
 </plist>

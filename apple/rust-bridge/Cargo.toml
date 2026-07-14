@@ -13,7 +13,10 @@ publish = false
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
+tersa-application.workspace = true
 tersa-presentation.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

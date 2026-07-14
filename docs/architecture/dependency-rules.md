@@ -12,7 +12,7 @@ adapters:
 | `tersa-application` | Commands, queries, and use cases | `tersa-domain` |
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
-| `tersa-apple-bridge` | C ABI linked by Apple application targets | `tersa-presentation` |
+| `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-presentation` |
 | `tersa-slint-spike` | Apple-only diagnostic Slint executable | `tersa-presentation` |
 | `tersa-dioxus-spike` | Apple-only diagnostic Dioxus executable | `tersa-presentation` |
 
@@ -22,6 +22,10 @@ depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
 respective UI runtimes, and every UI dependency is target-gated to Apple. New
 workspace crates must be added explicitly to the policy in `xtask`; an unknown
 crate fails CI.
+
+The Apple bridge may call application use cases directly when the operating
+system owns the transport. The M0 OAuth adapter uses this edge for the browser
+callback while keeping PKCE and callback validation in portable Rust.
 
 Run the boundary check with:
 

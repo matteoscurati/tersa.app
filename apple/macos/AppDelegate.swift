@@ -5,8 +5,15 @@
 import AppKit
 
 @main
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let oauthAuthorizationSession = OAuthAuthorizationSession()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = tersa_apple_bridge_version()
+    }
+
+    func startOAuthAuthorization() -> Bool {
+        oauthAuthorizationSession.start()
     }
 }

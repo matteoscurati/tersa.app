@@ -20,11 +20,18 @@ repository = "https://github.com/matteoscurati/tersa.app"
 authors = ["tersa.app contributors"]
 
 [workspace.dependencies]
+base64 = "0.22.1"
 cargo_metadata = "0.23.1"
 dioxus = { version = "=0.7.9", default-features = false, features = ["hooks", "html", "macro", "signals"] }
 dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }
 dioxus-document = { version = "=0.7.9", default-features = false }
+getrandom = "0.3.4"
+sha2 = "0.10.9"
+subtle = "2.6.1"
+tersa-application = { path = "crates/application", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
+url = "2.5.8"
+zeroize = "1.9.0"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

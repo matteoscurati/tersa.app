@@ -6669,12 +6669,23 @@ dependencies = [
 name = "tersa-apple-bridge"
 version = "0.0.0"
 dependencies = [
+ "tersa-application",
  "tersa-presentation",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
 name = "tersa-application"
 version = "0.0.0"
+dependencies = [
+ "base64",
+ "getrandom 0.3.4",
+ "sha2",
+ "subtle",
+ "url",
+ "zeroize",
+]
 
 [[package]]
 name = "tersa-dioxus-spike"

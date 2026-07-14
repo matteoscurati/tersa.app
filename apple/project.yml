@@ -13,20 +13,27 @@ settings:
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
     DEVELOPMENT_TEAM: ""
+    TERSA_OAUTH_CLIENT_ID: UNCONFIGURED
+    TERSA_OAUTH_REDIRECT_SCHEME: app.tersa.oauth.UNCONFIGURED
 targets:
   TersaMac:
     type: application
     platform: macOS
     sources:
       - path: macos
+      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt
+        buildPhase: resources
     info:
       path: macos/Info.plist
       properties:
         LSApplicationCategoryType: public.app-category.productivity
+        TersaOAuthClientID: "$(TERSA_OAUTH_CLIENT_ID)"
     entitlements:
       path: macos/TersaMac.entitlements
       properties:
         com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
@@ -50,9 +57,17 @@ targets:
     platform: iOS
     sources:
       - path: ios
+      - path: licenses/THIRD_PARTY_NOTICES-bridge-ios.txt
+        buildPhase: resources
     info:
       path: ios/Info.plist
       properties:
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLSchemes:
+              - "$(TERSA_OAUTH_REDIRECT_SCHEME)"
+        TersaOAuthClientID: "$(TERSA_OAUTH_CLIENT_ID)"
+        TersaOAuthRedirectScheme: "$(TERSA_OAUTH_REDIRECT_SCHEME)"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

@@ -42,26 +42,53 @@ mod apple {
                 }
 
                 window.__tersaVirtualizerResizeObserver?.disconnect();
-                const updateActualRows = () => window.requestAnimationFrame(() => {
-                    window.requestAnimationFrame(() => {
+                window.__tersaVirtualizerMutationObserver?.disconnect();
+                const updateActualRows = () => {
+                    const generation = (window.__tersaActualRowsGeneration ?? 0) + 1;
+                    window.__tersaActualRowsGeneration = generation;
+                    let attempts = 0;
+                    const settle = () => window.requestAnimationFrame(() => {
+                        if (generation !== window.__tersaActualRowsGeneration) {
+                            return;
+                        }
+                        const currentList = document.querySelector(
+                            '[data-evidence="virtual-list"]'
+                        );
                         const output = document.querySelector(
                             '[data-evidence="actual-dom-rows"]'
                         );
-                        if (output) {
-                            output.textContent = `ACTUAL DOM ROWS ${
-                                document.querySelectorAll('.mail-row').length
-                            }`;
+                        if (!currentList || !output) {
+                            return;
                         }
+                        const expected = Number(currentList.dataset.expectedRows);
+                        const actual = document.querySelectorAll('.mail-row').length;
+                        if (actual !== expected && attempts < 120) {
+                            attempts += 1;
+                            settle();
+                            return;
+                        }
+                        output.textContent = actual === expected
+                            ? `ACTUAL DOM ROWS ${actual}`
+                            : `ACTUAL DOM ROWS UNSETTLED ${actual} OF ${expected}`;
                     });
-                });
+                    settle();
+                };
                 const notify = () => {
                     list.dispatchEvent(new Event('scroll', { bubbles: true }));
                     updateActualRows();
                 };
                 const observer = new ResizeObserver(notify);
                 observer.observe(list);
+                const mutationObserver = new MutationObserver(updateActualRows);
+                mutationObserver.observe(list, {
+                    attributes: true,
+                    attributeFilter: ['data-expected-rows'],
+                    childList: true,
+                    subtree: true,
+                });
                 list.addEventListener('scroll', updateActualRows, { passive: true });
                 window.__tersaVirtualizerResizeObserver = observer;
+                window.__tersaVirtualizerMutationObserver = mutationObserver;
                 notify();
             };
             install();
@@ -267,6 +294,7 @@ mod apple {
                         div {
                             class: "virtual-list",
                             "data-evidence": "virtual-list",
+                            "data-expected-rows": "{rendered_rows}",
                             onscroll: move |event| {
                                 scroll_top.set(event.data().scroll_top().max(0.0));
                                 viewport_height.set(f64::from(event.data().client_height().max(1)));

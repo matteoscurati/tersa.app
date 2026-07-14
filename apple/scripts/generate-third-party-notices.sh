@@ -13,6 +13,7 @@ apple_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
 workspace_dir=$(CDPATH='' cd -- "${apple_dir}/.." && pwd)
 slint_config="${workspace_dir}/about.toml"
 dioxus_config="${workspace_dir}/about-dioxus.toml"
+bridge_config="${workspace_dir}/about-bridge.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
 
@@ -70,6 +71,13 @@ generate_notice THIRD_PARTY_NOTICES-dioxus-ios.txt \
   "iOS arm64 device and simulator targets" \
   apps/dioxus-spike/Cargo.toml - "$dioxus_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
+generate_notice THIRD_PARTY_NOTICES-bridge-macos.txt "tersa.app macOS arm64" \
+  apple/rust-bridge/Cargo.toml - "$bridge_config" \
+  --target aarch64-apple-darwin
+generate_notice THIRD_PARTY_NOTICES-bridge-ios.txt \
+  "tersa.app iOS arm64 device and simulator targets" \
+  apple/rust-bridge/Cargo.toml - "$bridge_config" \
+  --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
 if [ "$mode" = "--check" ]; then
   cmp "${output_dir}/THIRD_PARTY_NOTICES-macos.txt" \
@@ -80,4 +88,8 @@ if [ "$mode" = "--check" ]; then
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-dioxus-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-ios.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-macos.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-macos.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-ios.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-ios.txt"
 fi

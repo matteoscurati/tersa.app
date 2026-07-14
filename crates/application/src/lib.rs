@@ -6,4 +6,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod oauth;
+
 // Rust guideline compliant 1.0.
