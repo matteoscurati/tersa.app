@@ -17,6 +17,7 @@ use cargo_metadata::{Metadata, MetadataCommand};
 // Rust guideline compliant 1.0.
 
 type TaskResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+type RuntimeBoundary = (&'static str, fn(&str) -> bool, &'static str);
 
 fn main() -> ExitCode {
     match run() {
@@ -209,6 +210,7 @@ fn check_architecture() -> TaskResult {
         check_sqlcipher_dependency_graph(&dependency_graph, target, &mut violations);
         check_search_dependency_graph(&dependency_graph, target, &mut violations);
         check_mime_dependency_graph(&dependency_graph, target, &mut violations);
+        check_diagnostic_runtime_dependency_graph(&dependency_graph, target, &mut violations);
     }
 
     if violations.is_empty() {
@@ -221,6 +223,91 @@ fn check_architecture() -> TaskResult {
         violations.join(", ")
     ))
     .into())
+}
+
+fn check_diagnostic_runtime_dependency_graph(
+    metadata: &Metadata,
+    target: &str,
+    violations: &mut Vec<String>,
+) {
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let workspace_members: BTreeSet<String> = metadata
+        .workspace_members
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    check_diagnostic_runtime_reachability(
+        &package_names,
+        &workspace_members,
+        &dependencies,
+        target,
+        violations,
+    );
+}
+
+fn check_diagnostic_runtime_reachability(
+    package_names: &BTreeMap<String, String>,
+    workspace_members: &BTreeSet<String>,
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    target: &str,
+    violations: &mut Vec<String>,
+) {
+    const RUNTIMES: [RuntimeBoundary; 2] = [
+        (
+            "Slint runtime",
+            is_slint_runtime_dependency,
+            "tersa-slint-spike",
+        ),
+        (
+            "Dioxus runtime",
+            is_dioxus_runtime_dependency,
+            "tersa-dioxus-spike",
+        ),
+    ];
+
+    for (runtime, matches_runtime, allowed_root) in RUNTIMES {
+        let runtime_packages: BTreeSet<String> = package_names
+            .iter()
+            .filter_map(|(id, name)| matches_runtime(name).then_some(id.clone()))
+            .collect();
+        for member_id in workspace_members {
+            let Some(member_name) = package_names.get(member_id) else {
+                violations.push(format!(
+                    "workspace member `{member_id}` is absent from the resolved package graph"
+                ));
+                continue;
+            };
+            if member_name != allowed_root
+                && dependency_reaches(member_id, &runtime_packages, dependencies)
+            {
+                violations.push(format!(
+                    "{member_name} reaches {runtime} outside {allowed_root} for {target}"
+                ));
+            }
+        }
+    }
 }
 
 fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -446,6 +533,12 @@ fn is_dioxus_runtime_dependency(dependency_name: &str) -> bool {
         || matches!(dependency_name, "wry" | "tao" | "manganis")
 }
 
+fn is_slint_runtime_dependency(dependency_name: &str) -> bool {
+    dependency_name == "slint"
+        || dependency_name.starts_with("slint-")
+        || dependency_name.starts_with("i-slint-")
+}
+
 fn check_slint_dependency(
     package_name: &str,
     dependency: &cargo_metadata::Dependency,
@@ -455,9 +548,7 @@ fn check_slint_dependency(
     const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
 
     let dependency_name = dependency.name.as_str();
-    let is_slint = matches!(dependency_name, "slint" | "slint-build")
-        || dependency_name.starts_with("i-slint-");
-    if !is_slint {
+    if !is_slint_runtime_dependency(dependency_name) {
         return;
     }
 
@@ -655,7 +746,12 @@ fn parse_identity(identity: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_dioxus_runtime_dependency, parse_identity};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        check_diagnostic_runtime_reachability, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, parse_identity,
+    };
 
     #[test]
     fn parses_a_well_formed_identity() {
@@ -679,5 +775,103 @@ mod tests {
         assert!(is_dioxus_runtime_dependency("wry"));
         assert!(is_dioxus_runtime_dependency("tao"));
         assert!(!is_dioxus_runtime_dependency("tersa-domain"));
+    }
+
+    #[test]
+    fn recognizes_the_complete_slint_runtime_boundary() {
+        assert!(is_slint_runtime_dependency("slint"));
+        assert!(is_slint_runtime_dependency("slint-build"));
+        assert!(is_slint_runtime_dependency("slint-macros"));
+        assert!(is_slint_runtime_dependency("i-slint-core"));
+        assert!(!is_slint_runtime_dependency("tersa-domain"));
+    }
+
+    #[test]
+    fn rejects_indirect_diagnostic_runtime_reachability_from_a_non_spike() {
+        let package_names = BTreeMap::from([
+            ("application".to_owned(), "tersa-application".to_owned()),
+            ("adapter".to_owned(), "diagnostic-adapter".to_owned()),
+            ("slint".to_owned(), "i-slint-core".to_owned()),
+            ("dioxus".to_owned(), "dioxus-core".to_owned()),
+            ("wry".to_owned(), "wry".to_owned()),
+            ("tao".to_owned(), "tao".to_owned()),
+        ]);
+        let workspace_members = BTreeSet::from(["application".to_owned()]);
+        let dependencies = BTreeMap::from([
+            (
+                "application".to_owned(),
+                BTreeSet::from(["adapter".to_owned()]),
+            ),
+            (
+                "adapter".to_owned(),
+                BTreeSet::from([
+                    "slint".to_owned(),
+                    "dioxus".to_owned(),
+                    "wry".to_owned(),
+                    "tao".to_owned(),
+                ]),
+            ),
+        ]);
+        let mut violations = Vec::new();
+
+        check_diagnostic_runtime_reachability(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            "aarch64-apple-darwin",
+            &mut violations,
+        );
+
+        assert_eq!(
+            violations,
+            vec![
+                "tersa-application reaches Slint runtime outside tersa-slint-spike for aarch64-apple-darwin",
+                "tersa-application reaches Dioxus runtime outside tersa-dioxus-spike for aarch64-apple-darwin",
+            ]
+        );
+    }
+
+    #[test]
+    fn allows_indirect_diagnostic_runtime_reachability_from_its_spike() {
+        let package_names = BTreeMap::from([
+            ("slint-spike".to_owned(), "tersa-slint-spike".to_owned()),
+            ("dioxus-spike".to_owned(), "tersa-dioxus-spike".to_owned()),
+            ("slint-adapter".to_owned(), "slint-adapter".to_owned()),
+            ("dioxus-adapter".to_owned(), "dioxus-adapter".to_owned()),
+            ("slint".to_owned(), "slint".to_owned()),
+            ("dioxus".to_owned(), "dioxus".to_owned()),
+            ("tao".to_owned(), "tao".to_owned()),
+        ]);
+        let workspace_members =
+            BTreeSet::from(["slint-spike".to_owned(), "dioxus-spike".to_owned()]);
+        let dependencies = BTreeMap::from([
+            (
+                "slint-spike".to_owned(),
+                BTreeSet::from(["slint-adapter".to_owned()]),
+            ),
+            (
+                "dioxus-spike".to_owned(),
+                BTreeSet::from(["dioxus-adapter".to_owned()]),
+            ),
+            (
+                "slint-adapter".to_owned(),
+                BTreeSet::from(["slint".to_owned()]),
+            ),
+            (
+                "dioxus-adapter".to_owned(),
+                BTreeSet::from(["dioxus".to_owned(), "tao".to_owned()]),
+            ),
+        ]);
+        let mut violations = Vec::new();
+
+        check_diagnostic_runtime_reachability(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            "aarch64-apple-ios",
+            &mut violations,
+        );
+
+        assert!(violations.is_empty());
     }
 }

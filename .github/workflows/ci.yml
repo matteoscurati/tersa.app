@@ -95,6 +95,9 @@ jobs:
             | grep -F '_tersa_apple_bridge_version'
       - name: Verify OAuth PKCE and sandbox feasibility
         run: sh apple/scripts/verify-oauth-feasibility.sh
+      - name: Bind OAuth feasibility evidence to the checked-out commit
+        if: always()
+        run: python3 scripts/write-evidence-manifest.py apple/build/oauth-evidence "$GITHUB_SHA"
       - name: Upload OAuth feasibility evidence
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -102,6 +105,7 @@ jobs:
           name: oauth-pkce-feasibility-evidence
           path: apple/build/oauth-evidence
           if-no-files-found: error
+          retention-days: 90
       - name: Build and archive unsigned macOS Slint spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
@@ -122,6 +126,9 @@ jobs:
           -archivePath apple/build/TersaSlintIOS.xcarchive
       - name: Verify and capture Slint spike evidence
         run: sh apple/scripts/capture-slint-evidence.sh
+      - name: Bind Slint spike evidence to the checked-out commit
+        if: always()
+        run: python3 scripts/write-evidence-manifest.py apple/build/slint-evidence "$GITHUB_SHA"
       - name: Upload Slint spike screenshots and metrics
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -129,6 +136,7 @@ jobs:
           name: slint-spike-evidence
           path: apple/build/slint-evidence
           if-no-files-found: error
+          retention-days: 90
 
   dioxus-apple-evidence:
     name: Dioxus Apple evidence
@@ -188,6 +196,9 @@ jobs:
           -archivePath apple/build/TersaDioxusIOS.xcarchive
       - name: Verify and capture Dioxus spike evidence
         run: sh apple/scripts/capture-dioxus-evidence.sh
+      - name: Bind Dioxus spike evidence to the checked-out commit
+        if: always()
+        run: python3 scripts/write-evidence-manifest.py apple/build/dioxus-evidence "$GITHUB_SHA"
       - name: Upload Dioxus spike screenshots and metrics
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -195,6 +206,7 @@ jobs:
           name: dioxus-spike-evidence
           path: apple/build/dioxus-evidence
           if-no-files-found: error
+          retention-days: 90
 
   sqlcipher-apple-evidence:
     name: SQLCipher Apple evidence
@@ -227,6 +239,9 @@ jobs:
           cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
       - name: Verify SQLCipher storage feasibility
         run: sh apple/scripts/verify-sqlcipher-feasibility.sh
+      - name: Bind SQLCipher feasibility evidence to the checked-out commit
+        if: ${{ always() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
+        run: python3 scripts/write-evidence-manifest.py apple/build/sqlcipher-evidence "$GITHUB_SHA"
       - name: Upload SQLCipher feasibility evidence
         if: ${{ always() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -234,6 +249,7 @@ jobs:
           name: sqlcipher-feasibility-evidence
           path: apple/build/sqlcipher-evidence
           if-no-files-found: error
+          retention-days: 90
 
   search-apple-evidence:
     name: Search Apple evidence
@@ -267,6 +283,9 @@ jobs:
           cargo build --locked --release --package tersa-search-spike --target aarch64-apple-ios-sim
       - name: Verify encrypted search feasibility
         run: sh apple/scripts/verify-search-feasibility.sh
+      - name: Bind encrypted search evidence to the checked-out commit
+        if: ${{ always() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
+        run: python3 scripts/write-evidence-manifest.py apple/build/search-evidence "$GITHUB_SHA"
       - name: Upload encrypted search evidence
         if: ${{ always() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -274,6 +293,7 @@ jobs:
           name: encrypted-search-feasibility-evidence
           path: apple/build/search-evidence
           if-no-files-found: error
+          retention-days: 90
 
   mime-apple-evidence:
     name: MIME and HTML Apple evidence
@@ -338,6 +358,9 @@ jobs:
           -archivePath apple/build/TersaMimeIOS.xcarchive
       - name: Verify hostile MIME and HTML controls
         run: sh apple/scripts/verify-mime-feasibility.sh
+      - name: Bind MIME feasibility evidence to the checked-out commit
+        if: ${{ always() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
+        run: python3 scripts/write-evidence-manifest.py apple/build/mime-evidence "$GITHUB_SHA"
       - name: Upload MIME feasibility evidence
         if: ${{ always() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -345,6 +368,7 @@ jobs:
           name: mime-html-feasibility-evidence
           path: apple/build/mime-evidence
           if-no-files-found: error
+          retention-days: 90
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -376,6 +400,10 @@ jobs:
           fetch-depth: 0
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Verify M0 product gates
+        run: |
+          python3 scripts/verify-m0-gates.py --self-test
+          python3 scripts/write-evidence-manifest.py --self-test
       - name: Install policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
