@@ -123,13 +123,12 @@ mod apple {
                 'tersa-dioxus-ephemeral-cookie=written'
             );
             const anchor = document.createElement('a');
-            anchor.setAttribute(['hr', 'ef'].join(''), 'https://example.invalid/anchor');
+            anchor.setAttribute('href', 'https://example.invalid/anchor');
             anchor.textContent = 'Synthetic navigation probe';
             document.body.append(anchor);
             anchor.click();
             const ipcParams = {};
-            ipcParams[['hr', 'ef'].join('')] =
-                'https://example.invalid/ipc-browser-open';
+            ipcParams['href'] = 'https://example.invalid/ipc-browser-open';
             window.ipc.postMessage(JSON.stringify({
                 method: 'browser_open',
                 params: ipcParams
