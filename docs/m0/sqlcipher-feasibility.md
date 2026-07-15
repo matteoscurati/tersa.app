@@ -33,7 +33,26 @@ The macOS evidence executable uses only random synthetic values and proves:
 - the same scanner detects a sentinel in an unkeyed plaintext SQLite control,
   preventing a vacuous absence result; and
 - a large in-memory temporary-table workload creates no controlled filesystem
-  artifact.
+  artifact;
+- separate compiled, contiguous global and per-account migration chains use
+  distinct fixed application IDs and `user_version` as their only cursor;
+- only an exactly empty, unowned database is claimed, while unknown ownership,
+  future versions, downgrades, and noncanonical schemas are rejected;
+- fresh-to-latest and close/reopen incremental upgrades converge to the same
+  exact normalized `sqlite_schema`, while latest-version reopen is a no-op;
+- each migration is transactional, with the version bump as the final database
+  statement before commit and the application ID set atomically in migration
+  one; and
+- deterministic `SIGKILL` before migration-two commit recovers canonical version
+  one for both global and account databases, then a normal open reaches canonical
+  version two.
+
+The illustrative global schema contains only account references and preferences.
+The illustrative account schema contains only threads, messages, labels,
+message-label relations, and pending-operation intent. It has no production
+Gmail fields, explicit indexes, triggers, FTS, blobs, or migration-history
+table. Gmail remains authoritative for server mail and labels; pending
+operations represent temporary local intent.
 
 The parent sends the random key to its child over a private stdin pipe. Keys,
 sentinels, SQL, file paths, and raw database artifacts are never written to the
@@ -56,14 +75,21 @@ to permit a file spill. The diagnostic sets its key through a SQLCipher pragma;
 this can create transient library-owned SQL copies that Rust cannot reliably
 zeroize. A production adapter must use a narrowly audited keying boundary.
 
-Runtime durability is exercised on macOS only. iOS device and simulator builds
-prove compilation and linkage, not protected-data lifecycle, background access,
-power-loss behavior, or filesystem policy.
+Runtime durability and the migration crash protocol are exercised on macOS only.
+iOS device and simulator builds prove compilation and linkage, not protected-data
+lifecycle, background access, power-loss behavior, or filesystem policy. The
+host `SIGKILL` proof does not model power failure, disk-full behavior, or APFS
+failure semantics.
 
-Deferred work includes the storage repository API, schema and migrations,
-Keychain and Data Protection integration, key derivation and rotation,
-per-account databases, rekey and plaintext migration, corruption and disk-full
+Deferred work includes the production storage repository API and schema,
+migration-history policy, Keychain and Data Protection integration, key
+derivation and rotation, rekey and plaintext migration, corruption and disk-full
 recovery, backup and restore behavior, blob encryption, search, and app lock.
+
+The ownership and migration boundary is recorded in
+[ADR 0011](../architecture/adr-0011-sqlcipher-schema-and-migration-ownership.md).
+`M0-STORAGE-001` remains open: host migration evidence does not satisfy its
+signed physical-device requirement.
 
 ## Reproduce locally
 

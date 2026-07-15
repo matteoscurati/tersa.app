@@ -11,8 +11,13 @@ security policy, and Google API compliance.
 
 The SQLCipher diagnostic now proves CommonCrypto linkage, encrypted main/WAL
 payloads, abrupt-exit recovery, wrong-key rejection, integrity checks, and an
-in-memory temporary-store policy on macOS. iOS runtime, Keychain, Data
-Protection, schema, migrations, and production key handling remain M0 work.
+in-memory temporary-store policy on macOS. It also proves exact synthetic global
+and account schema ownership, contiguous transactional migrations, fresh and
+incremental convergence, no-op latest reopen, and deterministic rollback from
+an uncommitted migration-two WAL on the host. The schema remains illustrative,
+not production. iOS protected-data runtime, Keychain, Data Protection,
+production schema/repositories, migration-history policy, and production key
+handling remain M0 work; `M0-STORAGE-001` remains open.
 
 The search diagnostic proves host-side synthetic exact-match sets for SQLCipher
 FTS5 and Tantivy 0.26.1, immutable open handles after delete/replace,
@@ -21,8 +26,8 @@ nonblocking locks, one writer with concurrent readers, metadata watches,
 re-entrant callback safety, chunk-local range reads, wrong-key rejection, both
 integrity checks, and a retrievable random sentinel with redacted controls.
 Host evidence is not a device-gate result. Physical-iPhone runtime and
-performance, schema/migration ownership, garbage collection, backup behavior,
-and production key handling remain M0 gates.
+performance, search-index schema/migration ownership, garbage collection,
+backup behavior, and production key handling remain M0 gates.
 
 The hostile-content diagnostic now bounds encoded input, headers, MIME depth,
 part count, and decoded display bytes before producing a typed `SafeHtml`
