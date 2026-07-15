@@ -20,8 +20,9 @@ probe, not production search and not an iPhone performance result.
   generation, and a database uniqueness constraint preserves WORM behavior
   across independent connections. Tantivy's writer lock rejects a second
   writer while an existing reader remains usable on another thread; blocking
-  locks wait for release; metadata watches fire; and a sliced read proves that
-  only one intersecting SQLCipher chunk was loaded.
+  locks wait for release; metadata watches can re-enter the directory without
+  retaining its SQLCipher mutex; and a sliced read proves that only one
+  intersecting SQLCipher chunk was loaded.
 - Missing and wrong SQLCipher keys fail closed, both `integrity_check` and
   `cipher_integrity_check` succeed, and a random per-run sentinel is first
   retrieved from Tantivy and then proven absent from database, WAL, and SHM

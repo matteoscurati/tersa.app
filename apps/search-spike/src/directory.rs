@@ -205,12 +205,9 @@ impl SqlCipherDirectory {
             )
             .map_err(io::Error::other)?;
         transaction.commit().map_err(io::Error::other)?;
+        drop(connection);
         if path == "meta.json" {
-            self.inner
-                .watch_callbacks
-                .broadcast()
-                .wait()
-                .map_err(io::Error::other)?;
+            drop(self.inner.watch_callbacks.broadcast());
         }
         Ok(())
     }

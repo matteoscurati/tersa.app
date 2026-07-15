@@ -10,7 +10,6 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
@@ -329,19 +328,20 @@ fn verify_blocking_lock(directory: &SqlCipherDirectory, independent: SqlCipherDi
 
 fn verify_watch(directory: &SqlCipherDirectory) -> Result {
     let metadata = directory.atomic_read(Path::new("meta.json"))?;
-    let observed = Arc::new(Mutex::new(false));
-    let callback_observed = Arc::clone(&observed);
+    let callback_directory = directory.clone();
+    let (sender, receiver) = mpsc::channel();
     let handle = directory.watch(WatchCallback::new(move || {
-        if let Ok(mut observed) = callback_observed.lock() {
-            *observed = true;
-        }
+        let reentrant_read = callback_directory
+            .atomic_read(Path::new("meta.json"))
+            .map(|bytes| !bytes.is_empty())
+            .unwrap_or(false);
+        let _ = sender.send(reentrant_read);
     }))?;
     directory.atomic_write(Path::new("meta.json"), &metadata)?;
-    if !*observed
-        .lock()
-        .map_err(|error| format!("watch mutex poisoned: {error}"))?
-    {
-        return Err("meta.json watch callback was not invoked".into());
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(true) => {}
+        Ok(false) => return Err("meta.json watch callback could not re-enter the directory".into()),
+        Err(_) => return Err("meta.json watch callback timed out while re-entering".into()),
     }
     drop(handle);
     Ok(())
