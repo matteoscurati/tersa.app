@@ -23,6 +23,24 @@ SERVER_KEY = "server_key: [u8; KEY_SIZE],"
 SECURE_KEY_CREATION = "rand::rngs::StdRng::from_os_rng()"
 CONSTANT_TIME_COMPARE = "subtle::ConstantTimeEq::ct_eq("
 SERVER_KEY_RESPONSE = ".send(tungstenite::Message::Text(hex_encoded_server_key.into()))"
+HANDSHAKE_LIMIT = "const DEFAULT_HANDSHAKE_LIMIT: usize = 8;"
+HANDSHAKE_TIMEOUT = "const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);"
+HANDSHAKE_SLOT = "struct HandshakeSlot(Arc<HandshakeSlots>);"
+HANDSHAKE_REJECTION = "stream.shutdown(Shutdown::Both)"
+ABSOLUTE_HANDSHAKE_DEADLINE = "struct HandshakeStream {"
+HANDSHAKE_DEADLINE_REMAINING = "checked_duration_since(Instant::now())"
+HANDSHAKE_DEADLINE_CLEAR = "fn finish_handshake(&mut self) -> io::Result<()>"
+GENERATION = "generation: u64,"
+LISTENER_GENERATION_CAPTURE = "let accepted_location = listener_location;"
+GENERATION_CHECK = "if *active_server_location != current_server_location"
+GENERATION_INCREMENT = '.checked_add(1)\n                .expect("WebSocket listener generation exhausted")'
+GENERATION_TEARDOWN = "fn transition_to_pending_if_generation("
+SERVER_KEY_FAILURE = "Webview {} closed during server-key authentication"
+EXPLICIT_EDIT_ACK = "Ok(tungstenite::Message::Binary(_)) => break,"
+EDIT_DISCONNECT = "disconnected before acknowledging edits"
+LOSSLESS_TEARDOWN_DRAIN = "while let Ok(msg) = edits_incoming_rx.try_recv()"
+SLOW_DRIP_TEST = "fn slow_drip_upgrade_cannot_extend_the_handshake_deadline()"
+PRODUCTION_ROTATION_TEST = "fn stale_handshake_is_rejected_after_listener_generation_rotation()"
 DEVTOOLS_MATCH_ARM_GUARD = '#[cfg(debug_assertions)]\n            "dioxus-toggle-dev-tools" => {'
 DEVTOOLS_FIELD_GUARD = "#[cfg(debug_assertions)]\n    pub(crate) show_devtools: bool,"
 DEVTOOLS_INITIALIZER_GUARD = "#[cfg(debug_assertions)]\n            show_devtools: false,"
@@ -209,10 +227,33 @@ def main() -> None:
         SECURE_KEY_CREATION,
         CONSTANT_TIME_COMPARE,
         SERVER_KEY_RESPONSE,
+        HANDSHAKE_LIMIT,
+        HANDSHAKE_TIMEOUT,
+        HANDSHAKE_SLOT,
+        HANDSHAKE_REJECTION,
+        ABSOLUTE_HANDSHAKE_DEADLINE,
+        HANDSHAKE_DEADLINE_REMAINING,
+        HANDSHAKE_DEADLINE_CLEAR,
+        GENERATION,
+        LISTENER_GENERATION_CAPTURE,
+        GENERATION_CHECK,
+        GENERATION_INCREMENT,
+        GENERATION_TEARDOWN,
+        SERVER_KEY_FAILURE,
+        EXPLICIT_EDIT_ACK,
+        EDIT_DISCONNECT,
+        LOSSLESS_TEARDOWN_DRAIN,
+        SLOW_DRIP_TEST,
+        PRODUCTION_ROTATION_TEST,
     )
     for marker in transport_markers:
         if marker not in edits:
             raise SystemExit(f"Dioxus transport invariant changed: missing {marker!r}")
+    transport_tests = edits.split("mod transport_tests {", maxsplit=1)
+    if len(transport_tests) != 2 or "#[ignore" in transport_tests[1]:
+        raise SystemExit("Dioxus live transport tests must exist and must not be ignored")
+    if "set_read_timeout(Some(handshake_timeout))" in edits:
+        raise SystemExit("Dioxus handshakes must use an absolute deadline, not an inactivity timeout")
 
     cargo_toml = (workspace / "Cargo.toml").read_text(encoding="utf-8")
     if 'dioxus-desktop = { path = "vendor/dioxus-desktop-0.7.9" }' not in cargo_toml:

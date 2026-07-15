@@ -3,8 +3,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Captures reproducible launch, transport, and screenshot evidence for the
-# unsigned Dioxus diagnostic packages.
+# Captures reproducible launch, transport, sandbox, and screenshot evidence for
+# the Dioxus diagnostic packages.
 set -eu
 
 apple_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -12,6 +12,7 @@ build_dir="${apple_dir}/build/dioxus-evidence"
 mac_home="${build_dir}/macos-home"
 window_finder="${apple_dir}/build/find-process-window"
 mac_app="${apple_dir}/build/TersaDioxusMac.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
+mac_sandbox_app="${build_dir}/Tersa Dioxus Spike Sandbox.app"
 ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Release-iphonesimulator/Tersa Dioxus Spike.app"
 rm -rf "$build_dir"
 mkdir -p "$build_dir" "$mac_home"
@@ -31,7 +32,8 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
-mac_binary="${mac_app}/Contents/MacOS/tersa-dioxus-spike"
+mac_unsigned_binary="${mac_app}/Contents/MacOS/tersa-dioxus-spike"
+mac_entitlements="${apple_dir}/dioxus-macos/TersaDioxusMac.entitlements"
 ios_archive_app="${apple_dir}/build/TersaDioxusIOS.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
 ios_archive_binary="${ios_archive_app}/tersa-dioxus-spike"
 
@@ -57,23 +59,67 @@ require_no_devtools_strings() {
   rm -f "$strings_output"
 }
 
-test -x "$mac_binary"
+test -x "$mac_unsigned_binary"
 test -x "${ios_app}/tersa-dioxus-spike"
 test -x "$ios_archive_binary"
-file "$mac_binary" | grep -F 'arm64'
+file "$mac_unsigned_binary" | grep -F 'arm64'
 file "${ios_app}/tersa-dioxus-spike" | grep -F 'arm64'
 file "$ios_archive_binary" | grep -F 'arm64'
-otool -L "$mac_binary" | grep -F 'WebKit.framework'
+otool -L "$mac_unsigned_binary" | grep -F 'WebKit.framework'
 otool -L "${ios_app}/tersa-dioxus-spike" | grep -F 'WebKit.framework'
 otool -L "$ios_archive_binary" | grep -F 'WebKit.framework'
-strings -a "$mac_binary" | grep -F 'TERSA-DIOXUS-M0-THREAD'
+strings -a "$mac_unsigned_binary" | grep -F 'TERSA-DIOXUS-M0-THREAD'
 strings -a "${ios_app}/tersa-dioxus-spike" | grep -F 'TERSA-DIOXUS-M0-THREAD'
 strings -a "$ios_archive_binary" | grep -F 'TERSA-DIOXUS-M0-THREAD'
-require_no_devtools_strings "$mac_binary"
+require_no_devtools_strings "$mac_unsigned_binary"
 require_no_devtools_strings "${ios_app}/tersa-dioxus-spike"
 require_no_devtools_strings "$ios_archive_binary"
 
 python3 "${apple_dir}/scripts/verify-dioxus-runtime.py"
+
+ditto "$mac_app" "$mac_sandbox_app"
+codesign --force --sign - --entitlements "$mac_entitlements" "$mac_sandbox_app"
+mac_binary="${mac_sandbox_app}/Contents/MacOS/tersa-dioxus-spike"
+codesign -d --entitlements :- "$mac_binary" > "${build_dir}/sandbox-entitlements.plist" 2>/dev/null
+python3 - "${build_dir}/sandbox-entitlements.plist" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as entitlement_file:
+    actual = plistlib.load(entitlement_file)
+expected = {
+    "com.apple.security.app-sandbox": True,
+    "com.apple.security.network.client": True,
+    "com.apple.security.network.server": True,
+}
+if actual != expected:
+    raise SystemExit(f"Sandbox entitlements differ from the exact allowlist: {actual!r}")
+PY
+
+cat > "${build_dir}/sandbox-write-probe.c" <<'C'
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 64;
+    int descriptor = open(argv[1], O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (descriptor < 0) return 73;
+    if (write(descriptor, "sandbox-probe\n", 14) != 14) return 74;
+    return close(descriptor) == 0 ? 0 : 74;
+}
+C
+cc "${build_dir}/sandbox-write-probe.c" -o "${build_dir}/sandbox-write-probe-unsandboxed"
+probe_app="${build_dir}/Sandbox Write Probe.app"
+probe_binary="${probe_app}/Contents/MacOS/sandbox-write-probe"
+mkdir -p "${probe_app}/Contents/MacOS"
+cp "${build_dir}/sandbox-write-probe-unsandboxed" "$probe_binary"
+cp "${mac_sandbox_app}/Contents/Info.plist" "${probe_app}/Contents/Info.plist"
+plutil -replace CFBundleIdentifier -string app.tersa.sandbox-write-probe \
+  "${probe_app}/Contents/Info.plist"
+plutil -replace CFBundleExecutable -string sandbox-write-probe \
+  "${probe_app}/Contents/Info.plist"
+codesign --force --sign - --entitlements "$mac_entitlements" \
+  "$probe_app"
 
 mac_notice_source="${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-macos.txt"
 ios_notice_source="${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-ios.txt"
@@ -211,20 +257,57 @@ start_mac() {
   evidence_mode="$1"
   relaunch_mode="${2:-0}"
   process_log="${3:-macos-process.log}"
+  listener_log="${4:-macos-listeners.txt}"
+  launch_binary="$mac_binary"
   if [ "$evidence_mode" -eq 1 ]; then
+    launch_binary="$mac_unsigned_binary"
     if [ "$relaunch_mode" -eq 1 ]; then
       HOME="$mac_home" TERSA_DIOXUS_EVIDENCE=1 TERSA_DIOXUS_RELAUNCH=1 \
-        "$mac_binary" >"${build_dir}/${process_log}" 2>&1 &
+        "$launch_binary" -ApplePersistenceIgnoreState YES >"${build_dir}/${process_log}" 2>&1 &
     else
-      HOME="$mac_home" TERSA_DIOXUS_EVIDENCE=1 "$mac_binary" \
+      HOME="$mac_home" TERSA_DIOXUS_EVIDENCE=1 \
+        "$launch_binary" -ApplePersistenceIgnoreState YES \
         >"${build_dir}/${process_log}" 2>&1 &
     fi
   else
-    "$mac_binary" >"${build_dir}/${process_log}" 2>&1 &
+    "$launch_binary" -ApplePersistenceIgnoreState YES >"${build_dir}/${process_log}" 2>&1 &
   fi
   mac_pid=$!
   wait_for_mac_window
-  verify_loopback_listener "$mac_pid" "${build_dir}/macos-listeners.txt"
+  verify_loopback_listener "$mac_pid" "${build_dir}/${listener_log}"
+}
+
+verify_sandbox_enforcement() {
+  probe_path="${build_dir}/outside-sandbox-write-probe"
+  rm -f "$probe_path"
+  python3 - "$probe_binary" \
+    "${build_dir}/sandbox-write-probe-unsandboxed" "$probe_path" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+sandboxed, unsandboxed, destination = sys.argv[1:]
+sandboxed_result = subprocess.run(
+    [sandboxed, destination], capture_output=True, check=False
+)
+if sandboxed_result.returncode != 73:
+    raise SystemExit(
+        "The sandboxed write canary did not reach the expected denied open: "
+        f"returncode={sandboxed_result.returncode}, "
+        f"stdout={sandboxed_result.stdout!r}, stderr={sandboxed_result.stderr!r}"
+    )
+path = pathlib.Path(destination)
+if path.exists():
+    raise SystemExit("The sandboxed write canary left an outside-container file")
+subprocess.run([unsandboxed, destination], check=True)
+if not path.is_file():
+    raise SystemExit("The unsandboxed write control did not create its output")
+PY
+  printf '%s\n' \
+    'Sandboxed bundled write canary: denied outside-container create with exit 73.' \
+    'Unsandboxed write control: outside-container create succeeded.' \
+    > "${build_dir}/sandbox-enforcement.txt"
+  rm -f "$probe_path"
 }
 
 stop_mac() {
@@ -243,8 +326,9 @@ stop_mac() {
 }
 
 mac_cold_start=$(now_ns)
-start_mac 0
+start_mac 0 0 macos-process.log macos-sandbox-listeners.txt
 mac_cold_end=$(now_ns)
+verify_sandbox_enforcement
 capture_mac_until_text \
   "${build_dir}/macos-initial.png" \
   "${build_dir}/macos-initial-ocr.txt" \
@@ -260,13 +344,13 @@ stop_mac
 sleep 1
 
 mac_warm_start=$(now_ns)
-start_mac 0
+start_mac 0 0 macos-warm-process.log macos-sandbox-warm-listeners.txt
 mac_warm_end=$(now_ns)
 sleep 2
 stop_mac
 sleep 1
 
-start_mac 1 0 macos-navigation-process.log
+start_mac 1 0 macos-navigation-process.log macos-navigation-listeners.txt
 capture_mac_until_text \
   "${build_dir}/macos.png" \
   "${build_dir}/macos-ocr.txt" \
@@ -294,10 +378,10 @@ wait_for_exact_log_line \
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -gt 0
-verify_loopback_listener "$mac_pid" "${build_dir}/macos-listeners.txt"
+verify_loopback_listener "$mac_pid" "${build_dir}/macos-navigation-listeners.txt"
 stop_mac
 
-start_mac 1 1 macos-relaunch-process.log
+start_mac 1 1 macos-relaunch-process.log macos-relaunch-listeners.txt
 capture_mac_until_text \
   "${build_dir}/macos-relaunch.png" \
   "${build_dir}/macos-relaunch-ocr.txt" \
@@ -351,10 +435,10 @@ test "$first_row" -gt 0
 verify_loopback_listener "$ios_pid" "${build_dir}/ios-simulator-listeners.txt"
 xcrun simctl terminate "$device" app.tersa.dioxus-spike.ios
 
-release_size=$(stat -f '%z' "$mac_binary")
-printf '{"mac_cold_harness_ready_ns":%s,"mac_warm_harness_ready_ns":%s,"ios_cold_launch_command_ns":%s,"mac_release_binary_bytes":%s,"synthetic_rows":10000}\n' \
+unsigned_release_size=$(stat -f '%z' "$mac_unsigned_binary")
+printf '{"mac_sandboxed_cold_harness_ready_ns":%s,"mac_sandboxed_warm_harness_ready_ns":%s,"ios_cold_launch_command_ns":%s,"mac_unsigned_release_binary_bytes":%s,"synthetic_rows":10000}\n' \
   "$((mac_cold_end - mac_cold_start))" "$((mac_warm_end - mac_warm_start))" \
-  "$((ios_cold_end - ios_cold_start))" "$release_size" \
+  "$((ios_cold_end - ios_cold_start))" "$unsigned_release_size" \
   > "${build_dir}/metrics.json"
 
 printf '%s\n' \
@@ -365,7 +449,11 @@ printf '%s\n' \
   > "${build_dir}/physical-device-gaps.txt"
 
 printf '%s\n' \
-  'The macOS host probe verifies a localStorage write, location stability,' \
+  'The sandboxed macOS host copy verifies stable UI markers, a loopback-only' \
+  'listener, an exact entitlement allowlist, and a denied bundled write canary' \
+  'with a successful unsandboxed control.' \
+  'The separate unsigned macOS host probe verifies a localStorage write,' \
+  'location stability,' \
   'anchor navigation and injected browser_open IPC denial markers while the' \
   'page remains rendered, plus a later direct-location denial marker and a' \
   'rejected window.open,' \
@@ -375,6 +463,7 @@ printf '%s\n' \
   'probe cannot make or verify a cookie-persistence claim.' \
   'The direct-location marker does not claim that WebKit preserves the rendered' \
   'page after cancellation; that behavior remains a device-signed gate.' \
+  'Navigation and WebKit storage are not exercised as sandboxed claims.' \
   'It cannot enumerate every operating-system WebKit cache surface, prove zero' \
   'in-memory state, or establish physical-device or signed-distribution behavior.' \
   > "${build_dir}/ephemeral-navigation-limitations.txt"

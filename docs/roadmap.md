@@ -44,8 +44,9 @@ The Slint diagnostic packages successfully, but its production gate failed
 because the locked Winit accessibility adapter is a no-op on iOS. The planned
 Dioxus 0.7.9 fallback also packages successfully and is suitable for continued
 diagnostic work, but it is not a production baseline: persistent WebKit state,
-navigation interception, sandboxed loopback transport, runtime footprint, and
-physical-device evidence are unresolved. M0 must resolve those blockers or
+navigation interception, runtime footprint, and physical-device evidence are
+unresolved; the sandboxed-loopback capture path still awaits immutable
+exact-head host evidence. M0 must resolve those blockers or
 reopen the UI constraint before M1 product screens begin. M1 remains blocked
 because no production UI baseline has passed; the authoritative
 [M0 gate register](m0/gate-register.json) records current HEAD-checkable

@@ -80,13 +80,8 @@ Production adoption remains blocked because:
 2. External HTTP, HTTPS, and mailto navigation is opened by `webbrowser` before
    the configurable navigation handler runs. Production hostile-content policy
    needs a complete deny-by-default interception boundary.
-3. The diagnostic macOS target is deliberately unsandboxed. App Sandbox would
-   require testing and accepting the `com.apple.security.network.server`
-   entitlement for the loopback listener, or replacing the transport. The
-   single accept loop also performs each unauthenticated WebSocket handshake
-   synchronously without a deadline before spawning its connection thread, so
-   a local client can block startup or reconnection. Production requires a
-   bounded concurrent handshake or a replacement transport.
+3. The sandboxed diagnostic transport decision and its remaining production
+   limitations are recorded in [ADR-0009](adr-0009-dioxus-sandboxed-transport-diagnostic.md).
 4. The minimal runtime still creates a Tokio runtime because of the upstream
    0.7.9 build defect. The local Release-only devtools guard removes the prior
    feature-minimal Release compilation failure without enabling private WebKit

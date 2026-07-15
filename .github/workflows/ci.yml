@@ -16,6 +16,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Pull request jobs test a synthetic merge commit, but evidence records the immutable source head.
+  EVIDENCE_COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   apple-bootstrap:
@@ -95,9 +97,9 @@ jobs:
             | grep -F '_tersa_apple_bridge_version'
       - name: Verify OAuth PKCE and sandbox feasibility
         run: sh apple/scripts/verify-oauth-feasibility.sh
-      - name: Bind OAuth feasibility evidence to the checked-out commit
+      - name: Bind OAuth feasibility evidence to the source commit
         if: always()
-        run: python3 scripts/write-evidence-manifest.py apple/build/oauth-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/oauth-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload OAuth feasibility evidence
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -126,9 +128,9 @@ jobs:
           -archivePath apple/build/TersaSlintIOS.xcarchive
       - name: Verify and capture Slint spike evidence
         run: sh apple/scripts/capture-slint-evidence.sh
-      - name: Bind Slint spike evidence to the checked-out commit
+      - name: Bind Slint spike evidence to the source commit
         if: always()
-        run: python3 scripts/write-evidence-manifest.py apple/build/slint-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/slint-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload Slint spike screenshots and metrics
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -198,9 +200,9 @@ jobs:
           -archivePath apple/build/TersaDioxusIOS.xcarchive
       - name: Verify and capture Dioxus spike evidence
         run: sh apple/scripts/capture-dioxus-evidence.sh
-      - name: Bind Dioxus spike evidence to the checked-out commit
+      - name: Bind Dioxus spike evidence to the source commit
         if: always()
-        run: python3 scripts/write-evidence-manifest.py apple/build/dioxus-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/dioxus-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload Dioxus spike screenshots and metrics
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -241,9 +243,9 @@ jobs:
           cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
       - name: Verify SQLCipher storage feasibility
         run: sh apple/scripts/verify-sqlcipher-feasibility.sh
-      - name: Bind SQLCipher feasibility evidence to the checked-out commit
+      - name: Bind SQLCipher feasibility evidence to the source commit
         if: ${{ always() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/sqlcipher-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/sqlcipher-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload SQLCipher feasibility evidence
         if: ${{ always() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -285,9 +287,9 @@ jobs:
           cargo build --locked --release --package tersa-search-spike --target aarch64-apple-ios-sim
       - name: Verify encrypted search feasibility
         run: sh apple/scripts/verify-search-feasibility.sh
-      - name: Bind encrypted search evidence to the checked-out commit
+      - name: Bind encrypted search evidence to the source commit
         if: ${{ always() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/search-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/search-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload encrypted search evidence
         if: ${{ always() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -360,9 +362,9 @@ jobs:
           -archivePath apple/build/TersaMimeIOS.xcarchive
       - name: Verify hostile MIME and HTML controls
         run: sh apple/scripts/verify-mime-feasibility.sh
-      - name: Bind MIME feasibility evidence to the checked-out commit
+      - name: Bind MIME feasibility evidence to the source commit
         if: ${{ always() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/mime-evidence "$GITHUB_SHA"
+        run: python3 scripts/write-evidence-manifest.py apple/build/mime-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload MIME feasibility evidence
         if: ${{ always() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
