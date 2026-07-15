@@ -30,6 +30,9 @@ same-version `[patch.crates-io]` override. Wry is not patched. The local fork:
 - retains each navigation handler with its WebView and resolves intercepted
   anchor IPC against the originating window ID, so one window cannot inherit
   or bypass another window's policy. An unknown window ID fails closed.
+- is extended by ADR-0008 with compile-time Debug guards around the existing
+  devtools handler, state, and menu strings so feature-minimal Release omits
+  private-WebKit devtools paths without changing the Debug behavior.
 
 The diagnostic spike opts into incognito and deny-all navigation. Its denial
 handler emits `TERSA-DIOXUS-NAV-DENIED`. The vendor tree is reproducible from
@@ -60,4 +63,5 @@ API in the host probe, so cookie persistence is not exercised. No production
 navigation, storage, sandbox, signed-device, or distribution claim follows.
 
 M1-UI-001 remains blocked, `ui_baseline_approved` remains false, and every
-other blocker in ADR-0005 remains untouched.
+other blocker in ADR-0005 remains untouched. ADR-0008 records the narrow
+Release diagnostic extension; it does not revise this ADR's decision.

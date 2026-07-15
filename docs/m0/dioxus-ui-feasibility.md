@@ -17,15 +17,15 @@ The current verdict is:
 - **GO for the bounded diagnostic and physical-device investigation.**
 - **NO-GO for production adoption.** The local ephemeral fork has source and
   host diagnostics for WebKit storage and navigation only; App Sandbox listener
-  boundary, unavoidable Tokio runtime, feature-minimal macOS Release failure,
-  lifecycle gaps, and physical-device evidence remain unresolved blockers.
+  boundary, unavoidable Tokio runtime, lifecycle gaps, signing and distribution,
+  and physical-device evidence remain unresolved blockers.
 
 ## Stable acceptance criteria
 
 | ID | Criterion | Required result | Register status |
 |---|---|---|---|
 | `M0-DIOXUS-001` | Locked dx-free Apple build | Exact Dioxus 0.7.9; direct Cargo; no `dx`, Manganis, Dioxus devtools package, backend, or remote assets | `diagnostic` |
-| `M0-DIOXUS-002` | Unsigned Apple packages | Debug macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives | `blocked` |
+| `M0-DIOXUS-002` | Unsigned Apple packages | Release macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives; device-signed evidence remains required | `diagnostic` |
 | `M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | `open` |
 | `M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; measured viewport plus fixed overscan; computed range and independent DOM count | `diagnostic` |
 | `M0-DIOXUS-005` | Semantic structure | Landmarks, labels, list/listitem positions, focus treatment, live status, reduced motion | `diagnostic` |
@@ -65,10 +65,11 @@ The diagnostic Mac target does not claim App Sandbox compatibility.
 
 ## Local ephemeral fork boundary
 
-ADR-0007 vendors a byte-verified, local patch of `dioxus-desktop` 0.7.9. It is
+ADR-0007 and ADR-0008 vendor a byte-verified, local patch of `dioxus-desktop` 0.7.9. It is
 not an upstream Dioxus result: unpatched 0.7.9 remains failed for navigation
-interception and ephemeral WebKit storage. The diagnostic fork opts into
-incognito and deny-all navigation, and verifies both native browser-open paths.
+interception, ephemeral WebKit storage, and feature-minimal Release compilation.
+The diagnostic fork opts into incognito and deny-all navigation, verifies both
+native browser-open paths, and compiles devtools paths and strings only in Debug.
 Wry itself is not patched; its Apple implementation maps incognito to
 `WKWebsiteDataStore::nonPersistentDataStore`.
 
@@ -112,5 +113,6 @@ Apple CI job owns simulator launch evidence. Every physical-device criterion
 remains open regardless of simulator success.
 
 See [ADR 0005](../architecture/adr-0005-dioxus-diagnostic-runtime.md) for the
-production blockers and adoption decision, and [ADR 0007](../architecture/adr-0007-dioxus-local-ephemeral-fork.md)
-for the local-fork boundary.
+production blockers and adoption decision, [ADR 0007](../architecture/adr-0007-dioxus-local-ephemeral-fork.md)
+for the local-fork boundary, and [ADR 0008](../architecture/adr-0008-dioxus-release-diagnostic.md)
+for the Release diagnostic change.

@@ -31,12 +31,11 @@ The runtime feature is required because 0.7.9 imports `tokio::sync::Notify` and
 calls `tokio::task::yield_now` unconditionally in `edits.rs`; compiling with no
 features fails even though `launch.rs` contains a nominal non-Tokio branch.
 The `dioxus-devtools` package and transparent-window feature remain disabled.
-The unsigned packages use Debug because a feature-minimal macOS Release build
-also fails: `dioxus-desktop` unconditionally calls Wry's feature-gated
-`open_devtools` and `close_devtools` methods in its desktop menu handler. Wry
-exposes those methods under debug assertions, so Debug compiles, but it also
-enables Web inspector support. Enabling the production `devtools` feature would
-use private WebKit APIs on macOS and is not an acceptable release workaround.
+The unsigned packages use Release under the narrow local-fork change recorded
+in ADR-0008. It compiles the `dioxus-desktop` devtools handler, state, and menu
+strings only under debug assertions, so feature-minimal Release omits those
+calls and strings without enabling Wry's `devtools` feature or private WebKit
+APIs. Debug behavior remains upstream-compatible.
 
 The diagnostic renders 10,000 synthetic rows with a handwritten fixed-height
 virtualizer. Only the visible range plus six overscan rows on either side is
@@ -89,10 +88,11 @@ Production adoption remains blocked because:
    a local client can block startup or reconnection. Production requires a
    bounded concurrent handshake or a replacement transport.
 4. The minimal runtime still creates a Tokio runtime because of the upstream
-   0.7.9 build defect. A feature-minimal macOS Release build separately fails
-   on unguarded devtools calls, while Debug exposes the Web inspector. Its
-   launch, memory, thread, energy, and releasability are outside the product
-   gate.
+   0.7.9 build defect. The local Release-only devtools guard removes the prior
+   feature-minimal Release compilation failure without enabling private WebKit
+   APIs, but it proves neither signing nor production releasability. Its launch,
+   memory, thread, energy, notarization, TestFlight, and App Review behavior
+   remain outside the product gate.
 5. Tao maps active/inactive transitions to resumed/suspended, but its iOS
    foreground/background callbacks are empty and it exposes no memory-warning
    event through this path.
@@ -107,9 +107,9 @@ review.
 
 The Dioxus spike remains isolated from all production crates and from the Slint
 spike. Its target-specific Rust notices are generated from the locked Apple
-graphs and bundled byte-for-byte in both diagnostic applications. The large
-dependency and binary footprint is evidence to measure, not an accepted
-production cost.
+graphs and bundled byte-for-byte in both unsigned Release diagnostic
+applications. The large dependency and binary footprint is evidence to measure,
+not an accepted production cost.
 
 The M0 UI gate cannot close on CI alone. A production GO requires a new build
 that resolves all six blockers, followed by the physical-device matrix in the

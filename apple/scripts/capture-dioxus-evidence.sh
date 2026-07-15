@@ -12,7 +12,7 @@ build_dir="${apple_dir}/build/dioxus-evidence"
 mac_home="${build_dir}/macos-home"
 window_finder="${apple_dir}/build/find-process-window"
 mac_app="${apple_dir}/build/TersaDioxusMac.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
-ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Debug-iphonesimulator/Tersa Dioxus Spike.app"
+ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Release-iphonesimulator/Tersa Dioxus Spike.app"
 rm -rf "$build_dir"
 mkdir -p "$build_dir" "$mac_home"
 
@@ -34,14 +34,44 @@ trap cleanup EXIT HUP INT TERM
 mac_binary="${mac_app}/Contents/MacOS/tersa-dioxus-spike"
 ios_archive_app="${apple_dir}/build/TersaDioxusIOS.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
 ios_archive_binary="${ios_archive_app}/tersa-dioxus-spike"
+
+require_no_devtools_strings() {
+  binary="$1"
+  strings_output=$(mktemp "${build_dir}/release-strings.XXXXXX")
+  if ! strings -a "$binary" > "$strings_output"; then
+    rm -f "$strings_output"
+    echo "Could not inspect Release Dioxus binary strings: $binary" >&2
+    return 1
+  fi
+  for forbidden_devtools_string in \
+    'dioxus-toggle-dev-tools' \
+    'Toggle Developer Tools' \
+    'developerExtrasEnabled' \
+    '_inspector'; do
+    if grep -F -- "$forbidden_devtools_string" "$strings_output" >/dev/null 2>&1; then
+      rm -f "$strings_output"
+      echo "Release Dioxus binary contains forbidden devtools string '$forbidden_devtools_string': $binary" >&2
+      return 1
+    fi
+  done
+  rm -f "$strings_output"
+}
+
 test -x "$mac_binary"
+test -x "${ios_app}/tersa-dioxus-spike"
 test -x "$ios_archive_binary"
 file "$mac_binary" | grep -F 'arm64'
+file "${ios_app}/tersa-dioxus-spike" | grep -F 'arm64'
 file "$ios_archive_binary" | grep -F 'arm64'
 otool -L "$mac_binary" | grep -F 'WebKit.framework'
+otool -L "${ios_app}/tersa-dioxus-spike" | grep -F 'WebKit.framework'
 otool -L "$ios_archive_binary" | grep -F 'WebKit.framework'
 strings -a "$mac_binary" | grep -F 'TERSA-DIOXUS-M0-THREAD'
+strings -a "${ios_app}/tersa-dioxus-spike" | grep -F 'TERSA-DIOXUS-M0-THREAD'
 strings -a "$ios_archive_binary" | grep -F 'TERSA-DIOXUS-M0-THREAD'
+require_no_devtools_strings "$mac_binary"
+require_no_devtools_strings "${ios_app}/tersa-dioxus-spike"
+require_no_devtools_strings "$ios_archive_binary"
 
 python3 "${apple_dir}/scripts/verify-dioxus-runtime.py"
 
@@ -321,10 +351,10 @@ test "$first_row" -gt 0
 verify_loopback_listener "$ios_pid" "${build_dir}/ios-simulator-listeners.txt"
 xcrun simctl terminate "$device" app.tersa.dioxus-spike.ios
 
-debug_size=$(stat -f '%z' "$mac_binary")
-printf '{"mac_cold_harness_ready_ns":%s,"mac_warm_harness_ready_ns":%s,"ios_cold_launch_command_ns":%s,"mac_debug_binary_bytes":%s,"synthetic_rows":10000}\n' \
+release_size=$(stat -f '%z' "$mac_binary")
+printf '{"mac_cold_harness_ready_ns":%s,"mac_warm_harness_ready_ns":%s,"ios_cold_launch_command_ns":%s,"mac_release_binary_bytes":%s,"synthetic_rows":10000}\n' \
   "$((mac_cold_end - mac_cold_start))" "$((mac_warm_end - mac_warm_start))" \
-  "$((ios_cold_end - ios_cold_start))" "$debug_size" \
+  "$((ios_cold_end - ios_cold_start))" "$release_size" \
   > "${build_dir}/metrics.json"
 
 printf '%s\n' \

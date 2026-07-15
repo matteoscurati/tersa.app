@@ -181,19 +181,19 @@ jobs:
       - name: Archive unsigned macOS Dioxus spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusMac
-          -configuration Debug -destination 'generic/platform=macOS'
+          -configuration Release -destination 'generic/platform=macOS'
           -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive
           -archivePath apple/build/TersaDioxusMac.xcarchive
       - name: Build unsigned iOS simulator Dioxus spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS
-          -configuration Debug -sdk iphonesimulator
+          -configuration Release -sdk iphonesimulator
           -destination 'generic/platform=iOS Simulator'
           -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO build
       - name: Archive unsigned iOS Dioxus spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS
-          -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS'
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
           -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive
           -archivePath apple/build/TersaDioxusIOS.xcarchive
       - name: Verify and capture Dioxus spike evidence
