@@ -45,7 +45,8 @@ the same policy with:
 - `WKWebpagePreferences.allowsContentJavaScript = false`;
 - a compiled content rule list that blocks every subresource class;
 - a controlled inert document base with literal-loopback hostile URLs;
-- fail-closed navigation actions, responses, and new-window handling;
+- an explicit inert navigation probe for fail-closed action handling, plus
+  fail-closed response and new-window handling;
 - aggregate-only evidence and an empty nonpersistent website-data inventory.
 
 The macOS archive is ad-hoc signed with App Sandbox and network client enabled,

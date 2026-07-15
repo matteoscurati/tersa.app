@@ -53,6 +53,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
     private var initialNavigationPending = false
     private var initialNavigationWasAllowed = false
     private var initialNavigationResponsePending = false
+    private var navigationDenialWaiter: CheckedContinuation<Void, Never>?
     private var navigationWaiter: NavigationWaiter?
     private var sanitizedDocumentLoaded = false
     private var rawControlLoaded = false
@@ -108,6 +109,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         rawControlHash = Self.sha256(rawControl)
         await load(rawControl, into: webView, baseURL: documentBaseURL, kind: .rawControl)
         pageJavaScriptDidNotExecute = webView.title != "JAVASCRIPT_EXECUTED"
+        await exerciseNavigationDenial(in: webView)
 #if os(macOS)
         hostWindow.contentView = nil
 #endif
@@ -129,6 +131,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         }
 
         navigationActionsDenied += 1
+        finishNavigationDenialWaiter()
         decisionHandler(.cancel)
     }
 
@@ -253,6 +256,35 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         }
         navigationWaiter = nil
         waiter.continuation.resume()
+    }
+
+    private func exerciseNavigationDenial(in webView: WKWebView) async {
+        guard let deniedURL = URL(string: "about:blank#tersa-denied-navigation") else {
+            failureCount += 1
+            failureCode = -3
+            return
+        }
+        await withCheckedContinuation { continuation in
+            navigationDenialWaiter = continuation
+            webView.load(URLRequest(url: deniedURL))
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5))
+                guard navigationDenialWaiter != nil else {
+                    return
+                }
+                failureCount += 1
+                failureCode = -3
+                finishNavigationDenialWaiter()
+            }
+        }
+    }
+
+    private func finishNavigationDenialWaiter() {
+        guard let waiter = navigationDenialWaiter else {
+            return
+        }
+        navigationDenialWaiter = nil
+        waiter.resume()
     }
 
     private func loadSanitizedDocument() -> String? {
