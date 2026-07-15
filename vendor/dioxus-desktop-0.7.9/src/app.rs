@@ -39,7 +39,6 @@ pub(crate) struct App {
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
-    pub(crate) navigation_handler: Option<NavigationHandler>,
 
     /// This single blob of state is shared between all the windows so they have access to the runtime state
     ///
@@ -65,7 +64,6 @@ impl App {
             .unwrap_or_else(|| EventLoopBuilder::<UserWindowEvent>::with_user_event().build());
 
         let tray_icon_show_window_on_click = cfg.tray_icon_show_window_on_click;
-        let navigation_handler = cfg.navigation_handler.clone();
 
         let app = Self {
             exit_on_last_window_close: cfg.exit_on_last_window_close,
@@ -77,7 +75,6 @@ impl App {
             float_all: false,
             show_devtools: false,
             tray_icon_show_window_on_click,
-            navigation_handler,
             cfg: Cell::new(Some(cfg)),
             shared: Rc::new(SharedContext {
                 event_handlers: WindowEventHandlers::default(),
@@ -277,13 +274,16 @@ impl App {
         self.webviews.insert(id, webview);
     }
 
-    pub fn handle_browser_open(&mut self, msg: IpcMessage) {
+    pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId) {
+        let Some(webview) = self.webviews.get(&id) else {
+            return;
+        };
         if let Some(temp) = msg.params().as_object() {
             if temp.contains_key("href") {
                 if let Some(href) = temp.get("href").and_then(|v| v.as_str()) {
                     if let Err(err) = open_external_if_allowed(
                         href,
-                        self.navigation_handler.as_ref(),
+                        webview.navigation_handler.as_ref(),
                         webbrowser::open,
                     ) {
                         tracing::error!("Failed to open URL: {}", err);
@@ -671,6 +671,27 @@ mod browser_open_tests {
 
         assert_eq!(result, Ok(()));
         assert!(!opened.get());
+    }
+
+    #[test]
+    fn independent_window_policies_preserve_no_handler_fallback() {
+        let deny: NavigationHandler = Rc::new(|_| false);
+        let denied_opened = Cell::new(false);
+        let allowed_opened = Cell::new(false);
+
+        let denied = open_external_if_allowed("https://example.test", Some(&deny), |_| {
+            denied_opened.set(true);
+            Ok::<(), ()>(())
+        });
+        let allowed = open_external_if_allowed("https://example.test", None, |_| {
+            allowed_opened.set(true);
+            Ok::<(), ()>(())
+        });
+
+        assert_eq!(denied, Ok(()));
+        assert_eq!(allowed, Ok(()));
+        assert!(!denied_opened.get());
+        assert!(allowed_opened.get());
     }
 }
 

@@ -27,8 +27,9 @@ same-version `[patch.crates-io]` override. Wry is not patched. The local fork:
 - makes navigation a pure ordered decision: Dioxus internal one-shot handling,
   configured application handler, then upstream-compatible external-browser
   fallback;
-- shares only the navigation handler with the application so the intercepted
-  anchor IPC route cannot launch an external browser after a denial.
+- retains each navigation handler with its WebView and resolves intercepted
+  anchor IPC against the originating window ID, so one window cannot inherit
+  or bypass another window's policy. An unknown window ID fails closed.
 
 The diagnostic spike opts into incognito and deny-all navigation. Its denial
 handler emits `TERSA-DIOXUS-NAV-DENIED`. The vendor tree is reproducible from

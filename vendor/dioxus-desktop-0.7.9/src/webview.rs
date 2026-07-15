@@ -202,6 +202,7 @@ pub(crate) struct WebviewInstance {
     pub edits: WebviewEdits,
     pub desktop_context: DesktopContext,
     pub waker: Waker,
+    pub(crate) navigation_handler: Option<NavigationHandler>,
 
     // Wry assumes the webcontext is alive for the lifetime of the webview.
     // We need to keep the webcontext alive, otherwise the webview will crash
@@ -356,6 +357,7 @@ impl WebviewInstance {
         };
 
         let navigation_handler = cfg.navigation_handler.take();
+        let ipc_navigation_handler = navigation_handler.clone();
         let incognito = cfg.incognito;
         let page_loaded = AtomicBool::new(false);
 
@@ -521,6 +523,7 @@ impl WebviewInstance {
             edits,
             waker: tao_waker(shared.proxy.clone(), desktop_context.window.id()),
             desktop_context,
+            navigation_handler: ipc_navigation_handler,
             _menu: menu,
             _web_context: web_context,
         }

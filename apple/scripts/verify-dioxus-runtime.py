@@ -210,6 +210,8 @@ def main() -> None:
     config = (source / "src" / "config.rs").read_text(encoding="utf-8")
     webview = (source / "src" / "webview.rs").read_text(encoding="utf-8")
     app_runtime = (source / "src" / "app.rs").read_text(encoding="utf-8")
+    launch_runtime = (source / "src" / "launch.rs").read_text(encoding="utf-8")
+    desktop_runtime = config + webview + app_runtime + launch_runtime
     required_desktop_markers = (
         "pub fn with_incognito(mut self, incognito: bool) -> Self",
         "pub(crate) incognito: bool,",
@@ -217,11 +219,26 @@ def main() -> None:
         "pub(crate) fn navigation_decision(",
         "NavigationDecision::OpenExternal",
         "fn open_external_if_allowed<E>(",
-        "self.navigation_handler.as_ref(),",
+        "pub(crate) navigation_handler: Option<NavigationHandler>,",
+        "let ipc_navigation_handler = navigation_handler.clone();",
+        "navigation_handler: ipc_navigation_handler,",
+        "pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId)",
+        "let Some(webview) = self.webviews.get(&id)",
+        "webview.navigation_handler.as_ref(),",
+        "IpcMethod::BrowserOpen => app.handle_browser_open(msg, id)",
+        "independent_window_policies_preserve_no_handler_fallback",
     )
     for marker in required_desktop_markers:
-        if marker not in config + webview + app_runtime:
+        if marker not in desktop_runtime:
             raise SystemExit(f"Dioxus local patch invariant changed: missing {marker!r}")
+    forbidden_desktop_markers = (
+        "IpcMethod::BrowserOpen => app.handle_browser_open(msg),",
+        "pub(crate) navigation_handler: Option<NavigationHandler>,",
+    )
+    if forbidden_desktop_markers[0] in launch_runtime:
+        raise SystemExit("Dioxus browser-open IPC no longer carries its window ID")
+    if forbidden_desktop_markers[1] in app_runtime:
+        raise SystemExit("Dioxus navigation policy must be stored per WebView, not per App")
     require_ordered_markers(
         webview,
         (
