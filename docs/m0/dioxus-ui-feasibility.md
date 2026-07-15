@@ -15,10 +15,10 @@ WebSocket listener bound to `127.0.0.1`.
 The current verdict is:
 
 - **GO for the bounded diagnostic and physical-device investigation.**
-- **NO-GO for production adoption.** The persistent WebKit data store,
-  incomplete external-navigation interception, App Sandbox listener boundary,
-  unavoidable Tokio runtime, feature-minimal macOS Release failure, lifecycle
-  gaps, and physical-device evidence are unresolved blockers.
+- **NO-GO for production adoption.** The local ephemeral fork has source and
+  host diagnostics for WebKit storage and navigation only; App Sandbox listener
+  boundary, unavoidable Tokio runtime, feature-minimal macOS Release failure,
+  lifecycle gaps, and physical-device evidence remain unresolved blockers.
 
 ## Stable acceptance criteria
 
@@ -32,8 +32,8 @@ The current verdict is:
 | `M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, derived character status, and no explicit application save | `open` |
 | `M0-DIOXUS-007` | Safe-area and lifecycle diagnostics | CSS environment insets plus Tao resumed/suspended markers | `open` |
 | `M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | `diagnostic` |
-| `M0-DIOXUS-009` | Navigation boundary | No link surface in the mock; non-Dioxus schemes rejected; hostile production navigation fully interceptable | `failed` |
-| `M0-DIOXUS-010` | Ephemeral WebKit storage | Non-persistent `WKWebsiteDataStore` with no unmanaged cookies/cache/local storage | `failed` |
+| `M0-DIOXUS-009` | Navigation boundary | Locally patched Dioxus guards both WebView navigation and intercepted-anchor IPC before browser fallback | `diagnostic` |
+| `M0-DIOXUS-010` | Ephemeral WebKit storage | Locally patched Dioxus passes the diagnostic incognito opt-in to Wry's non-persistent `WKWebsiteDataStore` | `diagnostic` |
 | `M0-DIOXUS-011` | App Sandbox compatibility | Loopback transport works under minimal reviewed entitlements | `open` |
 | `M0-DIOXUS-012` | Target notices | Locked target-specific Rust inventory bundled byte-for-byte | `diagnostic` |
 | `M0-DIOXUS-013` | Physical-device accessibility | VoiceOver, Dynamic Type, Full Keyboard Access, contrast, switch control | `open` |
@@ -63,6 +63,25 @@ This socket is not a backend and carries only synthetic UI edits in the spike.
 It is nevertheless a network server from the operating system's perspective.
 The diagnostic Mac target does not claim App Sandbox compatibility.
 
+## Local ephemeral fork boundary
+
+ADR-0007 vendors a byte-verified, local patch of `dioxus-desktop` 0.7.9. It is
+not an upstream Dioxus result: unpatched 0.7.9 remains failed for navigation
+interception and ephemeral WebKit storage. The diagnostic fork opts into
+incognito and deny-all navigation, and verifies both native browser-open paths.
+Wry itself is not patched; its Apple implementation maps incognito to
+`WKWebsiteDataStore::nonPersistentDataStore`.
+
+Host evidence can exercise a localStorage write, direct location changes,
+injected anchor IPC, and a rejected `window.open`. It verifies that the written
+localStorage value is absent after relaunch and checks selected WebKit
+data-directory names under an isolated `HOME`. The `dioxus://` custom scheme
+does not expose a usable `document.cookie` API, so this host probe cannot make a
+cookie-persistence claim. It also cannot prove every WebKit disk surface,
+physical-device behavior, or that no state exists in memory. These probes are
+therefore diagnostic evidence, not a production storage claim. Any fork or
+version change resets this result.
+
 ## Evidence interpretation
 
 Launch measurements in `metrics.json` cover time until the Mac window/listener
@@ -87,4 +106,5 @@ Apple CI job owns simulator launch evidence. Every physical-device criterion
 remains open regardless of simulator success.
 
 See [ADR 0005](../architecture/adr-0005-dioxus-diagnostic-runtime.md) for the
-production blockers and adoption decision.
+production blockers and adoption decision, and [ADR 0007](../architecture/adr-0007-dioxus-local-ephemeral-fork.md)
+for the local-fork boundary.

@@ -36,5 +36,7 @@ diagnostics/
 coverage/
 .idea/
 .vscode/
+!vendor/dioxus-desktop-0.7.9/.vscode/
+!vendor/dioxus-desktop-0.7.9/.vscode/settings.json
 *.swp
 *.tmp
