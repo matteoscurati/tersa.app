@@ -9,11 +9,13 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 use tantivy::collector::TopDocs;
-use tantivy::directory::{Directory, TerminatingWrite};
+use tantivy::directory::{Directory, Lock, TerminatingWrite, WatchCallback};
 use tantivy::query::QueryParser;
 use tantivy::schema::{STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexSettings, ReloadPolicy, TantivyDocument, doc};
@@ -22,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::directory::{CHUNK_SIZE, CIPHER_VERSION, SQLITE_VERSION, SqlCipherDirectory};
 
 const PASS_LINE: &str = "Encrypted search M0 feasibility PASS";
-const SENTINEL_LENGTH: usize = 80;
+const SENTINEL_LENGTH: usize = 32;
 const QUERY_RUNS: usize = 20;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -90,8 +92,9 @@ pub(crate) fn run() -> Result {
 
     let (normalized_text_bytes, fts_p95) = build_and_verify_fts(&directory, profile, &sentinel)?;
     let (index_bytes, tantivy_p95) = build_and_verify_tantivy(&directory, profile, &sentinel)?;
-    verify_directory_contract(&directory)?;
+    verify_directory_contract(&directory, workspace.database(), &key)?;
     verify_integrity(&directory)?;
+    workspace.assert_live_artifacts()?;
     assert_absent(&workspace.controlled_files()?, &sentinel)?;
     verify_reopen(&workspace, directory, &key, &sentinel, profile)?;
     plaintext_positive_control(&workspace)?;
@@ -189,6 +192,13 @@ fn build_and_verify_tantivy(
     let searcher = reader.searcher();
     let actual = tantivy_ids(&searcher, query.as_ref(), id, profile.message_count())?;
     assert_ids("Tantivy", &actual, &expected_ids(profile))?;
+    let sentinel_query = parser.parse_query(sentinel)?;
+    let sentinel_ids = tantivy_ids(&searcher, sentinel_query.as_ref(), id, 2)?;
+    assert_ids(
+        "Tantivy privacy sentinel",
+        &sentinel_ids,
+        &["m-000001".to_owned()],
+    )?;
 
     let p95 = query_p95(|| {
         let results = searcher.search(&query, &TopDocs::with_limit(50).order_by_score())?;
@@ -229,7 +239,11 @@ fn build_and_verify_tantivy(
     Ok((index_bytes, p95))
 }
 
-fn verify_directory_contract(directory: &SqlCipherDirectory) -> Result {
+fn verify_directory_contract(
+    directory: &SqlCipherDirectory,
+    database: &Path,
+    key: &[u8],
+) -> Result {
     let immutable_path = Path::new("immutable-handle");
     let original = vec![b'a'; CHUNK_SIZE * 3];
     directory.atomic_write(immutable_path, &original)?;
@@ -240,18 +254,25 @@ fn verify_directory_contract(directory: &SqlCipherDirectory) -> Result {
         return Err("open handle changed after replacement and deletion".into());
     }
 
-    let unpublished = Path::new("unpublished-generation");
-    let mut provisional = directory.open_write(unpublished)?;
-    provisional.write_all(b"not visible before termination")?;
-    if directory.exists(unpublished)? {
-        return Err("staged generation became visible before termination".into());
+    let write_path = Path::new("write-conformance");
+    let mut provisional = directory.open_write(write_path)?;
+    if !directory.exists(write_path)? || !directory.open_read(write_path)?.read_bytes()?.is_empty()
+    {
+        return Err("open_write did not create an immediately readable empty file".into());
     }
-    if directory.open_write(unpublished).is_ok() {
-        return Err("a second staged writer reserved the same path".into());
+    provisional.write_all(b"visible after flush")?;
+    provisional.flush()?;
+    let flushed = directory.open_read(write_path)?;
+    if flushed.read_bytes()?.as_slice() != b"visible after flush" {
+        return Err("flush did not publish the written generation".into());
     }
     provisional.terminate()?;
-    if !directory.exists(unpublished)? {
-        return Err("terminated generation was not published".into());
+
+    let independent = SqlCipherDirectory::open_existing(database, key)?;
+    let cross_connection = Path::new("cross-connection-worm");
+    let _reserved = directory.open_write(cross_connection)?;
+    if independent.open_write(cross_connection).is_ok() {
+        return Err("independent connections both reserved one WORM path".into());
     }
 
     let range_path = Path::new("range-read");
@@ -270,6 +291,59 @@ fn verify_directory_contract(directory: &SqlCipherDirectory) -> Result {
     {
         return Err("range read did not load exactly one intersecting SQLCipher chunk".into());
     }
+
+    verify_blocking_lock(directory, independent.clone())?;
+    verify_watch(directory)?;
+    Ok(())
+}
+
+fn verify_blocking_lock(directory: &SqlCipherDirectory, independent: SqlCipherDirectory) -> Result {
+    let lock_path = PathBuf::from("diagnostic-blocking.lock");
+    let held = directory.acquire_lock(&Lock {
+        filepath: lock_path.clone(),
+        is_blocking: false,
+    })?;
+    let (sender, receiver) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let acquired = independent
+            .acquire_lock(&Lock {
+                filepath: lock_path,
+                is_blocking: true,
+            })
+            .is_ok();
+        let _ = sender.send(acquired);
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    if !matches!(receiver.try_recv(), Err(TryRecvError::Empty)) {
+        return Err("blocking directory lock did not wait for its holder".into());
+    }
+    drop(held);
+    if !receiver.recv_timeout(Duration::from_secs(2))? {
+        return Err("blocking directory lock failed after release".into());
+    }
+    waiter
+        .join()
+        .map_err(|_panic| "blocking-lock waiter panicked")?;
+    Ok(())
+}
+
+fn verify_watch(directory: &SqlCipherDirectory) -> Result {
+    let metadata = directory.atomic_read(Path::new("meta.json"))?;
+    let observed = Arc::new(Mutex::new(false));
+    let callback_observed = Arc::clone(&observed);
+    let handle = directory.watch(WatchCallback::new(move || {
+        if let Ok(mut observed) = callback_observed.lock() {
+            *observed = true;
+        }
+    }))?;
+    directory.atomic_write(Path::new("meta.json"), &metadata)?;
+    if !*observed
+        .lock()
+        .map_err(|error| format!("watch mutex poisoned: {error}"))?
+    {
+        return Err("meta.json watch callback was not invoked".into());
+    }
+    drop(handle);
     Ok(())
 }
 
@@ -281,6 +355,7 @@ fn verify_reopen(
     profile: Profile,
 ) -> Result {
     directory.sync_directory()?;
+    workspace.assert_live_artifacts()?;
     assert_absent(&workspace.controlled_files()?, sentinel)?;
     drop(directory);
 
@@ -299,6 +374,7 @@ fn verify_reopen(
     drop(connection);
     assert_ids("reopened SQLCipher FTS5", &ids, &expected_ids(profile))?;
     verify_integrity(&reopened)?;
+    workspace.assert_live_artifacts()?;
     assert_absent(&workspace.controlled_files()?, sentinel)
 }
 
@@ -446,6 +522,8 @@ fn emit(evidence: Evidence) {
 struct Workspace {
     root: PathBuf,
     database: PathBuf,
+    wal: PathBuf,
+    shm: PathBuf,
     positive_control: PathBuf,
 }
 
@@ -461,6 +539,8 @@ impl Workspace {
         fs::create_dir_all(&root)?;
         Ok(Self {
             database: root.join("search.sqlite"),
+            wal: root.join("search.sqlite-wal"),
+            shm: root.join("search.sqlite-shm"),
             positive_control: root.join("positive-control.txt"),
             root,
         })
@@ -475,6 +555,17 @@ impl Workspace {
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.is_file() && path != &self.positive_control)
             .collect())
+    }
+
+    fn assert_live_artifacts(&self) -> Result {
+        for artifact in [&self.database, &self.wal, &self.shm] {
+            if !artifact.is_file() {
+                return Err(
+                    "expected SQLCipher database, WAL, and SHM artifacts are not live".into(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 

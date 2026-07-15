@@ -15,14 +15,18 @@ probe, not production search and not an iPhone performance result.
   only the intersecting chunk ordinals; open handles retain generation IDs, not
   decrypted whole-file snapshots. It does not use memory mapping, temporary
   index files, compression, or a production storage API.
-- An already-open handle survives replacement and deletion; staged writes are
-  invisible until termination; Tantivy's writer lock rejects a second writer
-  while an existing reader remains usable on another thread; and a sliced read
-  proves that only one intersecting SQLCipher chunk was loaded.
+- An already-open handle survives replacement and deletion. `open_write`
+  immediately creates a readable empty file, each flush publishes an immutable
+  generation, and a database uniqueness constraint preserves WORM behavior
+  across independent connections. Tantivy's writer lock rejects a second
+  writer while an existing reader remains usable on another thread; blocking
+  locks wait for release; metadata watches fire; and a sliced read proves that
+  only one intersecting SQLCipher chunk was loaded.
 - Missing and wrong SQLCipher keys fail closed, both `integrity_check` and
-  `cipher_integrity_check` succeed, and a random per-run sentinel is absent from
-  database, WAL, and SHM artifacts before and after reopen. A separate
-  plaintext positive control proves the scanner can detect its input.
+  `cipher_integrity_check` succeed, and a random per-run sentinel is first
+  retrieved from Tantivy and then proven absent from database, WAL, and SHM
+  artifacts before and after reopen. A separate plaintext positive control
+  proves the scanner can detect its input.
 - The emitted evidence contains only aggregate profile and host timing values.
   It contains no key, sentinel, SQL, path, result identifier, database byte, or
   ranking output.

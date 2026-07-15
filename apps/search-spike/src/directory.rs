@@ -4,7 +4,7 @@
 
 //! SQLCipher-backed Tantivy directory used only by the M0 diagnostic.
 
-use std::collections::BTreeSet;
+use std::fmt;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use tantivy::HasLen;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, TerminatingWrite, WatchCallback,
-    WatchHandle, WritePtr,
+    WatchCallbackList, WatchHandle, WritePtr,
 };
 use zeroize::Zeroizing;
 
@@ -41,11 +41,20 @@ pub(crate) struct SqlCipherDirectory {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
 struct Inner {
     connection: Mutex<Connection>,
     metrics: Mutex<ReadMetrics>,
-    staged_paths: Mutex<BTreeSet<PathBuf>>,
+    watch_callbacks: WatchCallbackList,
+}
+
+impl fmt::Debug for Inner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Inner")
+            .field("connection", &"SQLCipher connection")
+            .field("metrics", &self.metrics)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqlCipherDirectory {
@@ -101,7 +110,7 @@ impl SqlCipherDirectory {
             inner: Arc::new(Inner {
                 connection: Mutex::new(connection),
                 metrics: Mutex::new(ReadMetrics::default()),
-                staged_paths: Mutex::new(BTreeSet::new()),
+                watch_callbacks: WatchCallbackList::default(),
             }),
         })
     }
@@ -195,7 +204,36 @@ impl SqlCipherDirectory {
                 params![path, generation_id],
             )
             .map_err(io::Error::other)?;
-        transaction.commit().map_err(io::Error::other)
+        transaction.commit().map_err(io::Error::other)?;
+        if path == "meta.json" {
+            self.inner
+                .watch_callbacks
+                .broadcast()
+                .wait()
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_empty_file(&self, path: &Path) -> io::Result<bool> {
+        let path = path_to_string(path)?;
+        let mut connection = self.connection().map_err(io::Error::other)?;
+        let transaction = connection.transaction().map_err(io::Error::other)?;
+        transaction
+            .execute("INSERT INTO file_generations (byte_len) VALUES (0)", [])
+            .map_err(io::Error::other)?;
+        let generation_id = transaction.last_insert_rowid();
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO visible_files (path, generation_id) VALUES (?1, ?2)",
+                params![path, generation_id],
+            )
+            .map_err(io::Error::other)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        transaction.commit().map_err(io::Error::other)?;
+        Ok(true)
     }
 
     fn snapshot(&self, path: &Path) -> std::result::Result<Snapshot, OpenReadError> {
@@ -222,27 +260,6 @@ impl SqlCipherDirectory {
             byte_len: usize::try_from(byte_len)
                 .map_err(|error| read_error(path, io::Error::other(error)))?,
         })
-    }
-
-    fn reserve_staged_path(&self, path: &Path) -> std::result::Result<(), OpenWriteError> {
-        let mut staged = self.inner.staged_paths.lock().map_err(|error| {
-            OpenWriteError::wrap_io_error(io::Error::other(error.to_string()), path.to_owned())
-        })?;
-        if staged.contains(path)
-            || self.exists(path).map_err(|error| {
-                OpenWriteError::wrap_io_error(io::Error::other(error), path.to_owned())
-            })?
-        {
-            return Err(OpenWriteError::FileAlreadyExists(path.to_owned()));
-        }
-        staged.insert(path.to_owned());
-        Ok(())
-    }
-
-    fn release_staged_path(&self, path: &Path) {
-        if let Ok(mut staged) = self.inner.staged_paths.lock() {
-            staged.remove(path);
-        }
     }
 
     fn try_lock(&self, path: &Path) -> std::result::Result<bool, LockError> {
@@ -303,13 +320,17 @@ impl Directory for SqlCipherDirectory {
     }
 
     fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
-        self.reserve_staged_path(path)?;
+        if !self
+            .reserve_empty_file(path)
+            .map_err(|error| OpenWriteError::wrap_io_error(error, path.to_owned()))?
+        {
+            return Err(OpenWriteError::FileAlreadyExists(path.to_owned()));
+        }
         Ok(io::BufWriter::new(Box::new(StagedWriter {
             directory: self.clone(),
             path: path.to_owned(),
             data: Vec::new(),
             position: 0,
-            terminated: false,
         })))
     }
 
@@ -332,23 +353,22 @@ impl Directory for SqlCipherDirectory {
     }
 
     fn acquire_lock(&self, lock: &Lock) -> std::result::Result<DirectoryLock, LockError> {
-        let attempts = if lock.is_blocking { 101 } else { 1 };
-        for attempt in 0..attempts {
+        loop {
             if self.try_lock(&lock.filepath)? {
                 return Ok(DirectoryLock::from(Box::new(DatabaseLockGuard {
                     directory: self.clone(),
                     path: lock.filepath.clone(),
                 })));
             }
-            if attempt + 1 < attempts {
-                thread::sleep(Duration::from_millis(100));
+            if !lock.is_blocking {
+                return Err(LockError::LockBusy);
             }
+            thread::sleep(Duration::from_millis(100));
         }
-        Err(LockError::LockBusy)
     }
 
-    fn watch(&self, _callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        Ok(WatchHandle::empty())
+    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Ok(self.inner.watch_callbacks.subscribe(callback))
     }
 }
 
@@ -454,7 +474,6 @@ struct StagedWriter {
     path: PathBuf,
     data: Vec<u8>,
     position: usize,
-    terminated: bool,
 }
 
 impl Write for StagedWriter {
@@ -469,7 +488,7 @@ impl Write for StagedWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.directory.publish(&self.path, &self.data)
     }
 }
 
@@ -491,18 +510,7 @@ impl Seek for StagedWriter {
 
 impl TerminatingWrite for StagedWriter {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
-        self.directory.publish(&self.path, &self.data)?;
-        self.terminated = true;
-        self.directory.release_staged_path(&self.path);
-        Ok(())
-    }
-}
-
-impl Drop for StagedWriter {
-    fn drop(&mut self) {
-        if !self.terminated {
-            self.directory.release_staged_path(&self.path);
-        }
+        self.flush()
     }
 }
 
