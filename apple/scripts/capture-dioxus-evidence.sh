@@ -252,9 +252,11 @@ grep -F 'NAVIGATION PROBE PAGE UNCHANGED' "${build_dir}/macos-ocr.txt"
 grep -F 'LOCAL STORAGE WRITTEN' "${build_dir}/macos-ocr.txt"
 grep -F 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME' "${build_dir}/macos-ocr.txt"
 grep -F 'WINDOW OPEN REJECTED' "${build_dir}/macos-ocr.txt"
-grep -Fx 'TERSA-DIOXUS-NAV-DENIED https://example.invalid/anchor' \
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/anchor' \
   "${build_dir}/macos-navigation-process.log"
-grep -Fx 'TERSA-DIOXUS-NAV-DENIED https://example.invalid/ipc-browser-open' \
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/ipc-browser-open' \
   "${build_dir}/macos-navigation-process.log"
 wait_for_exact_log_line \
   'TERSA-DIOXUS-NAV-DENIED https://example.invalid/location' \
