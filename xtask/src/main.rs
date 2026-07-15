@@ -179,6 +179,16 @@ fn check_architecture() -> TaskResult {
             ))
         })?;
 
+        if package_name == "tersa-blob-spike"
+            && !package
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "rustix")
+        {
+            violations
+                .push("tersa-blob-spike must depend directly on exact-pinned rustix".to_owned());
+        }
+
         for dependency in &package.dependencies {
             let dependency_name = dependency.name.clone();
             if workspace_names.contains(&dependency_name)
@@ -192,6 +202,7 @@ fn check_architecture() -> TaskResult {
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
             check_search_dependency(&package_name, dependency, &mut violations);
             check_mime_dependency(&package_name, dependency, &mut violations);
+            check_blob_dependency(&package_name, dependency, &mut violations);
         }
     }
 
@@ -210,6 +221,7 @@ fn check_architecture() -> TaskResult {
         check_sqlcipher_dependency_graph(&dependency_graph, target, &mut violations);
         check_search_dependency_graph(&dependency_graph, target, &mut violations);
         check_mime_dependency_graph(&dependency_graph, target, &mut violations);
+        check_blob_dependency_graph(&dependency_graph, target, &mut violations);
         check_diagnostic_runtime_dependency_graph(&dependency_graph, target, &mut violations);
     }
 
@@ -352,6 +364,53 @@ fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &m
         {
             violations.push(format!(
                 "{member_name} reaches a MIME parser dependency outside {MIME_SPIKE} for {target}"
+            ));
+        }
+    }
+}
+
+fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    const BLOB_SPIKE: &str = "tersa-blob-spike";
+    const BLOB_PACKAGES: [&str; 2] = ["chacha20poly1305", "hmac"];
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let blob_packages: BTreeSet<String> = package_names
+        .iter()
+        .filter_map(|(id, name)| BLOB_PACKAGES.contains(&name.as_str()).then_some(id.clone()))
+        .collect();
+    for member in &metadata.workspace_members {
+        let member_id = member.to_string();
+        let Some(member_name) = package_names.get(&member_id) else {
+            violations.push(format!(
+                "workspace member `{member_id}` is absent from the resolved package graph"
+            ));
+            continue;
+        };
+        if member_name != BLOB_SPIKE
+            && dependency_reaches(&member_id, &blob_packages, &dependencies)
+        {
+            violations.push(format!(
+                "{member_name} reaches a blob-cryptography dependency outside {BLOB_SPIKE} for {target}"
             ));
         }
     }
@@ -653,6 +712,41 @@ fn check_mime_dependency(
     }
 }
 
+fn check_blob_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const BLOB_SPIKE: &str = "tersa-blob-spike";
+    if dependency.name == "rustix" {
+        if package_name == BLOB_SPIKE && dependency.req.to_string() != "=1.1.4" {
+            violations.push(format!("{package_name} -> rustix must pin exactly 1.1.4"));
+        }
+        return;
+    }
+    let expected = match dependency.name.as_str() {
+        "chacha20poly1305" => Some("=0.10.1"),
+        "hmac" => Some("=0.12.1"),
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return;
+    };
+    if package_name != BLOB_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {} (blob cryptography is exclusive to {BLOB_SPIKE})",
+            dependency.name
+        ));
+    }
+    if dependency.req.to_string() != expected {
+        violations.push(format!(
+            "{package_name} -> {} must pin exactly {}",
+            dependency.name,
+            expected.trim_start_matches('=')
+        ));
+    }
+}
+
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         (
@@ -660,6 +754,7 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             BTreeSet::from(["tersa-application", "tersa-presentation"]),
         ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-blob-spike", BTreeSet::new()),
         ("tersa-mime-spike", BTreeSet::new()),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-sqlcipher-spike", BTreeSet::new()),

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/blob-spike",
     "apps/dioxus-spike",
     "apps/mime-spike",
     "apps/search-spike",
@@ -25,11 +26,14 @@ authors = ["tersa.app contributors"]
 [workspace.dependencies]
 base64 = "0.22.1"
 cargo_metadata = "0.23.1"
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 dioxus = { version = "=0.7.9", default-features = false, features = ["hooks", "html", "macro", "signals"] }
 dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }
 dioxus-document = { version = "=0.7.9", default-features = false }
 getrandom = "0.3.4"
+hmac = "=0.12.1"
 rusqlite = { version = "=0.39.0", default-features = false }
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 sha2 = "0.10.9"
 subtle = "2.6.1"
 tantivy = { version = "=0.26.1", default-features = false }
