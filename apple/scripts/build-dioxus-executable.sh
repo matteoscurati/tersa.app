@@ -39,9 +39,7 @@ case "$configuration" in
     profile="debug"
     ;;
   Release)
-    echo "Dioxus 0.7.9 minimal Release builds are blocked by unguarded devtools calls." >&2
-    echo "Do not enable private WebKit devtools APIs to bypass this product gate." >&2
-    exit 1
+    profile="release"
     ;;
   *)
     echo "Unsupported Xcode configuration: $configuration" >&2
@@ -57,7 +55,11 @@ bundle_binary="${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}"
 export CARGO_TARGET_DIR="${apple_dir}/build/dioxus-rust"
 cd "$workspace_dir"
 
-cargo build --locked --package tersa-dioxus-spike --target "$target"
+if [ "$configuration" = Release ]; then
+  cargo build --locked --release --package tersa-dioxus-spike --target "$target"
+else
+  cargo build --locked --package tersa-dioxus-spike --target "$target"
+fi
 
 binary="${CARGO_TARGET_DIR}/${target}/${profile}/tersa-dioxus-spike"
 test -f "$binary"

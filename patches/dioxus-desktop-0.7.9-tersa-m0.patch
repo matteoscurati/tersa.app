@@ -31,7 +31,31 @@ index 6b13961..9708dc2 100644
  pub(crate) struct App {
      // move the props into a cell so we can pop it out later to create the first window
      // iOS panics if we create a window before the event loop is started, so we toss them into a cell
-@@ -272,15 +274,16 @@ impl App {
+@@ -35,6 +37,7 @@ pub(crate) struct App {
+     pub(crate) disable_dma_buf_on_wayland: bool,
+     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
+     pub(crate) float_all: bool,
++    #[cfg(debug_assertions)]
+     pub(crate) show_devtools: bool,
+     pub(crate) tray_icon_show_window_on_click: bool,
+ 
+@@ -71,6 +74,7 @@ impl App {
+             control_flow: ControlFlow::Wait,
+             unmounted_dom: Cell::new(Some(virtual_dom)),
+             float_all: false,
++            #[cfg(debug_assertions)]
+             show_devtools: false,
+             tray_icon_show_window_on_click,
+             cfg: Cell::new(Some(cfg)),
+@@ -137,6 +141,7 @@ impl App {
+                 }
+                 self.float_all = !self.float_all;
+             }
++            #[cfg(debug_assertions)]
+             "dioxus-toggle-dev-tools" => {
+                 self.show_devtools = !self.show_devtools;
+                 for webview in self.webviews.values() {
+@@ -272,15 +277,16 @@ impl App {
          self.webviews.insert(id, webview);
      }
  
@@ -248,7 +272,7 @@ index 11e9f06..8f5981d 100644
                  },
              },
 diff --git a/src/menubar.rs b/src/menubar.rs
-index 0817bd6..aa7b3f3 100644
+index 0817bd6..a9b133a 100644
 --- a/src/menubar.rs
 +++ b/src/menubar.rs
 @@ -8,6 +8,7 @@ pub type DioxusMenu = ();
@@ -259,6 +283,25 @@ index 0817bd6..aa7b3f3 100644
  pub type DioxusMenuIcon = ();
  
  /// Initializes the menu bar for the window.
+@@ -37,5 +38,7 @@ mod desktop_platforms {
+     use super::*;
+-    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
++    use muda::{Menu, PredefinedMenuItem, Submenu};
++    #[cfg(debug_assertions)]
++    use muda::MenuItem;
+ 
+     #[allow(unused)]
+     pub fn init_menu_bar(menu: &Menu, window: &Window) {
+@@ -95,7 +98,8 @@ mod desktop_platforms {
+ 
+         menu.append_items(&[&window_menu, &edit_menu]).unwrap();
+ 
+-        if cfg!(debug_assertions) {
++        #[cfg(debug_assertions)]
++        {
+             let help_menu = Submenu::new("Help", true);
+ 
+             help_menu
 diff --git a/src/webview.rs b/src/webview.rs
 index a86a0b3..74c6f42 100644
 --- a/src/webview.rs
@@ -463,4 +506,3 @@ index a86a0b3..74c6f42 100644
  /// A synchronous response to a browser event which may prevent the default browser's action
  #[derive(serde::Serialize, Default)]
  pub struct SynchronousEventResponse {
-

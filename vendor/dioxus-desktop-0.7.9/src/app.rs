@@ -37,6 +37,7 @@ pub(crate) struct App {
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
     pub(crate) float_all: bool,
+    #[cfg(debug_assertions)]
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
 
@@ -73,6 +74,7 @@ impl App {
             control_flow: ControlFlow::Wait,
             unmounted_dom: Cell::new(Some(virtual_dom)),
             float_all: false,
+            #[cfg(debug_assertions)]
             show_devtools: false,
             tray_icon_show_window_on_click,
             cfg: Cell::new(Some(cfg)),
@@ -139,6 +141,7 @@ impl App {
                 }
                 self.float_all = !self.float_all;
             }
+            #[cfg(debug_assertions)]
             "dioxus-toggle-dev-tools" => {
                 self.show_devtools = !self.show_devtools;
                 for webview in self.webviews.values() {

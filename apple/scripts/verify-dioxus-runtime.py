@@ -23,6 +23,10 @@ SERVER_KEY = "server_key: [u8; KEY_SIZE],"
 SECURE_KEY_CREATION = "rand::rngs::StdRng::from_os_rng()"
 CONSTANT_TIME_COMPARE = "subtle::ConstantTimeEq::ct_eq("
 SERVER_KEY_RESPONSE = ".send(tungstenite::Message::Text(hex_encoded_server_key.into()))"
+DEVTOOLS_MATCH_ARM_GUARD = '#[cfg(debug_assertions)]\n            "dioxus-toggle-dev-tools" => {'
+DEVTOOLS_FIELD_GUARD = "#[cfg(debug_assertions)]\n    pub(crate) show_devtools: bool,"
+DEVTOOLS_INITIALIZER_GUARD = "#[cfg(debug_assertions)]\n            show_devtools: false,"
+MENUBAR_DEVTOOLS_GUARD = "#[cfg(debug_assertions)]\n        {\n            let help_menu = Submenu::new(\"Help\", true);"
 
 
 APPLE_TARGETS = (
@@ -177,6 +181,13 @@ def main() -> None:
                 f"feature for {target}; resolved {sorted(features)}"
             )
 
+        wry = package(metadata, "wry")
+        wry_features = resolved_features(metadata, wry["id"], "Wry")
+        if "devtools" in wry_features:
+            raise SystemExit(
+                f"Wry devtools must be absent for {target}; resolved {sorted(wry_features)}"
+            )
+
         dioxus_features = resolved_features(metadata, dioxus["id"], "Dioxus")
         expected_dioxus_features = {"hooks", "html", "macro", "signals"}
         if dioxus_features != expected_dioxus_features:
@@ -210,6 +221,7 @@ def main() -> None:
     config = (source / "src" / "config.rs").read_text(encoding="utf-8")
     webview = (source / "src" / "webview.rs").read_text(encoding="utf-8")
     app_runtime = (source / "src" / "app.rs").read_text(encoding="utf-8")
+    menubar_runtime = (source / "src" / "menubar.rs").read_text(encoding="utf-8")
     launch_runtime = (source / "src" / "launch.rs").read_text(encoding="utf-8")
     desktop_runtime = config + webview + app_runtime + launch_runtime
     required_desktop_markers = (
@@ -232,6 +244,17 @@ def main() -> None:
     for marker in required_desktop_markers:
         if marker not in desktop_runtime:
             raise SystemExit(f"Dioxus local patch invariant changed: missing {marker!r}")
+    for marker in (
+        DEVTOOLS_MATCH_ARM_GUARD,
+        DEVTOOLS_FIELD_GUARD,
+        DEVTOOLS_INITIALIZER_GUARD,
+    ):
+        if marker not in app_runtime:
+            raise SystemExit(f"Dioxus Release devtools guard changed: missing {marker!r}")
+    if MENUBAR_DEVTOOLS_GUARD not in menubar_runtime:
+        raise SystemExit("Dioxus Release menubar guard changed: missing compile-time cfg")
+    if "if cfg!(debug_assertions)" in menubar_runtime:
+        raise SystemExit("Dioxus Release menubar must use a compile-time debug guard")
     forbidden_desktop_markers = (
         "IpcMethod::BrowserOpen => app.handle_browser_open(msg),",
         "pub(crate) navigation_handler: Option<NavigationHandler>,",

@@ -36,7 +36,9 @@ pub fn default_menu_bar() -> DioxusMenu {
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod desktop_platforms {
     use super::*;
-    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+    use muda::{Menu, PredefinedMenuItem, Submenu};
+    #[cfg(debug_assertions)]
+    use muda::MenuItem;
 
     #[allow(unused)]
     pub fn init_menu_bar(menu: &Menu, window: &Window) {
@@ -96,7 +98,8 @@ mod desktop_platforms {
 
         menu.append_items(&[&window_menu, &edit_menu]).unwrap();
 
-        if cfg!(debug_assertions) {
+        #[cfg(debug_assertions)]
+        {
             let help_menu = Submenu::new("Help", true);
 
             help_menu

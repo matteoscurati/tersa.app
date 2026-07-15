@@ -180,7 +180,7 @@ package the M0 diagnostic Slint executable. `TersaDioxusMac` and
 None of the six diagnostic schemes is a production target.
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
-debug artifacts:
+diagnostic artifacts:
 
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
@@ -206,15 +206,15 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS \
   -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
 
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusMac \
-  -configuration Debug -destination 'generic/platform=macOS' \
+  -configuration Release -destination 'generic/platform=macOS' \
   -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive \
   -archivePath apple/build/TersaDioxusMac.xcarchive
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS \
-  -configuration Debug -sdk iphonesimulator \
+  -configuration Release -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO build
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS \
-  -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
+  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive \
   -archivePath apple/build/TersaDioxusIOS.xcarchive
 
