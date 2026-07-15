@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["fuzz"]
 members = [
     "apps/blob-spike",
     "apps/dioxus-spike",

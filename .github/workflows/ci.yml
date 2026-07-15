@@ -374,6 +374,65 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  mime-parser-fuzz:
+    name: Deterministic MIME parser fuzz regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install exact nightly toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: nightly-2026-07-14
+          components: clippy,rust-src,rustfmt
+      - name: Install exact fuzz and policy tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-fuzz@0.13.2,cargo-audit@0.22.1,cargo-deny@0.20.2
+      - name: Verify pinned fuzz tools
+        run: |
+          rustup show active-toolchain | grep -F 'nightly-2026-07-14'
+          cargo fuzz --version | grep -Fx 'cargo-fuzz 0.13.2'
+          cargo-audit --version | grep -Fx 'cargo-audit 0.22.1'
+          cargo-deny --version | grep -Fx 'cargo-deny 0.20.2'
+      - name: Fetch standalone fuzz dependencies
+        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Check standalone fuzz licenses, advisories, and sources
+        run: |
+          cargo deny --locked --manifest-path fuzz/Cargo.toml \
+            --config fuzz/deny.toml check
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+      - name: Check standalone fuzz formatting and lints
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml \
+            --all-targets -- -D warnings
+      - name: Verify fuzz dependencies stay outside application graphs
+        run: |
+          application_tree=$(cargo tree --locked --workspace --edges normal,build)
+          if printf '%s\n' "$application_tree" \
+            | grep -E 'libfuzzer-sys|tersa-mime-fuzz'; then
+            exit 1
+          fi
+      - name: Build, replay seeds, and run finite MIME fuzz regression
+        run: sh scripts/verify-mime-fuzz.sh
+        env:
+          TERSA_FUZZ_TARGET: x86_64-unknown-linux-gnu
+      - name: Bind MIME fuzz evidence to the source commit
+        if: ${{ always() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}
+        run: >-
+          python3 scripts/write-evidence-manifest.py
+          fuzz/target/mime-fuzz-evidence "$EVIDENCE_COMMIT_SHA"
+      - name: Upload MIME parser fuzz evidence
+        if: ${{ always() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: mime-parser-fuzz-evidence
+          path: fuzz/target/mime-fuzz-evidence
+          if-no-files-found: error
+          retention-days: 90
+
   blob-apple-evidence:
     name: Crash-safe AEAD blob Apple evidence
     runs-on: macos-26

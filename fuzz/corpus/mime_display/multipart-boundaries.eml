@@ -1,0 +1,11 @@
+333333Content-Type: multipart/alternative; boundary=outer
+
+--outer
+Content-Type: text/plain
+
+plain
+--outer
+Content-Type: text/html
+
+<p>html</p>
+--outer--

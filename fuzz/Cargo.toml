@@ -1,0 +1,52 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-mime-fuzz"
+description = "Standalone deterministic fuzz regression for the MIME display boundary"
+version = "0.0.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/matteoscurati/tersa.app"
+authors = ["tersa.app contributors"]
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+tersa-mime-spike = { path = "../apps/mime-spike", version = "=0.0.0" }
+
+[[bin]]
+name = "mime_display"
+path = "fuzz_targets/mime_display.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
