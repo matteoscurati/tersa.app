@@ -16,12 +16,21 @@ WebView and Dioxus's authenticated loopback UI transport. It is not a product
 UI, backend, sandbox-compatibility claim, or permission to persist mail in
 WebKit.
 
+The additive `TersaMimeMac` and `TersaMimeIOS` schemes compile a separate native
+Swift WKWebView policy around the portable `tersa-mime-spike`. The macOS host
+probe uses a nonpersistent data store, disabled content JavaScript, block-all
+network rules, navigation denial, an App Sandbox with a network client but no
+server entitlement, and an external positive-control canary. The iOS schemes
+provide locked compile evidence only; neither target is the production message
+viewer.
+
 Generate the project and use the reproducible build commands in
 [Development](../docs/development.md#apple-bootstrap).
 
-`rust-bridge` and both UI spikes are part of the root Cargo workspace so the
-standard formatting, lint, test, documentation, dependency, and advisory
-checks cover them. The bridge depends inward on `tersa-application` and
+`rust-bridge`, both UI spikes, and the MIME diagnostic are part of the root
+Cargo workspace, so the standard formatting, lint, test, documentation,
+dependency, and advisory checks cover them. The bridge depends inward on
+`tersa-application` and
 `tersa-presentation`, preserving the rule that shared core layers never depend
 on Apple frameworks.
 

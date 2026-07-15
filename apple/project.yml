@@ -219,3 +219,59 @@ targets:
         script: 'sh "${SRCROOT}/scripts/build-dioxus-executable.sh" ios "${CONFIGURATION}"'
     scheme:
       testTargets: []
+  TersaMimeMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: mime-common
+      - path: mime-macos
+      - path: licenses/THIRD_PARTY_NOTICES-mime-macos.txt
+        buildPhase: resources
+    info:
+      path: mime-macos/Info.plist
+      properties:
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSHighResolutionCapable: true
+    entitlements:
+      path: mime-macos/TersaMimeMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mime-spike.mac
+        PRODUCT_NAME: Tersa MIME Spike
+        EXECUTABLE_NAME: tersa-mime-native-spike
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        CODE_SIGN_ENTITLEMENTS: mime-macos/TersaMimeMac.entitlements
+    scheme:
+      testTargets: []
+  TersaMimeIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: mime-common
+      - path: mime-ios
+      - path: licenses/THIRD_PARTY_NOTICES-mime-ios.txt
+        buildPhase: resources
+    info:
+      path: mime-ios/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mime-spike.ios
+        PRODUCT_NAME: Tersa MIME Spike
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets: []

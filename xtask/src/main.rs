@@ -190,6 +190,7 @@ fn check_architecture() -> TaskResult {
             check_dioxus_dependency(&package_name, dependency, &mut violations);
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
             check_search_dependency(&package_name, dependency, &mut violations);
+            check_mime_dependency(&package_name, dependency, &mut violations);
         }
     }
 
@@ -207,6 +208,7 @@ fn check_architecture() -> TaskResult {
             .exec()?;
         check_sqlcipher_dependency_graph(&dependency_graph, target, &mut violations);
         check_search_dependency_graph(&dependency_graph, target, &mut violations);
+        check_mime_dependency_graph(&dependency_graph, target, &mut violations);
     }
 
     if violations.is_empty() {
@@ -219,6 +221,53 @@ fn check_architecture() -> TaskResult {
         violations.join(", ")
     ))
     .into())
+}
+
+fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    const MIME_SPIKE: &str = "tersa-mime-spike";
+    const MIME_PACKAGES: [&str; 2] = ["ammonia", "mail-parser"];
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let mime_packages: BTreeSet<String> = package_names
+        .iter()
+        .filter_map(|(id, name)| MIME_PACKAGES.contains(&name.as_str()).then_some(id.clone()))
+        .collect();
+    for member in &metadata.workspace_members {
+        let member_id = member.to_string();
+        let Some(member_name) = package_names.get(&member_id) else {
+            violations.push(format!(
+                "workspace member `{member_id}` is absent from the resolved package graph"
+            ));
+            continue;
+        };
+        if member_name != MIME_SPIKE
+            && dependency_reaches(&member_id, &mime_packages, &dependencies)
+        {
+            violations.push(format!(
+                "{member_name} reaches a MIME parser dependency outside {MIME_SPIKE} for {target}"
+            ));
+        }
+    }
 }
 
 fn check_search_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -484,6 +533,35 @@ fn check_search_dependency(
     }
 }
 
+fn check_mime_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const MIME_SPIKE: &str = "tersa-mime-spike";
+    let expected = match dependency.name.as_str() {
+        "ammonia" => Some("=4.1.3"),
+        "mail-parser" => Some("=0.11.5"),
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return;
+    };
+    if package_name != MIME_SPIKE {
+        violations.push(format!(
+            "{package_name} -> {} (MIME parsing is exclusive to {MIME_SPIKE})",
+            dependency.name
+        ));
+    }
+    if dependency.req.to_string() != expected {
+        violations.push(format!(
+            "{package_name} -> {} must pin exactly {}",
+            dependency.name,
+            expected.trim_start_matches('=')
+        ));
+    }
+}
+
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         (
@@ -491,6 +569,7 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             BTreeSet::from(["tersa-application", "tersa-presentation"]),
         ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
+        ("tersa-mime-spike", BTreeSet::new()),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-sqlcipher-spike", BTreeSet::new()),
         ("tersa-search-spike", BTreeSet::new()),
