@@ -22,28 +22,28 @@ The current verdict is:
 
 ## Stable acceptance criteria
 
-| ID | Criterion | Required result | Current status |
+| ID | Criterion | Required result | Register status |
 |---|---|---|---|
-| `#M0-DIOXUS-001` | Locked dx-free Apple build | Exact Dioxus 0.7.9; direct Cargo; no `dx`, Manganis, Dioxus devtools package, backend, or remote assets | **PASS locally; required CI gate** |
-| `#M0-DIOXUS-002` | Unsigned Apple packages | Debug macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives | **PASS locally; required CI gate; Release blocked** |
-| `#M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | **Required CI gate** |
-| `#M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; measured viewport plus fixed overscan; computed range and independent DOM count | **PASS by code; CI must independently query and prove at most 100 DOM rows before and after a synthetic scroll** |
-| `#M0-DIOXUS-005` | Semantic structure | Landmarks, labels, list/listitem positions, focus treatment, live status, reduced motion | **PASS by code; VoiceOver unverified** |
-| `#M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, derived character status, and no explicit application save | **CI must prove Dioxus state propagation; physical input remains unverified** |
-| `#M0-DIOXUS-007` | Safe-area and lifecycle diagnostics | CSS environment insets plus Tao resumed/suspended markers | **CI must prove a notched simulator inset and active/inactive markers; rotations and lifecycle edges remain unverified** |
-| `#M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | **PASS locally; required CI gate** |
-| `#M0-DIOXUS-009` | Navigation boundary | No link surface in the mock; non-Dioxus schemes rejected; hostile production navigation fully interceptable | **FAIL for production** |
-| `#M0-DIOXUS-010` | Ephemeral WebKit storage | Non-persistent `WKWebsiteDataStore` with no unmanaged cookies/cache/local storage | **FAIL in Dioxus 0.7.9** |
-| `#M0-DIOXUS-011` | App Sandbox compatibility | Loopback transport works under minimal reviewed entitlements | **UNVERIFIED** |
-| `#M0-DIOXUS-012` | Target notices | Locked target-specific Rust inventory bundled byte-for-byte | **PASS locally; required CI gate** |
-| `#M0-DIOXUS-013` | Physical-device accessibility | VoiceOver, Dynamic Type, Full Keyboard Access, contrast, switch control | **UNVERIFIED** |
-| `#M0-DIOXUS-014` | Physical-device input | IME, autocorrect, dictation, selection, copy/paste, and hardware keyboard | **UNVERIFIED** |
-| `#M0-DIOXUS-015` | Lifecycle and resources | foreground/background, lock/unlock, memory warning, protected data, energy, memory | **UNVERIFIED; memory warning API missing** |
-| `#M0-DIOXUS-016` | Signed distribution | TestFlight install, notarized Mac build, and App Review smoke test | **UNVERIFIED** |
+| `M0-DIOXUS-001` | Locked dx-free Apple build | Exact Dioxus 0.7.9; direct Cargo; no `dx`, Manganis, Dioxus devtools package, backend, or remote assets | `diagnostic` |
+| `M0-DIOXUS-002` | Unsigned Apple packages | Debug macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives | `blocked` |
+| `M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | `open` |
+| `M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; measured viewport plus fixed overscan; computed range and independent DOM count | `diagnostic` |
+| `M0-DIOXUS-005` | Semantic structure | Landmarks, labels, list/listitem positions, focus treatment, live status, reduced motion | `diagnostic` |
+| `M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, derived character status, and no explicit application save | `open` |
+| `M0-DIOXUS-007` | Safe-area and lifecycle diagnostics | CSS environment insets plus Tao resumed/suspended markers | `open` |
+| `M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | `diagnostic` |
+| `M0-DIOXUS-009` | Navigation boundary | No link surface in the mock; non-Dioxus schemes rejected; hostile production navigation fully interceptable | `failed` |
+| `M0-DIOXUS-010` | Ephemeral WebKit storage | Non-persistent `WKWebsiteDataStore` with no unmanaged cookies/cache/local storage | `failed` |
+| `M0-DIOXUS-011` | App Sandbox compatibility | Loopback transport works under minimal reviewed entitlements | `open` |
+| `M0-DIOXUS-012` | Target notices | Locked target-specific Rust inventory bundled byte-for-byte | `diagnostic` |
+| `M0-DIOXUS-013` | Physical-device accessibility | VoiceOver, Dynamic Type, Full Keyboard Access, contrast, switch control | `open` |
+| `M0-DIOXUS-014` | Physical-device input | IME, autocorrect, dictation, selection, copy/paste, and hardware keyboard | `open` |
+| `M0-DIOXUS-015` | Lifecycle and resources | foreground/background, lock/unlock, memory warning, protected data, energy, memory | `open` |
+| `M0-DIOXUS-016` | Signed distribution | TestFlight install, notarized Mac build, and App Review smoke test | `open` |
 
-The IDs are stable M0 placeholders until the repository issue tracker is
-provisioned. A required CI gate fails on missing evidence; it is not converted
-to a pass by documentation.
+The IDs are stable register identifiers, not claims that GitHub issues exist.
+The authoritative status and evidence requirements are in
+[`gate-register.json`](gate-register.json). Missing evidence is never a pass.
 
 ## Build and runtime boundary
 

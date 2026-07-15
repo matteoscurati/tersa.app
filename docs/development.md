@@ -21,6 +21,18 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
+Run the M0 product-gate validator separately before that Rust-only command:
+
+```sh
+python3 scripts/verify-m0-gates.py
+python3 scripts/verify-m0-gates.py --self-test
+```
+
+CI runs the validator in its policy job. It is intentionally not wired into
+`cargo xtask verify`: this PR does not change the Rust xtask crate. The xtask
+architecture check is nevertheless the enforcement point for diagnostic-only
+Slint and Dioxus dependency isolation; `cargo deny` alone cannot establish
+that runtime boundary.
 
 ## Dependency changes
 

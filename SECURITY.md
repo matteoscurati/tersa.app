@@ -30,3 +30,7 @@ attachment processing, Apple platform bridges, supply-chain integrity, or data
 isolation are especially valuable. Reports based only on the declared absence
 of a backend, reliable iOS push, or guaranteed offline scheduling are product
 limitations rather than vulnerabilities.
+
+The current [threat model](docs/security/threat-model.md) and
+[security data flow](docs/security/data-flow.md) describe the assets, trust
+boundaries, controls, and explicitly unopened future boundaries.

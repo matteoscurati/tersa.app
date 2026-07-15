@@ -19,24 +19,24 @@ composition and the remaining physical-device checks are still open evidence.
 
 ## Evidence
 
-| Check | Status | Evidence or follow-up |
-|---|---|---|
-| macOS unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 debug package and per-commit Release archive; `#M0-SLINT-001` |
-| iOS device unsigned Rust/Slint package | **PASS locally; required CI gate** | Xcode 26.6 arm64 device package and per-commit Release archive; `#M0-SLINT-002` |
-| Mac and simulator screenshots | **Required CI gate** | Per-commit OCR-verified evidence artifact; `#M0-SLINT-003` |
-| Skia archive integrity | **PASS locally; required CI gate** | All supported Apple archives are verified before extraction; `#M0-SLINT-004` |
-| Physical-device IME, autocorrect, dictation, selection, copy/paste, hardware keyboard | **UNVERIFIED** | `#M0-SLINT-005` |
-| VoiceOver accessibility tree | **FAIL by dependency inspection** | `accesskit_winit` 0.30.0 selects its no-op platform adapter on iOS; physical-device confirmation remains `#M0-SLINT-006` |
-| Dynamic Type and Full Keyboard Access | **UNVERIFIED** | `#M0-SLINT-006` |
-| Lifecycle, memory warning, protected data | **UNVERIFIED** | `#M0-SLINT-007` |
-| Performance, RAM, scroll behavior | **UNVERIFIED** | `#M0-SLINT-008` |
-| OAuth callback | **UNVERIFIED** | `#M0-SLINT-009` |
-| Hostile WKWebView composition | **UNVERIFIED** | `#M0-SLINT-010` |
-| Share sheet, file picker, notifications | **UNVERIFIED** | `#M0-SLINT-011` |
-| Signed TestFlight and App Review | **UNVERIFIED** | `#M0-SLINT-012` |
+| ID | Check | Register status | Evidence or follow-up |
+|---|---|---|---|
+| `M0-SLINT-001` | macOS unsigned Rust/Slint package | `diagnostic` | Xcode 26.6 arm64 debug package and per-commit Release archive. |
+| `M0-SLINT-002` | iOS device unsigned Rust/Slint package | `diagnostic` | Xcode 26.6 arm64 device package and per-commit Release archive. |
+| `M0-SLINT-003` | Mac and simulator screenshots | `open` | Per-commit OCR-verified evidence artifact required. |
+| `M0-SLINT-004` | Skia archive integrity | `diagnostic` | All supported Apple archives are verified before extraction. |
+| `M0-SLINT-005` | Physical-device input | `open` | IME, autocorrect, dictation, selection, copy/paste, and hardware keyboard. |
+| `M0-SLINT-006` | VoiceOver, Dynamic Type, and Full Keyboard Access | `failed` | `accesskit_winit` 0.30.0 selects its no-op iOS adapter. |
+| `M0-SLINT-007` | Lifecycle, memory warning, and protected data | `open` | Physical-device evidence required. |
+| `M0-SLINT-008` | Performance, RAM, and scroll behavior | `open` | Physical-device evidence required. |
+| `M0-SLINT-009` | OAuth callback | `open` | Physical-device evidence required. |
+| `M0-SLINT-010` | Hostile WKWebView composition | `open` | Physical-device evidence required. |
+| `M0-SLINT-011` | Share sheet, file picker, and notifications | `open` | Physical-device evidence required. |
+| `M0-SLINT-012` | Signed TestFlight and App Review | `open` | Signed-distribution evidence required. |
 
-Issue references are documented M0 placeholders until the repository issue
-tracker is provisioned; they are stable names for the required follow-up work.
+The stable IDs are gate-register identifiers, not claims that GitHub issues
+exist. The authoritative status and evidence requirements are in
+[`gate-register.json`](gate-register.json).
 
 ## Verified Skia archives
 

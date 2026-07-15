@@ -24,6 +24,12 @@ search, MIME handling, security policy, and Google API compliance before
 production feature development begins. See the [roadmap](docs/roadmap.md) for
 the milestone sequence and MVP exclusions.
 
+The accepted [product constraints](docs/architecture/adr-0006-product-constraints.md)
+and authoritative [M0 gate register](docs/m0/gate-register.json) define what
+counts as current evidence. See the [threat model](docs/security/threat-model.md)
+and [security data flow](docs/security/data-flow.md) for the current security
+boundaries.
+
 ## Development
 
 The workspace pins Rust 1.91.1. Run its baseline verification suite with:

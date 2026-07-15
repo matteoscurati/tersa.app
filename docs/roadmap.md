@@ -46,7 +46,10 @@ Dioxus 0.7.9 fallback also packages successfully and is suitable for continued
 diagnostic work, but it is not a production baseline: persistent WebKit state,
 navigation interception, sandboxed loopback transport, runtime footprint, and
 physical-device evidence are unresolved. M0 must resolve those blockers or
-reopen the UI constraint before M1 product screens begin.
+reopen the UI constraint before M1 product screens begin. M1 remains blocked
+because no production UI baseline has passed; the authoritative
+[M0 gate register](m0/gate-register.json) records current HEAD-checkable
+evidence and the cache measurement gate.
 
 ## M1 — Vertical slice
 
@@ -68,7 +71,7 @@ content, and signed Apple releases.
 
 ## MVP exclusions
 
-The MVP excludes AI, MCP, OpenPGP, production Tantivy, `maild`, arbitrary rules,
+The MVP excludes full-mailbox offline, AI, MCP, OpenPGP, production Tantivy, `maild`, arbitrary rules,
 snooze synchronization, Gmail send-as aliases, Google Contacts, IMAP/SMTP,
 non-Gmail accounts, Mac Intel, Mac App Store distribution, reliable iOS push,
 and guaranteed send-later scheduling.
