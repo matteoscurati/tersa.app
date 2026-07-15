@@ -103,6 +103,30 @@ Read [the SQLCipher feasibility record](m0/sqlcipher-feasibility.md) before
 changing the dependency, keying boundary, temporary-store policy, or evidence
 claims.
 
+## Crash-safe blob feasibility
+
+The portable M0 blob diagnostic proves a bounded candidate XChaCha20-Poly1305
+chunk format, authenticated random access, per-account HMAC content identifiers,
+exact-size validation, atomic same-directory no-replace hard-link publication,
+descriptor-bound no-follow collision validation, narrow staging cleanup, and
+deterministic process-crash publication using only synthetic data.
+
+```sh
+rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+cargo test --locked --package tersa-blob-spike
+sh apple/scripts/verify-blob-feasibility.sh
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
+  --package tersa-blob-spike --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
+  --package tersa-blob-spike --target aarch64-apple-ios-sim
+```
+
+The verifier builds and runs the macOS arm64 release executable and accepts
+only its exact three-line aggregate result. The iOS device and simulator builds
+are compile evidence only. Read [the blob feasibility record](m0/blob-feasibility.md)
+and [ADR 0012](architecture/adr-0012-chunked-blob-format.md) before changing the
+format, publication protocol, cryptographic dependencies, or evidence claims.
+
 ## Encrypted search feasibility
 
 The M0 search diagnostic is Apple-only and remains explicitly non-production.

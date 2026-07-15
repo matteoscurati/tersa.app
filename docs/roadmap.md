@@ -19,6 +19,21 @@ not production. iOS protected-data runtime, Keychain, Data Protection,
 production schema/repositories, migration-history policy, and production key
 handling remain M0 work; `M0-STORAGE-001` remains open.
 
+The portable blob diagnostic now proves a bounded versioned
+XChaCha20-Poly1305 chunk format, authenticated random access, exact-size
+validation, per-account HMAC content identifiers, run-wide nonce uniqueness,
+authenticated same-blob-ID reuse with fail-closed preservation of conflicting
+or corrupt finals, atomic same-directory no-replace hard-link publication, and
+descriptor-bound no-follow rejection of pre-open path swaps, and deterministic
+host process-crash recovery with narrow staging cleanup. It makes
+no cross-logical-blob deduplication claim and is not a production blob store.
+Manifest binding, cross-blob reuse, rollback freshness, filesystem behavior
+beyond the host same-filesystem boundary, key derivation and rotation,
+eviction, disk-full, backup, File Protection, signed-device runtime, and
+performance remain M0 work.
+Concurrent external mutation of an already-open inode also remains outside the
+process-crash diagnostic boundary.
+
 The search diagnostic proves host-side synthetic exact-match sets for SQLCipher
 FTS5 and Tantivy 0.26.1, immutable open handles after delete/replace,
 cross-connection WORM writes with flush-visible generations, blocking and

@@ -374,6 +374,49 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  blob-apple-evidence:
+    name: Crash-safe AEAD blob Apple evidence
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Verify Xcode 26
+        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
+      - name: Install notice generator
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Check target-specific third-party notices
+        run: sh apple/scripts/generate-third-party-notices.sh --check
+      - name: Cross-build portable blob diagnostic for iOS
+        run: |
+          cargo build --locked --release --package tersa-blob-spike --target aarch64-apple-ios
+          cargo build --locked --release --package tersa-blob-spike --target aarch64-apple-ios-sim
+      - name: Verify crash-safe chunked-AEAD blob controls
+        run: sh apple/scripts/verify-blob-feasibility.sh
+      - name: Bind blob feasibility evidence to the source commit
+        if: ${{ always() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}
+        run: python3 scripts/write-evidence-manifest.py apple/build/blob-evidence "$EVIDENCE_COMMIT_SHA"
+      - name: Upload blob feasibility evidence
+        if: ${{ always() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: crash-safe-aead-blob-feasibility-evidence
+          path: apple/build/blob-evidence
+          if-no-files-found: error
+          retention-days: 90
+
   rust:
     name: Rust (${{ matrix.os }})
     strategy:
