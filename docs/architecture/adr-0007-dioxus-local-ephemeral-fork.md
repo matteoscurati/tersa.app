@@ -43,6 +43,12 @@ The vendor fork is a maintained-drift risk. Any Dioxus version bump, patch or
 checksum-record change, or Wry behavior change invalidates this diagnostic and
 requires a new review.
 
+The verifier uses an existing Cargo cache entry when available. On a clean
+runner, where the path override gives Cargo no reason to cache the registry
+archive, it downloads the versioned archive from `static.crates.io` and rejects
+it before extraction unless the captured SHA-256 checksum matches. Offline runs
+can provide the same archive explicitly with `--archive`.
+
 ## Consequences
 
 M0-DIOXUS-009 and M0-DIOXUS-010 may be recorded as `diagnostic` with

@@ -127,6 +127,13 @@ mod apple {
             anchor.textContent = 'Synthetic navigation probe';
             document.body.append(anchor);
             anchor.click();
+            const ipcParams = {};
+            ipcParams[['hr', 'ef'].join('')] =
+                'https://example.invalid/ipc-browser-open';
+            window.ipc.postMessage(JSON.stringify({
+                method: 'browser_open',
+                params: ipcParams
+            }));
             const popupRejected =
                 window.open('https://example.invalid/window-open', '_blank') === null;
             advance.click();
@@ -156,7 +163,9 @@ mod apple {
                 storage.textContent = storageState;
                 cookie.textContent = cookieState;
                 popup.textContent = popupState;
-                window.location.assign('https://example.invalid/location');
+                window.setTimeout(() => {
+                    window.location.assign('https://example.invalid/location');
+                }, 15000);
             }, 250);
         }, 5000);
     "#;

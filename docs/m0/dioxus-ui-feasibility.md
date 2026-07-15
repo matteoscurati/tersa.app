@@ -72,15 +72,21 @@ incognito and deny-all navigation, and verifies both native browser-open paths.
 Wry itself is not patched; its Apple implementation maps incognito to
 `WKWebsiteDataStore::nonPersistentDataStore`.
 
-Host evidence can exercise a localStorage write, direct location changes,
-injected anchor IPC, and a rejected `window.open`. It verifies that the written
-localStorage value is absent after relaunch and checks selected WebKit
-data-directory names under an isolated `HOME`. The `dioxus://` custom scheme
-does not expose a usable `document.cookie` API, so this host probe cannot make a
-cookie-persistence claim. It also cannot prove every WebKit disk surface,
-physical-device behavior, or that no state exists in memory. These probes are
-therefore diagnostic evidence, not a production storage claim. Any fork or
-version change resets this result.
+Host evidence can exercise a localStorage write, an anchor navigation, an
+explicit `browser_open` IPC message, a direct location change, and a rejected
+`window.open`. It verifies that the written localStorage value is absent after
+relaunch and checks selected WebKit data-directory names under an isolated
+`HOME`. The `dioxus://` custom scheme does not expose a usable
+`document.cookie` API, so this host probe cannot make a cookie-persistence
+claim. It also cannot prove every WebKit disk surface, physical-device
+behavior, or that no state exists in memory. These probes are therefore
+diagnostic evidence, not a production storage claim. Any fork or version change
+resets this result.
+
+The host capture verifies that the page remains rendered after the anchor and
+explicit IPC denials. The later direct-location marker verifies policy callback
+execution only; it does not claim that WebKit preserves the rendered page after
+cancellation. That behavior remains part of the device-signed navigation gate.
 
 ## Evidence interpretation
 

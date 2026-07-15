@@ -163,6 +163,20 @@ verify_loopback_listener() {
   fi
 }
 
+wait_for_exact_log_line() {
+  expected_line="$1"
+  log_file="$2"
+  attempts=0
+  while ! grep -Fx "$expected_line" "$log_file" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 250 ]; then
+      echo "Timed out waiting for process evidence: $expected_line" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 start_mac() {
   evidence_mode="$1"
   relaunch_mode="${2:-0}"
@@ -238,7 +252,13 @@ grep -F 'NAVIGATION PROBE PAGE UNCHANGED' "${build_dir}/macos-ocr.txt"
 grep -F 'LOCAL STORAGE WRITTEN' "${build_dir}/macos-ocr.txt"
 grep -F 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME' "${build_dir}/macos-ocr.txt"
 grep -F 'WINDOW OPEN REJECTED' "${build_dir}/macos-ocr.txt"
-test "$(grep -c 'TERSA-DIOXUS-NAV-DENIED' "${build_dir}/macos-navigation-process.log")" -ge 2
+grep -Fx 'TERSA-DIOXUS-NAV-DENIED https://example.invalid/anchor' \
+  "${build_dir}/macos-navigation-process.log"
+grep -Fx 'TERSA-DIOXUS-NAV-DENIED https://example.invalid/ipc-browser-open' \
+  "${build_dir}/macos-navigation-process.log"
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/location' \
+  "${build_dir}/macos-navigation-process.log"
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -gt 0
@@ -314,11 +334,15 @@ printf '%s\n' \
 
 printf '%s\n' \
   'The macOS host probe verifies a localStorage write, location stability,' \
-  'injected anchor IPC and direct location denial markers, a rejected window.open,' \
+  'anchor navigation and injected browser_open IPC denial markers while the' \
+  'page remains rendered, plus a later direct-location denial marker and a' \
+  'rejected window.open,' \
   'localStorage absence after relaunch, and' \
   'the absence of WebKit or WebsiteData directories below an isolated HOME.' \
   'The dioxus:// custom scheme exposes no usable document.cookie API, so this' \
   'probe cannot make or verify a cookie-persistence claim.' \
+  'The direct-location marker does not claim that WebKit preserves the rendered' \
+  'page after cancellation; that behavior remains a device-signed gate.' \
   'It cannot enumerate every operating-system WebKit cache surface, prove zero' \
   'in-memory state, or establish physical-device or signed-distribution behavior.' \
   > "${build_dir}/ephemeral-navigation-limitations.txt"

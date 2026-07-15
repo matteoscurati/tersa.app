@@ -249,6 +249,7 @@ def main() -> None:
         "document.cookie = 'tersa-dioxus-ephemeral-cookie=written; SameSite=Strict'",
         "window.location.assign('https://example.invalid/location')",
         "window.open('https://example.invalid/window-open', '_blank')",
+        "https://example.invalid/ipc-browser-open",
         "LOCAL STORAGE ABSENT AFTER RELAUNCH",
         "COOKIE API UNAVAILABLE ON DIOXUS SCHEME",
         "WINDOW OPEN REJECTED",
