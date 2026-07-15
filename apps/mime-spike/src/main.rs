@@ -53,6 +53,34 @@ fn run() -> Result<(), ()> {
             false,
         ),
         (
+            b"Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\n<p>ambiguous</p>".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/html\r\nContent-Disposition: attachment\r\nContent-Disposition: inline\r\n\r\n<p>excluded</p>".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\nContent-Transfer-Encoding: 7bit\r\n\r\nYW1iaWd1b3Vz".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\nTQ==AAAA".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\nTR==".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\n\xc3\xa9".to_vec(),
+            false,
+        ),
+        (
+            b"Content-Type: text/plain; charset=us-ascii\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\xc3\xa9".to_vec(),
+            false,
+        ),
+        (
             b"Content-Type: text/plain; charset=iso-2022-jp\r\n\r\ntext".to_vec(),
             false,
         ),

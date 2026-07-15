@@ -231,6 +231,8 @@ targets:
       path: mime-macos/Info.plist
       properties:
         LSApplicationCategoryType: public.app-category.developer-tools
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
         NSHighResolutionCapable: true
     entitlements:
       path: mime-macos/TersaMimeMac.entitlements

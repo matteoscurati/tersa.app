@@ -26,7 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let encodingFailureEvidence = Data(
-        "{\"contentRuleListAttached\":false,\"dataStoreIsNonPersistent\":true,\"failureCode\":-1,\"failureCount\":1,\"initialNavigationAllowed\":false,\"javaScriptDisabled\":true,\"label\":\"NOT A DEVICE-GATE RESULT\",\"navigationActionsDenied\":0,\"navigationResponsesDenied\":0,\"newWindowsDenied\":0,\"pageJavaScriptDidNotExecute\":false,\"probeCompleted\":false,\"rawControlHash\":\"\",\"rawControlLoaded\":false,\"sanitizedDocumentHash\":\"\",\"sanitizedDocumentLoaded\":false,\"sanitizedResourceFound\":false,\"websiteDataRecordCount\":0}".utf8
+        "{\"contentRuleListAttached\":false,\"dataStoreIsNonPersistent\":false,\"failureCode\":-1,\"failureCount\":1,\"initialNavigationAllowed\":false,\"javaScriptDisabled\":false,\"label\":\"NOT A DEVICE-GATE RESULT\",\"navigationActionsDenied\":0,\"navigationResponsesDenied\":0,\"newWindowsDenied\":0,\"pageJavaScriptDidNotExecute\":false,\"probeCompleted\":false,\"rawControlHash\":\"\",\"rawControlLoaded\":false,\"runMode\":\"encoding-failure\",\"sanitizedDocumentHash\":\"\",\"sanitizedDocumentLoaded\":false,\"sanitizedResourceFound\":false,\"transportControlLoaded\":false,\"websiteDataRecordCount\":0}".utf8
     )
 }
 

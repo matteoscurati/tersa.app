@@ -254,6 +254,7 @@ fn parse_part(input: &[u8], depth: usize, budget: &mut Budget) -> Result<Part, E
         .get("content-type")
         .map_or("text/plain", String::as_str);
     let content_type = parse_content_type(content_type_value);
+    let us_ascii = declares_us_ascii(content_type_value);
     let attachment = headers
         .get("content-disposition")
         .is_some_and(|value| value.to_ascii_lowercase().contains("attachment"));
@@ -294,6 +295,7 @@ fn parse_part(input: &[u8], depth: usize, budget: &mut Budget) -> Result<Part, E
             decode_display_body(
                 body,
                 headers.get("content-transfer-encoding"),
+                us_ascii,
                 budget.limits,
             )
         })
@@ -348,10 +350,20 @@ fn parse_headers(
             return Err(ErrorCategory::HeaderLimit);
         }
         let name = name.to_ascii_lowercase();
+        if is_singleton_security_header(&name) && headers.contains_key(&name) {
+            return Err(ErrorCategory::HeaderLimit);
+        }
         headers.insert(name.clone(), value.trim().to_owned());
         previous_name = Some(name);
     }
     Ok((headers, &input[(header_end + separator_len)..]))
+}
+
+fn is_singleton_security_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type" | "content-disposition" | "content-transfer-encoding"
+    )
 }
 
 fn parse_content_type(value: &str) -> ContentType {
@@ -394,6 +406,19 @@ fn supported_charset(content_type: &str) -> bool {
                 value.trim().trim_matches('"').to_ascii_lowercase().as_str(),
                 "utf-8" | "us-ascii"
             )
+    })
+}
+
+fn declares_us_ascii(content_type: &str) -> bool {
+    content_type.split(';').skip(1).any(|parameter| {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("charset")
+            && value
+                .trim()
+                .trim_matches('"')
+                .eq_ignore_ascii_case("us-ascii")
     })
 }
 
@@ -444,7 +469,13 @@ fn decode_body(
         .trim()
         .to_ascii_lowercase();
     let decoded = match encoding.as_str() {
-        "7bit" | "8bit" | "binary" | "" => body.to_vec(),
+        "7bit" | "" => {
+            if body.iter().any(|byte| !byte.is_ascii()) {
+                return Err(ErrorCategory::Encoding);
+            }
+            body.to_vec()
+        }
+        "8bit" | "binary" => body.to_vec(),
         "base64" => decode_base64(body)?,
         "quoted-printable" => decode_quoted_printable(body)?,
         _ => return Err(ErrorCategory::Encoding),
@@ -458,9 +489,13 @@ fn decode_body(
 fn decode_display_body(
     body: &[u8],
     transfer_encoding: Option<&String>,
+    us_ascii: bool,
     limits: Limits,
 ) -> Result<Vec<u8>, ErrorCategory> {
     let decoded = decode_body(body, transfer_encoding, limits)?;
+    if us_ascii && decoded.iter().any(|byte| !byte.is_ascii()) {
+        return Err(ErrorCategory::Charset);
+    }
     std::str::from_utf8(&decoded).map_err(|_error| ErrorCategory::Charset)?;
     Ok(decoded)
 }
@@ -475,7 +510,8 @@ fn decode_base64(input: &[u8]) -> Result<Vec<u8>, ErrorCategory> {
         return Err(ErrorCategory::Encoding);
     }
     let mut output = Vec::with_capacity(compact.len() / 4 * 3);
-    for chunk in compact.chunks_exact(4) {
+    let chunk_count = compact.len() / 4;
+    for (index, chunk) in compact.chunks_exact(4).enumerate() {
         let a = base64_value(chunk[0])?;
         let b = base64_value(chunk[1])?;
         let c = (chunk[2] != b'=')
@@ -487,6 +523,16 @@ fn decode_base64(input: &[u8]) -> Result<Vec<u8>, ErrorCategory> {
             .transpose()?
             .unwrap_or(0);
         if chunk[2] == b'=' && chunk[3] != b'=' {
+            return Err(ErrorCategory::Encoding);
+        }
+        let padded = chunk[2] == b'=' || chunk[3] == b'=';
+        if padded && index + 1 != chunk_count {
+            return Err(ErrorCategory::Encoding);
+        }
+        if chunk[2] == b'=' && b & 0x0f != 0 {
+            return Err(ErrorCategory::Encoding);
+        }
+        if chunk[2] != b'=' && chunk[3] == b'=' && c & 0x03 != 0 {
             return Err(ErrorCategory::Encoding);
         }
         output.push((a << 2) | (b >> 4));
@@ -735,6 +781,58 @@ mod tests {
                 Limits::default()
             ),
             Err(ErrorCategory::Charset)
+        );
+    }
+
+    #[test]
+    fn duplicate_singleton_security_headers_are_rejected() {
+        let messages = [
+            "Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\n<p>ambiguous</p>",
+            "Content-Type: text/html\r\nContent-Disposition: attachment\r\nContent-Disposition: inline\r\n\r\n<p>attachment-secret</p>",
+            "Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\nContent-Transfer-Encoding: 7bit\r\n\r\nYW1iaWd1b3Vz",
+        ];
+
+        for message in messages {
+            assert_eq!(inspect(message), Err(ErrorCategory::HeaderLimit));
+        }
+    }
+
+    #[test]
+    fn base64_padding_must_be_terminal_and_canonical() {
+        assert_eq!(decode_base64(b"TQ=="), Ok(b"M".to_vec()));
+        assert_eq!(decode_base64(b"TWE="), Ok(b"Ma".to_vec()));
+        for malformed in [
+            b"TQ==AAAA".as_slice(),
+            b"TR==".as_slice(),
+            b"TWF=".as_slice(),
+            b"TQ=A".as_slice(),
+        ] {
+            assert_eq!(decode_base64(malformed), Err(ErrorCategory::Encoding));
+        }
+    }
+
+    #[test]
+    fn seven_bit_and_us_ascii_declarations_reject_non_ascii_bytes() {
+        assert_eq!(
+            inspect_synthetic_mime(
+                b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\n\xc3\xa9",
+                Limits::default(),
+            ),
+            Err(ErrorCategory::Encoding)
+        );
+        assert_eq!(
+            inspect_synthetic_mime(
+                b"Content-Type: text/plain; charset=us-ascii\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\xc3\xa9",
+                Limits::default(),
+            ),
+            Err(ErrorCategory::Charset)
+        );
+        assert!(
+            inspect_synthetic_mime(
+                b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\xc3\xa9",
+                Limits::default(),
+            )
+            .is_ok()
         );
     }
 

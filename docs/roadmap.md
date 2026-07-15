@@ -30,8 +30,8 @@ value. It excludes attachment bodies, strips every URL-bearing attribute, and
 preserves CID references only as inert metadata. A separate native macOS probe
 loads Rust-sanitized and raw hostile controls in a nonpersistent WKWebView with
 JavaScript disabled, block-all network rules, navigation denial, no server
-entitlement, a positive-control loopback canary, and website-data residue
-checks. iOS device and simulator artifacts are compile evidence only. The
+entitlement, an in-app transport-control loopback canary, and website-data
+residue checks. iOS device and simulator artifacts are compile evidence only. The
 synthetic corpus and macOS host run do not close parser fuzzing, WebKit device,
 physical-iPhone, accessibility, or production renderer gates.
 

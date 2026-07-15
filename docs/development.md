@@ -138,10 +138,11 @@ sh apple/scripts/verify-mime-feasibility.sh
 
 The verifier replaces the bundled synthetic fixture with current Rust
 sanitizer output, ad-hoc signs the macOS archive with App Sandbox and network
-client entitlements, proves the request canary with a positive control,
-and then requires zero WKWebView canary hits, zero TCP listeners, zero website
-data records, disabled content JavaScript, attached block rules, and denied
-navigation. Evidence contains only aggregate counts and hashes. Every result is
+client entitlements, proves literal-loopback transport with an unblocked in-app
+WKWebView control, resets the canary, and then requires zero protected
+WKWebView canary hits, zero TCP listeners, zero website data records, disabled
+content JavaScript, attached block rules, and denied action, response, and
+new-window paths. Evidence contains only aggregate counts and hashes. Every result is
 labeled `NOT A DEVICE-GATE RESULT`: macOS is the only runtime exercised, while
 iOS device and simulator commands are locked cross-build evidence.
 

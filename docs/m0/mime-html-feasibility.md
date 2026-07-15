@@ -19,10 +19,13 @@ The deterministic traversal then limits:
 - MIME nesting to 12 containers;
 - total MIME parts to 128;
 - headers in each part to 96 and 24 KiB;
+- singleton `Content-Type`, `Content-Disposition`, and
+  `Content-Transfer-Encoding` fields in each part;
 - decoded display content to 256 KiB;
-- display charsets to UTF-8 and US-ASCII;
-- transfer decoding to bounded 7bit, 8bit, binary, base64, and
-  quoted-printable input.
+- display charsets to UTF-8 and US-ASCII, with declared US-ASCII bytes
+  enforced;
+- transfer decoding to bounded ASCII-only 7bit, 8bit, binary, canonically
+  padded base64, and quoted-printable input.
 
 Attachment bodies and unsupported content types cannot become display output.
 `multipart/alternative` prefers sanitized HTML and falls back to escaped plain
@@ -34,7 +37,9 @@ reported only as inert typed placeholders.
 The hostile synthetic corpus covers malformed boundaries, invalid encodings,
 unsupported charsets, broken headers, excessive nesting and parts, active SVG
 and script content, CSS URLs, forms, refresh directives, remote images, unsafe
-schemes, CID references, attachment exclusion, and deterministic output.
+schemes, CID references, attachment exclusion, duplicate security headers,
+non-terminal or non-canonical base64 padding, invalid 7bit and US-ASCII bytes,
+and deterministic output.
 
 ## Native Apple boundary
 
@@ -52,12 +57,15 @@ the same policy with:
 The macOS archive is ad-hoc signed with App Sandbox and network client enabled,
 but has no network server entitlement. Keeping client access available makes
 the canary a meaningful WebKit-policy test instead of a sandbox-only denial.
-The verifier first sends a positive-control request to its external loopback
-canary, resets the count, runs both Rust-sanitized and raw hostile documents,
-then requires zero canary hits and zero TCP listeners. This distinguishes a
-working detector from an
-unobserved network attempt while adding sandbox enforcement to the WebKit
-policy controls.
+The diagnostic target alone permits arbitrary WebKit transport so App
+Transport Security cannot make the protected result pass vacuously. The
+verifier first runs an in-app WKWebView without the content blocker and
+requires exactly one loopback request plus an observed response denial. It
+then resets the canary, runs both Rust-sanitized and raw hostile documents with
+the protected configuration, and requires zero canary hits and zero TCP
+listeners. Explicit inert probes also exercise action and new-window denial.
+The broad transport exception is test-only and is not a production entitlement
+or application setting.
 
 ## Evidence contract
 
@@ -68,8 +76,10 @@ The dedicated `mime-apple-evidence` CI job:
    simulator;
 3. archives the native macOS and iOS targets and builds the simulator target;
 4. exports current Rust sanitizer output into the macOS app resource;
-5. checks signed entitlements, positive-control canary behavior, listeners,
-   native policy flags, navigation denial, output hashes, and website data;
+5. checks signed entitlements, the exact diagnostic-only ATS exception, in-app
+   transport-control behavior, listeners, native policy flags, action,
+   response, and new-window denial, independently derived output hashes, and
+   website data;
 6. uploads only aggregate text and JSON evidence.
 
 No token, message content, hostile fixture, URL, filesystem path, or raw WebKit

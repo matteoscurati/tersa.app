@@ -25,9 +25,11 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         let probeCompleted: Bool
         let rawControlHash: String
         let rawControlLoaded: Bool
+        let runMode: String
         let sanitizedDocumentHash: String
         let sanitizedDocumentLoaded: Bool
         let sanitizedResourceFound: Bool
+        let transportControlLoaded: Bool
         let websiteDataRecordCount: Int
         let label: String = "NOT A DEVICE-GATE RESULT"
     }
@@ -35,6 +37,26 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
     private enum CaseKind {
         case sanitized
         case rawControl
+        case transportControl
+        case newWindowControl
+    }
+
+    private enum ResponsePolicy {
+        case allow
+        case denyTransportControl
+    }
+
+    private enum RunMode: String {
+        case protected
+        case transportControl = "transport-control"
+
+        init(environment: [String: String]) {
+            if environment["TERSA_MIME_RUN_MODE"] == Self.transportControl.rawValue {
+                self = .transportControl
+            } else {
+                self = .protected
+            }
+        }
     }
 
     private struct NavigationWaiter {
@@ -48,15 +70,20 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
 
     private let dataStore: WKWebsiteDataStore
     private let canaryBaseURL: URL?
+    private let runMode: RunMode
     private var contentRuleListAttached = false
     private var currentCase: CaseKind?
-    private var initialNavigationPending = false
+    private var expectedInitialNavigationURL: URL?
+    private var expectedInitialResponsePolicy: ResponsePolicy?
+    private var expectedTransportCancellation = false
     private var initialNavigationWasAllowed = false
-    private var initialNavigationResponsePending = false
+    private var javaScriptWasDisabled = false
     private var navigationDenialWaiter: CheckedContinuation<Void, Never>?
     private var navigationWaiter: NavigationWaiter?
+    private var newWindowWaiter: CheckedContinuation<Void, Never>?
     private var sanitizedDocumentLoaded = false
     private var rawControlLoaded = false
+    private var transportControlLoaded = false
     private var rawControlHash = ""
     private var navigationActionsDenied = 0
     private var navigationResponsesDenied = 0
@@ -68,53 +95,21 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
     init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         dataStore = .nonPersistent()
         canaryBaseURL = Self.canaryBaseURL(environment: environment)
+        runMode = RunMode(environment: environment)
         super.init()
     }
 
     func run() async -> Evidence {
-        guard let canaryBaseURL, let documentBaseURL = URL(string: "about:blank") else {
-            failureCount += 1
+        guard let canaryBaseURL else {
+            recordFailure(code: -10)
             return await makeEvidence(probeCompleted: false)
         }
-
-        let configuration: WKWebViewConfiguration
-        do {
-            configuration = try await makeConfiguration()
-        } catch {
-            failureCount += 1
-            return await makeEvidence(probeCompleted: false)
+        switch runMode {
+        case .transportControl:
+            return await runTransportControl(canaryBaseURL: canaryBaseURL)
+        case .protected:
+            return await runProtectedProbe(canaryBaseURL: canaryBaseURL)
         }
-
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-#if os(macOS)
-        let hostWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        hostWindow.contentView = webView
-        hostWindow.orderOut(nil)
-#endif
-
-        let sanitizedDocument = loadSanitizedDocument()
-        if let sanitizedDocument {
-            await load(sanitizedDocument, into: webView, baseURL: documentBaseURL, kind: .sanitized)
-        } else {
-            failureCount += 1
-        }
-        let rawControl = Self.rawControl(canaryBaseURL: canaryBaseURL)
-        rawControlHash = Self.sha256(rawControl)
-        await load(rawControl, into: webView, baseURL: documentBaseURL, kind: .rawControl)
-        pageJavaScriptDidNotExecute = webView.title != "JAVASCRIPT_EXECUTED"
-        await exerciseNavigationDenial(in: webView)
-#if os(macOS)
-        hostWindow.contentView = nil
-#endif
-
-        return await makeEvidence(probeCompleted: sanitizedDocument != nil)
     }
 
     func webView(
@@ -122,10 +117,22 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
     ) {
-        if initialNavigationPending, navigationAction.targetFrame?.isMainFrame == true {
-            initialNavigationPending = false
-            initialNavigationWasAllowed = true
-            initialNavigationResponsePending = true
+        if let expectedURL = expectedInitialNavigationURL,
+           navigationAction.targetFrame?.isMainFrame == true
+        {
+            expectedInitialNavigationURL = nil
+            if navigationAction.request.url == expectedURL {
+                initialNavigationWasAllowed = true
+                decisionHandler(.allow)
+            } else {
+                recordFailure(code: -11)
+                finishNavigationWaiter()
+                decisionHandler(.cancel)
+            }
+            return
+        }
+
+        if newWindowWaiter != nil, navigationAction.targetFrame == nil {
             decisionHandler(.allow)
             return
         }
@@ -140,14 +147,28 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void
     ) {
-        if initialNavigationResponsePending {
-            initialNavigationResponsePending = false
-            decisionHandler(.allow)
+        guard let responsePolicy = expectedInitialResponsePolicy else {
+            navigationResponsesDenied += 1
+            decisionHandler(.cancel)
             return
         }
-
-        navigationResponsesDenied += 1
-        decisionHandler(.cancel)
+        expectedInitialResponsePolicy = nil
+        switch responsePolicy {
+        case .allow:
+            decisionHandler(.allow)
+        case .denyTransportControl:
+            guard navigationResponse.response.url == canaryBaseURL?.appendingPathComponent("transport-control") else {
+                recordFailure(code: -12)
+                finishNavigationWaiter()
+                decisionHandler(.cancel)
+                return
+            }
+            navigationResponsesDenied += 1
+            transportControlLoaded = true
+            expectedTransportCancellation = true
+            finishNavigationWaiter()
+            decisionHandler(.cancel)
+        }
     }
 
     func webView(
@@ -157,6 +178,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         newWindowsDenied += 1
+        finishNewWindowWaiter()
         return nil
     }
 
@@ -166,16 +188,18 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
             sanitizedDocumentLoaded = true
         case .rawControl:
             rawControlLoaded = true
+        case .newWindowControl:
+            break
+        case .transportControl:
+            recordFailure(code: -13)
         case nil:
-            failureCount += 1
+            recordFailure(code: -14)
         }
         finishNavigationWaiter()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        failureCount += 1
-        failureCode = (error as NSError).code
-        finishNavigationWaiter()
+        handleNavigationFailure(error)
     }
 
     func webView(
@@ -183,26 +207,95 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        failureCount += 1
-        failureCode = (error as NSError).code
-        finishNavigationWaiter()
+        handleNavigationFailure(error)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        failureCount += 1
-        failureCode = -1
+        recordFailure(code: -1)
         finishNavigationWaiter()
+        finishNavigationDenialWaiter()
+        finishNewWindowWaiter()
     }
 
-    private func makeConfiguration() async throws -> WKWebViewConfiguration {
-        let ruleList = try await compileRuleList()
+    private func runTransportControl(canaryBaseURL: URL) async -> Evidence {
+        let configuration = makeBaseConfiguration(javaScriptAllowed: false)
+        javaScriptWasDisabled = !configuration.defaultWebpagePreferences.allowsContentJavaScript
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        let hostWindow = host(webView)
+        let controlURL = canaryBaseURL.appendingPathComponent("transport-control")
+        await load(
+            URLRequest(url: controlURL),
+            into: webView,
+            expectedURL: controlURL,
+            kind: .transportControl,
+            responsePolicy: .denyTransportControl
+        )
+        try? await Task.sleep(for: .milliseconds(100))
+        release(hostWindow)
+        return await makeEvidence(probeCompleted: transportControlLoaded)
+    }
+
+    private func runProtectedProbe(canaryBaseURL: URL) async -> Evidence {
+        guard let documentBaseURL = URL(string: "about:blank") else {
+            recordFailure(code: -15)
+            return await makeEvidence(probeCompleted: false)
+        }
+        let configuration: WKWebViewConfiguration
+        do {
+            configuration = try await makeProtectedConfiguration()
+        } catch {
+            recordFailure(code: -16)
+            return await makeEvidence(probeCompleted: false)
+        }
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        let hostWindow = host(webView)
+
+        let sanitizedDocument = loadSanitizedDocument()
+        if let sanitizedDocument {
+            await load(
+                sanitizedDocument,
+                into: webView,
+                baseURL: documentBaseURL,
+                kind: .sanitized
+            )
+        } else {
+            recordFailure(code: -17)
+        }
+        let rawControl = Self.rawControl(canaryBaseURL: canaryBaseURL)
+        rawControlHash = Self.sha256(rawControl)
+        await load(rawControl, into: webView, baseURL: documentBaseURL, kind: .rawControl)
+        pageJavaScriptDidNotExecute = webView.title != "JAVASCRIPT_EXECUTED"
+        await exerciseNavigationDenial(in: webView)
+        await exerciseNewWindowDenial()
+        release(hostWindow)
+
+        let completed = sanitizedDocument != nil
+            && sanitizedDocumentLoaded
+            && rawControlLoaded
+            && navigationActionsDenied > 0
+            && newWindowsDenied > 0
+        return await makeEvidence(probeCompleted: completed)
+    }
+
+    private func makeBaseConfiguration(javaScriptAllowed: Bool) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = dataStore
         let preferences = WKWebpagePreferences()
-        preferences.allowsContentJavaScript = false
+        preferences.allowsContentJavaScript = javaScriptAllowed
         configuration.defaultWebpagePreferences = preferences
+        return configuration
+    }
+
+    private func makeProtectedConfiguration() async throws -> WKWebViewConfiguration {
+        let ruleList = try await compileRuleList()
+        let configuration = makeBaseConfiguration(javaScriptAllowed: false)
         configuration.userContentController.add(ruleList)
         contentRuleListAttached = true
+        javaScriptWasDisabled = !configuration.defaultWebpagePreferences.allowsContentJavaScript
         return configuration
     }
 
@@ -226,25 +319,48 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         }
     }
 
-    private func load(_ document: String, into webView: WKWebView, baseURL: URL, kind: CaseKind) async {
+    private func load(
+        _ document: String,
+        into webView: WKWebView,
+        baseURL: URL,
+        kind: CaseKind
+    ) async {
+        await beginNavigation(kind: kind, expectedURL: baseURL, responsePolicy: .allow) {
+            webView.loadHTMLString(document, baseURL: baseURL)
+        }
+    }
+
+    private func load(
+        _ request: URLRequest,
+        into webView: WKWebView,
+        expectedURL: URL,
+        kind: CaseKind,
+        responsePolicy: ResponsePolicy
+    ) async {
+        await beginNavigation(kind: kind, expectedURL: expectedURL, responsePolicy: responsePolicy) {
+            webView.load(request)
+        }
+    }
+
+    private func beginNavigation(
+        kind: CaseKind,
+        expectedURL: URL,
+        responsePolicy: ResponsePolicy,
+        start: () -> Void
+    ) async {
         currentCase = kind
-        initialNavigationPending = true
-        initialNavigationResponsePending = false
+        expectedInitialNavigationURL = expectedURL
+        expectedInitialResponsePolicy = responsePolicy
         let identifier = UUID()
         await withCheckedContinuation { continuation in
-            navigationWaiter = NavigationWaiter(
-                identifier: identifier,
-                continuation: continuation
-            )
-            webView.loadHTMLString(document, baseURL: baseURL)
+            navigationWaiter = NavigationWaiter(identifier: identifier, continuation: continuation)
+            start()
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(10))
                 guard navigationWaiter?.identifier == identifier else {
                     return
                 }
-                failureCount += 1
-                failureCode = -2
-                webView.stopLoading()
+                recordFailure(code: -2)
                 finishNavigationWaiter()
             }
         }
@@ -260,8 +376,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
 
     private func exerciseNavigationDenial(in webView: WKWebView) async {
         guard let deniedURL = URL(string: "about:blank#tersa-denied-navigation") else {
-            failureCount += 1
-            failureCode = -3
+            recordFailure(code: -3)
             return
         }
         await withCheckedContinuation { continuation in
@@ -272,8 +387,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
                 guard navigationDenialWaiter != nil else {
                     return
                 }
-                failureCount += 1
-                failureCode = -3
+                recordFailure(code: -3)
                 finishNavigationDenialWaiter()
             }
         }
@@ -285,6 +399,60 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         }
         navigationDenialWaiter = nil
         waiter.resume()
+    }
+
+    private func exerciseNewWindowDenial() async {
+        let configuration = makeBaseConfiguration(javaScriptAllowed: true)
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        let hostWindow = host(webView)
+        currentCase = .newWindowControl
+        await withCheckedContinuation { continuation in
+            newWindowWaiter = continuation
+            Task { @MainActor in
+                do {
+                    _ = try await webView.evaluateJavaScript(
+                        "window.open('about:blank#tersa-new-window', '_blank')"
+                    )
+                } catch {
+                    recordFailure(code: -4)
+                    finishNewWindowWaiter()
+                }
+                try? await Task.sleep(for: .seconds(5))
+                guard newWindowWaiter != nil else {
+                    return
+                }
+                recordFailure(code: -4)
+                finishNewWindowWaiter()
+            }
+        }
+        release(hostWindow)
+    }
+
+    private func finishNewWindowWaiter() {
+        guard let waiter = newWindowWaiter else {
+            return
+        }
+        newWindowWaiter = nil
+        waiter.resume()
+    }
+
+    private func handleNavigationFailure(_ error: Error) {
+        if expectedTransportCancellation {
+            expectedTransportCancellation = false
+            finishNavigationWaiter()
+            return
+        }
+        recordFailure(code: (error as NSError).code)
+        finishNavigationWaiter()
+        finishNavigationDenialWaiter()
+        finishNewWindowWaiter()
+    }
+
+    private func recordFailure(code: Int) {
+        failureCount += 1
+        failureCode = code
     }
 
     private func loadSanitizedDocument() -> String? {
@@ -301,11 +469,11 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         let recordCount = await websiteDataRecordCount()
         return Evidence(
             contentRuleListAttached: contentRuleListAttached,
-            dataStoreIsNonPersistent: true,
+            dataStoreIsNonPersistent: !dataStore.isPersistent,
             failureCount: failureCount,
             failureCode: failureCode,
             initialNavigationAllowed: initialNavigationWasAllowed,
-            javaScriptDisabled: true,
+            javaScriptDisabled: javaScriptWasDisabled,
             navigationActionsDenied: navigationActionsDenied,
             navigationResponsesDenied: navigationResponsesDenied,
             newWindowsDenied: newWindowsDenied,
@@ -313,9 +481,11 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
             probeCompleted: probeCompleted,
             rawControlHash: rawControlHash,
             rawControlLoaded: rawControlLoaded,
+            runMode: runMode.rawValue,
             sanitizedDocumentHash: Self.sha256(sanitizedDocument),
             sanitizedDocumentLoaded: sanitizedDocumentLoaded,
             sanitizedResourceFound: !sanitizedDocument.isEmpty,
+            transportControlLoaded: transportControlLoaded,
             websiteDataRecordCount: recordCount
         )
     }
@@ -326,6 +496,28 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
                 continuation.resume(returning: records.count)
             }
         }
+    }
+
+    private func host(_ webView: WKWebView) -> AnyObject? {
+#if os(macOS)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = webView
+        window.orderOut(nil)
+        return window
+#else
+        return nil
+#endif
+    }
+
+    private func release(_ host: AnyObject?) {
+#if os(macOS)
+        (host as? NSWindow)?.contentView = nil
+#endif
     }
 
     private static func canaryBaseURL(environment: [String: String]) -> URL? {
