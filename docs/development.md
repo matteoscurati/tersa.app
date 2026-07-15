@@ -84,6 +84,32 @@ Read [the SQLCipher feasibility record](m0/sqlcipher-feasibility.md) before
 changing the dependency, keying boundary, temporary-store policy, or evidence
 claims.
 
+## Encrypted search feasibility
+
+The M0 search diagnostic is Apple-only and remains explicitly non-production.
+It compares exact message-ID match sets from SQLCipher FTS5 and Tantivy 0.26.1;
+it does not claim ranking-order parity. Tantivy uses a custom fixed-size-chunk
+SQLCipher `Directory`, not memory mapping or temporary index files.
+
+```sh
+rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+sh apple/scripts/verify-search-feasibility.sh
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --release --package tersa-search-spike --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
+  --release --package tersa-search-spike --target aarch64-apple-ios-sim
+cargo run --locked --release --package tersa-search-spike \
+  --target aarch64-apple-darwin -- --profile manual
+```
+
+The CI profile uses 10,000 synthetic messages and at least 128 MiB of normalized
+text. The optional manual host profile uses 100,000 messages and at least 2 GiB
+of normalized text; it can consume substantial time and disk. Every host result
+is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only that the
+locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
+production performance. Only the physical-device M0 run can close the iPhone
+gate.
+
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only

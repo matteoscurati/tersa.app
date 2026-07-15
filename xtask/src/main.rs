@@ -189,13 +189,25 @@ fn check_architecture() -> TaskResult {
             check_slint_dependency(&package_name, dependency, &mut violations);
             check_dioxus_dependency(&package_name, dependency, &mut violations);
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
+            check_search_dependency(&package_name, dependency, &mut violations);
         }
     }
 
-    let dependency_graph = MetadataCommand::new()
-        .other_options(vec!["--locked".to_owned()])
-        .exec()?;
-    check_sqlcipher_dependency_graph(&dependency_graph, &mut violations);
+    for target in [
+        "aarch64-apple-darwin",
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim",
+    ] {
+        let dependency_graph = MetadataCommand::new()
+            .other_options(vec![
+                "--locked".to_owned(),
+                "--filter-platform".to_owned(),
+                target.to_owned(),
+            ])
+            .exec()?;
+        check_sqlcipher_dependency_graph(&dependency_graph, target, &mut violations);
+        check_search_dependency_graph(&dependency_graph, target, &mut violations);
+    }
 
     if violations.is_empty() {
         println!("Architecture dependency boundaries passed.");
@@ -209,8 +221,78 @@ fn check_architecture() -> TaskResult {
     .into())
 }
 
-fn check_sqlcipher_dependency_graph(metadata: &Metadata, violations: &mut Vec<String>) {
-    const SQLCIPHER_SPIKE: &str = "tersa-sqlcipher-spike";
+fn check_search_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    const SEARCH_SPIKE: &str = "tersa-search-spike";
+    const FORBIDDEN: [&str; 4] = ["memmap2", "tempfile", "lz4_flex", "zstd"];
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let tantivy: BTreeSet<String> = package_names
+        .iter()
+        .filter_map(|(id, name)| (name == "tantivy").then_some(id.clone()))
+        .collect();
+    for member in &metadata.workspace_members {
+        let member_id = member.to_string();
+        if package_names
+            .get(&member_id)
+            .is_some_and(|name| name != SEARCH_SPIKE)
+            && dependency_reaches(&member_id, &tantivy, &dependencies)
+        {
+            violations.push(format!(
+                "{} reaches tantivy outside {SEARCH_SPIKE}",
+                package_names[&member_id]
+            ));
+        }
+    }
+    let search_id = metadata
+        .workspace_members
+        .iter()
+        .map(ToString::to_string)
+        .find(|id| {
+            package_names
+                .get(id)
+                .is_some_and(|name| name == SEARCH_SPIKE)
+        });
+    if let Some(search_id) = search_id {
+        for forbidden in FORBIDDEN {
+            let targets: BTreeSet<String> = package_names
+                .iter()
+                .filter_map(|(id, name)| (name == forbidden).then_some(id.clone()))
+                .collect();
+            if dependency_reaches(&search_id, &targets, &dependencies) {
+                violations.push(format!(
+                    "{SEARCH_SPIKE} reaches forbidden package {forbidden} for {target}"
+                ));
+            }
+        }
+    }
+}
+
+fn check_sqlcipher_dependency_graph(
+    metadata: &Metadata,
+    target: &str,
+    violations: &mut Vec<String>,
+) {
+    const SQLCIPHER_CONSUMERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
 
     let Some(resolve) = &metadata.resolve else {
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
@@ -251,11 +333,11 @@ fn check_sqlcipher_dependency_graph(metadata: &Metadata, violations: &mut Vec<St
             ));
             continue;
         };
-        if member_name != SQLCIPHER_SPIKE
+        if !SQLCIPHER_CONSUMERS.contains(&member_name.as_str())
             && dependency_reaches(&member_id, &sqlite_packages, &dependencies)
         {
             violations.push(format!(
-                "{member_name} reaches libsqlite3-sys outside {SQLCIPHER_SPIKE}"
+                "{member_name} reaches libsqlite3-sys outside the Apple SQLCipher diagnostics for {target}"
             ));
         }
     }
@@ -349,7 +431,7 @@ fn check_sqlcipher_dependency(
     dependency: &cargo_metadata::Dependency,
     violations: &mut Vec<String>,
 ) {
-    const SQLCIPHER_SPIKE: &str = "tersa-sqlcipher-spike";
+    const SQLCIPHER_CONSUMERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
     const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
 
     let dependency_name = dependency.name.as_str();
@@ -357,9 +439,9 @@ fn check_sqlcipher_dependency(
         return;
     }
 
-    if package_name != SQLCIPHER_SPIKE {
+    if !SQLCIPHER_CONSUMERS.contains(&package_name) {
         violations.push(format!(
-            "{package_name} -> {dependency_name} (SQLCipher is exclusive to {SQLCIPHER_SPIKE})"
+            "{package_name} -> {dependency_name} (SQLCipher is exclusive to the Apple SQLCipher diagnostics)"
         ));
     }
 
@@ -368,6 +450,37 @@ fn check_sqlcipher_dependency(
         violations.push(format!(
             "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
         ));
+    }
+}
+
+fn check_search_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    const SEARCH_SPIKE: &str = "tersa-search-spike";
+    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
+    if dependency.name != "tantivy" {
+        return;
+    }
+    if package_name != SEARCH_SPIKE {
+        violations.push(format!(
+            "{package_name} -> tantivy (Tantivy is exclusive to {SEARCH_SPIKE})"
+        ));
+    }
+    if dependency
+        .target
+        .as_ref()
+        .map(ToString::to_string)
+        .as_deref()
+        != Some(APPLE_TARGET)
+    {
+        violations.push(format!(
+            "{package_name} -> tantivy must use target `{APPLE_TARGET}`"
+        ));
+    }
+    if dependency.req.to_string() != "=0.26.1" {
+        violations.push(format!("{package_name} -> tantivy must pin exactly 0.26.1"));
     }
 }
 
@@ -380,6 +493,7 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-sqlcipher-spike", BTreeSet::new()),
+        ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),

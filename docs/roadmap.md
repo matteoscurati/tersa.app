@@ -14,6 +14,16 @@ payloads, abrupt-exit recovery, wrong-key rejection, integrity checks, and an
 in-memory temporary-store policy on macOS. iOS runtime, Keychain, Data
 Protection, schema, migrations, and production key handling remain M0 work.
 
+The search diagnostic proves host-side synthetic exact-match sets for SQLCipher
+FTS5 and Tantivy 0.26.1, immutable open handles after delete/replace,
+cross-connection WORM writes with flush-visible generations, blocking and
+nonblocking locks, one writer with concurrent readers, metadata watches,
+re-entrant callback safety, chunk-local range reads, wrong-key rejection, both
+integrity checks, and a retrievable random sentinel with redacted controls.
+Host evidence is not a device-gate result. Physical-iPhone runtime and
+performance, schema/migration ownership, garbage collection, backup behavior,
+and production key handling remain M0 gates.
+
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. Real consumer and Workspace authorization, code
 exchange, Keychain persistence, revocation, and Google verification remain M0
