@@ -15,10 +15,11 @@ WebSocket listener bound to `127.0.0.1`.
 The current verdict is:
 
 - **GO for the bounded diagnostic and physical-device investigation.**
-- **NO-GO for production adoption.** The local ephemeral fork has source and
-  host diagnostics for WebKit storage and navigation only; App Sandbox listener
-  boundary, unavoidable Tokio runtime, lifecycle gaps, signing and distribution,
-  and physical-device evidence remain unresolved blockers.
+- **NO-GO for production adoption.** The local ephemeral fork has recorded host
+  diagnostics for loopback, navigation, and storage. Its sandbox capture path
+  awaits immutable exact-head evidence; unavoidable Tokio runtime, lifecycle
+  gaps, signing and distribution, and physical-device evidence remain
+  unresolved blockers.
 
 ## Stable acceptance criteria
 
@@ -34,7 +35,7 @@ The current verdict is:
 | `M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | `diagnostic` |
 | `M0-DIOXUS-009` | Navigation boundary | Locally patched Dioxus guards both WebView navigation and intercepted-anchor IPC before browser fallback | `diagnostic` |
 | `M0-DIOXUS-010` | Ephemeral WebKit storage | Locally patched Dioxus passes the diagnostic incognito opt-in to Wry's non-persistent `WKWebsiteDataStore` | `diagnostic` |
-| `M0-DIOXUS-011` | App Sandbox compatibility | Loopback transport works under minimal reviewed entitlements | `open` |
+| `M0-DIOXUS-011` | App Sandbox compatibility | Exact-head artifact must show that an ad-hoc-signed host copy uses the minimal entitlement allowlist, enforces sandbox denial, and keeps its listener loopback-only; device-signed evidence remains required | `open` |
 | `M0-DIOXUS-012` | Target notices | Locked target-specific Rust inventory bundled byte-for-byte | `diagnostic` |
 | `M0-DIOXUS-013` | Physical-device accessibility | VoiceOver, Dynamic Type, Full Keyboard Access, contrast, switch control | `open` |
 | `M0-DIOXUS-014` | Physical-device input | IME, autocorrect, dictation, selection, copy/paste, and hardware keyboard | `open` |
@@ -61,7 +62,14 @@ reject wildcard or IPv6-any listeners.
 
 This socket is not a backend and carries only synthetic UI edits in the spike.
 It is nevertheless a network server from the operating system's perspective.
-The diagnostic Mac target does not claim App Sandbox compatibility.
+The host capture path runs a copied, ad-hoc-signed macOS package with the exact
+App Sandbox, network-client, and network-server entitlement allowlist. The gate
+remains open until an immutable exact-head artifact records the stable UI,
+sandbox enforcement, and loopback-listener probes. The existing navigation and
+isolated-HOME storage diagnostics are rerun separately on the unsigned archive:
+a local exploratory sandbox run left the WebView blank after synthetic denied
+navigation, but that observation is not yet a repeatable gate result. This is
+not device-signed or production evidence and remains a production blocker.
 
 ## Local ephemeral fork boundary
 
@@ -92,9 +100,11 @@ cancellation. That behavior remains part of the device-signed navigation gate.
 ## Evidence interpretation
 
 Launch measurements in `metrics.json` cover time until the Mac window/listener
-harness or simulator launch command reports success. They include harness and
-process-spawn overhead and are not time-to-interactive or cold-versus-warm
-product comparisons. The evidence-only script activates one Dioxus
+harness or simulator launch command reports success. The Mac cold/warm values
+run the ad-hoc-signed sandboxed copy; the cold value may include first-launch
+App Sandbox container creation. They include harness and process-spawn overhead
+and are not time-to-interactive or cold-versus-warm product comparisons. The
+evidence-only script activates one Dioxus
 list-position control, performs its real DOM scroll, and injects one
 programmatic textarea input. OCR before and after those actions verifies both
 the computed range and a separate DOM query, and the derived character count
