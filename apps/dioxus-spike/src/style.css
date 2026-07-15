@@ -5,6 +5,11 @@
   font-synthesis: none;
 }
 
+body {
+  font: -apple-system-body;
+  -webkit-text-size-adjust: 100%;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -33,7 +38,10 @@ textarea:focus-visible,
 }
 
 .app-shell {
+  height: 100%;
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
   padding-top: env(safe-area-inset-top);
   padding-right: env(safe-area-inset-right);
   padding-bottom: env(safe-area-inset-bottom);
@@ -52,11 +60,14 @@ textarea:focus-visible,
 }
 
 .topbar {
-  height: 72px;
+  min-height: 72px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 24px;
   border-bottom: 1px solid #d9d5cb;
   background: rgb(250 249 245 / 86%);
 }
@@ -67,7 +78,13 @@ textarea:focus-visible,
   align-items: center;
 }
 
+.brand-lockup {
+  min-width: 0;
+  flex: 1 1 14rem;
+}
+
 .brand-lockup > div {
+  min-width: 0;
   align-items: flex-start;
   flex-direction: column;
   gap: 2px;
@@ -75,32 +92,33 @@ textarea:focus-visible,
 
 .brand-lockup strong {
   font-family: "New York", Georgia, serif;
-  font-size: 22px;
+  font-size: 1.375em;
   letter-spacing: -0.02em;
 }
 
 .brand-lockup span:not(.brand-mark) {
   color: #6e6b64;
-  font-size: 12px;
+  font-size: 0.75em;
+  overflow-wrap: anywhere;
 }
 
 .brand-mark {
-  width: 38px;
-  height: 38px;
-  margin-right: 12px;
+  width: 2.375rem;
+  height: 2.375rem;
+  margin-right: 0.75rem;
   display: grid;
   place-items: center;
-  border-radius: 12px;
+  border-radius: 0.75rem;
   color: #fff;
   background: #cf5d35;
-  font: 700 24px/1 "New York", Georgia, serif;
+  font: 700 1.5rem/1 "New York", Georgia, serif;
 }
 
 .transport-badge,
 .safe-area-status,
 .eyebrow {
   color: #755441;
-  font-size: 10px;
+  font-size: 0.625em;
   font-weight: 750;
   letter-spacing: 0.12em;
 }
@@ -123,7 +141,8 @@ textarea:focus-visible,
 }
 
 .workspace {
-  height: calc(100vh - 72px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: 190px minmax(420px, 1fr) 310px;
 }
@@ -131,10 +150,10 @@ textarea:focus-visible,
 .sidebar,
 .composer {
   padding: 24px 18px;
-  overflow: auto;
 }
 
 .sidebar {
+  overflow: auto;
   border-right: 1px solid #d9d5cb;
 }
 
@@ -181,7 +200,7 @@ textarea:focus-visible,
 
 .probe-card h2 {
   margin: 0 0 8px;
-  font-size: 13px;
+  font-size: 0.8125em;
 }
 
 .probe-card output,
@@ -189,7 +208,7 @@ textarea:focus-visible,
   display: block;
   margin: 5px 0;
   color: #67635c;
-  font-size: 11px;
+  font-size: 0.6875em;
   line-height: 1.4;
 }
 
@@ -212,7 +231,7 @@ textarea:focus-visible,
 
 .inbox-header h2 {
   margin-bottom: 0;
-  font-size: 24px;
+  font-size: 1.5em;
 }
 
 .search-field {
@@ -224,7 +243,7 @@ textarea:focus-visible,
   display: block;
   margin-bottom: 6px;
   color: #6b6860;
-  font-size: 11px;
+  font-size: 0.6875em;
   font-weight: 650;
 }
 
@@ -252,7 +271,7 @@ textarea:focus-visible,
   border-bottom: 1px solid #dedad1;
   color: #6d6961;
   background: #f8f6f1;
-  font-size: 10px;
+  font-size: 0.625em;
   font-variant-numeric: tabular-nums;
 }
 
@@ -262,7 +281,7 @@ textarea:focus-visible,
   border-radius: 7px;
   color: #6d6961;
   background: #fff;
-  font-size: 10px;
+  font-size: 0.625em;
 }
 
 .virtual-diagnostics output {
@@ -329,7 +348,7 @@ button:disabled {
 }
 
 .sender {
-  font-size: 12px;
+  font-size: 0.75em;
   font-weight: 680;
 }
 
@@ -341,13 +360,13 @@ button:disabled {
 }
 
 .message-copy strong {
-  font-size: 13px;
+  font-size: 0.8125em;
 }
 
 .message-copy span,
 .mail-row time {
   color: #77736b;
-  font-size: 11px;
+  font-size: 0.6875em;
 }
 
 .message-copy span {
@@ -361,9 +380,15 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-.composer {
+.right-rail {
+  min-width: 0;
+  overflow: auto;
   border-left: 1px solid #d9d5cb;
   background: #f2eee6;
+}
+
+.composer {
+  background: transparent;
 }
 
 .composer textarea {
@@ -377,7 +402,7 @@ button:disabled {
   display: block;
   margin-top: 8px;
   color: #77736b;
-  font-size: 11px;
+  font-size: 0.6875em;
 }
 
 .composer-actions {
@@ -390,7 +415,7 @@ button:disabled {
 .composer-actions button {
   padding: 9px 12px;
   border-radius: 9px;
-  font-size: 12px;
+  font-size: 0.75em;
   font-weight: 700;
 }
 
@@ -417,7 +442,7 @@ button:disabled {
   justify-content: space-between;
   gap: 10px;
   margin: 8px 0;
-  font-size: 10px;
+  font-size: 0.625em;
 }
 
 .runtime-facts dt {
@@ -429,6 +454,38 @@ button:disabled {
   text-align: right;
 }
 
+.device-evidence-card {
+  margin: 24px 18px 0;
+  padding: 14px;
+  border: 2px solid #9d492e;
+  border-radius: 12px;
+  background: #fff8f2;
+}
+
+.device-evidence-card h2,
+.device-evidence-card .runtime-facts {
+  margin-top: 8px;
+}
+
+.device-evidence-card p {
+  line-height: 1.45;
+}
+
+.device-evidence-card dd {
+  max-width: 16ch;
+  overflow-wrap: anywhere;
+}
+
+.evidence-action {
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid #8d3e26;
+  border-radius: 9px;
+  color: #fff;
+  background: #a84224;
+  font-weight: 700;
+}
+
 @media (max-width: 860px) {
   html,
   body,
@@ -437,15 +494,20 @@ button:disabled {
   }
 
   .topbar {
-    height: 64px;
-    padding: 0 16px;
+    min-height: 64px;
+    padding: 10px 16px;
   }
 
   .transport-badge {
     display: none;
   }
 
+  .brand-mark {
+    display: none;
+  }
+
   .workspace {
+    flex: 0 0 auto;
     height: auto;
     grid-template-columns: 1fr;
   }
@@ -455,9 +517,7 @@ button:disabled {
   }
 
   .inbox-panel {
-    height: calc(
-      100svh - 64px - env(safe-area-inset-top) - env(safe-area-inset-bottom)
-    );
+    height: 100svh;
     min-height: 0;
   }
 
@@ -465,10 +525,14 @@ button:disabled {
     min-height: 0;
   }
 
-  .composer {
+  .right-rail {
     display: block;
     border-top: 1px solid #d9d5cb;
     border-left: 0;
+  }
+
+  .composer {
+    display: block;
   }
 
   .inbox-header {

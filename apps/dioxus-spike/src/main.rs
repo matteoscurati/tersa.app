@@ -22,6 +22,14 @@ mod apple {
     const OVERSCAN_ROWS: usize = 6;
     const MAX_RENDERED_ROWS: usize = 100;
     const STYLE: &str = include_str!("style.css");
+    const DEVICE_EVIDENCE_ARGUMENT: &str = "--tersa-device-evidence";
+    const BUILD_COMMIT_MARKER_PREFIX: &[u8] = b"TERSA-DIOXUS-BUILD-COMMIT:";
+    const BUILD_COMMIT_MARKER_LEN: usize = BUILD_COMMIT_MARKER_PREFIX.len() + 42;
+    const BUILD_COMMIT: &str = match option_env!("TERSA_EVIDENCE_COMMIT") {
+        Some(commit) => commit,
+        None => "UNCONFIGURED",
+    };
+    static BUILD_COMMIT_MARKER: [u8; BUILD_COMMIT_MARKER_LEN] = build_commit_marker(BUILD_COMMIT);
     const INDEX: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -276,7 +284,11 @@ mod apple {
         if let Err(message) = sandbox_probe_from_env(
             std::env::var_os("TERSA_DIOXUS_EVIDENCE").as_deref(),
             std::env::var_os("TERSA_DIOXUS_SANDBOX_PROBE").as_deref(),
-        ) {
+        )
+        .and_then(|probe| {
+            validate_device_evidence_configuration(std::env::args_os().skip(1), BUILD_COMMIT)?;
+            Ok(probe)
+        }) {
             eprintln!("TERSA-DIOXUS-CONFIG-ERROR {message}");
             #[expect(
                 clippy::exit,
@@ -284,6 +296,7 @@ mod apple {
             )]
             std::process::exit(2);
         }
+        std::hint::black_box(&BUILD_COMMIT_MARKER);
         let config = platform_config();
         dioxus_desktop::launch::launch(app, Vec::new(), vec![Box::new(config)]);
     }
@@ -323,6 +336,45 @@ mod apple {
         config
     }
 
+    fn device_evidence_requested(arguments: impl Iterator<Item = std::ffi::OsString>) -> bool {
+        arguments
+            .filter_map(|argument| argument.into_string().ok())
+            .any(|argument| argument == DEVICE_EVIDENCE_ARGUMENT)
+    }
+
+    fn is_exact_commit(value: &str) -> bool {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    const fn build_commit_marker(commit: &str) -> [u8; BUILD_COMMIT_MARKER_LEN] {
+        let mut marker = [0; BUILD_COMMIT_MARKER_LEN];
+        let mut index = 0;
+        while index < BUILD_COMMIT_MARKER_PREFIX.len() {
+            marker[index + 1] = BUILD_COMMIT_MARKER_PREFIX[index];
+            index += 1;
+        }
+        let commit = commit.as_bytes();
+        let mut commit_index = 0;
+        while commit_index < commit.len() && commit_index < 40 {
+            marker[index + commit_index + 1] = commit[commit_index];
+            commit_index += 1;
+        }
+        marker
+    }
+
+    fn validate_device_evidence_configuration(
+        arguments: impl Iterator<Item = std::ffi::OsString>,
+        commit: &str,
+    ) -> Result<(), &'static str> {
+        if device_evidence_requested(arguments) && !is_exact_commit(commit) {
+            return Err("device evidence requires an exact build commit");
+        }
+        Ok(())
+    }
+
     #[component]
     fn app() -> Element {
         let mut scroll_top = use_signal(|| 0.0_f64);
@@ -331,6 +383,8 @@ mod apple {
         let mut focus_events = use_signal(|| 0_u32);
         let mut safe_area_top = use_signal(|| -1_i32);
         let mut viewport_height = use_signal(|| ROW_HEIGHT_PX * 9.0);
+        let mut device_reviewed = use_signal(|| false);
+        let device_evidence = device_evidence_requested(std::env::args_os().skip(1));
         let sandbox_probe = sandbox_probe_from_env(
             std::env::var_os("TERSA_DIOXUS_EVIDENCE").as_deref(),
             std::env::var_os("TERSA_DIOXUS_SANDBOX_PROBE").as_deref(),
@@ -372,6 +426,7 @@ mod apple {
         } else {
             format!("SAFE TOP {} PX", safe_area_top())
         };
+        let device_reviewed_state = if device_reviewed() { "true" } else { "false" };
 
         rsx! {
             main {
@@ -413,7 +468,7 @@ mod apple {
                 }
                 div { class: "workspace",
                     nav { class: "sidebar", aria_label: "Diagnostic mailbox navigation",
-                        p { class: "eyebrow", "M0 FALLBACK CANDIDATE" }
+                        p { class: "eyebrow", aria_hidden: "true", "M0 FALLBACK CANDIDATE" }
                         h1 { "Inbox" }
                         ul {
                             li { button { class: "nav-item selected", aria_current: "page", disabled: true, "Inbox", span { "10k" } } }
@@ -431,7 +486,7 @@ mod apple {
                     section { class: "inbox-panel", aria_labelledby: "inbox-title",
                         div { class: "inbox-header",
                             div {
-                                p { class: "eyebrow", "TERSA-DIOXUS-M0-THREAD" }
+                                p { class: "eyebrow", aria_hidden: "true", "TERSA-DIOXUS-M0-THREAD" }
                                 h2 { id: "inbox-title", "INBOX / 10,000 ROWS" }
                             }
                             label { class: "search-field",
@@ -503,34 +558,69 @@ mod apple {
                             }
                         }
                     }
-                    aside { class: "composer", aria_labelledby: "composer-title",
-                        p { class: "eyebrow", "INPUT AND IME PROBE" }
-                        h2 { id: "composer-title", "Draft reply" }
-                        label {
-                            span { "Message" }
-                            textarea {
-                                rows: "10",
-                                placeholder: "Type, dictate, select, and edit here…",
-                                autocapitalize: "sentences",
-                                autocomplete: "on",
-                                spellcheck: "true",
-                                "data-evidence": "composer",
-                                value: "{draft}",
-                                oninput: move |event| draft.set(event.value())
+                    div { class: "right-rail",
+                        if device_evidence {
+                            section {
+                                class: "device-evidence-card",
+                                aria_labelledby: "device-evidence-title",
+                                p { class: "eyebrow", aria_hidden: "true", "PHYSICAL DEVICE OBSERVATION" }
+                                h2 { id: "device-evidence-title", "Input and accessibility harness" }
+                                p {
+                                    "Synthetic data only. Follow the exact commit-bound script; this screen does not determine a gate result."
+                                }
+                                dl { class: "runtime-facts",
+                                    div { dt { "Commit" } dd { "{BUILD_COMMIT}" } }
+                                    div { dt { "Candidate" } dd { "Dioxus diagnostic" } }
+                                }
+                                button {
+                                    class: "evidence-action",
+                                    r#type: "button",
+                                    aria_pressed: "{device_reviewed_state}",
+                                    onclick: move |_| device_reviewed.toggle(),
+                                    if device_reviewed() {
+                                        "Synthetic review marked"
+                                    } else {
+                                        "Mark synthetic review"
+                                    }
+                                }
+                                output { class: "draft-status", role: "status", aria_live: "polite",
+                                    if device_reviewed() {
+                                        "Review marker active"
+                                    } else {
+                                        "Review marker inactive"
+                                    }
+                                }
                             }
                         }
-                        output { class: "draft-status", aria_live: "polite",
-                            "{draft().chars().count()} characters — not explicitly saved"
-                        }
-                        div { class: "composer-actions",
-                            button { class: "secondary", disabled: true, "Discard" }
-                            button { class: "primary", disabled: true, "Save synthetic draft" }
-                        }
-                        dl { class: "runtime-facts",
-                            div { dt { "Runtime" } dd { "Dioxus 0.7.9 / WKWebView" } }
-                            div { dt { "Transport" } dd { "Authenticated loopback only" } }
-                            div { dt { "Lifecycle" } dd { "Tao log markers" } }
-                            div { dt { "Protocol" } dd { "presentation v{protocol_version}" } }
+                        aside { class: "composer", aria_labelledby: "composer-title",
+                            p { class: "eyebrow", aria_hidden: "true", "INPUT AND IME PROBE" }
+                            h2 { id: "composer-title", "Draft reply" }
+                            label {
+                                span { "Message" }
+                                textarea {
+                                    rows: "10",
+                                    placeholder: "Type, dictate, select, and edit here…",
+                                    autocapitalize: "sentences",
+                                    autocomplete: "on",
+                                    spellcheck: "true",
+                                    "data-evidence": "composer",
+                                    value: "{draft}",
+                                    oninput: move |event| draft.set(event.value())
+                                }
+                            }
+                            output { class: "draft-status", aria_live: "polite",
+                                "{draft().chars().count()} characters — not explicitly saved"
+                            }
+                            div { class: "composer-actions",
+                                button { class: "secondary", disabled: true, "Discard" }
+                                button { class: "primary", disabled: true, "Save synthetic draft" }
+                            }
+                            dl { class: "runtime-facts",
+                                div { dt { "Runtime" } dd { "Dioxus 0.7.9 / WKWebView" } }
+                                div { dt { "Transport" } dd { "Authenticated loopback only" } }
+                                div { dt { "Lifecycle" } dd { "Tao log markers" } }
+                                div { dt { "Protocol" } dd { "presentation v{protocol_version}" } }
+                            }
                         }
                     }
                 }
@@ -591,8 +681,9 @@ mod apple {
     #[cfg(test)]
     mod tests {
         use super::{
-            MAX_RENDERED_ROWS, OVERSCAN_ROWS, ROW_HEIGHT_PX, SandboxProbe, sandbox_probe_from_env,
-            visible_row_count,
+            BUILD_COMMIT_MARKER_PREFIX, MAX_RENDERED_ROWS, OVERSCAN_ROWS, ROW_HEIGHT_PX,
+            SandboxProbe, build_commit_marker, device_evidence_requested, is_exact_commit,
+            sandbox_probe_from_env, validate_device_evidence_configuration, visible_row_count,
         };
 
         #[test]
@@ -637,6 +728,44 @@ mod apple {
                 sandbox_probe_from_env(Some("1".as_ref()), Some("ANCHOR".as_ref())),
                 Err("TERSA_DIOXUS_SANDBOX_PROBE must be anchor, ipc, or location")
             );
+        }
+
+        #[test]
+        fn device_evidence_requires_the_exact_argument_and_commit_shape() {
+            assert!(device_evidence_requested(
+                ["--tersa-device-evidence".into()].into_iter()
+            ));
+            assert!(!device_evidence_requested(
+                ["--tersa-device-evidence=true".into()].into_iter()
+            ));
+            assert!(is_exact_commit("0123456789abcdef0123456789abcdef01234567"));
+            assert!(!is_exact_commit("0123456789ABCDEF0123456789ABCDEF01234567"));
+            assert!(!is_exact_commit("UNCONFIGURED"));
+            assert_eq!(
+                validate_device_evidence_configuration(
+                    ["--tersa-device-evidence".into()].into_iter(),
+                    "UNCONFIGURED",
+                ),
+                Err("device evidence requires an exact build commit")
+            );
+            assert!(
+                validate_device_evidence_configuration(
+                    ["--tersa-device-evidence".into()].into_iter(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                )
+                .is_ok()
+            );
+            let marker = build_commit_marker("0123456789abcdef0123456789abcdef01234567");
+            assert_eq!(
+                &marker[1..=BUILD_COMMIT_MARKER_PREFIX.len()],
+                BUILD_COMMIT_MARKER_PREFIX
+            );
+            assert_eq!(
+                &marker[BUILD_COMMIT_MARKER_PREFIX.len() + 1..marker.len() - 1],
+                b"0123456789abcdef0123456789abcdef01234567"
+            );
+            assert_eq!(marker.first(), Some(&0));
+            assert_eq!(marker.last(), Some(&0));
         }
     }
 }

@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -245,6 +246,8 @@ def validate_review_metadata(
 def table_statuses(path: Path, errors: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.lstrip().startswith("|"):
+            continue
         matches = re.findall(r"`(M0-(?:SLINT|DIOXUS)-\d{3}|open|diagnostic|blocked|failed|passed)`", line)
         if not matches:
             continue
@@ -462,6 +465,25 @@ def self_test(data: Any) -> list[str]:
         "reviewed_at": reviewed_at,
         "expires_at": expires_at,
     }
+    with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+        prose_fixture = Path(temporary) / "ui-prose-reference.md"
+        prose_fixture.write_text(
+            "The `M0-DIOXUS-013` criterion remains `open` in prose.\n"
+            "| `M0-DIOXUS-013` | Physical-device accessibility | `open` |\n",
+            encoding="utf-8",
+        )
+        prose_errors: list[str] = []
+        prose_statuses = table_statuses(prose_fixture, prose_errors)
+        if prose_errors or prose_statuses != {"M0-DIOXUS-013": "open"}:
+            failures.append("backticked prose reference was parsed as a Markdown table row")
+        prose_fixture.write_text(
+            "| `M0-DIOXUS-013` | Missing status |\n",
+            encoding="utf-8",
+        )
+        malformed_errors: list[str] = []
+        table_statuses(prose_fixture, malformed_errors)
+        if not any("malformed registered UI table row" in message for message in malformed_errors):
+            failures.append("negative malformed Markdown register row unexpectedly passed")
     mutated = copy.deepcopy(data)
     simulator_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
     simulator_gate["status"] = "diagnostic"
