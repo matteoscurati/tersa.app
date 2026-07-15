@@ -37,6 +37,11 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         case rawControl
     }
 
+    private struct NavigationWaiter {
+        let identifier: UUID
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private static let rawControlTemplate = """
     <!doctype html><html><head><meta charset=\"utf-8\"><title>RAW_CONTROL</title><meta http-equiv=\"refresh\" content=\"0;url=__CANARY__/navigation\"><link rel=\"stylesheet\" href=\"__CANARY__/style.css\"><script src=\"__CANARY__/script.js\"></script></head><body onload=\"document.title='JAVASCRIPT_EXECUTED';fetch('__CANARY__/inline-js');window.open('__CANARY__/new-window');location='__CANARY__/inline-navigation'\"><img src=\"__CANARY__/image.png\"><form action=\"__CANARY__/form\" method=\"post\" target=\"_blank\"><button type=\"submit\">Submit</button></form><script>document.forms[0].submit();</script></body></html>
     """
@@ -48,6 +53,7 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
     private var initialNavigationPending = false
     private var initialNavigationWasAllowed = false
     private var initialNavigationResponsePending = false
+    private var navigationWaiter: NavigationWaiter?
     private var sanitizedDocumentLoaded = false
     private var rawControlLoaded = false
     private var rawControlHash = ""
@@ -160,11 +166,13 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         case nil:
             failureCount += 1
         }
+        finishNavigationWaiter()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         failureCount += 1
         failureCode = (error as NSError).code
+        finishNavigationWaiter()
     }
 
     func webView(
@@ -174,11 +182,13 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
     ) {
         failureCount += 1
         failureCode = (error as NSError).code
+        finishNavigationWaiter()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         failureCount += 1
         failureCode = -1
+        finishNavigationWaiter()
     }
 
     private func makeConfiguration() async throws -> WKWebViewConfiguration {
@@ -217,8 +227,32 @@ final class MimeHostileContentPolicy: NSObject, WKNavigationDelegate, WKUIDelega
         currentCase = kind
         initialNavigationPending = true
         initialNavigationResponsePending = false
-        webView.loadHTMLString(document, baseURL: baseURL)
-        try? await Task.sleep(for: .seconds(1))
+        let identifier = UUID()
+        await withCheckedContinuation { continuation in
+            navigationWaiter = NavigationWaiter(
+                identifier: identifier,
+                continuation: continuation
+            )
+            webView.loadHTMLString(document, baseURL: baseURL)
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(10))
+                guard navigationWaiter?.identifier == identifier else {
+                    return
+                }
+                failureCount += 1
+                failureCode = -2
+                webView.stopLoading()
+                finishNavigationWaiter()
+            }
+        }
+    }
+
+    private func finishNavigationWaiter() {
+        guard let waiter = navigationWaiter else {
+            return
+        }
+        navigationWaiter = nil
+        waiter.continuation.resume()
     }
 
     private func loadSanitizedDocument() -> String? {
