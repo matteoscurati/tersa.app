@@ -7,6 +7,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+mod migrations;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple {
     use std::env;
     use std::error::Error;
@@ -20,6 +23,11 @@ mod apple {
     use rusqlite::{Connection, Error as SqlError, ErrorCode, OpenFlags, params};
     use zeroize::{Zeroize, Zeroizing};
 
+    use crate::migrations::{
+        DatabaseKind, apply_migration_body, migrate_connection, schema_snapshot,
+        validate_database_state, verify_database_health,
+    };
+
     const ROW_COUNT: i64 = 3;
     const SENTINEL_LENGTH: usize = 80;
     const CIPHER_VERSION: &str = "4.10.0 community";
@@ -31,10 +39,10 @@ mod apple {
 
     /// Runs the parent or child half of the storage evidence protocol.
     pub fn run() -> DiagnosticResult {
-        if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("child")) {
-            child()
-        } else {
-            parent()
+        match env::args_os().nth(1).as_deref() {
+            Some(mode) if mode == std::ffi::OsStr::new("child") => child(),
+            Some(mode) if mode == std::ffi::OsStr::new("migration-child") => migration_child(),
+            _ => parent(),
         }
     }
 
@@ -58,6 +66,17 @@ mod apple {
 
         reopen_and_verify(&workspace, &key, &sentinel, &temp_sentinel).map_err(|_error| "P13")?;
         plaintext_positive_control(&workspace).map_err(|_error| "P14")?;
+        prove_migration_contract(&workspace, &key).map_err(|_error| "P15")?;
+        assert_absent(
+            &workspace.controlled_files().map_err(|_error| "P16")?,
+            &sentinel,
+        )
+        .map_err(|_error| "P17")?;
+        assert_absent(
+            &workspace.controlled_files().map_err(|_error| "P18")?,
+            &temp_sentinel,
+        )
+        .map_err(|_error| "P19")?;
         println!("{PASS_LINE}");
         println!("SQLCipher provider commoncrypto");
         println!("SQLCipher version {CIPHER_VERSION}");
@@ -92,6 +111,249 @@ mod apple {
         loop {
             std::thread::park();
         }
+    }
+
+    fn prove_migration_contract(workspace: &EvidenceWorkspace, key: &[u8]) -> Result {
+        for kind in [DatabaseKind::Global, DatabaseKind::Account] {
+            prove_upgrade_paths(workspace, key, kind)?;
+            prove_rejections(workspace, key, kind)?;
+            prove_uncommitted_migration_recovery(workspace, key, kind)?;
+        }
+        Ok(())
+    }
+
+    fn prove_upgrade_paths(
+        workspace: &EvidenceWorkspace,
+        key: &[u8],
+        kind: DatabaseKind,
+    ) -> Result {
+        let fresh_path = workspace.migration_database(kind, "fresh");
+        let (fresh, fresh_applied) = open_schema_database(&fresh_path, key, kind, kind.latest())?;
+        if fresh_applied != kind.latest() {
+            return Err("fresh database did not apply every compiled migration".into());
+        }
+        verify_database_health(&fresh)?;
+        let fresh_snapshot = schema_snapshot(&fresh)?;
+        drop(fresh);
+
+        let incremental_path = workspace.migration_database(kind, "incremental");
+        let (version_one, applied) = open_schema_database(&incremental_path, key, kind, 1)?;
+        if applied != 1 {
+            return Err("version-one bootstrap applied an unexpected migration count".into());
+        }
+        verify_database_health(&version_one)?;
+        drop(version_one);
+        let (incremental, applied) =
+            open_schema_database(&incremental_path, key, kind, kind.latest())?;
+        if applied != 1 {
+            return Err("incremental upgrade applied an unexpected migration count".into());
+        }
+        verify_database_health(&incremental)?;
+        let incremental_snapshot = schema_snapshot(&incremental)?;
+        if incremental_snapshot != fresh_snapshot {
+            return Err("fresh and incremental schemas differ".into());
+        }
+        drop(incremental);
+
+        let (reopened, applied) =
+            open_schema_database(&incremental_path, key, kind, kind.latest())?;
+        if applied != 0 || schema_snapshot(&reopened)? != incremental_snapshot {
+            return Err("latest-version reopen changed migration state".into());
+        }
+        verify_database_health(&reopened)?;
+        Ok(())
+    }
+
+    fn prove_rejections(workspace: &EvidenceWorkspace, key: &[u8], kind: DatabaseKind) -> Result {
+        let invalid_fresh = workspace.migration_database(kind, "invalid-fresh");
+        let connection = open_encrypted(&invalid_fresh, key)?;
+        configure(&connection)?;
+        connection.pragma_update(None, "user_version", 1_i64)?;
+        drop(connection);
+        expect_schema_open_rejected(&invalid_fresh, key, kind)?;
+
+        let occupied_unowned = workspace.migration_database(kind, "occupied-unowned");
+        let (connection, _) = open_schema_database(&occupied_unowned, key, kind, 1)?;
+        connection.pragma_update(None, "application_id", 0_i64)?;
+        connection.pragma_update(None, "user_version", 0_i64)?;
+        drop(connection);
+        expect_schema_open_rejected(&occupied_unowned, key, kind)?;
+
+        let unknown_owner = workspace.migration_database(kind, "unknown-owner");
+        let (connection, _) = open_schema_database(&unknown_owner, key, kind, 1)?;
+        connection.pragma_update(None, "application_id", kind.application_id() + 1)?;
+        drop(connection);
+        expect_schema_open_rejected(&unknown_owner, key, kind)?;
+
+        let wrong_kind = workspace.migration_database(kind, "wrong-kind");
+        let (connection, _) = open_schema_database(&wrong_kind, key, kind, 1)?;
+        drop(connection);
+        expect_schema_open_rejected(&wrong_kind, key, kind.other())?;
+
+        let future = workspace.migration_database(kind, "future-version");
+        let (connection, _) = open_schema_database(&future, key, kind, kind.latest())?;
+        connection.pragma_update(None, "user_version", kind.latest() + 1)?;
+        drop(connection);
+        expect_schema_open_rejected(&future, key, kind)?;
+
+        let downgrade = workspace.migration_database(kind, "downgrade");
+        let (connection, _) = open_schema_database(&downgrade, key, kind, kind.latest())?;
+        drop(connection);
+        if open_schema_database(&downgrade, key, kind, 1).is_ok() {
+            return Err("database downgrade was accepted".into());
+        }
+
+        let inconsistent = workspace.migration_database(kind, "inconsistent-schema");
+        let (connection, _) = open_schema_database(&inconsistent, key, kind, kind.latest())?;
+        connection.pragma_update(None, "user_version", 1_i64)?;
+        drop(connection);
+        expect_schema_open_rejected(&inconsistent, key, kind)
+    }
+
+    fn expect_schema_open_rejected(database: &Path, key: &[u8], kind: DatabaseKind) -> Result {
+        match open_schema_database(database, key, kind, kind.latest()) {
+            Ok(_) => Err("invalid database ownership or schema was accepted".into()),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn prove_uncommitted_migration_recovery(
+        workspace: &EvidenceWorkspace,
+        key: &[u8],
+        kind: DatabaseKind,
+    ) -> Result {
+        let database = workspace.migration_database(kind, "crash");
+        let (baseline, applied) = open_schema_database(&database, key, kind, 1)?;
+        if applied != 1 {
+            return Err("crash baseline did not stop at canonical version one".into());
+        }
+        verify_database_health(&baseline)?;
+        baseline.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        drop(baseline);
+        if wal_is_non_empty(&database)? {
+            return Err("crash baseline retained WAL frames after truncation".into());
+        }
+
+        let mut child = ChildGuard::new(spawn_migration_child(workspace, &database, key, kind)?);
+        wait_for_migration_ready(&mut child, workspace, &database, kind)?;
+        let status = child.kill_and_wait()?;
+        if status.signal() != Some(9) {
+            return Err("migration child did not terminate with signal 9".into());
+        }
+
+        let recovered = open_encrypted(&database, key)?;
+        configure(&recovered)?;
+        validate_database_state(&recovered, kind, 1)?;
+        verify_database_health(&recovered)?;
+        drop(recovered);
+
+        let (upgraded, applied) = open_schema_database(&database, key, kind, kind.latest())?;
+        if applied != 1 {
+            return Err("post-crash upgrade did not apply exactly migration two".into());
+        }
+        validate_database_state(&upgraded, kind, kind.latest())?;
+        verify_database_health(&upgraded)?;
+        Ok(())
+    }
+
+    fn migration_child() -> DiagnosticResult {
+        let kind = env::args_os()
+            .nth(2)
+            .as_deref()
+            .and_then(DatabaseKind::from_os_str)
+            .ok_or("M01")?;
+        let database =
+            PathBuf::from(env::var_os("TERSA_SQLCIPHER_MIGRATION_DATABASE").ok_or("M02")?);
+        let ready = PathBuf::from(env::var_os("TERSA_SQLCIPHER_MIGRATION_READY").ok_or("M03")?);
+        let mut key = receive_key().map_err(|_error| "M04")?;
+        let mut connection = open_encrypted(&database, &key).map_err(|_error| "M05")?;
+        key.zeroize();
+        configure(&connection).map_err(|_error| "M06")?;
+        verify_cipher(&connection).map_err(|_error| "M07")?;
+        validate_database_state(&connection, kind, 1).map_err(|_error| "M08")?;
+        let transaction = connection.transaction().map_err(|_error| "M09")?;
+        apply_migration_body(&transaction, kind, &kind.migrations()[1]).map_err(|_error| "M10")?;
+        transaction.cache_flush().map_err(|_error| "M11")?;
+        let marker = File::create(ready).map_err(|_error| "M12")?;
+        marker.sync_all().map_err(|_error| "M13")?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn spawn_migration_child(
+        workspace: &EvidenceWorkspace,
+        database: &Path,
+        key: &[u8],
+        kind: DatabaseKind,
+    ) -> Result<Child> {
+        let executable = env::current_exe()?;
+        let mut child = Command::new(executable)
+            .arg("migration-child")
+            .arg(kind.name())
+            .env("TERSA_SQLCIPHER_EVIDENCE_DIR", workspace.root())
+            .env("TERSA_SQLCIPHER_MIGRATION_DATABASE", database)
+            .env(
+                "TERSA_SQLCIPHER_MIGRATION_READY",
+                workspace.migration_ready(kind),
+            )
+            .env("SQLITE_TMPDIR", workspace.temp())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or("migration child stdin unavailable")?
+            .write_all(key)?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or("migration child stdin unavailable")?
+            .flush()?;
+        drop(child.stdin.take());
+        Ok(child)
+    }
+
+    fn wait_for_migration_ready(
+        child: &mut ChildGuard,
+        workspace: &EvidenceWorkspace,
+        database: &Path,
+        kind: DatabaseKind,
+    ) -> Result {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Some(status) = child.child_mut().try_wait()? {
+                child.mark_reaped();
+                return Err(
+                    format!("migration child exited before crash checkpoint: {status}").into(),
+                );
+            }
+            if workspace.migration_ready(kind).is_file() && wal_is_non_empty(database)? {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err("migration child did not expose an uncommitted WAL before timeout".into())
+    }
+
+    fn receive_key() -> Result<Zeroizing<Vec<u8>>> {
+        let mut key = Zeroizing::new(vec![0_u8; 32]);
+        std::io::stdin().lock().read_exact(&mut key)?;
+        Ok(key)
+    }
+
+    fn open_schema_database(
+        database: &Path,
+        key: &[u8],
+        kind: DatabaseKind,
+        target_version: i64,
+    ) -> Result<(Connection, i64)> {
+        let connection = open_encrypted(database, key)?;
+        configure(&connection)?;
+        verify_cipher(&connection)?;
+        migrate_connection(connection, kind, target_version)
     }
 
     fn insert_records(connection: &Connection, sentinel: &str) -> Result {
@@ -195,7 +457,8 @@ mod apple {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL; \
              PRAGMA secure_delete = ON; \
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY; \
+             PRAGMA foreign_keys = ON;",
         )?;
         Ok(())
     }
@@ -228,6 +491,11 @@ mod apple {
         let temp_store: i64 = connection.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
         if temp_store != 2 {
             return Err("SQLCipher in-memory temporary-store pragma is not enabled".into());
+        }
+        let foreign_keys: i64 =
+            connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if foreign_keys != 1 {
+            return Err("SQLite foreign-key enforcement is not enabled".into());
         }
         Ok(())
     }
@@ -442,6 +710,16 @@ mod apple {
 
         fn ready(&self) -> PathBuf {
             self.root.join("ready")
+        }
+
+        fn migration_database(&self, kind: DatabaseKind, scenario: &str) -> PathBuf {
+            self.root
+                .join("encrypted")
+                .join(format!("migration-{}-{scenario}.sqlite", kind.name()))
+        }
+
+        fn migration_ready(&self, kind: DatabaseKind) -> PathBuf {
+            self.root.join(format!("migration-{}-ready", kind.name()))
         }
 
         fn controlled_files(&self) -> Result<Vec<PathBuf>> {
