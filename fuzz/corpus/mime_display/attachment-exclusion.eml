@@ -1,0 +1,12 @@
+333333Content-Type: multipart/mixed; boundary=mixed
+
+--mixed
+Content-Type: text/html
+Content-Disposition: attachment; filename=hostile.html
+
+<script>attachment</script>
+--mixed
+Content-Type: text/plain
+
+visible
+--mixed--

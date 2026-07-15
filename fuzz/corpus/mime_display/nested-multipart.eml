@@ -1,0 +1,15 @@
+333333Content-Type: multipart/mixed; boundary=outer
+
+--outer
+Content-Type: multipart/alternative; boundary=inner
+
+--inner
+Content-Type: text/plain
+
+nested plain
+--inner
+Content-Type: text/html
+
+<p>nested html</p>
+--inner--
+--outer--

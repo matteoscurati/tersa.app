@@ -51,9 +51,15 @@ preserves CID references only as inert metadata. A separate native macOS probe
 loads Rust-sanitized and raw hostile controls in a nonpersistent WKWebView with
 JavaScript disabled, block-all network rules, navigation denial, no server
 entitlement, an in-app transport-control loopback canary, and website-data
-residue checks. iOS device and simulator artifacts are compile evidence only. The
-synthetic corpus and macOS host run do not close parser fuzzing, WebKit device,
-physical-iPhone, accessibility, or production renderer gates.
+residue checks. iOS device and simulator artifacts are compile evidence only.
+The synthetic corpus is now supplemented by a deterministic finite host fuzz
+regression: every seed is replayed before a fixed-seed budget of 10,000 total
+libFuzzer target executions, including corpus initialization, and each input
+must produce the same typed result twice while respecting output and CID
+invariants. This does not establish exhaustive parser safety, sustained fuzz
+coverage, memory-pressure behavior, WebKit device behavior, physical-iPhone
+containment, accessibility, or a production renderer. `M0-MIME-001` therefore
+remains open at its device-signed evidence requirement.
 
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. Real consumer and Workspace authorization, code

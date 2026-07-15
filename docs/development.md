@@ -172,6 +172,34 @@ IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
   --package tersa-mime-spike --target aarch64-apple-ios-sim
 ```
 
+The deterministic host fuzz regression is a standalone Cargo project with its
+own lockfile. It pins nightly `2026-07-14`, `cargo-fuzz` 0.13.2, and
+`libfuzzer-sys` 0.4.13. Install the exact toolchain and driver, then run its
+finite verifier:
+
+```sh
+rustup toolchain install nightly-2026-07-14 --profile minimal \
+  --component clippy --component rust-src --component rustfmt
+cargo install cargo-fuzz --version 0.13.2 --locked
+sh scripts/verify-mime-fuzz.sh
+cargo deny --locked --manifest-path fuzz/Cargo.toml \
+  --config fuzz/deny.toml check
+cargo audit --file fuzz/Cargo.lock --deny warnings
+```
+
+The verifier first replays every committed seed, then requests 10,000 total
+libFuzzer target executions, including corpus initialization, in one process
+with a fixed seed, a 512 KiB maximum input, and fixed per-input timeout and RSS
+limits. Each input runs the public parser twice and checks typed-result
+equality, conservative HTML expansion, and deterministic CID placeholder
+invariants. Its aggregate evidence is written below the ignored `fuzz/target`
+directory and contains no input, content, or path.
+
+The fuzz project is excluded from the root workspace and application notice
+generation. Its isolated supply-chain policy permits NCSA only because
+`libfuzzer-sys` requires it; neither dependency nor that license enters a
+shipping application graph.
+
 After generating the Apple project and creating the `TersaMimeMac` archive,
 run:
 
@@ -262,9 +290,10 @@ ignored with all local Apple build products.
 
 The Rust bridge, both UI spikes, and the MIME diagnostic are root workspace
 members and are therefore covered by `cargo xtask verify` and the repository
-supply-chain checks. Only the Apple application targets disable Xcode
-user-script sandboxing: Cargo and rustup must read the compiler sysroot outside
-`SRCROOT`, while locked build
+supply-chain checks. The standalone fuzz project is deliberately excluded and
+checked through its own locked verifier and deny policy. Only the Apple
+application targets disable Xcode user-script sandboxing: Cargo and rustup must
+read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`
 directory.
 The base macOS target declares both sandbox network client and server
