@@ -16,6 +16,7 @@ dioxus_config="${workspace_dir}/about-dioxus.toml"
 bridge_config="${workspace_dir}/about-bridge.toml"
 sqlcipher_config="${workspace_dir}/about-sqlcipher.toml"
 search_config="${workspace_dir}/about-search.toml"
+mime_config="${workspace_dir}/about-mime.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
 sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
@@ -96,6 +97,12 @@ generate_notice THIRD_PARTY_NOTICES-search-macos.txt "macOS arm64 search diagnos
 generate_notice THIRD_PARTY_NOTICES-search-ios.txt "iOS arm64 search diagnostic targets" \
   apps/search-spike/Cargo.toml "$sqlcipher_supplemental" "$search_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
+generate_notice THIRD_PARTY_NOTICES-mime-macos.txt "macOS arm64 MIME diagnostic" \
+  apps/mime-spike/Cargo.toml - "$mime_config" \
+  --target aarch64-apple-darwin
+generate_notice THIRD_PARTY_NOTICES-mime-ios.txt "iOS arm64 MIME diagnostic targets" \
+  apps/mime-spike/Cargo.toml - "$mime_config" \
+  --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
 if [ "$mode" = "--check" ]; then
   cmp "${output_dir}/THIRD_PARTY_NOTICES-macos.txt" \
@@ -118,4 +125,8 @@ if [ "$mode" = "--check" ]; then
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-search-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-search-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-search-ios.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-macos.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-macos.txt"
+  cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-ios.txt" \
+    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-ios.txt"
 fi

@@ -3,7 +3,7 @@
 tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
-The initial workspace has four shared architectural layers plus five platform
+The initial workspace has four shared architectural layers plus six platform
 and feasibility adapters:
 
 | Crate | Responsibility | Allowed workspace dependencies |
@@ -17,6 +17,7 @@ and feasibility adapters:
 | `tersa-dioxus-spike` | Apple-only diagnostic Dioxus executable | `tersa-presentation` |
 | `tersa-sqlcipher-spike` | Apple-only diagnostic encrypted-storage executable | None |
 | `tersa-search-spike` | Apple-only SQLCipher FTS5 and fixed-size-chunk Tantivy diagnostic | None |
+| `tersa-mime-spike` | Portable bounded MIME and deny-by-default HTML diagnostic | None |
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -25,9 +26,11 @@ respective UI runtimes. `tersa-sqlcipher-spike` and `tersa-search-spike` are the
 only crates allowed to depend on `rusqlite` or `libsqlite3-sys`; Tantivy is
 exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 `memmap2`, `tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
-Every diagnostic runtime dependency is target-gated to Apple. New workspace
-crates must be added explicitly to the policy in `xtask`; an unknown crate
-fails CI.
+`mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
+`tersa-mime-spike`. That portable M0 spike is the only exception to the Apple
+target gate: Linux CI exercises its deterministic parser and sanitizer tests,
+while Apple CI cross-builds the same locked graph. New workspace crates must be
+added explicitly to the policy in `xtask`; an unknown crate fails CI.
 
 The Apple bridge may call application use cases directly when the operating
 system owns the transport. The M0 OAuth adapter uses this edge for the browser

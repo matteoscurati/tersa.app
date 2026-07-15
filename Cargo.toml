@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/dioxus-spike",
+    "apps/mime-spike",
     "apps/search-spike",
     "apps/sqlcipher-spike",
     "apps/slint-spike",
