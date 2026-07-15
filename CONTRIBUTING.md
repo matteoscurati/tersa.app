@@ -31,6 +31,21 @@ Signed-off-by: Your Name <your.email@example.com>
 Create it with `git commit -s`. The sign-off certifies the contribution under
 the [Developer Certificate of Origin 1.1](https://developercertificate.org/).
 
+Squash merge messages must contain a real blank line before the trailer.
+Literal backslash-n sequences such as `\n\nSigned-off-by:` are not a valid Git
+trailer. After a squash merge, verify the immutable merge commit before
+treating the main build
+as complete:
+
+```sh
+cargo xtask dco HEAD^ HEAD
+```
+
+If a transport error makes an otherwise certified published commit
+unparsable, do not rewrite shared history. Record a public signed attestation
+in the pull request and in
+[`docs/governance/dco-attestations.md`](docs/governance/dco-attestations.md).
+
 ## Verification and review
 
 Run every check relevant to the change and record the commands and results in
