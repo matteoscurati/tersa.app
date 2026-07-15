@@ -1,5 +1,5 @@
 diff --git a/src/app.rs b/src/app.rs
-index 6b13961..a33e7cd 100644
+index 6b13961..9708dc2 100644
 --- a/src/app.rs
 +++ b/src/app.rs
 @@ -1,5 +1,5 @@
@@ -31,28 +31,33 @@ index 6b13961..a33e7cd 100644
  pub(crate) struct App {
      // move the props into a cell so we can pop it out later to create the first window
      // iOS panics if we create a window before the event loop is started, so we toss them into a cell
-@@ -272,11 +274,18 @@ impl App {
+@@ -272,15 +274,16 @@ impl App {
          self.webviews.insert(id, webview);
      }
  
 -    pub fn handle_browser_open(&mut self, msg: IpcMessage) {
-+    pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId) {
-+        let Some(webview) = self.webviews.get(&id) else {
-+            return;
-+        };
-         if let Some(temp) = msg.params().as_object() {
-             if temp.contains_key("href") {
-                 if let Some(href) = temp.get("href").and_then(|v| v.as_str()) {
+-        if let Some(temp) = msg.params().as_object() {
+-            if temp.contains_key("href") {
+-                if let Some(href) = temp.get("href").and_then(|v| v.as_str()) {
 -                    if let Err(err) = webbrowser::open(href) {
-+                    if let Err(err) = open_external_if_allowed(
-+                        href,
-+                        webview.navigation_handler.as_ref(),
-+                        webbrowser::open,
-+                    ) {
-                         tracing::error!("Failed to open URL: {}", err);
-                     }
-                 }
-@@ -586,6 +595,7 @@ impl App {
+-                        tracing::error!("Failed to open URL: {}", err);
+-                    }
+-                }
+-            }
++    pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId) {
++        if let Err(err) = handle_browser_open_for_windows(
++            self.webviews
++                .iter()
++                .map(|(window_id, webview)| (window_id, webview.navigation_handler.as_ref())),
++            &id,
++            msg,
++            webbrowser::open,
++        ) {
++            tracing::error!("Failed to open URL: {}", err);
+         }
+     }
+ 
+@@ -586,6 +589,7 @@ impl App {
      /// Wire up a receiver to sigkill that lets us preserve the window state
      /// Whenever sigkill is sent, we shut down the app and save the window state
      #[cfg(debug_assertions)]
@@ -60,7 +65,7 @@ index 6b13961..a33e7cd 100644
      fn connect_preserve_window_state_handler(&self) {
          // TODO: make this work on windows
          #[cfg(unix)]
-@@ -632,6 +642,59 @@ impl App {
+@@ -632,6 +636,116 @@ impl App {
      }
  }
  
@@ -75,11 +80,45 @@ index 6b13961..a33e7cd 100644
 +    open(href)
 +}
 +
++fn handle_browser_open_for_windows<'a, K: PartialEq + 'a, E>(
++    windows: impl IntoIterator<Item = (&'a K, Option<&'a NavigationHandler>)>,
++    originating_window: &K,
++    msg: IpcMessage,
++    open: impl FnOnce(&str) -> Result<(), E>,
++) -> Result<(), E> {
++    let Some(navigation_handler) = windows
++        .into_iter()
++        .find_map(|(window_id, handler)| (window_id == originating_window).then_some(handler))
++    else {
++        return Ok(());
++    };
++
++    let params = msg.params();
++    let Some(href) = params
++        .as_object()
++        .and_then(|params| params.get("href"))
++        .and_then(|href| href.as_str())
++    else {
++        return Ok(());
++    };
++
++    open_external_if_allowed(href, navigation_handler, open)
++}
++
 +#[cfg(test)]
 +mod browser_open_tests {
-+    use super::open_external_if_allowed;
++    use super::{handle_browser_open_for_windows, open_external_if_allowed};
 +    use crate::config::NavigationHandler;
++    use crate::ipc::IpcMessage;
 +    use std::{cell::Cell, rc::Rc};
++
++    fn browser_open_message(href: &str) -> IpcMessage {
++        serde_json::from_value(serde_json::json!({
++            "method": "browser_open",
++            "params": { "href": href },
++        }))
++        .expect("browser-open test message must deserialize")
++    }
 +
 +    #[test]
 +    fn deny_policy_prevents_ipc_browser_open() {
@@ -96,24 +135,47 @@ index 6b13961..a33e7cd 100644
 +    }
 +
 +    #[test]
-+    fn independent_window_policies_preserve_no_handler_fallback() {
++    fn browser_open_uses_originating_window_policy_and_unknown_ids_fail_closed() {
 +        let deny: NavigationHandler = Rc::new(|_| false);
 +        let denied_opened = Cell::new(false);
 +        let allowed_opened = Cell::new(false);
++        let unknown_opened = Cell::new(false);
++        let windows = [(1_u8, Some(deny)), (2_u8, None)];
 +
-+        let denied = open_external_if_allowed("https://example.test", Some(&deny), |_| {
-+            denied_opened.set(true);
-+            Ok::<(), ()>(())
-+        });
-+        let allowed = open_external_if_allowed("https://example.test", None, |_| {
-+            allowed_opened.set(true);
-+            Ok::<(), ()>(())
-+        });
++        let denied = handle_browser_open_for_windows(
++            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
++            &1,
++            browser_open_message("https://denied.example.test"),
++            |_| {
++                denied_opened.set(true);
++                Ok::<(), ()>(())
++            },
++        );
++        let allowed = handle_browser_open_for_windows(
++            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
++            &2,
++            browser_open_message("https://allowed.example.test"),
++            |_| {
++                allowed_opened.set(true);
++                Ok::<(), ()>(())
++            },
++        );
++        let unknown = handle_browser_open_for_windows(
++            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
++            &3,
++            browser_open_message("https://unknown.example.test"),
++            |_| {
++                unknown_opened.set(true);
++                Ok::<(), ()>(())
++            },
++        );
 +
 +        assert_eq!(denied, Ok(()));
 +        assert_eq!(allowed, Ok(()));
++        assert_eq!(unknown, Ok(()));
 +        assert!(!denied_opened.get());
 +        assert!(allowed_opened.get());
++        assert!(!unknown_opened.get());
 +    }
 +}
 +
@@ -401,3 +463,4 @@ index a86a0b3..74c6f42 100644
  /// A synchronous response to a browser event which may prevent the default browser's action
  #[derive(serde::Serialize, Default)]
  pub struct SynchronousEventResponse {
+

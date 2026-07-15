@@ -223,10 +223,11 @@ def main() -> None:
         "let ipc_navigation_handler = navigation_handler.clone();",
         "navigation_handler: ipc_navigation_handler,",
         "pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId)",
-        "let Some(webview) = self.webviews.get(&id)",
-        "webview.navigation_handler.as_ref(),",
+        ".map(|(window_id, webview)| (window_id, webview.navigation_handler.as_ref()))",
+        "fn handle_browser_open_for_windows<'a, K: PartialEq + 'a, E>(",
+        ".find_map(|(window_id, handler)| (window_id == originating_window).then_some(handler))",
         "IpcMethod::BrowserOpen => app.handle_browser_open(msg, id)",
-        "independent_window_policies_preserve_no_handler_fallback",
+        "browser_open_uses_originating_window_policy_and_unknown_ids_fail_closed",
     )
     for marker in required_desktop_markers:
         if marker not in desktop_runtime:

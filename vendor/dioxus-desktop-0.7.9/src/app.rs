@@ -275,21 +275,15 @@ impl App {
     }
 
     pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId) {
-        let Some(webview) = self.webviews.get(&id) else {
-            return;
-        };
-        if let Some(temp) = msg.params().as_object() {
-            if temp.contains_key("href") {
-                if let Some(href) = temp.get("href").and_then(|v| v.as_str()) {
-                    if let Err(err) = open_external_if_allowed(
-                        href,
-                        webview.navigation_handler.as_ref(),
-                        webbrowser::open,
-                    ) {
-                        tracing::error!("Failed to open URL: {}", err);
-                    }
-                }
-            }
+        if let Err(err) = handle_browser_open_for_windows(
+            self.webviews
+                .iter()
+                .map(|(window_id, webview)| (window_id, webview.navigation_handler.as_ref())),
+            &id,
+            msg,
+            webbrowser::open,
+        ) {
+            tracing::error!("Failed to open URL: {}", err);
         }
     }
 
@@ -653,11 +647,45 @@ fn open_external_if_allowed<E>(
     open(href)
 }
 
+fn handle_browser_open_for_windows<'a, K: PartialEq + 'a, E>(
+    windows: impl IntoIterator<Item = (&'a K, Option<&'a NavigationHandler>)>,
+    originating_window: &K,
+    msg: IpcMessage,
+    open: impl FnOnce(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(navigation_handler) = windows
+        .into_iter()
+        .find_map(|(window_id, handler)| (window_id == originating_window).then_some(handler))
+    else {
+        return Ok(());
+    };
+
+    let params = msg.params();
+    let Some(href) = params
+        .as_object()
+        .and_then(|params| params.get("href"))
+        .and_then(|href| href.as_str())
+    else {
+        return Ok(());
+    };
+
+    open_external_if_allowed(href, navigation_handler, open)
+}
+
 #[cfg(test)]
 mod browser_open_tests {
-    use super::open_external_if_allowed;
+    use super::{handle_browser_open_for_windows, open_external_if_allowed};
     use crate::config::NavigationHandler;
+    use crate::ipc::IpcMessage;
     use std::{cell::Cell, rc::Rc};
+
+    fn browser_open_message(href: &str) -> IpcMessage {
+        serde_json::from_value(serde_json::json!({
+            "method": "browser_open",
+            "params": { "href": href },
+        }))
+        .expect("browser-open test message must deserialize")
+    }
 
     #[test]
     fn deny_policy_prevents_ipc_browser_open() {
@@ -674,24 +702,47 @@ mod browser_open_tests {
     }
 
     #[test]
-    fn independent_window_policies_preserve_no_handler_fallback() {
+    fn browser_open_uses_originating_window_policy_and_unknown_ids_fail_closed() {
         let deny: NavigationHandler = Rc::new(|_| false);
         let denied_opened = Cell::new(false);
         let allowed_opened = Cell::new(false);
+        let unknown_opened = Cell::new(false);
+        let windows = [(1_u8, Some(deny)), (2_u8, None)];
 
-        let denied = open_external_if_allowed("https://example.test", Some(&deny), |_| {
-            denied_opened.set(true);
-            Ok::<(), ()>(())
-        });
-        let allowed = open_external_if_allowed("https://example.test", None, |_| {
-            allowed_opened.set(true);
-            Ok::<(), ()>(())
-        });
+        let denied = handle_browser_open_for_windows(
+            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
+            &1,
+            browser_open_message("https://denied.example.test"),
+            |_| {
+                denied_opened.set(true);
+                Ok::<(), ()>(())
+            },
+        );
+        let allowed = handle_browser_open_for_windows(
+            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
+            &2,
+            browser_open_message("https://allowed.example.test"),
+            |_| {
+                allowed_opened.set(true);
+                Ok::<(), ()>(())
+            },
+        );
+        let unknown = handle_browser_open_for_windows(
+            windows.iter().map(|(id, handler)| (id, handler.as_ref())),
+            &3,
+            browser_open_message("https://unknown.example.test"),
+            |_| {
+                unknown_opened.set(true);
+                Ok::<(), ()>(())
+            },
+        );
 
         assert_eq!(denied, Ok(()));
         assert_eq!(allowed, Ok(()));
+        assert_eq!(unknown, Ok(()));
         assert!(!denied_opened.get());
         assert!(allowed_opened.get());
+        assert!(!unknown_opened.get());
     }
 }
 
