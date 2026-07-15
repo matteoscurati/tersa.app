@@ -194,8 +194,96 @@ mod apple {
         }, 1000);
     "#;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SandboxProbe {
+        Anchor,
+        Ipc,
+        Location,
+    }
+
+    impl SandboxProbe {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Anchor => "ANCHOR",
+                Self::Ipc => "IPC",
+                Self::Location => "LOCATION",
+            }
+        }
+
+        const fn denial_url(self) -> &'static str {
+            match self {
+                Self::Anchor => "https://example.invalid/anchor",
+                Self::Ipc => "https://example.invalid/ipc-browser-open",
+                Self::Location => "https://example.invalid/location",
+            }
+        }
+    }
+
+    /// Maps the evidence-only environment to one isolated sandbox diagnostic.
+    fn sandbox_probe_from_env(
+        evidence: Option<&std::ffi::OsStr>,
+        probe: Option<&std::ffi::OsStr>,
+    ) -> Result<Option<SandboxProbe>, &'static str> {
+        let Some(probe) = probe else {
+            return Ok(None);
+        };
+        if evidence.is_none() {
+            return Err("TERSA_DIOXUS_SANDBOX_PROBE requires TERSA_DIOXUS_EVIDENCE");
+        }
+        match probe.to_str() {
+            Some("anchor") => Ok(Some(SandboxProbe::Anchor)),
+            Some("ipc") => Ok(Some(SandboxProbe::Ipc)),
+            Some("location") => Ok(Some(SandboxProbe::Location)),
+            _ => Err("TERSA_DIOXUS_SANDBOX_PROBE must be anchor, ipc, or location"),
+        }
+    }
+
+    fn sandbox_probe_script(probe: SandboxProbe) -> String {
+        format!(
+            r#"
+        window.setTimeout(() => {{
+            const probe = document.querySelector('[data-evidence="sandbox-probe"]');
+            if (!probe) {{
+                throw new Error('Dioxus sandbox probe control is missing');
+            }}
+            probe.textContent = 'SANDBOX PROBE {name} ARMED';
+            window.setTimeout(() => {{
+                {action}
+                window.setTimeout(() => {{
+                    probe.textContent = 'SANDBOX PROBE {name} FIRED';
+                }}, 0);
+            }}, 10000);
+        }}, 5000);
+    "#,
+            name = probe.name(),
+            action = match probe {
+                SandboxProbe::Anchor => format!(
+                    "const anchor = document.createElement('a'); anchor.href = '{}'; document.body.append(anchor); anchor.click();",
+                    probe.denial_url()
+                ),
+                SandboxProbe::Ipc => format!(
+                    "window.ipc.postMessage(JSON.stringify({{ method: 'browser_open', params: {{ 'href': '{}' }} }}));",
+                    probe.denial_url()
+                ),
+                SandboxProbe::Location =>
+                    format!("window.location.assign('{}');", probe.denial_url()),
+            },
+        )
+    }
+
     /// Starts the diagnostic interface with synthetic, non-production data.
     pub fn run() {
+        if let Err(message) = sandbox_probe_from_env(
+            std::env::var_os("TERSA_DIOXUS_EVIDENCE").as_deref(),
+            std::env::var_os("TERSA_DIOXUS_SANDBOX_PROBE").as_deref(),
+        ) {
+            eprintln!("TERSA-DIOXUS-CONFIG-ERROR {message}");
+            #[expect(
+                clippy::exit,
+                reason = "Invalid evidence configuration must fail before the event loop starts"
+            )]
+            std::process::exit(2);
+        }
         let config = platform_config();
         dioxus_desktop::launch::launch(app, Vec::new(), vec![Box::new(config)]);
     }
@@ -243,21 +331,28 @@ mod apple {
         let mut focus_events = use_signal(|| 0_u32);
         let mut safe_area_top = use_signal(|| -1_i32);
         let mut viewport_height = use_signal(|| ROW_HEIGHT_PX * 9.0);
+        let sandbox_probe = sandbox_probe_from_env(
+            std::env::var_os("TERSA_DIOXUS_EVIDENCE").as_deref(),
+            std::env::var_os("TERSA_DIOXUS_SANDBOX_PROBE").as_deref(),
+        )
+        .expect("sandbox probe was validated before event-loop launch");
 
-        use_effect(|| {
+        use_effect(move || {
             spawn(async move {
                 if let Err(error) = dioxus_document::eval(VIRTUALIZER_SCRIPT).await {
                     eprintln!("TERSA-DIOXUS-VIRTUALIZER error: {error}");
                 }
             });
             if std::env::var_os("TERSA_DIOXUS_EVIDENCE").is_some() {
-                let evidence_script = if std::env::var_os("TERSA_DIOXUS_RELAUNCH").is_some() {
-                    RELAUNCH_EVIDENCE_SCRIPT
-                } else {
-                    EVIDENCE_SCRIPT
+                let evidence_script = match sandbox_probe {
+                    Some(probe) => sandbox_probe_script(probe),
+                    None if std::env::var_os("TERSA_DIOXUS_RELAUNCH").is_some() => {
+                        RELAUNCH_EVIDENCE_SCRIPT.to_owned()
+                    }
+                    None => EVIDENCE_SCRIPT.to_owned(),
                 };
                 spawn(async move {
-                    if let Err(error) = dioxus_document::eval(evidence_script).await {
+                    if let Err(error) = dioxus_document::eval(&evidence_script).await {
                         eprintln!("TERSA-DIOXUS-EVIDENCE error: {error}");
                     }
                 });
@@ -371,6 +466,10 @@ mod apple {
                             output {
                                 "data-evidence": "popup",
                                 "WINDOW OPEN PROBE PENDING"
+                            }
+                            output {
+                                "data-evidence": "sandbox-probe",
+                                "SANDBOX PROBE PENDING"
                             }
                             button {
                                 r#type: "button",
@@ -491,7 +590,10 @@ mod apple {
 
     #[cfg(test)]
     mod tests {
-        use super::{MAX_RENDERED_ROWS, OVERSCAN_ROWS, ROW_HEIGHT_PX, visible_row_count};
+        use super::{
+            MAX_RENDERED_ROWS, OVERSCAN_ROWS, ROW_HEIGHT_PX, SandboxProbe, sandbox_probe_from_env,
+            visible_row_count,
+        };
 
         #[test]
         fn visible_rows_cover_the_complete_viewport() {
@@ -510,6 +612,31 @@ mod apple {
                 .min(MAX_RENDERED_ROWS.saturating_sub(OVERSCAN_ROWS.saturating_mul(2)));
 
             assert_eq!(visible_rows + (OVERSCAN_ROWS * 2), MAX_RENDERED_ROWS);
+        }
+
+        #[test]
+        fn sandbox_probe_mapping_requires_evidence_and_exact_values() {
+            assert_eq!(sandbox_probe_from_env(None, None), Ok(None));
+            assert_eq!(
+                sandbox_probe_from_env(None, Some("anchor".as_ref())),
+                Err("TERSA_DIOXUS_SANDBOX_PROBE requires TERSA_DIOXUS_EVIDENCE")
+            );
+            assert_eq!(
+                sandbox_probe_from_env(Some("1".as_ref()), Some("anchor".as_ref())),
+                Ok(Some(SandboxProbe::Anchor))
+            );
+            assert_eq!(
+                sandbox_probe_from_env(Some("1".as_ref()), Some("ipc".as_ref())),
+                Ok(Some(SandboxProbe::Ipc))
+            );
+            assert_eq!(
+                sandbox_probe_from_env(Some("1".as_ref()), Some("location".as_ref())),
+                Ok(Some(SandboxProbe::Location))
+            );
+            assert_eq!(
+                sandbox_probe_from_env(Some("1".as_ref()), Some("ANCHOR".as_ref())),
+                Err("TERSA_DIOXUS_SANDBOX_PROBE must be anchor, ipc, or location")
+            );
         }
     }
 }
