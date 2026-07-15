@@ -348,6 +348,29 @@ def main() -> None:
     for marker in required_app_markers:
         if marker not in app:
             raise SystemExit(f"Dioxus application policy changed: missing {marker!r}")
+    evidence_probe_markers = (
+        "fn sandbox_probe_from_env(",
+        'if evidence.is_none()',
+        'Some("anchor") => Ok(Some(SandboxProbe::Anchor))',
+        "fn sandbox_probe_script(probe: SandboxProbe) -> String",
+        "const anchor = document.createElement('a'); anchor.href = '{}'; "
+        "document.body.append(anchor); anchor.click();",
+        "params: {{ 'href': '{}' }}",
+        "window.location.assign('{}')",
+        "if let Err(message) = sandbox_probe_from_env(",
+        "std::process::exit(2);",
+    )
+    for marker in evidence_probe_markers:
+        if app.count(marker) != 1:
+            raise SystemExit(
+                "Dioxus evidence-only navigation probe changed: "
+                f"expected one {marker!r}"
+            )
+    require_ordered_markers(
+        app,
+        evidence_probe_markers,
+        "evidence-only navigation probe definition and launch validation",
+    )
     if "href:" in app or re.search(r"(?m)^\s*a\s*\{", app):
         raise SystemExit("External navigation elements are forbidden in the diagnostic UI")
 

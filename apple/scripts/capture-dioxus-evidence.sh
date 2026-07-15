@@ -19,6 +19,8 @@ mkdir -p "$build_dir" "$mac_home"
 
 mac_pid=''
 device=''
+sandbox_container=''
+readonly sandbox_probe_bundle_identifier='app.tersa.dioxus-spike.mac'
 
 cleanup() {
   if [ -n "$mac_pid" ] && kill -0 "$mac_pid" 2>/dev/null; then
@@ -277,6 +279,96 @@ start_mac() {
   verify_loopback_listener "$mac_pid" "${build_dir}/${listener_log}"
 }
 
+prepare_sandbox_probe_container() {
+  bundle_identifier=$(plutil -extract CFBundleIdentifier raw \
+    "${mac_sandbox_app}/Contents/Info.plist")
+  if [ "$bundle_identifier" != "$sandbox_probe_bundle_identifier" ]; then
+    echo "Unexpected Dioxus sandbox probe bundle identifier: $bundle_identifier" >&2
+    return 1
+  fi
+  sandbox_container="${HOME}/Library/Containers/${bundle_identifier}"
+  rm -rf -- "$sandbox_container"
+}
+
+record_sandbox_webkit_directories() {
+  output_file="$1"
+  : > "$output_file"
+  if [ -d "${sandbox_container}/Data" ]; then
+    (
+      cd "${sandbox_container}/Data"
+      find . -type d \( -name WebKit -o -name WebsiteData \) -print
+    ) > "$output_file"
+  fi
+}
+
+start_sandbox_probe() {
+  probe="$1"
+  process_log="$2"
+  listener_log="$3"
+  prepare_sandbox_probe_container
+  HOME="$HOME" TERSA_DIOXUS_EVIDENCE=1 TERSA_DIOXUS_SANDBOX_PROBE="$probe" \
+    "$mac_binary" -ApplePersistenceIgnoreState YES \
+    >"${build_dir}/${process_log}" 2>&1 &
+  mac_pid=$!
+  wait_for_mac_window
+  verify_loopback_listener "$mac_pid" "${build_dir}/${listener_log}"
+}
+
+capture_sandbox_probe() {
+  probe="$1"
+  upper_probe=$(printf '%s' "$probe" | tr '[:lower:]' '[:upper:]')
+  denial_url="$2"
+  probe_dir="${build_dir}/sandbox-probe-${probe}"
+  mkdir -p "$probe_dir"
+  start_sandbox_probe "$probe" "sandbox-probe-${probe}.log" \
+    "sandbox-probe-${probe}-listeners.txt"
+  process_log="${build_dir}/sandbox-probe-${probe}.log"
+  listener_log="${build_dir}/sandbox-probe-${probe}-listeners.txt"
+
+  capture_mac_until_text "$probe_dir/armed.png" "$probe_dir/armed-ocr.txt" \
+    "SANDBOX PROBE ${upper_probe} ARMED" 60
+  test "$(stat -f '%z' "$probe_dir/armed.png")" -gt 10000
+  if ! kill -0 "$mac_pid" 2>/dev/null; then
+    echo "Sandbox probe ${probe} exited before its action" >&2
+    return 1
+  fi
+  sleep 12
+  wait_for_exact_log_line "TERSA-DIOXUS-NAV-DENIED ${denial_url}" "$process_log"
+  if ! kill -0 "$mac_pid" 2>/dev/null; then
+    echo "Sandbox probe ${probe} exited before final classification" >&2
+    return 1
+  fi
+  screencapture -x -l "$mac_window" "$probe_dir/final.png"
+  test "$(stat -f '%z' "$probe_dir/final.png")" -gt 10000
+  recognize_text "$probe_dir/final.png" > "$probe_dir/final-ocr.txt"
+  verify_loopback_listener "$mac_pid" "$listener_log"
+  record_sandbox_webkit_directories "$probe_dir/container-webkit-directories.txt"
+
+  has_thread_marker=0
+  if grep -E 'TERSA-DIOXUS-M[0O]-THREAD' "$probe_dir/final-ocr.txt" >/dev/null 2>&1; then
+    has_thread_marker=1
+  fi
+  has_inbox_marker=0
+  if grep -E '10.?000' "$probe_dir/final-ocr.txt" >/dev/null 2>&1; then
+    has_inbox_marker=1
+  fi
+  fired=0
+  if grep -F "SANDBOX PROBE ${upper_probe} FIRED" "$probe_dir/final-ocr.txt" >/dev/null 2>&1; then
+    fired=1
+  fi
+
+  if [ "$has_thread_marker" -eq 1 ] && [ "$has_inbox_marker" -eq 1 ] \
+    && [ "$fired" -eq 1 ]; then
+    printf '%s\n' RENDERED_PRESERVED > "$probe_dir/outcome.txt"
+  elif [ "$has_thread_marker" -eq 0 ] && [ "$has_inbox_marker" -eq 0 ]; then
+    printf '%s\n' BLANK_AFTER_DENIAL > "$probe_dir/outcome.txt"
+  else
+    echo "Sandbox probe ${probe} has ambiguous final OCR" >&2
+    return 1
+  fi
+  stop_mac
+}
+
 verify_sandbox_enforcement() {
   probe_path="${build_dir}/outside-sandbox-write-probe"
   rm -f "$probe_path"
@@ -380,6 +472,10 @@ first_row=${virtualization#* }
 test "$first_row" -gt 0
 verify_loopback_listener "$mac_pid" "${build_dir}/macos-navigation-listeners.txt"
 stop_mac
+
+capture_sandbox_probe anchor 'https://example.invalid/anchor'
+capture_sandbox_probe ipc 'https://example.invalid/ipc-browser-open'
+capture_sandbox_probe location 'https://example.invalid/location'
 
 start_mac 1 1 macos-relaunch-process.log macos-relaunch-listeners.txt
 capture_mac_until_text \

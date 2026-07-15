@@ -98,6 +98,16 @@ cancellation. That behavior remains part of the device-signed navigation gate.
 
 ## Evidence interpretation
 
+The sandboxed-navigation work adds a classifier, not new evidence or a gate
+transition. It launches one fresh-container sandboxed process per anchor, IPC,
+or location denial, records `ARMED` before its one action, and classifies only
+`RENDERED_PRESERVED` or `BLANK_AFTER_DENIAL`. Both outcomes retain diagnostic
+evidence; neither changes M0-DIOXUS-009, M0-DIOXUS-010, M0-DIOXUS-011,
+`ui_baseline_approved`, or the M1 block. The classifier records only named
+`WebKit` and `WebsiteData` directories under the diagnostic container's `Data`
+directory and does not claim zero residue or coverage of all operating-system
+storage surfaces.
+
 Launch measurements in `metrics.json` cover time until the Mac window/listener
 harness or simulator launch command reports success. The Mac cold/warm values
 run the ad-hoc-signed sandboxed copy; the cold value may include first-launch
