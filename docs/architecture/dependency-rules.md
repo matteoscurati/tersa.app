@@ -3,7 +3,7 @@
 tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
-The initial workspace has four shared architectural layers plus four platform
+The initial workspace has four shared architectural layers plus five platform
 and feasibility adapters:
 
 | Crate | Responsibility | Allowed workspace dependencies |

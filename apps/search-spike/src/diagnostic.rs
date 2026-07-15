@@ -329,20 +329,35 @@ fn verify_blocking_lock(directory: &SqlCipherDirectory, independent: SqlCipherDi
 fn verify_watch(directory: &SqlCipherDirectory) -> Result {
     let metadata = directory.atomic_read(Path::new("meta.json"))?;
     let callback_directory = directory.clone();
-    let (sender, receiver) = mpsc::channel();
+    let (callback_sender, callback_receiver) = mpsc::channel();
     let handle = directory.watch(WatchCallback::new(move || {
         let reentrant_read = callback_directory
             .atomic_read(Path::new("meta.json"))
             .map(|bytes| !bytes.is_empty())
             .unwrap_or(false);
-        let _ = sender.send(reentrant_read);
+        let _ = callback_sender.send(reentrant_read);
     }))?;
-    directory.atomic_write(Path::new("meta.json"), &metadata)?;
-    match receiver.recv_timeout(Duration::from_secs(2)) {
+    let publication_directory = directory.clone();
+    let (publication_sender, publication_receiver) = mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        let published = publication_directory
+            .atomic_write(Path::new("meta.json"), &metadata)
+            .is_ok();
+        let _ = publication_sender.send(published);
+    });
+    match publication_receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(true) => {}
+        Ok(false) => return Err("meta.json publication failed".into()),
+        Err(_) => return Err("meta.json publication timed out during callback dispatch".into()),
+    }
+    match callback_receiver.recv_timeout(Duration::from_secs(2)) {
         Ok(true) => {}
         Ok(false) => return Err("meta.json watch callback could not re-enter the directory".into()),
         Err(_) => return Err("meta.json watch callback timed out while re-entering".into()),
     }
+    publisher
+        .join()
+        .map_err(|_panic| "meta.json publisher panicked")?;
     drop(handle);
     Ok(())
 }
