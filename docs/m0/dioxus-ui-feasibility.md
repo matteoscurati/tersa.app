@@ -16,10 +16,9 @@ The current verdict is:
 
 - **GO for the bounded diagnostic and physical-device investigation.**
 - **NO-GO for production adoption.** The local ephemeral fork has recorded host
-  diagnostics for loopback, navigation, and storage. Its sandbox capture path
-  awaits immutable exact-head evidence; unavoidable Tokio runtime, lifecycle
-  gaps, signing and distribution, and physical-device evidence remain
-  unresolved blockers.
+  diagnostics for loopback, navigation, storage, and App Sandbox compatibility.
+  Unavoidable Tokio runtime, lifecycle gaps, signing and distribution, and
+  physical-device evidence remain unresolved blockers.
 
 ## Stable acceptance criteria
 
@@ -35,7 +34,7 @@ The current verdict is:
 | `M0-DIOXUS-008` | Loopback transport | Source pinned to `127.0.0.1`, 256-byte mutual keys, live listeners loopback-only | `diagnostic` |
 | `M0-DIOXUS-009` | Navigation boundary | Locally patched Dioxus guards both WebView navigation and intercepted-anchor IPC before browser fallback | `diagnostic` |
 | `M0-DIOXUS-010` | Ephemeral WebKit storage | Locally patched Dioxus passes the diagnostic incognito opt-in to Wry's non-persistent `WKWebsiteDataStore` | `diagnostic` |
-| `M0-DIOXUS-011` | App Sandbox compatibility | Exact-head artifact must show that an ad-hoc-signed host copy uses the minimal entitlement allowlist, enforces sandbox denial, and keeps its listener loopback-only; device-signed evidence remains required | `open` |
+| `M0-DIOXUS-011` | App Sandbox compatibility | Exact-head artifact records that an ad-hoc-signed host copy uses the minimal entitlement allowlist, enforces sandbox denial, and keeps its listener loopback-only; device-signed evidence remains required | `diagnostic` |
 | `M0-DIOXUS-012` | Target notices | Locked target-specific Rust inventory bundled byte-for-byte | `diagnostic` |
 | `M0-DIOXUS-013` | Physical-device accessibility | VoiceOver, Dynamic Type, Full Keyboard Access, contrast, switch control | `open` |
 | `M0-DIOXUS-014` | Physical-device input | IME, autocorrect, dictation, selection, copy/paste, and hardware keyboard | `open` |
@@ -63,10 +62,10 @@ reject wildcard or IPv6-any listeners.
 This socket is not a backend and carries only synthetic UI edits in the spike.
 It is nevertheless a network server from the operating system's perspective.
 The host capture path runs a copied, ad-hoc-signed macOS package with the exact
-App Sandbox, network-client, and network-server entitlement allowlist. The gate
-remains open until an immutable exact-head artifact records the stable UI,
-sandbox enforcement, and loopback-listener probes. The existing navigation and
-isolated-HOME storage diagnostics are rerun separately on the unsigned archive:
+App Sandbox, network-client, and network-server entitlement allowlist. The
+immutable exact-head host artifact records the stable UI, sandbox enforcement,
+and loopback-listener probes. The existing navigation and isolated-HOME storage
+diagnostics are rerun separately on the unsigned archive:
 a local exploratory sandbox run left the WebView blank after synthetic denied
 navigation, but that observation is not yet a repeatable gate result. This is
 not device-signed or production evidence and remains a production blocker.
@@ -115,7 +114,33 @@ markers are required from iOS transitions; the macOS path does not emit a
 reliable initial `Resumed` event.
 
 The simulator and Mac evidence use only synthetic content. No diagnostic log
-contains message data, addresses, credentials, paths, or user-generated text.
+contains message data, addresses, credentials, or user-generated text.
+
+### Recorded sandboxed host diagnostic evidence
+
+Successful CI run `29412344557` recorded the App Sandbox host diagnostic for
+exact commit `63fe4f4fbc2edbb3e384d2655ecd0884cbe8f351`. Its 34-entry manifest
+(`dioxus-spike-evidence` artifact `8342070346`) is located at
+`github-actions://runs/29412344557/artifacts/8342070346/manifest.json#evidence-commit=63fe4f4fbc2edbb3e384d2655ecd0884cbe8f351`.
+Every manifest hash and size matched. The redacted manifest has SHA-256
+`81c174d11953d233ba1ae954c18583926db3241f897cfb62770a49dab4eceadb`, was
+generated at `2026-07-15T11:57:19Z`, and is retained until
+`2026-10-12T11:57:19Z`.
+
+Inspection recorded the three-key App Sandbox, network-client, and
+network-server entitlement allowlist; an outside-container write denial with
+exit `73`; a successful unsandboxed control; stable synthetic UI; loopback-only
+listeners; iOS `SAFE TOP 62 PX`; and inspected screenshots, OCR, and nonclaims.
+This is a host-tier diagnostic only. It is not device signing, distribution,
+production sandbox compatibility, or sandboxed navigation or storage evidence.
+Independent human attestation is absent and is required before any signed-tier
+claim.
+
+Release binaries contain fixed public GitHub runner build paths such as
+`/Users/runner/.cargo/...`. They are non-identifying build provenance. The
+artifact contains no mailbox or account data, credentials, tokens, private
+keys, personal developer paths, provisioning or certificate material, or
+message content.
 
 ### Recorded live UI diagnostic evidence
 

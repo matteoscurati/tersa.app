@@ -3,8 +3,10 @@
 ## Status
 
 Accepted as the design for collecting host-only M0 diagnostic evidence. The
-gate remains open until an immutable exact-head artifact is recorded. M1
-remains blocked and `ui_baseline_approved` remains false.
+immutable exact-head host artifact is recorded and M0-DIOXUS-011 is
+`diagnostic` at the host tier. Independent human attestation remains absent;
+it is required before any signed-tier claim. M1 remains blocked and
+`ui_baseline_approved` remains false.
 
 ## Decision
 
@@ -38,12 +40,12 @@ sandboxed-storage claim.
 
 ## Consequences
 
-M0-DIOXUS-011 remains `open` at the `none` tier until CI produces an immutable,
-exact-head host artifact and that artifact is independently reviewed and
-recorded. Its required tier stays `device-signed`. The fork change re-runs the
-existing unsigned host evidence for M0-DIOXUS-008, M0-DIOXUS-009, and
-M0-DIOXUS-010 without changing their scope. It makes no physical-device,
-signed-device, UI-baseline, distribution, or production claim.
+M0-DIOXUS-011 is recorded as `diagnostic` at the `host` tier from immutable
+exact-head evidence. Its required tier stays `device-signed`; independent human
+attestation remains absent and is required before any signed-tier claim. The
+fork change re-runs the existing unsigned host evidence for M0-DIOXUS-008,
+M0-DIOXUS-009, and M0-DIOXUS-010 without changing their scope. It makes no
+physical-device, signed-device, UI-baseline, distribution, or production claim.
 
 ## Risks and nonclaims
 
