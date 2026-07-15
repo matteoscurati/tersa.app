@@ -108,6 +108,16 @@ notarization.
 
 ## Evidence, redaction, and attestation
 
+At every evidence tier, `evidence.commit` and `evidence.artifact` are a
+presence-bound pair: both are `null`, or both are present. A non-null commit is
+an exact lowercase 40-character Git SHA. Any non-null artifact is validated as
+an immutable commit-bound manifest, including its digest, redaction flag,
+generation timestamp, and retention semantics. Evidence at the exact
+`simulator` tier must include that commit-bound artifact, even for a diagnostic
+gate. The existing `device-unsigned` diagnostics are explicitly
+allowed to retain null commit and artifact fields; they do not claim a device
+pass or substitute for signed physical-device evidence.
+
 Each passed physical-device or signed-distribution gate requires:
 
 - an exact commit SHA and an immutable artifact locator bound to that same SHA;
@@ -126,13 +136,22 @@ Each passed physical-device or signed-distribution gate requires:
 Repository evidence uses
 `repository://evidence/<exact-evidence.commit>/<path>`. GitHub Actions evidence
 uses `github-actions://runs/<run>/artifacts/<id>/manifest.json#evidence-commit=<exact-evidence.commit>`.
+The repository path is relative to the commit-specific evidence namespace and
+must not contain empty, current-directory, or parent-directory segments.
 The uploaded `manifest.json` records the exact `GITHUB_SHA`, generation and
 retention timestamps, and the relative path, size, and SHA-256 of every evidence
 file. The gate record contains the manifest SHA-256 and matching timestamps. The
 validator compares the locator SHA with `evidence.commit`, bounds retention to
-90 days, and requires review expiry before artifact expiry; it does not rely on
-a mutable run name, branch, or artifact label. The independent reviewer verifies
-the downloaded manifest and its file hashes before attesting.
+90 days, and requires review expiry no later than artifact expiry; it does not
+rely on a mutable run name, branch, or artifact label. The independent reviewer
+verifies the downloaded manifest and its file hashes before attesting.
+
+Whenever complete review metadata and an artifact coexist at any tier, the
+review timestamp must be on or after manifest generation. For GitHub Actions
+artifacts, review expiry must also be no later than the artifact retention
+timestamp. Signed-tier and passed physical/distribution claims additionally
+require the named independent reviewer and canonical attestation described
+above.
 
 GitHub Actions evidence is retained for 90 days, while the manifest uses an
 89-day safety margin. A gate backed by that form must be reviewed and expire no

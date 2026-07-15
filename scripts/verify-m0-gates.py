@@ -110,7 +110,8 @@ GATE_ID = re.compile(r"^(?:M0|M1)-[A-Z]+-\d{3}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REPOSITORY_ARTIFACT_LOCATOR = re.compile(
-    r"^repository://evidence/(?P<commit>[0-9a-f]{40})/[A-Za-z0-9._/-]+$"
+    r"^repository://evidence/(?P<commit>[0-9a-f]{40})/"
+    r"(?P<path>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)$"
 )
 GITHUB_ACTIONS_ARTIFACT_LOCATOR = re.compile(
     r"^github-actions://runs/\d+/artifacts/\d+/manifest\.json#evidence-commit=(?P<commit>[0-9a-f]{40})$"
@@ -159,13 +160,19 @@ def validate_artifact(
                 locator_kind = "github-actions"
     if not locator_match:
         error(errors, f"{gate_id}: artifact.locator must be an immutable, commit-bound evidence locator")
+    elif locator_kind == "repository" and any(
+        segment in {".", ".."} for segment in locator_match["path"].split("/")
+    ):
+        error(errors, f"{gate_id}: repository artifact locator cannot contain dot path segments")
     elif locator_match["commit"] != evidence_commit:
         error(errors, f"{gate_id}: artifact locator commit must exactly match evidence.commit")
     if not isinstance(value["sha256"], str) or not SHA256.fullmatch(value["sha256"]):
         error(errors, f"{gate_id}: artifact.sha256 must be a lowercase SHA-256 digest")
     if value["redacted"] is not True:
-        error(errors, f"{gate_id}: signed evidence artifact must be explicitly redacted")
+        error(errors, f"{gate_id}: evidence artifact must be explicitly redacted")
     generated = parse_date(value["generated_at"], f"{gate_id}.artifact.generated_at", errors)
+    if generated and generated > dt.datetime.now(tz=dt.timezone.utc):
+        error(errors, f"{gate_id}: artifact generation cannot be dated in the future")
     retained = None
     if locator_kind == "github-actions":
         retained = parse_date(
@@ -211,6 +218,28 @@ def validate_attestation(value: Any, reviewer: Any, gate_id: str, errors: list[s
         error(errors, f"{gate_id}: implementer cannot independently review their own evidence")
     if value.get("statement") != INDEPENDENT_REVIEW_STATEMENT:
         error(errors, f"{gate_id}: attestation statement must use the canonical independent-review text")
+
+
+def validate_review_metadata(
+    evidence: dict[str, Any],
+    gate_id: str,
+    errors: list[str],
+) -> tuple[dt.datetime | None, dt.datetime | None]:
+    """Validate a complete optional review record and return its timestamps."""
+    review_fields = ("reviewer", "attestation", "reviewed_at", "expires_at")
+    review_values = [evidence[key] for key in review_fields]
+    if not all(review_values):
+        return None, None
+    validate_attestation(evidence["attestation"], evidence["reviewer"], gate_id, errors)
+    reviewed = parse_date(evidence["reviewed_at"], f"{gate_id}.evidence.reviewed_at", errors)
+    expiry = parse_date(evidence["expires_at"], f"{gate_id}.evidence.expires_at", errors)
+    if reviewed and expiry and expiry <= reviewed:
+        error(errors, f"{gate_id}: evidence expiry must follow review")
+    if reviewed and reviewed > dt.datetime.now(tz=dt.timezone.utc):
+        error(errors, f"{gate_id}: evidence review cannot be dated in the future")
+    if expiry and expiry <= dt.datetime.now(tz=dt.timezone.utc):
+        error(errors, f"{gate_id}: evidence review has expired")
+    return reviewed, expiry
 
 
 def table_statuses(path: Path, errors: list[str]) -> dict[str, str]:
@@ -326,6 +355,31 @@ def validate(data: Any) -> list[str]:
         review_values = [evidence[key] for key in review_fields]
         if any(value is not None for value in review_values) and not all(review_values):
             error(errors, f"{gate_id}: review identity, attestation, and expiry metadata are all required together")
+        has_commit = evidence["commit"] is not None
+        has_artifact = evidence["artifact"] is not None
+        if has_commit != has_artifact:
+            error(errors, f"{gate_id}: evidence.commit and evidence.artifact must either both be null or both be present")
+        if has_commit and (not isinstance(evidence["commit"], str) or not COMMIT.fullmatch(evidence["commit"])):
+            error(errors, f"{gate_id}: evidence.commit must be an exact lowercase 40-character commit SHA")
+        artifact_kind = None
+        artifact_generated = None
+        artifact_retained = None
+        if has_artifact:
+            artifact_kind, artifact_generated, artifact_retained = validate_artifact(
+                evidence["artifact"], evidence["commit"], gate_id, errors
+            )
+        reviewed, expiry = validate_review_metadata(evidence, gate_id, errors)
+        if reviewed and artifact_generated and reviewed < artifact_generated:
+            error(errors, f"{gate_id}: evidence review cannot predate artifact generation")
+        if (
+            artifact_kind == "github-actions"
+            and expiry
+            and artifact_retained
+            and expiry > artifact_retained
+        ):
+            error(errors, f"{gate_id}: evidence review cannot outlast GitHub Actions artifact retention")
+        if evidence_tier == "simulator" and not has_artifact:
+            error(errors, f"{gate_id}: simulator evidence requires a commit-bound artifact")
         if gate["status"] == "passed":
             evidence_rank = tier_order.get(evidence_tier, -1) if isinstance(evidence_tier, str) else -1
             required_rank = tier_order.get(required_tier, 99) if isinstance(required_tier, str) else 99
@@ -346,41 +400,8 @@ def validate(data: Any) -> list[str]:
             for key in ("commit", "artifact", "reviewer", "attestation", "reviewed_at", "expires_at"):
                 if not evidence[key]:
                     error(errors, f"{gate_id}: signed evidence requires evidence.{key}")
-            if not isinstance(evidence["commit"], str) or not COMMIT.fullmatch(evidence["commit"]):
-                error(errors, f"{gate_id}: signed evidence requires an exact 40-character commit SHA")
-            artifact_kind, artifact_generated, artifact_retained = validate_artifact(
-                evidence["artifact"], evidence["commit"], gate_id, errors
-            )
             if not isinstance(evidence["reviewer"], str) or not evidence["reviewer"].strip():
                 error(errors, f"{gate_id}: signed evidence requires a named reviewer")
-            validate_attestation(evidence["attestation"], evidence["reviewer"], gate_id, errors)
-            reviewed = parse_date(evidence["reviewed_at"], f"{gate_id}.evidence.reviewed_at", errors)
-            expiry = parse_date(evidence["expires_at"], f"{gate_id}.evidence.expires_at", errors)
-            if reviewed and expiry and expiry <= reviewed:
-                error(errors, f"{gate_id}: evidence expiry must follow review")
-            if reviewed and reviewed > dt.datetime.now(tz=dt.timezone.utc):
-                error(errors, f"{gate_id}: evidence review cannot be dated in the future")
-            if reviewed and artifact_generated and reviewed < artifact_generated:
-                error(errors, f"{gate_id}: evidence review cannot predate artifact generation")
-            if expiry and expiry <= dt.datetime.now(tz=dt.timezone.utc):
-                error(errors, f"{gate_id}: evidence review has expired")
-            if (
-                artifact_kind == "github-actions"
-                and expiry
-                and artifact_retained
-                and expiry > artifact_retained
-            ):
-                error(errors, f"{gate_id}: evidence review cannot outlast GitHub Actions artifact retention")
-        elif all(review_values):
-            validate_attestation(evidence["attestation"], evidence["reviewer"], gate_id, errors)
-            reviewed = parse_date(evidence["reviewed_at"], f"{gate_id}.evidence.reviewed_at", errors)
-            expiry = parse_date(evidence["expires_at"], f"{gate_id}.evidence.expires_at", errors)
-            if reviewed and expiry and expiry <= reviewed:
-                error(errors, f"{gate_id}: evidence expiry must follow review")
-            if reviewed and reviewed > dt.datetime.now(tz=dt.timezone.utc):
-                error(errors, f"{gate_id}: evidence review cannot be dated in the future")
-            if expiry and expiry <= dt.datetime.now(tz=dt.timezone.utc):
-                error(errors, f"{gate_id}: evidence review has expired")
     if ids != set(CANONICAL_REQUIRED_TIERS):
         error(errors, "gate IDs must exactly match the reviewed canonical register")
     for gate in gate_by_id.values():
@@ -430,6 +451,114 @@ def self_test(data: Any) -> list[str]:
         "generated_at": artifact_generated_at,
         "retained_until": artifact_retained_until,
     }
+    valid_review = {
+        "reviewer": "reviewer",
+        "attestation": {
+            "implementer": "implementer",
+            "reviewer": "reviewer",
+            "competence": ["apple-platform"],
+            "statement": INDEPENDENT_REVIEW_STATEMENT,
+        },
+        "reviewed_at": reviewed_at,
+        "expires_at": expires_at,
+    }
+    mutated = copy.deepcopy(data)
+    simulator_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    simulator_gate["status"] = "diagnostic"
+    simulator_gate["evidence_tier"] = "simulator"
+    simulator_gate["evidence"].update(
+        {
+            "kind": "simulator-diagnostic",
+            "commit": "a" * 40,
+            "artifact": copy.deepcopy(valid_artifact),
+        }
+    )
+    errors = validate(mutated)
+    if errors:
+        failures.append("valid simulator diagnostic fixture unexpectedly failed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"].update(
+        {
+            "commit": "a" * 40,
+            "artifact": {**valid_artifact, "locator": "latest"},
+        }
+    )
+    errors = validate(mutated)
+    if not any("immutable, commit-bound evidence locator" in message for message in errors):
+        failures.append("negative malformed diagnostic artifact mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"].update(
+        {
+            "commit": "a" * 40,
+            "artifact": {
+                **valid_artifact,
+                "locator": f"repository://evidence/{'c' * 40}/manifest.json",
+                "retained_until": None,
+            },
+        }
+    )
+    errors = validate(mutated)
+    if not any("locator commit must exactly match evidence.commit" in message for message in errors):
+        failures.append("negative commit/artifact mismatch mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"].update(
+        {
+            "commit": "A" * 40,
+            "artifact": copy.deepcopy(valid_artifact),
+        }
+    )
+    errors = validate(mutated)
+    if not any("must be an exact lowercase 40-character commit SHA" in message for message in errors):
+        failures.append("negative malformed non-null commit mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"]["artifact"] = copy.deepcopy(valid_artifact)
+    errors = validate(mutated)
+    if not any("must either both be null or both be present" in message for message in errors):
+        failures.append("negative artifact-without-commit mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"]["commit"] = "a" * 40
+    errors = validate(mutated)
+    if not any("must either both be null or both be present" in message for message in errors):
+        failures.append("negative commit-without-artifact mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    simulator_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    simulator_gate["status"] = "diagnostic"
+    simulator_gate["evidence_tier"] = "simulator"
+    simulator_gate["evidence"]["kind"] = "simulator-diagnostic"
+    errors = validate(mutated)
+    if not any("simulator evidence requires a commit-bound artifact" in message for message in errors):
+        failures.append("negative simulator-without-artifact mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"].update(
+        {
+            "commit": "a" * 40,
+            "artifact": copy.deepcopy(valid_artifact),
+            **valid_review,
+            "reviewed_at": (now - dt.timedelta(days=3)).isoformat(),
+        }
+    )
+    errors = validate(mutated)
+    if not any("review cannot predate artifact generation" in message for message in errors):
+        failures.append("negative review-before-generation mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    diagnostic_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-001")
+    diagnostic_gate["evidence"].update(
+        {
+            "commit": "a" * 40,
+            "artifact": copy.deepcopy(valid_artifact),
+            **valid_review,
+            "expires_at": (now + dt.timedelta(days=88)).isoformat(),
+        }
+    )
+    errors = validate(mutated)
+    if not any("review cannot outlast GitHub Actions artifact retention" in message for message in errors):
+        failures.append("negative review-expiry-after-retention mutation unexpectedly passed")
     mutated = copy.deepcopy(data)
     mutated["gates"][0]["status"] = "PASS locally"
     errors = validate(mutated)
@@ -582,6 +711,44 @@ def self_test(data: Any) -> list[str]:
     )
     if not any("retention cannot exceed 90 days" in message for message in errors):
         failures.append("negative excessive artifact retention unexpectedly passed")
+    errors = []
+    validate_artifact(
+        {
+            **valid_artifact,
+            "redacted": False,
+        },
+        "a" * 40,
+        "SELF-TEST",
+        errors,
+    )
+    if not any("evidence artifact must be explicitly redacted" in message for message in errors):
+        failures.append("negative unredacted diagnostic artifact mutation unexpectedly passed")
+    errors = []
+    validate_artifact(
+        {
+            **valid_artifact,
+            "generated_at": (now + dt.timedelta(days=1)).isoformat(),
+            "retained_until": (now + dt.timedelta(days=89)).isoformat(),
+        },
+        "a" * 40,
+        "SELF-TEST",
+        errors,
+    )
+    if not any("artifact generation cannot be dated in the future" in message for message in errors):
+        failures.append("negative future-dated artifact mutation unexpectedly passed")
+    errors = []
+    validate_artifact(
+        {
+            **valid_artifact,
+            "locator": f"repository://evidence/{'a' * 40}/../../main/manifest.json",
+            "retained_until": None,
+        },
+        "a" * 40,
+        "SELF-TEST",
+        errors,
+    )
+    if not any("repository artifact locator cannot contain dot path segments" in message for message in errors):
+        failures.append("negative repository path-traversal mutation unexpectedly passed")
     mutated = copy.deepcopy(data)
     unknown_gate = copy.deepcopy(mutated["gates"][-1])
     unknown_gate["id"] = "M0-UNKNOWN-001"
