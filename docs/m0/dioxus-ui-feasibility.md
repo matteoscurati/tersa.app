@@ -26,7 +26,7 @@ The current verdict is:
 |---|---|---|---|
 | `M0-DIOXUS-001` | Locked dx-free Apple build | Exact Dioxus 0.7.9; direct Cargo; no `dx`, Manganis, Dioxus devtools package, backend, or remote assets | `diagnostic` |
 | `M0-DIOXUS-002` | Unsigned Apple packages | Release macOS arm64, iOS simulator arm64, and iOS device arm64 packages and archives; device-signed evidence remains required | `diagnostic` |
-| `M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | `open` |
+| `M0-DIOXUS-003` | Live UI evidence | Mac and simulator screenshots with both stable OCR markers | `diagnostic` |
 | `M0-DIOXUS-004` | Hand virtualization | Exactly 10,000 logical rows; measured viewport plus fixed overscan; computed range and independent DOM count | `diagnostic` |
 | `M0-DIOXUS-005` | Semantic structure | Landmarks, labels, list/listitem positions, focus treatment, live status, reduced motion | `diagnostic` |
 | `M0-DIOXUS-006` | Text input | Multiline textarea with spellcheck, autocapitalize, derived character status, and no explicit application save | `open` |
@@ -106,6 +106,26 @@ reliable initial `Resumed` event.
 
 The simulator and Mac evidence use only synthetic content. No diagnostic log
 contains message data, addresses, credentials, paths, or user-generated text.
+
+### Recorded live UI diagnostic evidence
+
+Successful post-merge main CI run `29401059126` recorded the live UI diagnostic
+for source/build commit `86ce0e502ba84f26154d3f962e8f64622b68d52f`. Its
+`dioxus-spike-evidence` artifact (`8337394114`) is located at
+`github-actions://runs/29401059126/artifacts/8337394114/manifest.json#evidence-commit=86ce0e502ba84f26154d3f962e8f64622b68d52f`.
+The redacted manifest has SHA-256
+`33eb4344142b654091cf81c7e6b8343b375308041a414acf0578c7f59b2e148f`, was
+generated at `2026-07-15T08:45:37Z`, and is retained until
+`2026-10-12T08:45:37Z`. This evidence must be refreshed before that timestamp;
+the gate validator rejects the expired artifact at or after it.
+
+The screenshots and OCR show live macOS and iOS Simulator rendering, each with
+`TERSA-DIOXUS-M0-THREAD` and `INBOX / 10,000 ROWS`. The iOS Simulator capture
+also records `SAFE TOP 62 PX`; macOS diagnostics cover virtualization, input,
+navigation, and storage. This is simulator-tier diagnostic evidence only. It
+does not prove physical-device input, accessibility, lifecycle, performance,
+signing, distribution, or production suitability. All physical-device gaps
+remain open, this gate is not passed, and neither UI candidate is approved.
 
 The local CoreSimulator runtime remains unavailable because the installed
 framework is 1051.54 while Xcode 26.6 requires 1051.55. The separate Dioxus
