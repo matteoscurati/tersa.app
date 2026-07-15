@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import ThreadingTCPServer
 from threading import Lock
 
 
@@ -32,6 +33,13 @@ class RequestCounter:
     def read(self) -> int:
         with self._lock:
             return self._count
+
+
+class CanaryServer(ThreadingTCPServer):
+    """Loopback server without HTTPServer's reverse-DNS bind lookup."""
+
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def handler_for(counter: RequestCounter) -> type[BaseHTTPRequestHandler]:
@@ -74,8 +82,8 @@ def main() -> None:
     parser.add_argument("--port-file", required=True, type=Path)
     arguments = parser.parse_args()
     counter = RequestCounter()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(counter))
-    arguments.port_file.write_text(str(server.server_port), encoding="ascii")
+    server = CanaryServer(("127.0.0.1", 0), handler_for(counter))
+    arguments.port_file.write_text(str(server.server_address[1]), encoding="ascii")
     server.serve_forever(poll_interval=0.05)
 
 

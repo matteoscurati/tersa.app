@@ -19,6 +19,7 @@ rust_binary="${workspace_dir}/target/aarch64-apple-darwin/release/tersa-mime-spi
 port_file="${staging_dir}/canary-port"
 native_output="${evidence_dir}/native.json"
 native_stderr="${staging_dir}/native.stderr"
+canary_stderr="${staging_dir}/canary.stderr"
 rust_output="${evidence_dir}/portable.txt"
 listener_output="${staging_dir}/listeners.txt"
 
@@ -34,7 +35,7 @@ cleanup() {
   if [ -n "$canary_pid" ] && kill -0 "$canary_pid" 2>/dev/null; then
     kill "$canary_pid" 2>/dev/null || true
   fi
-  rm -f "$native_stderr" "$listener_output" "$port_file"
+  rm -f "$native_stderr" "$canary_stderr" "$listener_output" "$port_file"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -49,7 +50,8 @@ grep -Fx 'NOT A DEVICE-GATE RESULT' "$rust_output"
 
 "$rust_binary" --export-sanitized-html "${staging_dir}/sanitized.html"
 test -s "${staging_dir}/sanitized.html"
-if rg -i 'script|https?:|javascript:|data:|file:|src=|href=' "${staging_dir}/sanitized.html"; then
+if grep -Eiq 'script|https?:|javascript:|data:|file:|src=|href=' \
+  "${staging_dir}/sanitized.html"; then
   echo 'The exported sanitized fixture contains active or remote content.' >&2
   exit 1
 fi
@@ -76,10 +78,16 @@ if entitlements != expected:
     raise SystemExit("the MIME diagnostic has unexpected entitlements")
 PY
 
-python3 "${script_dir}/mime-canary.py" --port-file "$port_file" &
+python3 -u "${script_dir}/mime-canary.py" --port-file "$port_file" \
+  2> "$canary_stderr" &
 canary_pid=$!
 attempt=0
 while [ ! -s "$port_file" ]; do
+  if ! kill -0 "$canary_pid" 2>/dev/null; then
+    cat "$canary_stderr" >&2
+    echo 'The MIME canary terminated before becoming ready.' >&2
+    exit 1
+  fi
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 100 ]; then
     echo 'The MIME canary did not start.' >&2
@@ -165,7 +173,7 @@ if not re.fullmatch(r"[0-9a-f]{64}", evidence.get("rawControlHash", "")):
     raise SystemExit("native MIME evidence has an invalid raw-control hash")
 PY
 
-if rg -i 'inline-js|image\.png|script\.js|style\.css|127\.0\.0\.1|http://' \
+if grep -Eiq 'inline-js|image\.png|script\.js|style\.css|127\.0\.0\.1|http://' \
   "$native_output" "$rust_output"; then
   echo 'MIME evidence contains hostile input or a canary address.' >&2
   exit 1
