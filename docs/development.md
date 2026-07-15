@@ -34,6 +34,10 @@ architecture check is nevertheless the enforcement point for diagnostic-only
 Slint and Dioxus dependency isolation; `cargo deny` alone cannot establish
 that runtime boundary.
 
+The validator self-test is mandatory in CI. Adding a gate, changing a minimum
+evidence tier, or changing the attestation schema requires a matching validator
+update and independent exact-head review; editing the JSON alone fails closed.
+
 ## Dependency changes
 
 Use intentional dependency declarations in the workspace manifest. Do not use

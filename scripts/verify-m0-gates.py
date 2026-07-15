@@ -54,9 +54,57 @@ CANONICAL_TIERS = [
     "device-signed",
     "distribution-signed",
 ]
+CANONICAL_REQUIRED_TIERS = {
+    "M0-SLINT-001": "device-signed",
+    "M0-SLINT-002": "device-signed",
+    "M0-SLINT-003": "simulator",
+    "M0-SLINT-004": "host",
+    "M0-SLINT-005": "device-signed",
+    "M0-SLINT-006": "device-signed",
+    "M0-SLINT-007": "device-signed",
+    "M0-SLINT-008": "device-signed",
+    "M0-SLINT-009": "device-signed",
+    "M0-SLINT-010": "device-signed",
+    "M0-SLINT-011": "device-signed",
+    "M0-SLINT-012": "distribution-signed",
+    "M0-DIOXUS-001": "host",
+    "M0-DIOXUS-002": "device-signed",
+    "M0-DIOXUS-003": "simulator",
+    "M0-DIOXUS-004": "simulator",
+    "M0-DIOXUS-005": "device-signed",
+    "M0-DIOXUS-006": "device-signed",
+    "M0-DIOXUS-007": "device-signed",
+    "M0-DIOXUS-008": "host",
+    "M0-DIOXUS-009": "device-signed",
+    "M0-DIOXUS-010": "device-signed",
+    "M0-DIOXUS-011": "device-signed",
+    "M0-DIOXUS-012": "host",
+    "M0-DIOXUS-013": "device-signed",
+    "M0-DIOXUS-014": "device-signed",
+    "M0-DIOXUS-015": "device-signed",
+    "M0-DIOXUS-016": "distribution-signed",
+    "M0-CACHE-001": "device-signed",
+    "M0-OAUTH-001": "device-signed",
+    "M0-STORAGE-001": "device-signed",
+    "M0-SEARCH-001": "device-signed",
+    "M0-MIME-001": "device-signed",
+    "M1-UI-001": "distribution-signed",
+}
+ALLOWED_REVIEW_COMPETENCIES = {
+    "accessibility",
+    "apple-platform",
+    "release-engineering",
+    "security",
+}
+INDEPENDENT_REVIEW_STATEMENT = (
+    "I independently reviewed the commit-bound, redacted evidence and verified the claimed result."
+)
 GATE_ID = re.compile(r"^(?:M0|M1)-[A-Z]+-\d{3}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+ARTIFACT_LOCATOR = re.compile(
+    r"^(?:github-actions://runs/\d+/artifacts/\d+|repository://evidence/[0-9a-f]{40}/[A-Za-z0-9._/-]+)$"
+)
 
 
 def error(errors: list[str], message: str) -> None:
@@ -72,7 +120,7 @@ def parse_date(value: Any, label: str, errors: list[str]) -> dt.datetime | None:
     except ValueError:
         error(errors, f"{label} is not an ISO 8601 timestamp")
         return None
-    if parsed.tzinfo is None:
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
         error(errors, f"{label} must include a timezone")
         return None
     return parsed
@@ -82,8 +130,8 @@ def validate_artifact(value: Any, gate_id: str, errors: list[str]) -> None:
     if not isinstance(value, dict) or set(value) != {"locator", "sha256", "redacted"}:
         error(errors, f"{gate_id}: artifact must contain locator, sha256, and redacted")
         return
-    if not isinstance(value["locator"], str) or not value["locator"].strip():
-        error(errors, f"{gate_id}: artifact.locator must be a non-empty string")
+    if not isinstance(value["locator"], str) or not ARTIFACT_LOCATOR.fullmatch(value["locator"]):
+        error(errors, f"{gate_id}: artifact.locator must be an immutable evidence locator")
     if not isinstance(value["sha256"], str) or not SHA256.fullmatch(value["sha256"]):
         error(errors, f"{gate_id}: artifact.sha256 must be a lowercase SHA-256 digest")
     if value["redacted"] is not True:
@@ -95,13 +143,28 @@ def validate_attestation(value: Any, reviewer: Any, gate_id: str, errors: list[s
     if not isinstance(value, dict) or set(value) != required:
         error(errors, f"{gate_id}: attestation must identify implementer, reviewer, competence, and statement")
         return
-    for key in required:
+    for key in required - {"competence"}:
         if not isinstance(value[key], str) or not value[key].strip():
             error(errors, f"{gate_id}: attestation.{key} must be a non-empty string")
+    competence = value.get("competence")
+    if (
+        not isinstance(competence, list)
+        or not competence
+        or any(
+            not isinstance(item, str) or item not in ALLOWED_REVIEW_COMPETENCIES
+            for item in competence
+        )
+        or len(set(competence)) != len(competence)
+    ):
+        error(errors, f"{gate_id}: attestation.competence must list unique approved competencies")
     if value.get("reviewer") != reviewer:
         error(errors, f"{gate_id}: attestation reviewer must match evidence.reviewer")
-    if value.get("implementer") == value.get("reviewer"):
+    implementer_identity = str(value.get("implementer", "")).strip().casefold()
+    reviewer_identity = str(value.get("reviewer", "")).strip().casefold()
+    if implementer_identity == reviewer_identity:
         error(errors, f"{gate_id}: implementer cannot independently review their own evidence")
+    if value.get("statement") != INDEPENDENT_REVIEW_STATEMENT:
+        error(errors, f"{gate_id}: attestation statement must use the canonical independent-review text")
 
 
 def table_statuses(path: Path, errors: list[str]) -> dict[str, str]:
@@ -183,11 +246,17 @@ def validate(data: Any) -> list[str]:
                 error(errors, f"{gate_id}.{key} must be a non-empty string")
         if gate["status"] not in CANONICAL_STATUSES:
             error(errors, f"{gate_id}.status is unknown")
-        if gate["evidence_tier"] not in tier_order or gate["required_tier"] not in tier_order:
+        evidence_tier = gate["evidence_tier"]
+        required_tier = gate["required_tier"]
+        if not isinstance(evidence_tier, str) or evidence_tier not in tier_order:
             error(errors, f"{gate_id} has an unknown evidence tier")
+        if not isinstance(required_tier, str) or required_tier not in tier_order:
+            error(errors, f"{gate_id} has an unknown evidence tier")
+        if gate_id in CANONICAL_REQUIRED_TIERS and required_tier != CANONICAL_REQUIRED_TIERS[gate_id]:
+            error(errors, f"{gate_id}.required_tier does not match the reviewed minimum")
         if isinstance(gate["source_document"], str) and not (ROOT / gate["source_document"]).is_file():
             error(errors, f"{gate_id}.source_document does not exist")
-        if gate["phase"] not in {"M0", "M1"} or not gate_id.startswith(f"{gate['phase']}-"):
+        if gate["phase"] not in ("M0", "M1") or not gate_id.startswith(f"{gate['phase']}-"):
             error(errors, f"{gate_id}.phase must match the gate ID")
         if not isinstance(gate["dependencies"], list) or not all(isinstance(item, str) for item in gate["dependencies"]):
             error(errors, f"{gate_id}.dependencies must be an array of IDs")
@@ -204,29 +273,38 @@ def validate(data: Any) -> list[str]:
         if any(value is not None for value in review_values) and not all(review_values):
             error(errors, f"{gate_id}: review identity, attestation, and expiry metadata are all required together")
         if gate["status"] == "passed":
-            if tier_order.get(gate["evidence_tier"], -1) < tier_order.get(gate["required_tier"], 99):
+            evidence_rank = tier_order.get(evidence_tier, -1) if isinstance(evidence_tier, str) else -1
+            required_rank = tier_order.get(required_tier, 99) if isinstance(required_tier, str) else 99
+            if evidence_rank < required_rank:
                 error(errors, f"{gate_id}: passed status does not meet required evidence tier")
             if gate["phase"] == "M1" or gate_id.startswith("M1-"):
                 error(errors, f"{gate_id}: M1 cannot pass while ui_baseline_approved is false")
             if gate_id.startswith(("M0-SLINT-", "M0-DIOXUS-")):
                 error(errors, f"{gate_id}: production UI cannot pass while ui_baseline_approved is false")
-        if gate["required_tier"] in {"device-signed", "distribution-signed"} and gate["status"] == "passed":
+        signed_tier_claim = evidence_tier in (
+            "device-signed",
+            "distribution-signed",
+        ) or (
+            gate["status"] == "passed"
+            and required_tier in ("device-signed", "distribution-signed")
+        )
+        if signed_tier_claim:
             for key in ("commit", "artifact", "reviewer", "attestation", "reviewed_at", "expires_at"):
                 if not evidence[key]:
-                    error(errors, f"{gate_id}: signed pass requires evidence.{key}")
+                    error(errors, f"{gate_id}: signed evidence requires evidence.{key}")
             if not isinstance(evidence["commit"], str) or not COMMIT.fullmatch(evidence["commit"]):
-                error(errors, f"{gate_id}: signed pass requires an exact 40-character commit SHA")
+                error(errors, f"{gate_id}: signed evidence requires an exact 40-character commit SHA")
             validate_artifact(evidence["artifact"], gate_id, errors)
             if not isinstance(evidence["reviewer"], str) or not evidence["reviewer"].strip():
-                error(errors, f"{gate_id}: signed pass requires a named reviewer")
+                error(errors, f"{gate_id}: signed evidence requires a named reviewer")
             validate_attestation(evidence["attestation"], evidence["reviewer"], gate_id, errors)
             reviewed = parse_date(evidence["reviewed_at"], f"{gate_id}.evidence.reviewed_at", errors)
             expiry = parse_date(evidence["expires_at"], f"{gate_id}.evidence.expires_at", errors)
             if reviewed and expiry and expiry <= reviewed:
                 error(errors, f"{gate_id}: evidence expiry must follow review")
-            if reviewed and reviewed > dt.datetime.now(tz=dt.UTC):
+            if reviewed and reviewed > dt.datetime.now(tz=dt.timezone.utc):
                 error(errors, f"{gate_id}: evidence review cannot be dated in the future")
-            if expiry and expiry <= dt.datetime.now(tz=dt.UTC):
+            if expiry and expiry <= dt.datetime.now(tz=dt.timezone.utc):
                 error(errors, f"{gate_id}: evidence review has expired")
         elif all(review_values):
             validate_attestation(evidence["attestation"], evidence["reviewer"], gate_id, errors)
@@ -234,13 +312,28 @@ def validate(data: Any) -> list[str]:
             expiry = parse_date(evidence["expires_at"], f"{gate_id}.evidence.expires_at", errors)
             if reviewed and expiry and expiry <= reviewed:
                 error(errors, f"{gate_id}: evidence expiry must follow review")
+            if reviewed and reviewed > dt.datetime.now(tz=dt.timezone.utc):
+                error(errors, f"{gate_id}: evidence review cannot be dated in the future")
+            if expiry and expiry <= dt.datetime.now(tz=dt.timezone.utc):
+                error(errors, f"{gate_id}: evidence review has expired")
+    if ids != set(CANONICAL_REQUIRED_TIERS):
+        error(errors, "gate IDs must exactly match the reviewed canonical register")
     for gate in gate_by_id.values():
+        if not isinstance(gate["dependencies"], list) or not all(
+            isinstance(item, str) for item in gate["dependencies"]
+        ):
+            continue
         for dependency in gate["dependencies"]:
             if dependency not in ids:
                 error(errors, f"{gate['id']}: unknown dependency {dependency}")
+            elif gate["status"] == "passed" and gate_by_id[dependency]["status"] != "passed":
+                error(errors, f"{gate['id']}: passed gate has unresolved dependency {dependency}")
     table_ids: dict[str, str] = {}
     for document in UI_DOCUMENTS:
-        table_ids.update(table_statuses(document, errors))
+        document_ids = table_statuses(document, errors)
+        for duplicate in set(table_ids) & set(document_ids):
+            error(errors, f"duplicate UI table ID across documents: {duplicate}")
+        table_ids.update(document_ids)
     registered_ui_ids = {gate_id for gate_id in ids if gate_id.startswith(("M0-SLINT-", "M0-DIOXUS-"))}
     if set(table_ids) != registered_ui_ids:
         error(errors, "UI Markdown table IDs must exactly match registered UI gate IDs")
@@ -260,7 +353,7 @@ def load_register() -> Any:
 
 def self_test(data: Any) -> list[str]:
     failures: list[str] = []
-    now = dt.datetime.now(tz=dt.UTC)
+    now = dt.datetime.now(tz=dt.timezone.utc)
     reviewed_at = (now - dt.timedelta(days=1)).isoformat()
     expires_at = (now + dt.timedelta(days=30)).isoformat()
     mutated = copy.deepcopy(data)
@@ -279,7 +372,7 @@ def self_test(data: Any) -> list[str]:
     signed_gate["evidence_tier"] = "distribution-signed"
     signed_gate["evidence"]["kind"] = "distribution"
     errors = validate(mutated)
-    if not any("signed pass requires evidence.commit" in message for message in errors):
+    if not any("signed evidence requires evidence.commit" in message for message in errors):
         failures.append("negative unsigned distribution-pass mutation unexpectedly passed")
     mutated = copy.deepcopy(data)
     ui_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-SLINT-011")
@@ -289,13 +382,13 @@ def self_test(data: Any) -> list[str]:
         {
             "kind": "device-run",
             "commit": "a" * 40,
-            "artifact": {"locator": "evidence.json", "sha256": "b" * 64, "redacted": True},
+            "artifact": {"locator": "github-actions://runs/1/artifacts/1", "sha256": "b" * 64, "redacted": True},
             "reviewer": "reviewer",
             "attestation": {
                 "implementer": "implementer",
                 "reviewer": "reviewer",
-                "competence": "Apple platform review",
-                "statement": "I independently reviewed the commit-bound evidence.",
+                "competence": ["apple-platform"],
+                "statement": INDEPENDENT_REVIEW_STATEMENT,
             },
             "reviewed_at": reviewed_at,
             "expires_at": expires_at,
@@ -312,13 +405,13 @@ def self_test(data: Any) -> list[str]:
         {
             "kind": "distribution",
             "commit": "a" * 40,
-            "artifact": {"locator": "evidence.json", "sha256": "b" * 64, "redacted": True},
+            "artifact": {"locator": "github-actions://runs/1/artifacts/1", "sha256": "b" * 64, "redacted": True},
             "reviewer": "same-person",
             "attestation": {
-                "implementer": "same-person",
+                "implementer": " Same-Person ",
                 "reviewer": "same-person",
-                "competence": "Release review",
-                "statement": "I reviewed my own evidence.",
+                "competence": ["release-engineering"],
+                "statement": INDEPENDENT_REVIEW_STATEMENT,
             },
             "reviewed_at": reviewed_at,
             "expires_at": expires_at,
@@ -327,6 +420,67 @@ def self_test(data: Any) -> list[str]:
     errors = validate(mutated)
     if not any("implementer cannot independently review" in message for message in errors):
         failures.append("negative self-review mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    cache_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    cache_gate["required_tier"] = "host"
+    errors = validate(mutated)
+    if not any("required_tier does not match" in message for message in errors):
+        failures.append("negative required-tier downgrade unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    cache_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    cache_gate["status"] = "passed"
+    cache_gate["dependencies"] = ["M0-SLINT-006"]
+    errors = validate(mutated)
+    if not any("passed gate has unresolved dependency" in message for message in errors):
+        failures.append("negative unresolved-dependency mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    cache_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    cache_gate["evidence_tier"] = []
+    errors = validate(mutated)
+    if not any("unknown evidence tier" in message for message in errors):
+        failures.append("negative malformed-tier mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    cache_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    cache_gate["evidence_tier"] = "device-signed"
+    errors = validate(mutated)
+    if not any("signed evidence requires evidence.commit" in message for message in errors):
+        failures.append("negative unbound signed-tier claim unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    cache_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M0-CACHE-001")
+    cache_gate["dependencies"] = None
+    errors = validate(mutated)
+    if not any("dependencies must be an array" in message for message in errors):
+        failures.append("negative malformed-dependency mutation unexpectedly passed")
+    errors = []
+    validate_attestation(
+        {
+            "implementer": "implementer",
+            "reviewer": "reviewer",
+            "competence": [[]],
+            "statement": INDEPENDENT_REVIEW_STATEMENT,
+        },
+        "reviewer",
+        "SELF-TEST",
+        errors,
+    )
+    if not any("approved competencies" in message for message in errors):
+        failures.append("negative malformed-competence mutation unexpectedly passed")
+    errors = []
+    validate_artifact(
+        {"locator": "latest", "sha256": "b" * 64, "redacted": True},
+        "SELF-TEST",
+        errors,
+    )
+    if not any("immutable evidence locator" in message for message in errors):
+        failures.append("negative mutable-artifact mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    unknown_gate = copy.deepcopy(mutated["gates"][-1])
+    unknown_gate["id"] = "M0-UNKNOWN-001"
+    unknown_gate["phase"] = "M0"
+    mutated["gates"].append(unknown_gate)
+    errors = validate(mutated)
+    if not any("exactly match the reviewed canonical register" in message for message in errors):
+        failures.append("negative unknown-gate mutation unexpectedly passed")
     return failures
 
 

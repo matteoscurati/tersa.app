@@ -33,6 +33,12 @@ only `passed` closes a gate. Evidence tiers are ordered `none`, `source`,
 `distribution-signed`. Historical phrases such as “PASS locally” and “PASS by
 code” are represented as `diagnostic`, never `passed`.
 
+The register is authoritative for current state and evidence. The validator
+separately pins the reviewed gate-ID set and minimum required tier so a register
+edit cannot silently add a gate or lower its acceptance bar. A passed gate must
+also have every declared dependency in `passed` state. Changing the canonical
+ID or tier policy is an architecture change and requires exact-head review.
+
 Evidence claiming a physical-device or signed-distribution pass must be
 commit-bound, redacted, and independently reviewed. A qualifying reviewer is
 a named contributor other than the implementer, with relevant Apple platform,

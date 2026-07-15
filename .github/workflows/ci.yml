@@ -383,7 +383,7 @@ jobs:
       - name: Fetch locked dependencies for offline policy checks
         run: cargo fetch --locked
       - name: Verify M0 product gates
-        run: python3 scripts/verify-m0-gates.py
+        run: python3 scripts/verify-m0-gates.py --self-test
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories

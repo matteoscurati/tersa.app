@@ -116,11 +116,16 @@ Each passed physical-device or signed-distribution gate requires:
   material, account data, filesystem paths, credentials, tokens, message
   content, keys, and private submission identifiers;
 - the named implementer/evidence producer;
-- a different named reviewer with relevant Apple platform, accessibility,
-  security, or release competence;
-- the reviewer's competence and explicit attestation;
+- a different named reviewer, compared case-insensitively, with one or more
+  reviewed competence identifiers: `apple-platform`, `accessibility`,
+  `security`, or `release-engineering`;
+- the canonical explicit independent-review attestation required by the gate
+  schema;
 - timezone-qualified review and expiry timestamps.
 
-The gate validator rejects missing fields, self-review, expired review,
-abbreviated commit identifiers, unredacted artifacts, insufficient evidence
-tiers, and any UI or M1 pass while no production UI baseline is approved.
+Artifact locators use an immutable `github-actions://runs/<run>/artifacts/<id>`
+or `repository://evidence/<commit>/<path>` form. The gate validator rejects
+missing fields, unknown gate IDs, tier downgrades, unresolved dependencies,
+self-review, expired review, abbreviated commit identifiers, mutable locators,
+unredacted artifacts, insufficient evidence tiers, and any UI or M1 pass while
+no production UI baseline is approved.
