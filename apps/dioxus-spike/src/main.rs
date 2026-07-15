@@ -107,9 +107,34 @@ mod apple {
         window.setTimeout(() => {
             const editor = document.querySelector('[data-evidence="composer"]');
             const advance = document.querySelector('[data-evidence="advance-list"]');
-            if (!editor || !advance) {
+            const navigation = document.querySelector('[data-evidence="navigation"]');
+            const storage = document.querySelector('[data-evidence="storage"]');
+            const cookie = document.querySelector('[data-evidence="cookie"]');
+            const popup = document.querySelector('[data-evidence="popup"]');
+            if (!editor || !advance || !navigation || !storage || !cookie || !popup) {
                 throw new Error('Dioxus evidence controls are missing');
             }
+            const initialLocation = window.location.href;
+            localStorage.setItem('tersa-dioxus-ephemeral-probe', 'written');
+            document.cookie = 'tersa-dioxus-ephemeral-cookie=written; SameSite=Strict';
+            const localStorageWritten =
+                localStorage.getItem('tersa-dioxus-ephemeral-probe') === 'written';
+            const cookieWritten = document.cookie.includes(
+                'tersa-dioxus-ephemeral-cookie=written'
+            );
+            const anchor = document.createElement('a');
+            anchor.setAttribute('href', 'https://example.invalid/anchor');
+            anchor.textContent = 'Synthetic navigation probe';
+            document.body.append(anchor);
+            anchor.click();
+            const ipcParams = {};
+            ipcParams['href'] = 'https://example.invalid/ipc-browser-open';
+            window.ipc.postMessage(JSON.stringify({
+                method: 'browser_open',
+                params: ipcParams
+            }));
+            const popupRejected =
+                window.open('https://example.invalid/window-open', '_blank') === null;
             advance.click();
             window.setTimeout(() => {
                 const setter = Object.getOwnPropertyDescriptor(
@@ -121,8 +146,52 @@ mod apple {
                     'TERSA DIOXUS INPUT ONE\nTERSA DIOXUS INPUT TWO'
                 );
                 editor.dispatchEvent(new Event('input', { bubbles: true }));
+                const locationState = window.location.href === initialLocation
+                    ? 'NAVIGATION PROBE PAGE UNCHANGED'
+                    : 'NAVIGATION PROBE PAGE CHANGED';
+                const storageState = localStorageWritten
+                    ? 'LOCAL STORAGE WRITTEN'
+                    : 'LOCAL STORAGE WRITE FAILED';
+                const cookieState = cookieWritten
+                    ? 'COOKIE WRITTEN'
+                    : 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME';
+                const popupState = popupRejected
+                    ? 'WINDOW OPEN REJECTED'
+                    : 'WINDOW OPEN RETURNED A HANDLE';
+                navigation.textContent = locationState;
+                storage.textContent = storageState;
+                cookie.textContent = cookieState;
+                popup.textContent = popupState;
+                window.setTimeout(() => {
+                    window.location.assign('https://example.invalid/location');
+                }, 15000);
             }, 250);
         }, 5000);
+    "#;
+    const RELAUNCH_EVIDENCE_SCRIPT: &str = r#"
+        window.setTimeout(() => {
+            const navigation = document.querySelector('[data-evidence="navigation"]');
+            const storage = document.querySelector('[data-evidence="storage"]');
+            const cookie = document.querySelector('[data-evidence="cookie"]');
+            if (!navigation || !storage || !cookie) {
+                throw new Error('Dioxus relaunch evidence control is missing');
+            }
+            const storageAbsent =
+                localStorage.getItem('tersa-dioxus-ephemeral-probe') === null;
+            document.cookie = 'tersa-dioxus-relaunch-cookie=probe; SameSite=Strict';
+            const cookieApiAvailable = document.cookie.includes(
+                'tersa-dioxus-relaunch-cookie=probe'
+            );
+            const storageState = storageAbsent
+                ? 'LOCAL STORAGE ABSENT AFTER RELAUNCH'
+                : 'LOCAL STORAGE PRESENT AFTER RELAUNCH';
+            const cookieState = cookieApiAvailable
+                ? 'COOKIE API AVAILABLE AFTER RELAUNCH'
+                : 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME';
+            navigation.textContent = 'EPHEMERAL RELAUNCH PROBE';
+            storage.textContent = storageState;
+            cookie.textContent = cookieState;
+        }, 1000);
     "#;
 
     /// Starts the diagnostic interface with synthetic, non-production data.
@@ -139,7 +208,11 @@ mod apple {
         let config = Config::new()
             .with_custom_index(INDEX.to_owned())
             .with_custom_head(head)
-            .with_navigation_handler(|_| false)
+            .with_incognito(true)
+            .with_navigation_handler(|url| {
+                eprintln!("TERSA-DIOXUS-NAV-DENIED {url}");
+                false
+            })
             .with_disable_context_menu(true)
             .with_background_color((246, 244, 238, 255))
             .with_custom_event_handler(|event, _| match event {
@@ -178,8 +251,13 @@ mod apple {
                 }
             });
             if std::env::var_os("TERSA_DIOXUS_EVIDENCE").is_some() {
+                let evidence_script = if std::env::var_os("TERSA_DIOXUS_RELAUNCH").is_some() {
+                    RELAUNCH_EVIDENCE_SCRIPT
+                } else {
+                    EVIDENCE_SCRIPT
+                };
                 spawn(async move {
-                    if let Err(error) = dioxus_document::eval(EVIDENCE_SCRIPT).await {
+                    if let Err(error) = dioxus_document::eval(evidence_script).await {
                         eprintln!("TERSA-DIOXUS-EVIDENCE error: {error}");
                     }
                 });
@@ -277,6 +355,22 @@ mod apple {
                             output {
                                 "data-evidence": "actual-dom-rows",
                                 "ACTUAL DOM ROWS PENDING"
+                            }
+                            output {
+                                "data-evidence": "navigation",
+                                "NAVIGATION PROBE PENDING"
+                            }
+                            output {
+                                "data-evidence": "storage",
+                                "STORAGE PROBE PENDING"
+                            }
+                            output {
+                                "data-evidence": "cookie",
+                                "COOKIE PROBE PENDING"
+                            }
+                            output {
+                                "data-evidence": "popup",
+                                "WINDOW OPEN PROBE PENDING"
                             }
                             button {
                                 r#type: "button",

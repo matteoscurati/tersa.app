@@ -9,10 +9,12 @@ set -eu
 
 apple_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${apple_dir}/build/dioxus-evidence"
+mac_home="${build_dir}/macos-home"
 window_finder="${apple_dir}/build/find-process-window"
 mac_app="${apple_dir}/build/TersaDioxusMac.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
 ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Debug-iphonesimulator/Tersa Dioxus Spike.app"
-mkdir -p "$build_dir"
+rm -rf "$build_dir"
+mkdir -p "$build_dir" "$mac_home"
 
 mac_pid=''
 device=''
@@ -83,6 +85,28 @@ for observation in request.results ?? [] {
 SWIFT
 }
 
+capture_mac_until_text() {
+  image_path="$1"
+  ocr_path="$2"
+  expected_pattern="$3"
+  maximum_attempts="$4"
+  attempts=0
+  while :; do
+    attempts=$((attempts + 1))
+    if screencapture -x -l "$mac_window" "$image_path" \
+      && recognize_text "$image_path" > "$ocr_path"; then
+      if grep -E "$expected_pattern" "$ocr_path" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    if [ "$attempts" -ge "$maximum_attempts" ]; then
+      echo "Timed out waiting for macOS Dioxus evidence: $expected_pattern" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
 xcrun swiftc "${apple_dir}/scripts/find-process-window.swift" -o "$window_finder"
 
 verify_virtualization_ocr() {
@@ -139,12 +163,34 @@ verify_loopback_listener() {
   fi
 }
 
+wait_for_exact_log_line() {
+  expected_line="$1"
+  log_file="$2"
+  attempts=0
+  while ! grep -Fx "$expected_line" "$log_file" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 250 ]; then
+      echo "Timed out waiting for process evidence: $expected_line" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 start_mac() {
   evidence_mode="$1"
+  relaunch_mode="${2:-0}"
+  process_log="${3:-macos-process.log}"
   if [ "$evidence_mode" -eq 1 ]; then
-    TERSA_DIOXUS_EVIDENCE=1 "$mac_binary" >"${build_dir}/macos-process.log" 2>&1 &
+    if [ "$relaunch_mode" -eq 1 ]; then
+      HOME="$mac_home" TERSA_DIOXUS_EVIDENCE=1 TERSA_DIOXUS_RELAUNCH=1 \
+        "$mac_binary" >"${build_dir}/${process_log}" 2>&1 &
+    else
+      HOME="$mac_home" TERSA_DIOXUS_EVIDENCE=1 "$mac_binary" \
+        >"${build_dir}/${process_log}" 2>&1 &
+    fi
   else
-    "$mac_binary" >"${build_dir}/macos-process.log" 2>&1 &
+    "$mac_binary" >"${build_dir}/${process_log}" 2>&1 &
   fi
   mac_pid=$!
   wait_for_mac_window
@@ -169,37 +215,72 @@ stop_mac() {
 mac_cold_start=$(now_ns)
 start_mac 0
 mac_cold_end=$(now_ns)
-sleep 2
-stop_mac
-mac_warm_start=$(now_ns)
-start_mac 0
-mac_warm_end=$(now_ns)
-sleep 2
-screencapture -x -l "$mac_window" "${build_dir}/macos-initial.png"
+capture_mac_until_text \
+  "${build_dir}/macos-initial.png" \
+  "${build_dir}/macos-initial-ocr.txt" \
+  'ACTUAL DOM ROWS [0-9]+' \
+  30
 test "$(stat -f '%z' "${build_dir}/macos-initial.png")" -gt 10000
-recognize_text "${build_dir}/macos-initial.png" > "${build_dir}/macos-initial-ocr.txt"
 grep -E 'TERSA-DIOXUS-M[0O]-THREAD' "${build_dir}/macos-initial-ocr.txt"
 grep -E '10.?000' "${build_dir}/macos-initial-ocr.txt"
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-initial-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -eq 0
 stop_mac
+sleep 1
 
-start_mac 1
-sleep 7
-screencapture -x -l "$mac_window" "${build_dir}/macos.png"
+mac_warm_start=$(now_ns)
+start_mac 0
+mac_warm_end=$(now_ns)
+sleep 2
+stop_mac
+sleep 1
+
+start_mac 1 0 macos-navigation-process.log
+capture_mac_until_text \
+  "${build_dir}/macos.png" \
+  "${build_dir}/macos-ocr.txt" \
+  'LOCAL STORAGE (WRITTEN|WRITE FAILED)' \
+  40
 test "$(stat -f '%z' "${build_dir}/macos.png")" -gt 10000
-recognize_text "${build_dir}/macos.png" > "${build_dir}/macos-ocr.txt"
 grep -E 'TERSA-DIOXUS-M[0O]-THREAD' "${build_dir}/macos-ocr.txt"
 grep -E '10.?000' "${build_dir}/macos-ocr.txt"
 grep -F 'TERSA DIOXUS INPUT ONE' "${build_dir}/macos-ocr.txt"
 grep -F 'TERSA DIOXUS INPUT TWO' "${build_dir}/macos-ocr.txt"
 grep -E '45 characters' "${build_dir}/macos-ocr.txt"
+grep -F 'NAVIGATION PROBE PAGE UNCHANGED' "${build_dir}/macos-ocr.txt"
+grep -F 'LOCAL STORAGE WRITTEN' "${build_dir}/macos-ocr.txt"
+grep -F 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME' "${build_dir}/macos-ocr.txt"
+grep -F 'WINDOW OPEN REJECTED' "${build_dir}/macos-ocr.txt"
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/anchor' \
+  "${build_dir}/macos-navigation-process.log"
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/ipc-browser-open' \
+  "${build_dir}/macos-navigation-process.log"
+wait_for_exact_log_line \
+  'TERSA-DIOXUS-NAV-DENIED https://example.invalid/location' \
+  "${build_dir}/macos-navigation-process.log"
 virtualization=$(verify_virtualization_ocr "${build_dir}/macos-ocr.txt")
 first_row=${virtualization#* }
 test "$first_row" -gt 0
 verify_loopback_listener "$mac_pid" "${build_dir}/macos-listeners.txt"
 stop_mac
+
+start_mac 1 1 macos-relaunch-process.log
+capture_mac_until_text \
+  "${build_dir}/macos-relaunch.png" \
+  "${build_dir}/macos-relaunch-ocr.txt" \
+  'LOCAL STORAGE (ABSENT|PRESENT) AFTER RELAUNCH' \
+  30
+grep -F 'LOCAL STORAGE ABSENT AFTER RELAUNCH' "${build_dir}/macos-relaunch-ocr.txt"
+grep -F 'COOKIE API UNAVAILABLE ON DIOXUS SCHEME' "${build_dir}/macos-relaunch-ocr.txt"
+stop_mac
+
+if find "$mac_home" -type d \( -name WebKit -o -name WebsiteData \) -print -quit | grep -q .; then
+  echo "Incognito Dioxus diagnostic created a WebKit data directory below its isolated HOME" >&2
+  exit 1
+fi
 
 device=$(xcrun simctl list devices available \
   | awk -F '[()]' '/iPhone (1[5-9].*Pro|Air)/ { print $2; exit }')
@@ -252,3 +333,18 @@ printf '%s\n' \
   'Full Keyboard Access, safe-area rotations, lifecycle edge cases, memory warning,' \
   'protected data, energy, memory, and signed TestFlight/App Review behavior.' \
   > "${build_dir}/physical-device-gaps.txt"
+
+printf '%s\n' \
+  'The macOS host probe verifies a localStorage write, location stability,' \
+  'anchor navigation and injected browser_open IPC denial markers while the' \
+  'page remains rendered, plus a later direct-location denial marker and a' \
+  'rejected window.open,' \
+  'localStorage absence after relaunch, and' \
+  'the absence of WebKit or WebsiteData directories below an isolated HOME.' \
+  'The dioxus:// custom scheme exposes no usable document.cookie API, so this' \
+  'probe cannot make or verify a cookie-persistence claim.' \
+  'The direct-location marker does not claim that WebKit preserves the rendered' \
+  'page after cancellation; that behavior remains a device-signed gate.' \
+  'It cannot enumerate every operating-system WebKit cache surface, prove zero' \
+  'in-memory state, or establish physical-device or signed-distribution behavior.' \
+  > "${build_dir}/ephemeral-navigation-limitations.txt"

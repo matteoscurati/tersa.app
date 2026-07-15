@@ -120,8 +120,18 @@ def resolved_packages(metadata: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+def require_ordered_markers(source: str, markers: tuple[str, ...], label: str) -> None:
+    positions = [source.find(marker) for marker in markers]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise SystemExit(f"Dioxus {label} invariant changed: expected ordered markers {markers!r}")
+
+
 def main() -> None:
     workspace = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        ["python3", str(workspace / "apple" / "scripts" / "verify-dioxus-vendor.py")],
+        check=True,
+    )
     metadata_by_target = {
         target: cargo_metadata(workspace, target) for target in APPLE_TARGETS
     }
@@ -193,11 +203,74 @@ def main() -> None:
         if marker not in edits:
             raise SystemExit(f"Dioxus transport invariant changed: missing {marker!r}")
 
+    cargo_toml = (workspace / "Cargo.toml").read_text(encoding="utf-8")
+    if 'dioxus-desktop = { path = "vendor/dioxus-desktop-0.7.9" }' not in cargo_toml:
+        raise SystemExit("Dioxus local patch pin is missing")
+
+    config = (source / "src" / "config.rs").read_text(encoding="utf-8")
+    webview = (source / "src" / "webview.rs").read_text(encoding="utf-8")
+    app_runtime = (source / "src" / "app.rs").read_text(encoding="utf-8")
+    launch_runtime = (source / "src" / "launch.rs").read_text(encoding="utf-8")
+    desktop_runtime = config + webview + app_runtime + launch_runtime
+    required_desktop_markers = (
+        "pub fn with_incognito(mut self, incognito: bool) -> Self",
+        "pub(crate) incognito: bool,",
+        ".with_incognito(incognito)",
+        "pub(crate) fn navigation_decision(",
+        "NavigationDecision::OpenExternal",
+        "fn open_external_if_allowed<E>(",
+        "pub(crate) navigation_handler: Option<NavigationHandler>,",
+        "let ipc_navigation_handler = navigation_handler.clone();",
+        "navigation_handler: ipc_navigation_handler,",
+        "pub fn handle_browser_open(&mut self, msg: IpcMessage, id: WindowId)",
+        ".map(|(window_id, webview)| (window_id, webview.navigation_handler.as_ref()))",
+        "fn handle_browser_open_for_windows<'a, K: PartialEq + 'a, E>(",
+        ".find_map(|(window_id, handler)| (window_id == originating_window).then_some(handler))",
+        "IpcMethod::BrowserOpen => app.handle_browser_open(msg, id)",
+        "browser_open_uses_originating_window_policy_and_unknown_ids_fail_closed",
+    )
+    for marker in required_desktop_markers:
+        if marker not in desktop_runtime:
+            raise SystemExit(f"Dioxus local patch invariant changed: missing {marker!r}")
+    forbidden_desktop_markers = (
+        "IpcMethod::BrowserOpen => app.handle_browser_open(msg),",
+        "pub(crate) navigation_handler: Option<NavigationHandler>,",
+    )
+    if forbidden_desktop_markers[0] in launch_runtime:
+        raise SystemExit("Dioxus browser-open IPC no longer carries its window ID")
+    if forbidden_desktop_markers[1] in app_runtime:
+        raise SystemExit("Dioxus navigation policy must be stored per WebView, not per App")
+    require_ordered_markers(
+        webview,
+        (
+            "if is_dioxus_internal_url(url)",
+            "if let Some(handler) = navigation_handler",
+            "if is_external_browser_url(url)",
+        ),
+        "navigation decision ordering",
+    )
+
+    wry = package(metadata, "wry")
+    wry_source = Path(wry["manifest_path"]).parent
+    wry_webview = (wry_source / "src" / "wkwebview" / "mod.rs").read_text(encoding="utf-8")
+    if "WKWebsiteDataStore::nonPersistentDataStore" not in wry_webview:
+        raise SystemExit("Wry non-persistent WKWebsiteDataStore invariant changed")
+
     app = (workspace / "apps" / "dioxus-spike" / "src" / "main.rs").read_text(
         encoding="utf-8"
     )
     required_app_markers = (
-        ".with_navigation_handler(|_| false)",
+        ".with_incognito(true)",
+        ".with_navigation_handler(|url| {",
+        "TERSA-DIOXUS-NAV-DENIED",
+        "localStorage.setItem('tersa-dioxus-ephemeral-probe', 'written')",
+        "document.cookie = 'tersa-dioxus-ephemeral-cookie=written; SameSite=Strict'",
+        "window.location.assign('https://example.invalid/location')",
+        "window.open('https://example.invalid/window-open', '_blank')",
+        "https://example.invalid/ipc-browser-open",
+        "LOCAL STORAGE ABSENT AFTER RELAUNCH",
+        "COOKIE API UNAVAILABLE ON DIOXUS SCHEME",
+        "WINDOW OPEN REJECTED",
         ".with_custom_index(INDEX.to_owned())",
         '<html lang="en">',
         "<title>tersa.app — Dioxus M0 diagnostic</title>",

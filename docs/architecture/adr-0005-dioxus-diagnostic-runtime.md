@@ -45,14 +45,11 @@ visible focus treatment, a multiline textarea, reduced-motion handling, and
 CSS safe-area insets. Tao `Resumed` and `Suspended` events emit fixed diagnostic
 markers without content.
 
-The diagnostic contains no anchors, URLs, remote assets, server functions,
+The rendered diagnostic contains no anchors, remote assets, server functions,
 Gmail code, or credentials, and the application does not explicitly save its
-synthetic UI state. Wry nevertheless uses the default persistent WebKit data
-store. A navigation callback rejects schemes that Dioxus delegates to the
-application. Dioxus handles HTTP, HTTPS, and mailto links before that callback
-and opens them in the system browser, so the spike prevents those paths by
-never rendering a link. This is not sufficient for untrusted production email
-content.
+synthetic UI state. Its evidence-only mode injects synthetic URLs to exercise
+the locally patched deny boundary described in ADR-0007. This is not sufficient
+for untrusted production email content.
 
 CI verifies every Apple target's resolved feature set, the absence of Manganis
 and Dioxus devtools, the exact loopback bind expression, independent CSPRNG

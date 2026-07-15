@@ -174,6 +174,8 @@ jobs:
         run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Verify Dioxus runtime boundary
         run: python3 apple/scripts/verify-dioxus-runtime.py
+      - name: Test patched Dioxus behavior
+        run: cargo test --locked --offline --package dioxus-desktop --lib
       - name: Generate Apple project
         run: xcodegen generate --spec apple/project.yml --project apple
       - name: Archive unsigned macOS Dioxus spike

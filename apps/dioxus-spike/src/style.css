@@ -269,6 +269,14 @@ textarea:focus-visible,
   white-space: nowrap;
 }
 
+.virtual-diagnostics output[data-evidence="navigation"],
+.virtual-diagnostics output[data-evidence="storage"],
+.virtual-diagnostics output[data-evidence="cookie"],
+.virtual-diagnostics output[data-evidence="popup"] {
+  flex-basis: 100%;
+  white-space: normal;
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
