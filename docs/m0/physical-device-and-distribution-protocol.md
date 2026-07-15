@@ -110,7 +110,7 @@ notarization.
 
 Each passed physical-device or signed-distribution gate requires:
 
-- an exact commit SHA and immutable artifact locator;
+- an exact commit SHA and an immutable artifact locator bound to that same SHA;
 - a SHA-256 for a redacted evidence manifest;
 - `redacted: true` after an explicit scan for UDIDs, certificate or provisioning
   material, account data, filesystem paths, credentials, tokens, message
@@ -123,9 +123,22 @@ Each passed physical-device or signed-distribution gate requires:
   schema;
 - timezone-qualified review and expiry timestamps.
 
-Artifact locators use an immutable `github-actions://runs/<run>/artifacts/<id>`
-or `repository://evidence/<commit>/<path>` form. The gate validator rejects
-missing fields, unknown gate IDs, tier downgrades, unresolved dependencies,
-self-review, expired review, abbreviated commit identifiers, mutable locators,
-unredacted artifacts, insufficient evidence tiers, and any UI or M1 pass while
-no production UI baseline is approved.
+Repository evidence uses
+`repository://evidence/<exact-evidence.commit>/<path>`. GitHub Actions evidence
+uses `github-actions://runs/<run>/artifacts/<id>/manifest.json#evidence-commit=<exact-evidence.commit>`.
+The uploaded `manifest.json` records the exact `GITHUB_SHA`, generation and
+retention timestamps, and the relative path, size, and SHA-256 of every evidence
+file. The gate record contains the manifest SHA-256 and matching timestamps. The
+validator compares the locator SHA with `evidence.commit`, bounds retention to
+90 days, and requires review expiry before artifact expiry; it does not rely on
+a mutable run name, branch, or artifact label. The independent reviewer verifies
+the downloaded manifest and its file hashes before attesting.
+
+GitHub Actions evidence is retained for 90 days, while the manifest uses an
+89-day safety margin. A gate backed by that form must be reviewed and expire no
+later than the recorded retention timestamp; repository evidence is
+preferred when the review period needs to outlive artifact retention. The gate
+validator rejects missing fields, unknown gate IDs, tier downgrades, unresolved
+dependencies, self-review, expired review, abbreviated commit identifiers,
+mutable or mismatched locators, unredacted artifacts, insufficient evidence
+tiers, and any UI or M1 pass while no production UI baseline is approved.

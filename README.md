@@ -28,7 +28,8 @@ The accepted [product constraints](docs/architecture/adr-0006-product-constraint
 and authoritative [M0 gate register](docs/m0/gate-register.json) define what
 counts as current evidence. See the [threat model](docs/security/threat-model.md)
 and [security data flow](docs/security/data-flow.md) for the current security
-boundaries.
+boundaries. Physical-device and signed-distribution closure follows the
+[M0 physical-device and distribution protocol](docs/m0/physical-device-and-distribution-protocol.md).
 
 ## Development
 
