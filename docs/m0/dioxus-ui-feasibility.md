@@ -20,6 +20,14 @@ The current verdict is:
   Unavoidable Tokio runtime, lifecycle gaps, signing and distribution, and
   physical-device evidence remain unresolved blockers.
 
+An opt-in [physical-device observation harness](dioxus-device-evidence.md) now
+prepares signed exact-head, redacted, aggregate evidence for text input,
+VoiceOver, Dynamic Type, Full Keyboard Access, and Switch Control. It does not
+measure contrast and therefore provides only partial evidence for
+`M0-DIOXUS-013`. It records no result in this document or the gate register. The
+criteria stay open, the UI baseline remains unapproved, and Dioxus remains
+diagnostic only.
+
 ## Stable acceptance criteria
 
 | ID | Criterion | Required result | Register status |

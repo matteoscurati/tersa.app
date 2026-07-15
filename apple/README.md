@@ -16,6 +16,14 @@ WebView and Dioxus's authenticated loopback UI transport. It is not a product
 UI, backend, sandbox-compatibility claim, or permission to persist mail in
 WebKit.
 
+The iOS Dioxus target also exposes an opt-in, exact-head physical-device
+observation mode. Signing values are accepted only through the ignored
+`apple/local.xcconfig`; the checked-in example contains placeholders. The
+capture script defaults to a no-action dry run, deletes raw Apple command
+output, and emits only aggregate review-required evidence. See the
+[device evidence protocol](../docs/m0/dioxus-device-evidence.md). This harness
+does not change any M0 gate or select Dioxus.
+
 The additive `TersaMimeMac` and `TersaMimeIOS` schemes compile a separate native
 Swift WKWebView policy around the portable `tersa-mime-spike`. The macOS host
 probe uses a nonpersistent data store, disabled content JavaScript, block-all

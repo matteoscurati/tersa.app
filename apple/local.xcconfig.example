@@ -1,0 +1,15 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// Local-only Dioxus physical-device signing configuration.
+// Copy this file to apple/local.xcconfig. Never commit the populated copy.
+// Do not add TERSA_EVIDENCE_COMMIT; the capture script owns that exact binding.
+
+TERSA_DIOXUS_DEVICE_EVIDENCE_OPT_IN = NO
+TERSA_DIOXUS_CODE_SIGNING_ALLOWED = YES
+TERSA_DIOXUS_CODE_SIGNING_REQUIRED = YES
+TERSA_DIOXUS_DEVELOPMENT_TEAM = REPLACE_WITH_LOCAL_TEAM
+TERSA_DIOXUS_CODE_SIGN_STYLE = Automatic
+TERSA_DIOXUS_CODE_SIGN_IDENTITY = Apple Development
+TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER =

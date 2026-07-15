@@ -176,6 +176,31 @@ jobs:
         run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Verify Dioxus runtime boundary
         run: python3 apple/scripts/verify-dioxus-runtime.py
+      - name: Verify device evidence schema and redaction rejection
+        run: |
+          python3 apple/scripts/verify-dioxus-device-evidence.py --self-test
+          sh -n apple/scripts/capture-dioxus-device-evidence.sh
+          sh apple/scripts/capture-dioxus-device-evidence.sh --self-test-contract
+          output=$(sh apple/scripts/capture-dioxus-device-evidence.sh)
+          printf '%s\n' "$output" | grep -Fx 'DIOXUS DEVICE EVIDENCE DRY RUN'
+          printf '%s\n' "$output" | grep -Fx 'No build, signing, installation, launch, or device command was executed.'
+          printf '%s\n' "$output" | grep -Fx 'NOT A DEVICE-GATE RESULT'
+          if sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/opt-in-negative.txt" 2>&1; then
+            exit 1
+          fi
+          grep -Fx 'Execution requires TERSA_DEVICE_EVIDENCE_OPT_IN=YES.' "$RUNNER_TEMP/opt-in-negative.txt"
+          if TERSA_DEVICE_EVIDENCE_OPT_IN=YES \
+            sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/selector-negative.txt" 2>&1; then
+            exit 1
+          fi
+          grep -Fx 'Execution requires a local TERSA_DEVICE_SELECTOR; it is never retained.' "$RUNNER_TEMP/selector-negative.txt"
+          if TERSA_DEVICE_EVIDENCE_OPT_IN=YES TERSA_DEVICE_SELECTOR=synthetic \
+            sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/terminal-negative.txt" 2>&1; then
+            exit 1
+          fi
+          grep -Fx 'Execution requires an interactive terminal.' "$RUNNER_TEMP/terminal-negative.txt"
+          rm "$RUNNER_TEMP/opt-in-negative.txt" "$RUNNER_TEMP/selector-negative.txt" "$RUNNER_TEMP/terminal-negative.txt"
+          cargo test --locked --offline --package tersa-dioxus-spike
       - name: Test patched Dioxus behavior
         run: cargo test --locked --offline --package dioxus-desktop --lib
       - name: Generate Apple project
