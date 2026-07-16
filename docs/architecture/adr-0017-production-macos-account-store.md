@@ -44,6 +44,8 @@ Schema v1 owns a singleton account binding and message envelopes with nullable
 RFC 5322 content. Only an exactly empty database may be claimed. Ownership,
 version, schema, integrity, and decoded domain values are revalidated and map to
 opaque corruption errors; operational failures map to opaque storage errors.
+This includes non-OK raw-key setup results such as `SQLITE_NOMEM`; a wrong key
+instead succeeds at setup and maps to corruption when the first read fails.
 An envelope without content is a valid partial cache entry, so `message`
 returns `None` until complete content is stored. Reads preflight SQLite types
 and byte lengths before materializing user-controlled text or message bytes.

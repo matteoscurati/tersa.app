@@ -367,7 +367,7 @@ mod macos {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(PathBuf::from(uri), flags)
             .map_err(|_error| OpenFailure::Storage)?;
-        apply_key(&connection, key).map_err(|_error| OpenFailure::Corrupted)?;
+        apply_key(&connection, key).map_err(classify_key)?;
         let fresh = validate_identity(&connection, account)?;
         if fresh && database_sidecar_exists(path)? {
             return Err(OpenFailure::Corrupted);
@@ -511,7 +511,7 @@ mod macos {
         account: &AccountId,
         key: &[u8; 32],
     ) -> Result<(), OpenFailure> {
-        apply_key(connection, key).map_err(|_error| OpenFailure::Corrupted)?;
+        apply_key(connection, key).map_err(classify_key)?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(|_error| OpenFailure::Storage)?;
@@ -675,6 +675,10 @@ mod macos {
                 key_length,
             )
         };
+        key_result(result)
+    }
+
+    fn key_result(result: i32) -> rusqlite::Result<()> {
         if result == rusqlite::ffi::SQLITE_OK {
             Ok(())
         } else {
@@ -683,6 +687,13 @@ mod macos {
                 None,
             ))
         }
+    }
+
+    fn classify_key(_error: rusqlite::Error) -> OpenFailure {
+        // Wrong keys are accepted by `sqlite3_key` and surface as corruption on
+        // the first database read. A non-OK keying result is therefore an
+        // operational setup failure, most notably `SQLITE_NOMEM`.
+        OpenFailure::Storage
     }
     fn schema(connection: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut statement = connection.prepare(
@@ -947,6 +958,10 @@ mod macos {
 
         #[test]
         fn fresh_create_converges_reopen_is_noop_and_wrong_key_is_rejected() {
+            assert_eq!(
+                key_result(rusqlite::ffi::SQLITE_NOMEM).map_err(classify_key),
+                Err(OpenFailure::Storage)
+            );
             let database = TestDatabase::new("reopen");
             let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             let expected_state = (APPLICATION_ID, VERSION, canonical_schema());
