@@ -97,6 +97,15 @@ CANONICAL_REQUIRED_TIERS = {
     "M0-SEARCH-001": "device-signed",
     "M0-MIME-001": "device-signed",
     "M1-UI-001": "distribution-signed",
+    "P1-MACOS-001": "distribution-signed",
+    "P1-MACOS-002": "distribution-signed",
+    "P1-MACOS-003": "distribution-signed",
+}
+CANONICAL_DEPENDENCIES = {
+    "M1-UI-001": ["M0-SLINT-006", "M0-DIOXUS-009", "M0-DIOXUS-010"],
+    "P1-MACOS-001": [],
+    "P1-MACOS-002": [],
+    "P1-MACOS-003": ["P1-MACOS-001", "P1-MACOS-002"],
 }
 ALLOWED_REVIEW_COMPETENCIES = {
     "accessibility",
@@ -107,7 +116,7 @@ ALLOWED_REVIEW_COMPETENCIES = {
 INDEPENDENT_REVIEW_STATEMENT = (
     "I independently reviewed the commit-bound, redacted evidence and verified the claimed result."
 )
-GATE_ID = re.compile(r"^(?:M0|M1)-[A-Z]+-\d{3}$")
+GATE_ID = re.compile(r"^(?:M0|M1|P1)-[A-Z]+-\d{3}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REPOSITORY_ARTIFACT_LOCATOR = re.compile(
@@ -342,7 +351,7 @@ def validate(data: Any) -> list[str]:
             error(errors, f"{gate_id}.required_tier does not match the reviewed minimum")
         if isinstance(gate["source_document"], str) and not (ROOT / gate["source_document"]).is_file():
             error(errors, f"{gate_id}.source_document does not exist")
-        if gate["phase"] not in ("M0", "M1") or not gate_id.startswith(f"{gate['phase']}-"):
+        if gate["phase"] not in ("M0", "M1", "P1") or not gate_id.startswith(f"{gate['phase']}-"):
             error(errors, f"{gate_id}.phase must match the gate ID")
         if not isinstance(gate["dependencies"], list) or not all(isinstance(item, str) for item in gate["dependencies"]):
             error(errors, f"{gate_id}.dependencies must be an array of IDs")
@@ -407,6 +416,9 @@ def validate(data: Any) -> list[str]:
                 error(errors, f"{gate_id}: signed evidence requires a named reviewer")
     if ids != set(CANONICAL_REQUIRED_TIERS):
         error(errors, "gate IDs must exactly match the reviewed canonical register")
+    for gate_id, dependencies in CANONICAL_DEPENDENCIES.items():
+        if gate_by_id.get(gate_id, {}).get("dependencies") != dependencies:
+            error(errors, f"{gate_id}.dependencies do not match the reviewed dependency policy")
     for gate in gate_by_id.values():
         if not isinstance(gate["dependencies"], list) or not all(
             isinstance(item, str) for item in gate["dependencies"]
@@ -415,8 +427,28 @@ def validate(data: Any) -> list[str]:
         for dependency in gate["dependencies"]:
             if dependency not in ids:
                 error(errors, f"{gate['id']}: unknown dependency {dependency}")
+            elif gate["phase"] == "P1" and gate_by_id[dependency]["phase"] != "P1":
+                error(errors, f"{gate['id']}: P1 gates may depend only on P1 gates")
+            elif gate["phase"] in ("M0", "M1") and gate_by_id[dependency]["phase"] == "P1":
+                error(errors, f"{gate['id']}: M0 and M1 gates cannot depend on P1 gates")
             elif gate["status"] == "passed" and gate_by_id[dependency]["status"] != "passed":
                 error(errors, f"{gate['id']}: passed gate has unresolved dependency {dependency}")
+    p1_macos_gate_ids = ("P1-MACOS-001", "P1-MACOS-002", "P1-MACOS-003")
+    p1_macos_guard = gate_by_id.get("P1-MACOS-003")
+    if p1_macos_guard and p1_macos_guard["status"] == "passed":
+        p1_macos_gates = [gate_by_id.get(gate_id) for gate_id in p1_macos_gate_ids]
+        p1_macos_commits = {
+            gate["evidence"].get("commit")
+            if isinstance(gate, dict) and isinstance(gate.get("evidence"), dict)
+            else None
+            for gate in p1_macos_gates
+        }
+        if len(p1_macos_commits) != 1:
+            error(
+                errors,
+                "P1-MACOS-003: aggregate pass requires P1-MACOS-001, P1-MACOS-002, "
+                "and P1-MACOS-003 evidence commits to match",
+            )
     table_ids: dict[str, str] = {}
     for document in UI_DOCUMENTS:
         document_ids = table_statuses(document, errors)
@@ -779,6 +811,120 @@ def self_test(data: Any) -> list[str]:
     errors = validate(mutated)
     if not any("exactly match the reviewed canonical register" in message for message in errors):
         failures.append("negative unknown-gate mutation unexpectedly passed")
+    if validate(copy.deepcopy(data)):
+        failures.append("legal M1-to-M0 dependency fixture unexpectedly failed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    p1_ui["id"] = "P2-MACOS-001"
+    p1_ui["phase"] = "P2"
+    errors = validate(mutated)
+    if not any("not a stable gate ID" in message for message in errors):
+        failures.append("negative P1 gate-ID grammar mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    p1_ui["required_tier"] = "device-signed"
+    errors = validate(mutated)
+    if not any("required_tier does not match" in message for message in errors):
+        failures.append("negative P1 required-tier mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_guard = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-003")
+    p1_guard["dependencies"] = ["P1-MACOS-002", "P1-MACOS-001"]
+    errors = validate(mutated)
+    if not any("dependencies do not match" in message for message in errors):
+        failures.append("negative P1 canonical-dependency mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_guard = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-003")
+    p1_guard["dependencies"] = ["M0-CACHE-001"]
+    errors = validate(mutated)
+    if not any("P1 gates may depend only on P1 gates" in message for message in errors):
+        failures.append("negative P1-to-M0 dependency mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    m1_gate = next(gate for gate in mutated["gates"] if gate["id"] == "M1-UI-001")
+    m1_gate["dependencies"] = ["P1-MACOS-001"]
+    errors = validate(mutated)
+    if not any("M0 and M1 gates cannot depend on P1 gates" in message for message in errors):
+        failures.append("negative M1-to-P1 dependency mutation unexpectedly passed")
+
+    def pass_p1_gate(gate: dict[str, Any]) -> None:
+        gate["status"] = "passed"
+        gate["evidence_tier"] = "distribution-signed"
+        gate["evidence"].update(
+            {
+                "kind": "distribution",
+                "commit": "a" * 40,
+                "artifact": copy.deepcopy(valid_artifact),
+                **copy.deepcopy(valid_review),
+            }
+        )
+
+    mutated = copy.deepcopy(data)
+    p1_guard = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-003")
+    pass_p1_gate(p1_guard)
+    errors = validate(mutated)
+    if not any("passed gate has unresolved dependency" in message for message in errors):
+        failures.append("negative unresolved P1 aggregate pass unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    pass_p1_gate(p1_ui)
+    p1_ui["evidence"]["reviewer"] = None
+    errors = validate(mutated)
+    if not any("signed evidence requires evidence.reviewer" in message for message in errors):
+        failures.append("negative incomplete P1 evidence mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    pass_p1_gate(p1_ui)
+    p1_ui["evidence"]["artifact"]["redacted"] = False
+    errors = validate(mutated)
+    if not any("explicitly redacted" in message for message in errors):
+        failures.append("negative unredacted P1 evidence mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    pass_p1_gate(p1_ui)
+    p1_ui["evidence"]["expires_at"] = (now - dt.timedelta(days=1)).isoformat()
+    errors = validate(mutated)
+    if not any("evidence review has expired" in message for message in errors):
+        failures.append("negative expired P1 evidence mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    pass_p1_gate(p1_ui)
+    p1_ui["evidence"].update(
+        {
+            "reviewer": "implementer",
+            "attestation": {
+                **p1_ui["evidence"]["attestation"],
+                "reviewer": "implementer",
+            },
+        }
+    )
+    errors = validate(mutated)
+    if not any("implementer cannot independently review" in message for message in errors):
+        failures.append("negative P1 self-review mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    p1_ui = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-001")
+    pass_p1_gate(p1_ui)
+    p1_ui["evidence"]["artifact"]["locator"] = (
+        f"github-actions://runs/1/artifacts/1/manifest.json#evidence-commit={'c' * 40}"
+    )
+    errors = validate(mutated)
+    if not any("locator commit must exactly match evidence.commit" in message for message in errors):
+        failures.append("negative P1 commit/artifact mismatch mutation unexpectedly passed")
+    mutated = copy.deepcopy(data)
+    for gate_id in ("P1-MACOS-001", "P1-MACOS-002", "P1-MACOS-003"):
+        pass_p1_gate(next(gate for gate in mutated["gates"] if gate["id"] == gate_id))
+    errors = validate(mutated)
+    if errors:
+        failures.append("legal P1 pass sequence with ui_baseline_approved=false unexpectedly failed")
+    mutated = copy.deepcopy(data)
+    for gate_id in ("P1-MACOS-001", "P1-MACOS-002", "P1-MACOS-003"):
+        pass_p1_gate(next(gate for gate in mutated["gates"] if gate["id"] == gate_id))
+    p1_release = next(gate for gate in mutated["gates"] if gate["id"] == "P1-MACOS-002")
+    p1_release["evidence"]["commit"] = "c" * 40
+    p1_release["evidence"]["artifact"]["locator"] = (
+        f"github-actions://runs/1/artifacts/1/manifest.json#evidence-commit={'c' * 40}"
+    )
+    errors = validate(mutated)
+    if not any("aggregate pass requires" in message for message in errors):
+        failures.append("negative P1 aggregate commit-mismatch mutation unexpectedly passed")
     return failures
 
 

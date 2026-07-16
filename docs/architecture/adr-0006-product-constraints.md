@@ -39,6 +39,12 @@ edit cannot silently add a gate or lower its acceptance bar. A passed gate must
 also have every declared dependency in `passed` state. Changing the canonical
 ID or tier policy is an architecture change and requires exact-head review.
 
+`P1-MACOS-001`, `P1-MACOS-002`, and `P1-MACOS-003` are a separately governed
+macOS Phase 1 carve-out. Their passes do not count as M1 or UI-dependent
+mobile-inclusive passes, do not satisfy `M1-UI-001`, and leave
+`ui_baseline_approved` false. They neither approve a mobile toolkit nor alter
+the existing mobile gate policy.
+
 Evidence claiming a physical-device or signed-distribution pass must be
 commit-bound, redacted, and independently reviewed. A qualifying reviewer is
 a named contributor other than the implementer, with relevant Apple platform,
