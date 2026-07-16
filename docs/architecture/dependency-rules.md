@@ -3,7 +3,7 @@
 tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
-The initial workspace has four shared architectural layers plus eight platform
+The workspace has four shared architectural layers plus nine platform
 and feasibility adapters:
 
 | Crate | Responsibility | Allowed workspace dependencies |
@@ -20,12 +20,14 @@ and feasibility adapters:
 | `tersa-mime-spike` | Portable bounded MIME and deny-by-default HTML diagnostic | None |
 | `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
+| `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
 `tersa-dioxus-spike` are the only workspace crates allowed to depend on their
-respective UI runtimes. `tersa-sqlcipher-spike` and `tersa-search-spike` are the
-only crates allowed to depend on `rusqlite` or `libsqlite3-sys`; Tantivy is
+respective UI runtimes. `tersa-sqlcipher-spike`, `tersa-search-spike`, and
+`tersa-store-sqlcipher-macos` are the only crates allowed to depend on
+`rusqlite` or `libsqlite3-sys`; Tantivy is
 exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 `memmap2`, `tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
 `mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
@@ -36,26 +38,23 @@ cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 and `hmac`
 Apple target graph. New workspace crates must be added explicitly to the policy
 in `xtask`; an unknown crate fails CI.
 
-## Reserved macOS production adapters
+## macOS production account store
 
-The `RESERVED_FUTURE_POLICY` table in `xtask` reserves
-`tersa-store-sqlcipher-macos`; it is not an active dependency-policy entry and
-the crate does not exist in this change. The architecture check fails if the
-reserved name appears in workspace
-membership. This is a tripwire, not pre-authorization: the crate-introducing
-pull request must explicitly move its name from the reserved table to the
-active policy under review.
-
-When introduced, the store adapter may depend inward only on
+`tersa-store-sqlcipher-macos` is an active, macOS-only production adapter. It
+may depend inward only on
 `tersa-application` and `tersa-domain`. Remote mailbox and local mailbox-store
 ports now exist in `tersa-application`; adapters implement those inward-defined
 ports, while `tersa-application` and `tersa-domain` never depend on adapters.
 
-The future macOS store adapter must declare `rusqlite`, `libsqlite3-sys`,
-`chacha20poly1305`, and `hmac` only under the exact target cfg
-`cfg(target_os = "macos")`. Untargeted, iOS-only, and iOS-inclusive declarations
-are violations. It may own both SQLCipher and blob AEAD because both share one
-commit and crash-safety protocol.
+The adapter must pin `rusqlite` exactly to 0.39.0 under the exact target cfg
+`cfg(target_os = "macos")`, disable its default features, and select only
+`bundled-sqlcipher`. Every resolved Apple graph must contain only rusqlite
+0.39.0 with the exact unified feature set `bundled`, `bundled-sqlcipher`, and
+`modern_sqlite`; extension-loading and hook features fail closed. Version,
+feature, untargeted, iOS-only, and iOS-inclusive deviations are violations.
+Blob/attachment encryption is deliberately deferred:
+this adapter does not own `chacha20poly1305` or `hmac` until a real
+blob/attachment port and cross-file commit protocol are accepted.
 
 `tersa-gmail-rest-macos` is active and may depend inward only on
 `tersa-application` and `tersa-domain`. `reqwest` is pinned exactly to 0.13.4,

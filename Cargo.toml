@@ -9,6 +9,7 @@ members = [
     "apps/slint-spike",
     "apple/rust-bridge",
     "adapters/gmail-rest-macos",
+    "adapters/store-sqlcipher-macos",
     "crates/application",
     "crates/domain",
     "crates/platform",

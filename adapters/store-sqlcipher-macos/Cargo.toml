@@ -1,0 +1,25 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-store-sqlcipher-macos"
+description = "macOS-only account-scoped SQLCipher mailbox store for tersa.app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tersa-application = { workspace = true }
+tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { workspace = true, default-features = false, features = ["bundled-sqlcipher"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true
