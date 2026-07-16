@@ -36,6 +36,7 @@ const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
 const REQWEST_RESOLVED_FEATURES: [&str; 4] =
     ["__native-tls", "__native-tls-alpn", "__tls", "native-tls"];
+const RUSQLITE_RESOLVED_FEATURES: [&str; 3] = ["bundled", "bundled-sqlcipher", "modern_sqlite"];
 
 fn main() -> ExitCode {
     match run() {
@@ -747,6 +748,34 @@ fn check_sqlcipher_dependency_graph(
             )
         })
         .collect();
+    let rusqlite_packages: BTreeSet<String> = metadata
+        .packages
+        .iter()
+        .filter_map(|package| {
+            if package.name != "rusqlite" {
+                return None;
+            }
+            if package.version.to_string() != "0.39.0" {
+                violations.push("resolved rusqlite must be exactly 0.39.0".to_owned());
+            }
+            Some(package.id.to_string())
+        })
+        .collect();
+    if rusqlite_packages.is_empty() {
+        violations.push("resolved dependency graph is missing rusqlite".to_owned());
+    }
+    for node in &resolve.nodes {
+        if rusqlite_packages.contains(&node.id.to_string()) {
+            violations.extend(rusqlite_resolved_feature_violations(
+                &node
+                    .features
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                target,
+            ));
+        }
+    }
     let sqlite_packages: BTreeSet<String> = package_names
         .iter()
         .filter_map(|(id, name)| (name == "libsqlite3-sys").then_some(id.clone()))
@@ -767,6 +796,17 @@ fn check_sqlcipher_dependency_graph(
         &sqlite_packages,
         target,
     ));
+}
+
+fn rusqlite_resolved_feature_violations(features: &[String], target: &str) -> Vec<String> {
+    let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = RUSQLITE_RESOLVED_FEATURES.into_iter().collect();
+    if features == expected {
+        return Vec::new();
+    }
+    vec![format!(
+        "resolved rusqlite features for {target} must be exactly bundled SQLCipher without extension loading or hooks"
+    )]
 }
 
 fn sqlcipher_dependency_graph_violations(
@@ -1289,8 +1329,8 @@ mod tests {
         gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
         gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
         is_slint_runtime_dependency, parse_identity, resolved_workspace_dependency_names,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        target_metadata_options,
+        rusqlite_resolved_feature_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, target_metadata_options,
     };
 
     #[test]
@@ -1506,6 +1546,31 @@ mod tests {
                 "tersa-store-sqlcipher-macos -> rusqlite must pin exactly 0.39.0",
                 "tersa-store-sqlcipher-macos -> rusqlite must disable default features",
                 "tersa-store-sqlcipher-macos -> rusqlite must enable only the `bundled-sqlcipher` feature",
+            ]
+        );
+        assert!(
+            rusqlite_resolved_feature_violations(
+                &[
+                    "bundled".to_owned(),
+                    "bundled-sqlcipher".to_owned(),
+                    "modern_sqlite".to_owned(),
+                ],
+                "aarch64-apple-darwin",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rusqlite_resolved_feature_violations(
+                &[
+                    "bundled".to_owned(),
+                    "bundled-sqlcipher".to_owned(),
+                    "load_extension".to_owned(),
+                    "modern_sqlite".to_owned(),
+                ],
+                "aarch64-apple-darwin",
+            ),
+            vec![
+                "resolved rusqlite features for aarch64-apple-darwin must be exactly bundled SQLCipher without extension loading or hooks"
             ]
         );
     }

@@ -9,7 +9,7 @@
 //! latency-sensitive async executor thread. It deliberately owns neither blob
 //! encryption nor cross-file commit orchestration.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -18,7 +18,7 @@ mod macos {
     use std::fs::OpenOptions;
     use std::io::ErrorKind;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -87,18 +87,26 @@ mod macos {
         pub fn open<P: AsRef<Path>>(
             account: AccountId,
             path: P,
-            mut key: DatabaseKey,
+            key: DatabaseKey,
         ) -> Result<Self, MailboxStoreError> {
-            let canonical_path =
-                canonical_database_path(path.as_ref()).map_err(|kind| match kind {
-                    OpenFailure::Corrupted => MailboxStoreError::Corrupted,
-                    OpenFailure::Storage => MailboxStoreError::Storage,
-                })?;
-            let created = prepare_database_leaf(&canonical_path).map_err(|kind| match kind {
+            Self::open_inner(account, path.as_ref(), key, |_path| {})
+        }
+
+        fn open_inner(
+            account: AccountId,
+            path: &Path,
+            mut key: DatabaseKey,
+            after_preflight: impl FnOnce(&Path),
+        ) -> Result<Self, MailboxStoreError> {
+            let canonical_path = canonical_database_path(path).map_err(|kind| match kind {
                 OpenFailure::Corrupted => MailboxStoreError::Corrupted,
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
-            if !created {
+            let prepared = prepare_database_leaf(&canonical_path).map_err(|kind| match kind {
+                OpenFailure::Corrupted => MailboxStoreError::Corrupted,
+                OpenFailure::Storage => MailboxStoreError::Storage,
+            })?;
+            if !prepared.created {
                 let preflight = preflight_existing(&canonical_path, &account, &key.0);
                 if let Err(kind) = preflight {
                     key.0.zeroize();
@@ -108,10 +116,30 @@ mod macos {
                     });
                 }
             }
+            after_preflight(&canonical_path);
             let connection = open_connection(&canonical_path).map_err(|kind| match kind {
                 OpenFailure::Corrupted => MailboxStoreError::Corrupted,
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
+            if file_identity(&canonical_path).map_err(|kind| match kind {
+                OpenFailure::Corrupted => MailboxStoreError::Corrupted,
+                OpenFailure::Storage => MailboxStoreError::Storage,
+            })? != prepared.identity
+            {
+                key.0.zeroize();
+                return Err(MailboxStoreError::Storage);
+            }
+            if prepared.created
+                && database_sidecar_exists(&canonical_path).map_err(|kind| match kind {
+                    OpenFailure::Corrupted => MailboxStoreError::Corrupted,
+                    OpenFailure::Storage => MailboxStoreError::Storage,
+                })?
+            {
+                key.0.zeroize();
+                drop(connection);
+                let _ = std::fs::remove_file(&canonical_path);
+                return Err(MailboxStoreError::Corrupted);
+            }
             let outcome = configure_and_migrate(&connection, &account, &key.0);
             key.0.zeroize();
             outcome.map_err(|kind| match kind {
@@ -237,6 +265,18 @@ mod macos {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FileIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PreparedLeaf {
+        created: bool,
+        identity: FileIdentity,
+    }
+
     fn canonical_database_path(path: &Path) -> Result<PathBuf, OpenFailure> {
         let file_name = path.file_name().ok_or(OpenFailure::Storage)?;
         let parent = path
@@ -248,11 +288,17 @@ mod macos {
         Ok(canonical_parent.join(file_name))
     }
 
-    fn prepare_database_leaf(path: &Path) -> Result<bool, OpenFailure> {
+    fn prepare_database_leaf(path: &Path) -> Result<PreparedLeaf, OpenFailure> {
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => Ok(false),
+            Ok(metadata) if metadata.file_type().is_file() => Ok(PreparedLeaf {
+                created: false,
+                identity: identity_from_metadata(&metadata),
+            }),
             Ok(_metadata) => Err(OpenFailure::Storage),
             Err(error) if error.kind() == ErrorKind::NotFound => {
+                if database_sidecar_exists(path)? {
+                    return Err(OpenFailure::Corrupted);
+                }
                 match OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -261,21 +307,45 @@ mod macos {
                 {
                     Ok(file) => {
                         drop(file);
-                        Ok(true)
+                        if database_sidecar_exists(path)? {
+                            let _ = std::fs::remove_file(path);
+                            return Err(OpenFailure::Corrupted);
+                        }
+                        Ok(PreparedLeaf {
+                            created: true,
+                            identity: file_identity(path)?,
+                        })
                     }
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                         let metadata = std::fs::symlink_metadata(path)
                             .map_err(|_error| OpenFailure::Storage)?;
-                        metadata
-                            .file_type()
-                            .is_file()
-                            .then_some(false)
-                            .ok_or(OpenFailure::Storage)
+                        if !metadata.file_type().is_file() {
+                            return Err(OpenFailure::Storage);
+                        }
+                        Ok(PreparedLeaf {
+                            created: false,
+                            identity: identity_from_metadata(&metadata),
+                        })
                     }
                     Err(_error) => Err(OpenFailure::Storage),
                 }
             }
             Err(_error) => Err(OpenFailure::Storage),
+        }
+    }
+
+    fn file_identity(path: &Path) -> Result<FileIdentity, OpenFailure> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_error| OpenFailure::Storage)?;
+        if !metadata.file_type().is_file() {
+            return Err(OpenFailure::Storage);
+        }
+        Ok(identity_from_metadata(&metadata))
+    }
+
+    fn identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         }
     }
 
@@ -588,15 +658,31 @@ mod macos {
         }
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "SQLCipher's raw-key API avoids copying the key into an ordinary SQL string"
+    )]
     fn apply_key(connection: &Connection, key: &[u8; 32]) -> rusqlite::Result<()> {
-        let mut literal = Zeroizing::new(String::with_capacity(67));
-        literal.push_str("x'");
-        for byte in key {
-            use std::fmt::Write as _;
-            let _ = write!(literal, "{byte:02x}");
+        let key_length =
+            i32::try_from(key.len()).map_err(|_error| rusqlite::Error::InvalidQuery)?;
+        // SAFETY: `connection.handle()` remains valid for this call, SQLCipher
+        // copies exactly `key_length` bytes before returning, and the borrowed
+        // key buffer remains alive and immutable for the complete call.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_key(
+                connection.handle(),
+                key.as_ptr().cast::<std::ffi::c_void>(),
+                key_length,
+            )
+        };
+        if result == rusqlite::ffi::SQLITE_OK {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(result),
+                None,
+            ))
         }
-        literal.push('\'');
-        connection.pragma_update(None, "key", literal.as_str())
     }
     fn schema(connection: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut statement = connection.prepare(
@@ -779,13 +865,61 @@ mod macos {
 
         fn raw_connection(database: &TestDatabase) -> Connection {
             let path = canonical_database_path(database.path()).unwrap();
-            assert!(prepare_database_leaf(&path).unwrap());
+            assert!(prepare_database_leaf(&path).unwrap().created);
             open_connection(&path).unwrap()
         }
 
         fn raw_existing_connection(database: &TestDatabase) -> Connection {
             let path = canonical_database_path(database.path()).unwrap();
             open_connection(&path).unwrap()
+        }
+
+        fn journal_path(database: &TestDatabase) -> PathBuf {
+            let mut name = database.path().as_os_str().to_os_string();
+            name.push("-journal");
+            PathBuf::from(name)
+        }
+
+        fn leave_foreign_hot_journal(database: &TestDatabase) {
+            let connection = raw_connection(database);
+            apply_key(&connection, &key(7).0).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     PRAGMA synchronous = FULL;
+                     CREATE TABLE foreign_owner (value BLOB NOT NULL);
+                     INSERT INTO foreign_owner (value) VALUES (zeroblob(4096));",
+                )
+                .unwrap();
+            drop(connection);
+
+            let ready = database.directory.join("hot-journal-ready");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::foreign_hot_journal_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_HOT_JOURNAL_DATABASE", database.path())
+                .env("TERSA_STORE_HOT_JOURNAL_READY", &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() && Instant::now() < deadline {
+                assert!(child.try_wait().unwrap().is_none());
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                ready.exists(),
+                "hot-journal child did not reach its checkpoint"
+            );
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+            assert!(journal_path(database).exists());
         }
 
         fn schema_state(
@@ -847,14 +981,25 @@ mod macos {
             fs::File::create(empty_with_sidecar.path()).unwrap();
             let mut journal_name = empty_with_sidecar.path().as_os_str().to_os_string();
             journal_name.push("-journal");
-            let journal_path = PathBuf::from(journal_name);
-            fs::write(&journal_path, b"foreign-sidecar").unwrap();
+            let existing_journal_path = PathBuf::from(journal_name);
+            fs::write(&existing_journal_path, b"foreign-sidecar").unwrap();
             assert_corrupted(SqlCipherMailboxStore::open(
                 account(),
                 empty_with_sidecar.path(),
                 key(7),
             ));
-            assert_eq!(fs::read(journal_path).unwrap(), b"foreign-sidecar");
+            assert_eq!(fs::read(existing_journal_path).unwrap(), b"foreign-sidecar");
+
+            let absent_with_sidecar = TestDatabase::new("absent-with-sidecar");
+            let absent_journal = journal_path(&absent_with_sidecar);
+            fs::write(&absent_journal, b"orphan-foreign-sidecar").unwrap();
+            assert_corrupted(SqlCipherMailboxStore::open(
+                account(),
+                absent_with_sidecar.path(),
+                key(7),
+            ));
+            assert!(!absent_with_sidecar.path().exists());
+            assert_eq!(fs::read(absent_journal).unwrap(), b"orphan-foreign-sidecar");
         }
 
         #[test]
@@ -967,49 +1112,8 @@ mod macos {
         #[test]
         fn foreign_hot_journal_is_rejected_without_recovery_or_mutation() {
             let database = TestDatabase::new("foreign-hot-journal");
-            let connection = raw_connection(&database);
-            apply_key(&connection, &key(7).0).unwrap();
-            connection
-                .execute_batch(
-                    "PRAGMA journal_mode = DELETE;
-                     PRAGMA synchronous = FULL;
-                     CREATE TABLE foreign_owner (value BLOB NOT NULL);
-                     INSERT INTO foreign_owner (value) VALUES (zeroblob(4096));",
-                )
-                .unwrap();
-            drop(connection);
-
-            let ready = database.directory.join("hot-journal-ready");
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "macos::tests::foreign_hot_journal_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("TERSA_STORE_HOT_JOURNAL_DATABASE", database.path())
-                .env("TERSA_STORE_HOT_JOURNAL_READY", &ready)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !ready.exists() && Instant::now() < deadline {
-                assert!(child.try_wait().unwrap().is_none());
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                ready.exists(),
-                "hot-journal child did not reach its checkpoint"
-            );
-            child.kill().unwrap();
-            assert!(!child.wait().unwrap().success());
-
-            let mut journal_name = database.path().as_os_str().to_os_string();
-            journal_name.push("-journal");
-            let journal_path = PathBuf::from(journal_name);
-            assert!(journal_path.exists());
+            leave_foreign_hot_journal(&database);
+            let journal_path = journal_path(&database);
             let database_before = fs::read(database.path()).unwrap();
             let journal_before = fs::read(&journal_path).unwrap();
 
@@ -1020,6 +1124,37 @@ mod macos {
             ));
             assert_eq!(fs::read(database.path()).unwrap(), database_before);
             assert_eq!(fs::read(journal_path).unwrap(), journal_before);
+        }
+
+        #[test]
+        fn replacement_between_preflight_and_reopen_is_rejected_before_database_reads() {
+            let original = TestDatabase::new("preflight-original");
+            let store = SqlCipherMailboxStore::open(account(), original.path(), key(7)).unwrap();
+            drop(store);
+            let replacement = TestDatabase::new("preflight-replacement");
+            leave_foreign_hot_journal(&replacement);
+            let replacement_database = fs::read(replacement.path()).unwrap();
+            let replacement_journal_path = journal_path(&replacement);
+            let replacement_journal = fs::read(&replacement_journal_path).unwrap();
+            let original_backup = original.directory.join("owned-backup.sqlite3");
+            let original_journal_path = journal_path(&original);
+
+            let result = SqlCipherMailboxStore::open_inner(
+                account(),
+                original.path(),
+                key(7),
+                |_canonical_path| {
+                    fs::rename(original.path(), &original_backup).unwrap();
+                    fs::rename(replacement.path(), original.path()).unwrap();
+                    fs::rename(&replacement_journal_path, &original_journal_path).unwrap();
+                },
+            );
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert_eq!(fs::read(original.path()).unwrap(), replacement_database);
+            assert_eq!(
+                fs::read(original_journal_path).unwrap(),
+                replacement_journal
+            );
         }
 
         #[test]

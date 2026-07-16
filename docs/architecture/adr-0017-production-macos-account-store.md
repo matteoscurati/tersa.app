@@ -19,17 +19,21 @@ bound to one local account, and reject unknown schema ownership.
 
 `tersa-store-sqlcipher-macos` implements `MailboxStore` for exactly one
 `AccountId` and one caller-selected SQLCipher file. It accepts a zeroizing
-32-byte database key, applies the raw SQLCipher key before schema access, and
-uses WAL, foreign keys, in-memory temporary storage, secure deletion, a bounded
-busy timeout, canonical schema validation, `SQLite` and `SQLCipher` integrity
+32-byte database key, applies it through SQLCipher's raw-key FFI before schema
+access, and uses WAL, foreign keys, in-memory temporary storage, secure
+deletion, a bounded busy timeout, canonical schema validation, `SQLite` and `SQLCipher` integrity
 checks, and no-follow opening of the canonicalized database leaf.
 An existing file is first inspected through an immutable read-only SQLite URI,
 so rollback-journal recovery cannot modify it before ownership is established.
 An empty candidate with any SQLite sidecar is rejected rather than claimed.
-Only then is the canonical path reopened read-write. Connection-local
+Only then is the canonical path reopened read-write, and its device/inode
+identity is checked before the first database read. Connection-local
 safeguards are applied before the second ownership check, but durable WAL and
 secure-delete configuration occurs only after a fresh or already-owned
 canonical store has been established; a foreign file is rejected unchanged.
+The adapter's only `unsafe` block is the documented `sqlite3_key` call. It
+borrows the live rusqlite handle and fixed-size key for one synchronous call,
+avoiding the non-zeroizing SQL builder that a key PRAGMA would otherwise use.
 
 The adapter is synchronous internally but returns lazy, runtime-free futures.
 Later orchestration must poll it on a bounded blocking executor; it must not be
@@ -53,11 +57,12 @@ cross-file commit protocol are accepted. ADR 0011 engine crash evidence remains
 the applicable SQLCipher engine evidence until that protocol exists.
 
 Deterministic adapter tests cover exact schema convergence and no-op reopen,
-wrong-key and foreign/future/noncanonical schema rejection, foreign hot-journal
-non-mutation, transaction rollback, lazy cancellation, corrupted row rejection,
-mutex poisoning, symlink denial, and absence of plaintext sentinels from the
-database and sidecars. A broader process-crash harness is deferred until the
-store adds a commit protocol beyond one SQLCipher transaction.
+wrong-key and foreign/future/noncanonical schema rejection, orphan-sidecar and
+foreign hot-journal non-mutation, preflight/reopen replacement rejection,
+transaction rollback, lazy cancellation, corrupted row rejection, mutex
+poisoning, symlink denial, and absence of plaintext sentinels from the database
+and sidecars. A broader process-crash harness is deferred until the store adds a
+commit protocol beyond one SQLCipher transaction.
 
 ## Consequences
 

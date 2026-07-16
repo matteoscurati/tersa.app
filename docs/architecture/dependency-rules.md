@@ -48,8 +48,11 @@ ports, while `tersa-application` and `tersa-domain` never depend on adapters.
 
 The adapter must pin `rusqlite` exactly to 0.39.0 under the exact target cfg
 `cfg(target_os = "macos")`, disable its default features, and select only
-`bundled-sqlcipher`. Version, feature, untargeted, iOS-only, and iOS-inclusive
-deviations are violations. Blob/attachment encryption is deliberately deferred:
+`bundled-sqlcipher`. Every resolved Apple graph must contain only rusqlite
+0.39.0 with the exact unified feature set `bundled`, `bundled-sqlcipher`, and
+`modern_sqlite`; extension-loading and hook features fail closed. Version,
+feature, untargeted, iOS-only, and iOS-inclusive deviations are violations.
+Blob/attachment encryption is deliberately deferred:
 this adapter does not own `chacha20poly1305` or `hmac` until a real
 blob/attachment port and cross-file commit protocol are accepted.
 
