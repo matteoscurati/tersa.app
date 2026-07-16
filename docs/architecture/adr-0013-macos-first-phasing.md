@@ -37,10 +37,13 @@ governed iPhone and iPad implementation. The binding pull-request sequence is:
 9. macOS UI baseline and signed/notarized vertical slice, only after its own
    gates pass.
 
-The macOS UI work in pull request 9 is separately gated. A later governance
-pull request defines and pins its macOS UI and release acceptance gates before
-that work can claim a pass. Until then, this ADR authorizes sequencing only;
-it passes no existing gate.
+The macOS UI work in pull request 9 is separately gated by
+`P1-MACOS-001` (macOS UI acceptance), `P1-MACOS-002` (macOS release
+acceptance), and `P1-MACOS-003` (macOS Phase 1 acceptance guard).
+`P1-MACOS-003` can pass only after both preceding gates pass with the required
+distribution-signed evidence. These are Phase 1-only claims: they do not
+satisfy `M1-UI-001`, approve a mobile toolkit, change any M0/mobile/M1 status,
+or change `ui_baseline_approved`. This ADR records no pass.
 
 ## Non-claims
 
