@@ -165,8 +165,9 @@ checkpoint retains both `-wal` and `-shm` for a later reader. The read-only path
 requires the main database and both sidecars to exist with the expected file
 identities before it opens. It never creates, replaces, deletes, or repairs a
 sidecar. If a legacy profile lacks the pair, a crash requires recovery, or a
-sidecar changes during open, the reader fails closed until the owning
-read-write application opens and establishes a valid persistent-WAL state.
+sidecar replacement remains observable during the post-open identity check,
+the reader fails closed until the owning read-write application opens and
+establishes a valid persistent-WAL state.
 
 The live connection uses SQLite read-only mode without `immutable=1` and
 without a private copy. SQLite may update lock and WAL-index coordination in
@@ -175,9 +176,11 @@ database and WAL content must remain unchanged, and no new filesystem entry may
 be created. Deterministic tests must prove both supported states: a standalone
 reader after a clean writer close, and a reader while a writer holds WAL mode
 and commits data that remains in the WAL. They must also prove that missing or
-replaced sidecars fail without creation or database/WAL mutation. Busy,
-moved-path, wrong-key, foreign-owner, unknown-schema, and integrity failures
-remain fail closed and redacted.
+ordinarily replaced sidecars that remain observable at the post-open check fail
+without creation or database/WAL mutation. The swap-in/open/swap-back race
+fixture records the accepted non-detection instead of asserting prevention.
+Busy, moved-path, wrong-key, foreign-owner, unknown-schema, and integrity
+failures remain fail closed and redacted.
 
 The current bundled Unix VFS does not expose a supported handle that binds its
 internally opened `-shm` inode to the caller's preflight identity. Pre-open and

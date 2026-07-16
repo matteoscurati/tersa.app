@@ -139,10 +139,11 @@ The future store activation must keep WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The
 reader may coordinate through an existing `-shm`, but it may not create,
 replace, delete, or repair the main database or either sidecar. Missing or
-changed sidecars fail closed until the owning writer establishes a valid state.
-The Unix VFS does not descriptor-bind its internally opened `-shm` identity to
-the caller's pathname preflight; swap-in/open/swap-back by local malware remains
-an explicit unlocked-device residual, not a prevented attack or release claim.
+ordinarily replaced sidecars that remain observable at the post-open check fail
+closed until the owning writer establishes a valid state. The Unix VFS does not
+descriptor-bind its internally opened `-shm` identity to the caller's pathname
+preflight; swap-in/open/swap-back by local malware remains an explicit
+unlocked-device residual, not a prevented attack or release claim.
 
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
 Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,
