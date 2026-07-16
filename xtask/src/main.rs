@@ -24,12 +24,13 @@ struct ResolvedDependencyIdentity {
     package_id: PackageId,
 }
 
-const SQLCIPHER_DIAGNOSTIC_OWNERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
-const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 1] = [(
+const SQLCIPHER_OWNERS: [&str; 3] = [
+    "tersa-search-spike",
+    "tersa-sqlcipher-spike",
     "tersa-store-sqlcipher-macos",
-    &["tersa-application", "tersa-domain"],
-)];
+];
+const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
+const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 0] = [];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
@@ -783,12 +784,18 @@ fn sqlcipher_dependency_graph_violations(
             ));
             continue;
         };
-        if !SQLCIPHER_DIAGNOSTIC_OWNERS.contains(&member_name.as_str())
-            && dependency_reaches(member_id, sqlite_packages, dependencies)
-        {
-            violations.push(format!(
-                "{member_name} reaches libsqlite3-sys outside the Apple SQLCipher diagnostics for {target}"
-            ));
+        if dependency_reaches(member_id, sqlite_packages, dependencies) {
+            if !SQLCIPHER_OWNERS.contains(&member_name.as_str()) {
+                violations.push(format!(
+                    "{member_name} reaches libsqlite3-sys outside the approved Apple SQLCipher owners for {target}"
+                ));
+            } else if member_name == "tersa-store-sqlcipher-macos"
+                && target != "aarch64-apple-darwin"
+            {
+                violations.push(format!(
+                    "tersa-store-sqlcipher-macos reaches libsqlite3-sys on non-macOS target {target}"
+                ));
+            }
         }
     }
     violations
@@ -889,11 +896,16 @@ fn check_sqlcipher_dependency(
     const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
 
     let target = dependency.target.as_ref().map(ToString::to_string);
+    let expected_target = if package_name == "tersa-store-sqlcipher-macos" {
+        MACOS_STORE_TARGET
+    } else {
+        APPLE_TARGET
+    };
     violations.extend(sqlcipher_manifest_dependency_violations(
         package_name,
         dependency.name.as_str(),
         target.as_deref(),
-        APPLE_TARGET,
+        expected_target,
     ));
 }
 
@@ -908,9 +920,9 @@ fn sqlcipher_manifest_dependency_violations(
     }
 
     let mut violations = Vec::new();
-    if !SQLCIPHER_DIAGNOSTIC_OWNERS.contains(&package_name) {
+    if !SQLCIPHER_OWNERS.contains(&package_name) {
         violations.push(format!(
-            "{package_name} -> {dependency_name} (SQLCipher is exclusive to the Apple SQLCipher diagnostics)"
+            "{package_name} -> {dependency_name} (SQLCipher is exclusive to approved Apple SQLCipher owners)"
         ));
     }
     if target != Some(apple_target) {
@@ -1151,6 +1163,10 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("tersa-mime-spike", BTreeSet::new()),
         ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-sqlcipher-spike", BTreeSet::new()),
+        (
+            "tersa-store-sqlcipher-macos",
+            BTreeSet::from(["tersa-application", "tersa-domain"]),
+        ),
         ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
@@ -1245,10 +1261,10 @@ mod tests {
     use super::{
         ResolvedDependencyIdentity, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency, parse_identity,
-        reserved_future_policy_violations, resolved_workspace_dependency_names,
+        dependency_policy, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, parse_identity, resolved_workspace_dependency_names,
         sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
         target_metadata_options,
     };
@@ -1287,17 +1303,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_reserved_future_package_in_the_workspace() {
-        let workspace_resolved_dependencies = BTreeMap::from([(
-            "tersa-store-sqlcipher-macos".to_owned(),
-            BTreeSet::from(["tersa-application".to_owned()]),
-        )]);
-
+    fn activated_store_name_is_not_reserved() {
         assert_eq!(
-            reserved_future_policy_violations(&workspace_resolved_dependencies),
-            vec![
-                "workspace crate `tersa-store-sqlcipher-macos` is reserved for a later reviewed policy change"
-            ]
+            dependency_policy()["tersa-store-sqlcipher-macos"],
+            BTreeSet::from(["tersa-application", "tersa-domain"])
         );
     }
 
@@ -1345,11 +1354,12 @@ mod tests {
         )]);
 
         assert_eq!(
-            reserved_future_policy_violations(&workspace_resolved_dependencies),
-            vec![
-                "workspace crate `tersa-store-sqlcipher-macos` is reserved for a later reviewed policy change",
-                "reserved future crate `tersa-store-sqlcipher-macos` -> `tersa-platform` exceeds its allowed inward dependencies",
-            ]
+            workspace_resolved_dependencies["tersa-store-sqlcipher-macos"],
+            BTreeSet::from([
+                "tersa-application".to_owned(),
+                "tersa-domain".to_owned(),
+                "tersa-platform".to_owned(),
+            ])
         );
     }
 
@@ -1380,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn permits_future_store_dependencies_only_under_the_exact_macos_cfg() {
+    fn permits_store_crypto_dependencies_only_under_the_exact_macos_cfg() {
         for dependency_name in ["rusqlite", "libsqlite3-sys", "chacha20poly1305", "hmac"] {
             let violation = future_macos_store_dependency_violation(
                 "tersa-store-sqlcipher-macos",
@@ -1392,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_untargeted_or_ios_future_store_dependencies() {
+    fn rejects_untargeted_or_ios_store_sqlcipher_dependencies() {
         for target in [
             None,
             Some(r#"cfg(target_os = "ios")"#),
@@ -1430,7 +1440,7 @@ mod tests {
                 r#"cfg(any(target_os = "macos", target_os = "ios"))"#,
             ),
             vec![
-                "tersa-application -> rusqlite (SQLCipher is exclusive to the Apple SQLCipher diagnostics)"
+                "tersa-application -> rusqlite (SQLCipher is exclusive to approved Apple SQLCipher owners)"
             ]
         );
         assert_eq!(
@@ -1583,13 +1593,37 @@ mod tests {
         assert_eq!(
             sqlcipher_violations,
             vec![
-                "tersa-application reaches libsqlite3-sys outside the Apple SQLCipher diagnostics for aarch64-apple-darwin"
+                "tersa-application reaches libsqlite3-sys outside the approved Apple SQLCipher owners for aarch64-apple-darwin"
             ]
         );
         assert_eq!(
             blob_violations,
             vec![
                 "tersa-application reaches a blob-cryptography dependency outside tersa-blob-spike for aarch64-apple-darwin"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_production_store_sqlcipher_reachability_on_ios() {
+        let package_names = BTreeMap::from([
+            ("store".to_owned(), "tersa-store-sqlcipher-macos".to_owned()),
+            ("sqlite".to_owned(), "libsqlite3-sys".to_owned()),
+        ]);
+        let workspace_members = vec!["store".to_owned()];
+        let dependencies =
+            BTreeMap::from([("store".to_owned(), BTreeSet::from(["sqlite".to_owned()]))]);
+
+        assert_eq!(
+            sqlcipher_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &dependencies,
+                &BTreeSet::from(["sqlite".to_owned()]),
+                "aarch64-apple-ios",
+            ),
+            vec![
+                "tersa-store-sqlcipher-macos reaches libsqlite3-sys on non-macOS target aarch64-apple-ios"
             ]
         );
     }
