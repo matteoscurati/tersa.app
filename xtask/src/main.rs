@@ -26,17 +26,12 @@ struct ResolvedDependencyIdentity {
 
 const SQLCIPHER_DIAGNOSTIC_OWNERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
 const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 2] = [
-    (
-        "tersa-gmail-rest-macos",
-        &["tersa-application", "tersa-domain"],
-    ),
-    (
-        "tersa-store-sqlcipher-macos",
-        &["tersa-application", "tersa-domain"],
-    ),
-];
+const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 1] = [(
+    "tersa-store-sqlcipher-macos",
+    &["tersa-application", "tersa-domain"],
+)];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
+const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -231,6 +226,7 @@ fn check_architecture() -> TaskResult {
             check_search_dependency(&package_name, dependency, &mut violations);
             check_mime_dependency(&package_name, dependency, &mut violations);
             check_blob_dependency(&package_name, dependency, &mut violations);
+            check_gmail_dependency(&package_name, dependency, &mut violations);
             if let Some(violation) = future_macos_store_dependency_violation(
                 &package_name,
                 dependency.name.as_str(),
@@ -259,6 +255,50 @@ fn check_architecture() -> TaskResult {
     .into())
 }
 
+fn check_gmail_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    violations.extend(gmail_manifest_dependency_violations(
+        package_name,
+        &dependency.name,
+        &dependency.req.to_string(),
+        dependency
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+    ));
+}
+
+fn gmail_manifest_dependency_violations(
+    package_name: &str,
+    dependency_name: &str,
+    requirement: &str,
+    target: Option<&str>,
+) -> Vec<String> {
+    const OWNER: &str = "tersa-gmail-rest-macos";
+    if dependency_name != "reqwest" {
+        return Vec::new();
+    }
+    let mut violations = Vec::new();
+    if package_name != OWNER {
+        violations.push(format!(
+            "{package_name} -> reqwest (reqwest is exclusive to {OWNER})"
+        ));
+    }
+    if requirement != "=0.13.4" {
+        violations.push(format!("{package_name} -> reqwest must pin exactly 0.13.4"));
+    }
+    if target != Some(MACOS_GMAIL_TARGET) {
+        violations.push(format!(
+            "{package_name} -> reqwest must use target `{MACOS_GMAIL_TARGET}`"
+        ));
+    }
+    violations
+}
+
 fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
     for target in [
         "aarch64-apple-darwin",
@@ -272,9 +312,94 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
         check_search_dependency_graph(&dependency_graph, target, violations);
         check_mime_dependency_graph(&dependency_graph, target, violations);
         check_blob_dependency_graph(&dependency_graph, target, violations);
+        check_gmail_dependency_graph(&dependency_graph, target, violations);
         check_diagnostic_runtime_dependency_graph(&dependency_graph, target, violations);
     }
     Ok(())
+}
+
+fn check_gmail_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let reqwest: BTreeSet<String> = metadata
+        .packages
+        .iter()
+        .filter_map(|package| {
+            (package.name == "reqwest")
+                .then_some((package.id.to_string(), package.version.to_string()))
+        })
+        .filter_map(|(id, version)| {
+            if version == "0.13.4" {
+                Some(id)
+            } else {
+                violations.push("resolved reqwest must be exactly 0.13.4".to_owned());
+                None
+            }
+        })
+        .collect();
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps
+                    .iter()
+                    .map(|dependency| dependency.pkg.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    violations.extend(gmail_dependency_graph_violations(
+        &package_names,
+        &metadata
+            .workspace_members
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        &dependencies,
+        &reqwest,
+        target,
+    ));
+}
+
+fn gmail_dependency_graph_violations(
+    package_names: &BTreeMap<String, String>,
+    workspace_members: &[String],
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    reqwest_packages: &BTreeSet<String>,
+    target: &str,
+) -> Vec<String> {
+    const OWNER: &str = "tersa-gmail-rest-macos";
+    let mut violations = Vec::new();
+    for member_id in workspace_members {
+        let Some(name) = package_names.get(member_id) else {
+            violations.push(format!(
+                "workspace member `{member_id}` is absent from the resolved package graph"
+            ));
+            continue;
+        };
+        if !dependency_reaches(member_id, reqwest_packages, dependencies) {
+            continue;
+        }
+        if name != OWNER {
+            violations.push(format!(
+                "{name} reaches reqwest outside {OWNER} for {target}"
+            ));
+        } else if target != "aarch64-apple-darwin" {
+            violations.push(format!(
+                "{OWNER} reaches reqwest on non-macOS target {target}"
+            ));
+        }
+    }
+    violations
 }
 
 fn target_metadata_options(target: &str) -> Vec<String> {
@@ -987,6 +1112,10 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
+        (
+            "tersa-gmail-rest-macos",
+            BTreeSet::from(["tersa-application", "tersa-domain"]),
+        ),
         ("tersa-platform", BTreeSet::from(["tersa-domain"])),
         (
             "tersa-presentation",
@@ -1074,7 +1203,8 @@ mod tests {
     use super::{
         ResolvedDependencyIdentity, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
-        future_macos_store_dependency_violation, is_dioxus_runtime_dependency,
+        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
+        gmail_manifest_dependency_violations, is_dioxus_runtime_dependency,
         is_slint_runtime_dependency, parse_identity, reserved_future_policy_violations,
         resolved_workspace_dependency_names, sqlcipher_dependency_graph_violations,
         sqlcipher_manifest_dependency_violations, target_metadata_options,
@@ -1116,14 +1246,14 @@ mod tests {
     #[test]
     fn rejects_a_reserved_future_package_in_the_workspace() {
         let workspace_resolved_dependencies = BTreeMap::from([(
-            "tersa-gmail-rest-macos".to_owned(),
+            "tersa-store-sqlcipher-macos".to_owned(),
             BTreeSet::from(["tersa-application".to_owned()]),
         )]);
 
         assert_eq!(
             reserved_future_policy_violations(&workspace_resolved_dependencies),
             vec![
-                "workspace crate `tersa-gmail-rest-macos` is reserved for a later reviewed policy change"
+                "workspace crate `tersa-store-sqlcipher-macos` is reserved for a later reviewed policy change"
             ]
         );
     }
@@ -1264,6 +1394,73 @@ mod tests {
             blob_manifest_dependency_violations("tersa-application", "chacha20poly1305", "=0.10.1",),
             vec![
                 "tersa-application -> chacha20poly1305 (blob cryptography is exclusive to tersa-blob-spike)"
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_exact_macos_only_reqwest_manifest_ownership() {
+        assert!(
+            gmail_manifest_dependency_violations(
+                "tersa-gmail-rest-macos",
+                "reqwest",
+                "=0.13.4",
+                Some(r#"cfg(target_os = "macos")"#),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            gmail_manifest_dependency_violations("tersa-application", "reqwest", "^0.13", None,),
+            vec![
+                "tersa-application -> reqwest (reqwest is exclusive to tersa-gmail-rest-macos)",
+                "tersa-application -> reqwest must pin exactly 0.13.4",
+                "tersa-application -> reqwest must use target `cfg(target_os = \"macos\")`",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_reqwest_graph_reachability_outside_the_macos_adapter() {
+        let package_names = BTreeMap::from([
+            ("application".to_owned(), "tersa-application".to_owned()),
+            ("gmail".to_owned(), "tersa-gmail-rest-macos".to_owned()),
+            ("wrapper".to_owned(), "network-wrapper".to_owned()),
+            ("reqwest".to_owned(), "reqwest".to_owned()),
+        ]);
+        let workspace_members = vec!["application".to_owned(), "gmail".to_owned()];
+        let dependencies = BTreeMap::from([
+            (
+                "application".to_owned(),
+                BTreeSet::from(["wrapper".to_owned()]),
+            ),
+            ("gmail".to_owned(), BTreeSet::from(["reqwest".to_owned()])),
+            ("wrapper".to_owned(), BTreeSet::from(["reqwest".to_owned()])),
+        ]);
+        let reqwest = BTreeSet::from(["reqwest".to_owned()]);
+
+        assert_eq!(
+            gmail_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &dependencies,
+                &reqwest,
+                "aarch64-apple-darwin",
+            ),
+            vec![
+                "tersa-application reaches reqwest outside tersa-gmail-rest-macos for aarch64-apple-darwin"
+            ]
+        );
+        assert_eq!(
+            gmail_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &dependencies,
+                &reqwest,
+                "aarch64-apple-ios",
+            ),
+            vec![
+                "tersa-application reaches reqwest outside tersa-gmail-rest-macos for aarch64-apple-ios",
+                "tersa-gmail-rest-macos reaches reqwest on non-macOS target aarch64-apple-ios",
             ]
         );
     }
