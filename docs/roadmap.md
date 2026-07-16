@@ -79,23 +79,67 @@ because no production UI baseline has passed; the authoritative
 [M0 gate register](m0/gate-register.json) records current HEAD-checkable
 evidence and the cache measurement gate.
 
-## M1 — Vertical slice
+## Phase 1 — macOS-first product path
 
-Connect one account, sync a bounded recent mailbox, show an encrypted cached
-inbox and thread, modify read/archive state, reopen offline, and exercise the
-same core through a read-only CLI.
+Phase 1 is planned delivery work, not an M0 or M1 pass. Its order is fixed by
+the accepted [macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing.md):
 
-## M2 — MVP alpha
+1. Split governance gates and define the macOS acceptance protocol without
+   passing any gate.
+2. Amend the dependency boundary for production Gmail, macOS SQLCipher, and
+   AEAD dependencies.
+3. Add shared mailbox contracts with no I/O.
+4. Add the official Gmail REST adapter behind ports, using fake transport and
+   deterministic tests with no network or credentials.
+5. Add an encrypted macOS store behind ports.
+6. Add bounded sync and cache orchestration.
+7. Add a read-only macOS CLI.
+8. Build a macOS UI baseline and signed/notarized vertical slice only after its
+   separately pinned macOS UI and release gates pass.
 
-Add multi-account UX, composition, drafts, attachments, send and offline outbox,
-mailbox actions, encrypted search, storage controls, app lock, safe HTML, and
-best-effort iOS background refresh.
+The target slice connects one account, synchronizes a bounded recent mailbox,
+shows an encrypted cached inbox and thread, supports the planned bounded
+mailbox state flow, reopens offline, and exposes the same core through the
+read-only CLI. It retains the existing product boundaries: no required
+proprietary backend, encrypted local persistence, shared Rust core, open source,
+and Gmail through the official API.
 
-## M3 — Public MVP
+This phase does not pass, delete, or downgrade M0 gates. A macOS baseline never
+satisfies `M1-UI-001` and never changes the mobile-inclusive
+`ui_baseline_approved` flag. The current cache budgets remain constraints, not
+passes. Real Google authorization and verification also remain open until their
+own reviewed evidence exists.
 
-Complete accessibility, English and Italian localization, performance budgets,
-recovery, independent security remediation, Google verification, public policy
-content, and signed Apple releases.
+## Phase 2 — iPhone and iPad implementation
+
+Phase 2 contains all iPhone and iPad product implementation. It resumes under
+separately accepted mobile governance and covers mobile-specific Keychain and
+protected-data behavior; physical-device accessibility, input, lifecycle, and
+performance; TestFlight and App Store release work; best-effort background
+refresh; and closure of the existing device-signed mobile gates.
+
+No Phase 1 source, host, macOS UI, signing, or notarization evidence can close
+a Phase 2 device-signed mobile gate. M1 remains blocked in the authoritative
+[M0 gate register](m0/gate-register.json) until its existing mobile-inclusive
+requirements are independently satisfied; this roadmap does not imply that it
+is unblocked or passed.
+
+## Platform MVP completion
+
+This platform-specific completion work carries forward the previous combined
+M2 and M3 roadmap scope. Existing governance references to M3 apply to the
+relevant platform MVP completion work.
+
+The macOS public MVP may proceed after the Phase 1 acceptance conditions. Add
+multi-account UX, composition, drafts, attachments, send and offline outbox,
+mailbox actions, encrypted search, storage controls, app lock, safe HTML,
+accessibility, English and Italian localization, performance budgets, recovery,
+independent security remediation, Google verification, public policy content,
+and a signed and notarized macOS release.
+
+The iPhone and iPad public MVP may proceed only after the separate Phase 2
+acceptance conditions. Deferring Phase 2 does not block the macOS public MVP,
+and a macOS release does not supply or waive any mobile evidence.
 
 ## MVP exclusions
 
