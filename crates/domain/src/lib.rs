@@ -6,4 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+/// Shared mailbox identifiers, envelopes, and redacted message content.
+pub mod mailbox;
+
 // Rust guideline compliant 1.0.

@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Shared inward mailbox ports and pagination contracts.
+pub mod mailbox;
 pub mod oauth;
 
 // Rust guideline compliant 1.0.
