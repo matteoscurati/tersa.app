@@ -1,0 +1,947 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! macOS Data Protection Keychain root-key and fixed App Group capabilities.
+//!
+//! The production constructors use only the signing-time application-group
+//! value. They deliberately offer no runtime configuration or fallback.
+
+#![deny(unsafe_code)]
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use hkdf::Hkdf;
+use sha2::{Digest, Sha256};
+use tersa_platform::secure_storage::{
+    AccountKeyProvider, AccountKeyPurpose, AccountProfileLocator, InstallationRootKeyProvisioner,
+    KeyStorageError, ProfileStorageError, ProvisionOutcome,
+};
+use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(target_os = "macos")]
+const SERVICE: &str = "app.tersa.mac.storage-root.v1";
+#[cfg(target_os = "macos")]
+const ACCOUNT: &str = "default";
+const ROOT_SALT: &[u8] = b"tersa.app/macos/root-key/v1";
+const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
+const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
+const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
+
+/// Provisions only the fixed installation root key.
+pub struct DataProtectionRootKeyProvisioner {
+    backend: ProductionBackend,
+}
+
+impl fmt::Debug for DataProtectionRootKeyProvisioner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DataProtectionRootKeyProvisioner([REDACTED])")
+    }
+}
+
+/// Retrieves only the fixed root key and derives account keys from it.
+///
+/// It intentionally cannot provision the root key:
+///
+/// ```compile_fail
+/// use tersa_keychain_macos::DataProtectionAccountKeyProvider;
+/// use tersa_platform::secure_storage::InstallationRootKeyProvisioner;
+///
+/// fn require_provisioner<T: InstallationRootKeyProvisioner>() {}
+/// require_provisioner::<DataProtectionAccountKeyProvider>();
+/// ```
+pub struct DataProtectionAccountKeyProvider {
+    backend: ProductionBackend,
+}
+
+impl fmt::Debug for DataProtectionAccountKeyProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DataProtectionAccountKeyProvider([REDACTED])")
+    }
+}
+
+/// Locates only the fixed default profile in the configured App Group.
+pub struct AppGroupProfileLocator {
+    locator: ProductionContainerLocator,
+}
+
+impl fmt::Debug for AppGroupProfileLocator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AppGroupProfileLocator([REDACTED])")
+    }
+}
+
+impl DataProtectionRootKeyProvisioner {
+    /// Creates the fixed production provisioner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error when the signing-time App Group is absent.
+    pub fn new() -> Result<Self, KeyStorageError> {
+        Ok(Self {
+            backend: ProductionBackend::new()?,
+        })
+    }
+}
+
+impl DataProtectionAccountKeyProvider {
+    /// Creates the fixed production retrieval-only provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error when the signing-time App Group is absent.
+    pub fn new() -> Result<Self, KeyStorageError> {
+        Ok(Self {
+            backend: ProductionBackend::new()?,
+        })
+    }
+}
+
+impl AppGroupProfileLocator {
+    /// Creates the fixed production profile locator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error when the signing-time App Group is absent.
+    pub fn new() -> Result<Self, ProfileStorageError> {
+        Ok(Self {
+            locator: ProductionContainerLocator::new()?,
+        })
+    }
+}
+
+impl InstallationRootKeyProvisioner for DataProtectionRootKeyProvisioner {
+    fn provision_installation_root_key(&self) -> Result<ProvisionOutcome, KeyStorageError> {
+        provision_installation_root_key(&self.backend)
+    }
+}
+
+fn provision_installation_root_key(
+    backend: &impl RootKeyBackend,
+) -> Result<ProvisionOutcome, KeyStorageError> {
+    if backend.copy()?.is_some() {
+        return Ok(ProvisionOutcome::Existing);
+    }
+
+    let mut candidate = backend.random_key()?;
+    match backend.add(&candidate)? {
+        AddResult::Added => {
+            candidate.zeroize();
+            backend.candidate_zeroized_before_reread(&candidate);
+            backend.copy()?.ok_or(KeyStorageError::Invalid)?;
+            Ok(ProvisionOutcome::Created)
+        }
+        AddResult::Duplicate => {
+            candidate.zeroize();
+            backend.candidate_zeroized_before_reread(&candidate);
+            backend.copy()?.ok_or(KeyStorageError::Invalid)?;
+            Ok(ProvisionOutcome::Existing)
+        }
+    }
+}
+
+impl AccountKeyProvider for DataProtectionAccountKeyProvider {
+    fn with_account_key<R>(
+        &self,
+        account_id: &str,
+        purpose: AccountKeyPurpose,
+        operation: impl FnOnce(&[u8; 32]) -> R,
+    ) -> Result<R, KeyStorageError> {
+        let root = self.backend.copy()?.ok_or(KeyStorageError::NotFound)?;
+        let mut derived = derive_account_key(&root, account_id, purpose)?;
+        let result = operation(&derived);
+        derived.zeroize();
+        Ok(result)
+    }
+}
+
+impl AccountProfileLocator for AppGroupProfileLocator {
+    fn account_database_path(&self, account_id: &str) -> Result<PathBuf, ProfileStorageError> {
+        account_database_path(&self.locator, account_id)
+    }
+}
+
+fn account_database_path(
+    locator: &impl ContainerLocator,
+    account_id: &str,
+) -> Result<PathBuf, ProfileStorageError> {
+    if account_id.is_empty() {
+        return Err(ProfileStorageError::Invalid);
+    }
+    let container = locator.container()?;
+    if !container.is_dir() || !is_readable_directory(&container) {
+        return Err(ProfileStorageError::Unavailable);
+    }
+    let digest = hex_digest(account_id.as_bytes());
+    Ok(PROFILE_PREFIX
+        .iter()
+        .fold(container, |path, part| path.join(part))
+        .join(digest)
+        .join("mail.sqlite3"))
+}
+
+fn derive_account_key(
+    root: &[u8; 32],
+    account_id: &str,
+    purpose: AccountKeyPurpose,
+) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+    let purpose = match purpose {
+        AccountKeyPurpose::SqlCipherAccountDatabaseV1 => DATABASE_PURPOSE,
+    };
+    let info = framed_info(account_id.as_bytes(), purpose)?;
+    let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root);
+    let mut output = Zeroizing::new([0_u8; 32]);
+    hkdf.expand(&info, &mut *output)
+        .map_err(|_invalid_length| KeyStorageError::Invalid)?;
+    Ok(output)
+}
+
+fn framed_info(account: &[u8], purpose: &[u8]) -> Result<Vec<u8>, KeyStorageError> {
+    let account_len = u16::try_from(account.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
+    let purpose_len = u16::try_from(purpose.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
+    let mut result = Vec::with_capacity(HKDF_PREFIX.len() + 4 + account.len() + purpose.len());
+    result.extend_from_slice(HKDF_PREFIX);
+    result.extend_from_slice(&account_len.to_be_bytes());
+    result.extend_from_slice(account);
+    result.extend_from_slice(&purpose_len.to_be_bytes());
+    result.extend_from_slice(purpose);
+    Ok(result)
+}
+
+fn hex_digest(account: &[u8]) -> String {
+    let digest = Sha256::digest(account);
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn is_readable_directory(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "Non-macOS builds retain the portable capability shape but fail before constructing a Keychain add result."
+    )
+)]
+enum AddResult {
+    Added,
+    Duplicate,
+}
+
+trait RootKeyBackend: Send + Sync {
+    fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError>;
+    fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError>;
+    fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError>;
+
+    fn candidate_zeroized_before_reread(&self, _candidate: &[u8; 32]) {}
+}
+
+trait ContainerLocator: Send + Sync {
+    fn container(&self) -> Result<PathBuf, ProfileStorageError>;
+}
+
+/// Internal fixed production Keychain implementation.
+#[derive(Debug)]
+struct ProductionBackend {
+    group: &'static str,
+}
+
+impl ProductionBackend {
+    fn new() -> Result<Self, KeyStorageError> {
+        Ok(Self {
+            group: configured_group(option_env!("TERSA_MACOS_APP_GROUP"))?,
+        })
+    }
+}
+
+impl RootKeyBackend for ProductionBackend {
+    fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+        macos_keychain::copy(self.group)
+    }
+    fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        macos_keychain::random()
+    }
+    fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+        macos_keychain::add(self.group, candidate)
+    }
+}
+
+/// Internal fixed production App Group container implementation.
+#[derive(Debug)]
+struct ProductionContainerLocator {
+    group: &'static str,
+}
+impl ProductionContainerLocator {
+    fn new() -> Result<Self, ProfileStorageError> {
+        Ok(Self {
+            group: configured_profile_group(option_env!("TERSA_MACOS_APP_GROUP"))?,
+        })
+    }
+}
+
+fn configured_group(group: Option<&'static str>) -> Result<&'static str, KeyStorageError> {
+    group
+        .filter(|value| !value.is_empty())
+        .ok_or(KeyStorageError::Unavailable)
+}
+
+fn configured_profile_group(
+    group: Option<&'static str>,
+) -> Result<&'static str, ProfileStorageError> {
+    group
+        .filter(|value| !value.is_empty())
+        .ok_or(ProfileStorageError::Unavailable)
+}
+impl ContainerLocator for ProductionContainerLocator {
+    fn container(&self) -> Result<PathBuf, ProfileStorageError> {
+        macos_container::lookup(self.group)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    clippy::borrow_as_ptr,
+    clippy::undocumented_unsafe_blocks,
+    reason = "Security.framework and Core Foundation expose this add-only Keychain contract only through audited C FFI."
+)]
+mod macos_keychain {
+    use super::{AddResult, KeyStorageError};
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFEqual, CFType, CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::{CFString, CFStringRef};
+    use security_framework_sys::{access_control, base, item, keychain_item, random};
+    use std::ffi::c_void;
+    use zeroize::Zeroizing;
+
+    // security-framework-sys 2.17.0 omits only this stable dictionary-key
+    // symbol. All other Security constants come from the audited sys crate.
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecAttrAccessible: CFStringRef;
+    }
+
+    macro_rules! security_string {
+        ($symbol:path) => {
+            static_string(unsafe { $symbol })
+        };
+    }
+
+    pub(super) fn copy(group: &str) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+        let query = record_dictionary(group, None, true);
+        let mut raw: CFTypeRef = std::ptr::null();
+        let status =
+            unsafe { keychain_item::SecItemCopyMatching(query.as_concrete_TypeRef(), &mut raw) };
+        if status == base::errSecItemNotFound {
+            return Ok(None);
+        }
+        if status != base::errSecSuccess || raw.is_null() {
+            return Err(KeyStorageError::OperationFailed);
+        }
+        let result = unsafe { CFType::wrap_under_create_rule(raw) };
+        decode_copy_result(result, group).map(Some)
+    }
+    pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        let status = unsafe {
+            random::SecRandomCopyBytes(
+                random::kSecRandomDefault,
+                key.len(),
+                key.as_mut_ptr().cast::<c_void>(),
+            )
+        };
+        if status == 0 {
+            Ok(key)
+        } else {
+            Err(KeyStorageError::OperationFailed)
+        }
+    }
+    pub(super) fn add(group: &str, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+        let attributes = record_dictionary(group, Some(candidate), false);
+        let status = unsafe {
+            keychain_item::SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut())
+        };
+        match status {
+            base::errSecSuccess => Ok(AddResult::Added),
+            base::errSecDuplicateItem => Ok(AddResult::Duplicate),
+            _ => Err(KeyStorageError::OperationFailed),
+        }
+    }
+
+    fn record_dictionary(
+        group: &str,
+        data: Option<&[u8]>,
+        returning: bool,
+    ) -> CFDictionary<CFType, CFType> {
+        let service = CFString::new(super::SERVICE);
+        let account = CFString::new(super::ACCOUNT);
+        let group = CFString::new(group);
+        let class = security_string!(item::kSecClassGenericPassword);
+        let accessible_key = security_string!(kSecAttrAccessible);
+        let accessible =
+            security_string!(access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly);
+        let data_protection_key = security_string!(item::kSecUseDataProtectionKeychain);
+        let pairs = vec![
+            (security_string!(item::kSecClass), class.as_CFType()),
+            (security_string!(item::kSecAttrService), service.as_CFType()),
+            (security_string!(item::kSecAttrAccount), account.as_CFType()),
+            (
+                security_string!(item::kSecAttrAccessGroup),
+                group.as_CFType(),
+            ),
+            (accessible_key, accessible.as_CFType()),
+            (
+                security_string!(item::kSecAttrSynchronizable),
+                CFBoolean::false_value().as_CFType(),
+            ),
+            (data_protection_key, CFBoolean::true_value().as_CFType()),
+        ];
+        let mut pairs = pairs;
+        if returning {
+            pairs.extend([
+                (
+                    security_string!(item::kSecReturnData),
+                    CFBoolean::true_value().as_CFType(),
+                ),
+                (
+                    security_string!(item::kSecReturnAttributes),
+                    CFBoolean::true_value().as_CFType(),
+                ),
+                (
+                    security_string!(item::kSecMatchLimit),
+                    CFNumber::from(2).as_CFType(),
+                ),
+            ]);
+        }
+        if let Some(data) = data {
+            pairs.push((
+                security_string!(item::kSecValueData),
+                CFData::from_buffer(data).as_CFType(),
+            ));
+        }
+        CFDictionary::from_CFType_pairs(&pairs)
+    }
+
+    fn static_string(raw: CFStringRef) -> CFType {
+        unsafe { CFString::wrap_under_get_rule(raw).into_CFType() }
+    }
+
+    fn decode_copy_result(
+        result: CFType,
+        group: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        let array = result
+            .downcast_into::<CFArray>()
+            .ok_or(KeyStorageError::Invalid)?;
+        if array.len() != 1 {
+            return Err(KeyStorageError::Invalid);
+        }
+        let raw = array.get_all_values()[0];
+        let dictionary = unsafe { CFType::wrap_under_get_rule(raw) }
+            .downcast_into::<CFDictionary>()
+            .ok_or(KeyStorageError::Invalid)?;
+        decode_record(&dictionary, group)
+    }
+
+    fn decode_record(
+        dictionary: &CFDictionary,
+        group: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        let service = CFString::new(super::SERVICE);
+        let account = CFString::new(super::ACCOUNT);
+        let group = CFString::new(group);
+        let expected = [
+            (
+                security_string!(item::kSecClass),
+                security_string!(item::kSecClassGenericPassword),
+            ),
+            (security_string!(item::kSecAttrService), service.as_CFType()),
+            (security_string!(item::kSecAttrAccount), account.as_CFType()),
+            (
+                security_string!(item::kSecAttrAccessGroup),
+                group.as_CFType(),
+            ),
+            (
+                security_string!(kSecAttrAccessible),
+                security_string!(access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
+            ),
+            (
+                security_string!(item::kSecAttrSynchronizable),
+                CFBoolean::false_value().as_CFType(),
+            ),
+        ];
+        for (key, value) in expected {
+            let actual = dictionary
+                .find(key.as_CFTypeRef())
+                .ok_or(KeyStorageError::Invalid)?;
+            if unsafe { CFEqual(*actual, value.as_CFTypeRef()) } == 0 {
+                return Err(KeyStorageError::Invalid);
+            }
+        }
+        let data = dictionary
+            .find(security_string!(item::kSecValueData).as_CFTypeRef())
+            .ok_or(KeyStorageError::Invalid)?;
+        let data = unsafe { data.as_ref() };
+        let data = data.ok_or(KeyStorageError::Invalid)?;
+        let data = unsafe { CFType::wrap_under_get_rule(data) }
+            .downcast_into::<CFData>()
+            .ok_or(KeyStorageError::Invalid)?;
+        let bytes: [u8; 32] = data
+            .bytes()
+            .try_into()
+            .map_err(|_wrong_length| KeyStorageError::Invalid)?;
+        Ok(Zeroizing::new(bytes))
+    }
+
+    #[cfg(test)]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Focused Core Foundation boundary tests fail immediately when a required fixture value is absent."
+    )]
+    mod tests {
+        use super::*;
+
+        fn assert_dictionary_value(
+            dictionary: &CFDictionary<CFType, CFType>,
+            key: &CFType,
+            expected: &CFType,
+        ) {
+            let actual = dictionary.find(key.as_CFTypeRef()).unwrap();
+            assert_ne!(
+                unsafe { CFEqual(actual.as_CFTypeRef(), expected.as_CFTypeRef()) },
+                0
+            );
+        }
+
+        #[test]
+        fn copy_query_is_fixed_to_data_protection_non_sync_group_and_limit_two() {
+            let group = "TEAM.app.tersa.shared";
+            let query = record_dictionary(group, None, true);
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecAttrAccessGroup),
+                &CFString::new(group).as_CFType(),
+            );
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecUseDataProtectionKeychain),
+                &CFBoolean::true_value().as_CFType(),
+            );
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecAttrSynchronizable),
+                &CFBoolean::false_value().as_CFType(),
+            );
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecMatchLimit),
+                &CFNumber::from(2).as_CFType(),
+            );
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecReturnData),
+                &CFBoolean::true_value().as_CFType(),
+            );
+            assert_dictionary_value(
+                &query,
+                &security_string!(item::kSecReturnAttributes),
+                &CFBoolean::true_value().as_CFType(),
+            );
+        }
+
+        #[test]
+        fn copy_decoder_accepts_one_exact_record_and_rejects_ambiguous_or_malformed_results() {
+            let group = "TEAM.app.tersa.shared";
+            let record = record_dictionary(group, Some(&[7; 32]), false);
+            let one = CFArray::from_CFTypes(&[record.as_CFType()]);
+            assert_eq!(
+                *decode_copy_result(one.as_CFType(), group).unwrap(),
+                [7; 32]
+            );
+
+            let first = record_dictionary(group, Some(&[7; 32]), false);
+            let second = record_dictionary(group, Some(&[8; 32]), false);
+            let duplicate = CFArray::from_CFTypes(&[first.as_CFType(), second.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(duplicate.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+            assert_eq!(
+                decode_copy_result(CFString::new("not-an-array").as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+        }
+
+        #[test]
+        fn copy_decoder_rejects_wrong_attributes_and_secret_lengths() {
+            let group = "TEAM.app.tersa.shared";
+            let wrong_group = record_dictionary("OTHER.app.tersa.shared", Some(&[7; 32]), false);
+            let wrong_group = CFArray::from_CFTypes(&[wrong_group.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(wrong_group.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+
+            let short = record_dictionary(group, Some(&[7; 31]), false);
+            let short = CFArray::from_CFTypes(&[short.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(short.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+
+            let missing_data = record_dictionary(group, None, false);
+            let missing_data = CFArray::from_CFTypes(&[missing_data.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(missing_data.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+        }
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod macos_keychain {
+    use super::{AddResult, KeyStorageError};
+    use zeroize::Zeroizing;
+    pub(super) fn copy(_: &str) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+        Err(KeyStorageError::Unavailable)
+    }
+    pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        Err(KeyStorageError::Unavailable)
+    }
+    pub(super) fn add(_: &str, _: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+        Err(KeyStorageError::Unavailable)
+    }
+}
+#[cfg(target_os = "macos")]
+mod macos_container {
+    use super::ProfileStorageError;
+    use objc2_foundation::{NSFileManager, NSString};
+    use std::path::PathBuf;
+    pub(super) fn lookup(group: &str) -> Result<PathBuf, ProfileStorageError> {
+        let group = NSString::from_str(group);
+        let url = NSFileManager::defaultManager()
+            .containerURLForSecurityApplicationGroupIdentifier(&group)
+            .ok_or(ProfileStorageError::Unavailable)?;
+        if !url.isFileURL() {
+            return Err(ProfileStorageError::Unavailable);
+        }
+        let path = url.path().ok_or(ProfileStorageError::Unavailable)?;
+        Ok(PathBuf::from(path.to_string()))
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod macos_container {
+    use super::ProfileStorageError;
+    use std::path::PathBuf;
+    pub(super) fn lookup(_: &str) -> Result<PathBuf, ProfileStorageError> {
+        Err(ProfileStorageError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used,
+    reason = "Test fixtures use bounded indices and fail immediately on poisoned locks or unexpected results."
+)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct FakeLocator(Result<PathBuf, ProfileStorageError>);
+    impl ContainerLocator for FakeLocator {
+        fn container(&self) -> Result<PathBuf, ProfileStorageError> {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        item: Mutex<Option<[u8; 32]>>,
+        random: Mutex<[u8; 32]>,
+        calls: Mutex<Vec<&'static str>>,
+        duplicate_on_add: bool,
+        zeroized_before_reread: Mutex<bool>,
+    }
+    impl RootKeyBackend for Fake {
+        fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+            self.calls.lock().unwrap().push("copy");
+            Ok(self.item.lock().unwrap().map(Zeroizing::new))
+        }
+        fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+            self.calls.lock().unwrap().push("random");
+            Ok(Zeroizing::new(*self.random.lock().unwrap()))
+        }
+        fn add(&self, c: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+            self.calls.lock().unwrap().push("add");
+            let mut item = self.item.lock().unwrap();
+            if self.duplicate_on_add {
+                *item = Some([9; 32]);
+                Ok(AddResult::Duplicate)
+            } else if item.is_some() {
+                Ok(AddResult::Duplicate)
+            } else {
+                *item = Some(*c);
+                Ok(AddResult::Added)
+            }
+        }
+        fn candidate_zeroized_before_reread(&self, candidate: &[u8; 32]) {
+            assert_eq!(candidate, &[0; 32]);
+            *self.zeroized_before_reread.lock().unwrap() = true;
+            self.calls.lock().unwrap().push("zeroized");
+        }
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentFake {
+        item: Arc<Mutex<Option<[u8; 32]>>>,
+        first_copy: Arc<AtomicBool>,
+        initial_copy_barrier: Arc<Barrier>,
+        candidate: [u8; 32],
+    }
+
+    impl RootKeyBackend for ConcurrentFake {
+        fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+            if !self.first_copy.swap(true, Ordering::SeqCst) {
+                let snapshot = *self.item.lock().unwrap();
+                self.initial_copy_barrier.wait();
+                return Ok(snapshot.map(Zeroizing::new));
+            }
+            Ok(self.item.lock().unwrap().map(Zeroizing::new))
+        }
+
+        fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+            Ok(Zeroizing::new(self.candidate))
+        }
+
+        fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+            let mut item = self.item.lock().unwrap();
+            if item.is_some() {
+                Ok(AddResult::Duplicate)
+            } else {
+                *item = Some(*candidate);
+                Ok(AddResult::Added)
+            }
+        }
+    }
+    #[test]
+    fn hkdf_known_answer_and_info() {
+        let root: [u8; 32] = core::array::from_fn(|i| i as u8);
+        assert_eq!(
+            hex_encode(&framed_info(b"acct-test-1", DATABASE_PURPOSE).unwrap()),
+            "74657273612e6170702f6d61636f732f686b64662d7368613235362f7631000b616363742d746573742d31001d73716c6369706865722f6163636f756e742d64617461626173652f7631"
+        );
+        assert_eq!(
+            hex_encode(
+                &*derive_account_key(
+                    &root,
+                    "acct-test-1",
+                    AccountKeyPurpose::SqlCipherAccountDatabaseV1
+                )
+                .unwrap()
+            ),
+            "c822b72b2aaad045b983307618e4ea580ab2c1a219dcf379b229661f68f8c148"
+        );
+    }
+    #[test]
+    fn existing_item_skips_rng_and_add() {
+        let fake = Fake::default();
+        *fake.item.lock().unwrap() = Some([7; 32]);
+        assert_eq!(
+            provision_installation_root_key(&fake),
+            Ok(ProvisionOutcome::Existing)
+        );
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["copy"]);
+    }
+    #[test]
+    fn success_rereads_after_add() {
+        let fake = Fake::default();
+        assert_eq!(
+            provision_installation_root_key(&fake),
+            Ok(ProvisionOutcome::Created)
+        );
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec!["copy", "random", "add", "zeroized", "copy"]
+        );
+    }
+    #[test]
+    fn duplicate_loser_zeroizes_before_reread() {
+        let fake = Fake {
+            duplicate_on_add: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            provision_installation_root_key(&fake),
+            Ok(ProvisionOutcome::Existing)
+        );
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec!["copy", "random", "add", "zeroized", "copy"]
+        );
+        assert!(*fake.zeroized_before_reread.lock().unwrap());
+    }
+
+    #[test]
+    fn simultaneous_provisioners_converge_on_one_stored_winner() {
+        let item = Arc::new(Mutex::new(None));
+        let barrier = Arc::new(Barrier::new(2));
+        let first = ConcurrentFake {
+            item: Arc::clone(&item),
+            first_copy: Arc::new(AtomicBool::new(false)),
+            initial_copy_barrier: Arc::clone(&barrier),
+            candidate: [1; 32],
+        };
+        let second = ConcurrentFake {
+            item: Arc::clone(&item),
+            first_copy: Arc::new(AtomicBool::new(false)),
+            initial_copy_barrier: barrier,
+            candidate: [2; 32],
+        };
+
+        let first = std::thread::spawn(move || provision_installation_root_key(&first));
+        let second = std::thread::spawn(move || provision_installation_root_key(&second));
+        let mut outcomes = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+        outcomes.sort_by_key(|outcome| match outcome {
+            ProvisionOutcome::Created => 0,
+            ProvisionOutcome::Existing => 1,
+        });
+
+        assert_eq!(
+            outcomes,
+            [ProvisionOutcome::Created, ProvisionOutcome::Existing]
+        );
+        let winner = *item.lock().unwrap();
+        assert!(winner == Some([1; 32]) || winner == Some([2; 32]));
+    }
+    #[test]
+    fn digest_is_fixed() {
+        assert_eq!(
+            hex_digest(b"acct-test-1"),
+            "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47"
+        );
+    }
+    #[test]
+    fn fixed_profile_layout_requires_an_existing_readable_directory() {
+        let directory = std::env::temp_dir();
+        let locator = FakeLocator(Ok(directory.clone()));
+        assert_eq!(
+            account_database_path(&locator, "acct-test-1").unwrap(),
+            directory.join("profiles/default/accounts/1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47/mail.sqlite3")
+        );
+        let missing = FakeLocator(Ok(directory.join("tersa-missing-container")));
+        assert_eq!(
+            account_database_path(&missing, "acct-test-1"),
+            Err(ProfileStorageError::Unavailable)
+        );
+        let no_config = FakeLocator(Err(ProfileStorageError::Unavailable));
+        assert_eq!(
+            account_database_path(&no_config, "acct-test-1"),
+            Err(ProfileStorageError::Unavailable)
+        );
+        assert_eq!(
+            account_database_path(&locator, ""),
+            Err(ProfileStorageError::Invalid)
+        );
+    }
+
+    #[test]
+    fn profile_locator_rejects_non_directories_without_fallback() {
+        let path = std::env::temp_dir().join(format!(
+            "tersa-keychain-profile-file-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not a container").unwrap();
+        let locator = FakeLocator(Ok(path.clone()));
+        assert_eq!(
+            account_database_path(&locator, "acct-test-1"),
+            Err(ProfileStorageError::Unavailable)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_locator_rejects_unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "tersa-keychain-unreadable-container-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locator = FakeLocator(Ok(path.clone()));
+        assert_eq!(
+            account_database_path(&locator, "acct-test-1"),
+            Err(ProfileStorageError::Unavailable)
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn production_group_configuration_fails_closed() {
+        assert_eq!(configured_group(None), Err(KeyStorageError::Unavailable));
+        assert_eq!(
+            configured_group(Some("")),
+            Err(KeyStorageError::Unavailable)
+        );
+        assert_eq!(
+            configured_group(Some("TEAM.app.tersa.shared")),
+            Ok("TEAM.app.tersa.shared")
+        );
+        assert_eq!(
+            configured_profile_group(None),
+            Err(ProfileStorageError::Unavailable)
+        );
+        assert_eq!(
+            configured_profile_group(Some("TEAM.app.tersa.shared")),
+            Ok("TEAM.app.tersa.shared")
+        );
+    }
+    #[test]
+    fn framing_rejects_oversized_segments_and_separates_purpose() {
+        assert_eq!(
+            framed_info(&vec![0; usize::from(u16::MAX) + 1], DATABASE_PURPOSE),
+            Err(KeyStorageError::Invalid)
+        );
+        assert_ne!(
+            framed_info(b"ab", b"c").unwrap(),
+            framed_info(b"a", b"bc").unwrap()
+        );
+    }
+    #[test]
+    fn errors_and_capabilities_are_redacted() {
+        assert_eq!(
+            format!("{:?}", KeyStorageError::Invalid),
+            "KeyStorageError([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", ProfileStorageError::Invalid),
+            "ProfileStorageError([REDACTED])"
+        );
+    }
+}

@@ -94,29 +94,34 @@ versioned enum; the initial value is `sqlcipher/account-database/v1`. Unknown
 versions or purposes fail closed. Root and derived key buffers use best-effort
 zeroization and never implement content-revealing `Debug` or serialization.
 
-The reviewed future pins are `security-framework =3.7.0` with default features
-disabled and only `OSX_10_15` enabled, `security-framework-sys =2.17.0`,
+PR 32 uses direct `security-framework-sys =2.17.0` with default features
+disabled and only `OSX_10_15`,
 `core-foundation =0.10.1`, `objc2-foundation =0.3.2` with default features
 disabled and only `std`, `NSFileManager`, `NSString`, and `NSURL` enabled,
 `hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. They are declared only
 for the exact macOS target where applicable. The explicit Security/Core
 Foundation surface exists so PR 32 can build add-only and attribute-returning
-Keychain dictionaries; the public generic-password setter is forbidden because
-its duplicate-item path updates existing data. `OSX_10_15` is required for the
+Keychain dictionaries; the high-level `security-framework` generic-password
+setter is forbidden because its duplicate-item path can update existing data.
+`OSX_10_15` is required for the
 Data Protection Keychain API on macOS. The Foundation surface resolves and
 validates the application-group container through the inward platform port.
 
-crates.io metadata identifies 3.7.0 as the current `security-framework`
-release. The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
+The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
-This policy does not weaken the existing exclusive HMAC ownership. PR 32 must
-explicitly and narrowly expand that owner set after reviewing the exact
-resolved graph; PR 30 changes no manifest or lockfile.
+PR 32 narrowly expands the HMAC owner set to `tersa-blob-spike` and
+`tersa-keychain-macos` after checking the exact resolved graph. ChaCha20-
+Poly1305 remains exclusive to `tersa-blob-spike`.
 
 `tersa-keychain-macos` may depend inward only on `tersa-platform`. Any needed
 portable key capability belongs in that inward port; Apple Security types do
 not cross it. Additional inward edges require a new ADR rather than an
 incidental manifest edit.
+
+PR 32 proves simultaneous-provisioner convergence only against its fake
+backend. Real signed cross-target Data Protection Keychain interoperability is
+a PR 33 acceptance condition; this is a Fable approval condition and is not
+claimed by unsigned builds.
 
 ### Fixed profile layout
 

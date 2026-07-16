@@ -41,10 +41,15 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.network.client: true
         com.apple.security.network.server: true
+        com.apple.security.application-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         PRODUCT_NAME: Tersa
+        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: macos/TersaMac-Bridging-Header.h

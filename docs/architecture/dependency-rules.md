@@ -21,6 +21,7 @@ and feasibility adapters:
 | `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
+| `tersa-keychain-macos` | macOS Data Protection Keychain root-key and fixed App Group profile adapter | `tersa-platform` |
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -33,9 +34,10 @@ exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 `mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
 `tersa-mime-spike`. The portable MIME and blob M0 spikes are exceptions to the
 Apple target gate: Linux CI exercises their deterministic tests, while Apple CI
-cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 and `hmac`
-0.12.1 are pinned exactly and exclusive to `tersa-blob-spike` in every resolved
-Apple target graph. New workspace crates must be added explicitly to the policy
+cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 is pinned exactly
+and exclusive to `tersa-blob-spike`; `hmac` 0.12.1 is pinned exactly and may be
+reached only by `tersa-blob-spike` and `tersa-keychain-macos` through HKDF in
+every resolved Apple target graph. New workspace crates must be added explicitly to the policy
 in `xtask`; an unknown crate fails CI.
 
 ## macOS production account store
@@ -83,44 +85,38 @@ reconciliation, retry, background work, mutations, outbox, labels, blobs,
 search, CLI/UI, real network or credentials tests, mobile code, or gate-status
 changes. Cache budgets remain constraints rather than evidence.
 
-## Reserved macOS key and CLI boundaries
+## Active macOS key boundary and reserved CLI boundary
 
-ADR 0019 reserves two future workspace crate names without activating them:
+ADR 0019 defines one active adapter and one reserved future crate:
 
-| Reserved crate | Planned responsibility | Maximum reserved inward dependencies |
+| Crate | Responsibility | Maximum inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | Retrieval/provisioning-separated macOS Keychain root provider, versioned HKDF derivation, and signed App Group container locator | `tersa-platform` |
+| `tersa-keychain-macos` | Active retrieval/provisioning-separated macOS Keychain root provider, versioned HKDF derivation, and App Group container locator | `tersa-platform` |
 | `tersa-cli-macos` | Fixed-profile composition and metadata-only JSON rendering | `tersa-application`, `tersa-domain`, `tersa-keychain-macos`, `tersa-platform`, `tersa-store-sqlcipher-macos` |
 
-The `RESERVED_FUTURE_POLICY` tripwire fails if either crate appears, even when
-its dependency edges fit this table. The pull request that adds a crate must
-replace its reservation with an explicitly reviewed active policy; it may not
-silently promote a reservation. PR 30 is policy text and a tripwire only. It
-adds no crate or dependency and must leave `Cargo.lock` and the resolved graph
-byte-identical.
+`tersa-keychain-macos` is active and has an explicit `xtask` policy entry. The
+`RESERVED_FUTURE_POLICY` tripwire now reserves only the CLI crate.
 
-When `tersa-keychain-macos` is activated, its external dependencies are planned
-as exact macOS-only pins: `security-framework =3.7.0` with default features
-disabled and only `OSX_10_15` enabled, `security-framework-sys =2.17.0`,
+The active Keychain adapter uses direct exact pins: `security-framework-sys =2.17.0`
+with default features disabled and only `OSX_10_15`,
 `core-foundation =0.10.1`, `objc2-foundation =0.3.2` with default features
 disabled and only `std`, `NSFileManager`, `NSString`, and `NSURL` enabled,
-`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. crates.io metadata lists
-`security-framework` 3.7.0 as the current release. HKDF 0.12.4 is deliberately
+`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. HKDF 0.12.4 is deliberately
 selected instead of current 0.13.0 because 0.12.4 uses the already pinned
 `hmac =0.12.1`, while 0.13.0 moves to HMAC 0.13. The activation pull request
-must verify these facts again, pin every direct dependency exactly, restrict
-Apple dependencies to exact `cfg(target_os = "macos")`, and add resolved-graph
-feature/ownership checks before changing a manifest.
+direct declarations and resolved per-target reachability are enforced by xtask.
+The high-level `security-framework` crate is deliberately not used: raw
+`SecItemAdd` and `SecItemCopyMatching` preserve the add-only contract.
 
-The current `hmac =0.12.1` exclusivity to `tersa-blob-spike` remains unchanged
-in PR 30. The Keychain/HKDF activation must deliberately expand the owner set
-to exactly `tersa-blob-spike` and `tersa-keychain-macos`; no other crate may
-reach HMAC. `tersa-keychain-macos` may not add direct application or domain
+The active `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
+`tersa-keychain-macos`; no other crate may reach HMAC. ChaCha20-Poly1305 remains
+exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
+`tersa-keychain-macos` may not add direct application or domain
 edges without separately accepted ADR reasoning. `tersa-cli-macos` receives no
 general Apple-framework, SQLCipher, key export, database-path override, or
 transport capability from its reservation.
 
-The future adapter must opt every macOS Keychain operation into the Data
+The active adapter opts every macOS Keychain operation into the Data
 Protection Keychain, disable synchronization, and name the registered
 application group shared by the same-team signed app and bundled `mailctl`
 target. The same group owns their shared filesystem container. Neither target
