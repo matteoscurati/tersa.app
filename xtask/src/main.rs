@@ -12,6 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use cargo_metadata::{Metadata, MetadataCommand, PackageId};
@@ -291,6 +292,19 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     let entitlements = fs::read_to_string("apple/macos/TersaMac.entitlements")?;
     let project = fs::read_to_string("apple/project.yml")?;
     violations.extend(signing_configuration_violations(&entitlements, &project));
+    let mut entitlement_paths = Vec::new();
+    collect_entitlement_paths(Path::new("apple"), &mut entitlement_paths)?;
+    entitlement_paths.sort();
+    for path in entitlement_paths {
+        if path == Path::new("apple/macos/TersaMac.entitlements") {
+            continue;
+        }
+        let document = fs::read_to_string(&path)?;
+        violations.extend(non_owner_entitlement_violations(
+            &path.to_string_lossy(),
+            &document,
+        ));
+    }
 
     let adapter = fs::read_to_string("adapters/keychain-macos/src/lib.rs")?;
     for required in [
@@ -316,8 +330,51 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     Ok(())
 }
 
+fn collect_entitlement_paths(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_entitlement_paths(&path, output)?;
+        } else if file_type.is_symlink() {
+            return Err(io::Error::other(format!(
+                "Apple signing inventory path `{}` must not be a symbolic link",
+                path.display()
+            )));
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("entitlements")
+        {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
+    let root: StrictYamlValue = match plist::from_bytes(document.as_bytes()) {
+        Ok(root) => root,
+        Err(error) => {
+            return vec![format!("{path} plist parse failed: {error}")];
+        }
+    };
+    let mut violations = Vec::new();
+    for key in [
+        "com.apple.security.application-groups",
+        "keychain-access-groups",
+    ] {
+        if yaml_contains_key(&root, key) {
+            violations.push(format!(
+                "{path} must not contain protected entitlement `{key}`"
+            ));
+        }
+    }
+    violations
+}
+
 const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
 const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
+const TERSA_MAC_ENTITLEMENTS: &str = "macos/TersaMac.entitlements";
 
 #[derive(Clone, Debug, PartialEq)]
 struct ProjectTarget {
@@ -460,7 +517,16 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         }
     }
 
-    let targets = match parse_project_targets(project) {
+    let root = match parse_project_root(project) {
+        Ok(root) => root,
+        Err(error) => {
+            violations.push(format!(
+                "apple/project.yml target structure is invalid: {error}"
+            ));
+            return violations;
+        }
+    };
+    let targets = match project_targets(&root) {
         Ok(targets) => targets,
         Err(error) => {
             violations.push(format!(
@@ -469,12 +535,19 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
             return violations;
         }
     };
+    violations.extend(effective_signing_configuration_violations(&root, &targets));
     let Some(application) = targets.iter().find(|target| target.name == "TersaMac") else {
         violations.push("apple/project.yml is missing the TersaMac target".to_owned());
         return violations;
     };
     if application.platform != "macOS" {
         violations.push("the TersaMac target must declare platform macOS".to_owned());
+    }
+    if !matches!(
+        yaml_path(&application.body, &["entitlements", "path"]),
+        Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
+    ) {
+        violations.push("the TersaMac target must use only macos/TersaMac.entitlements".to_owned());
     }
 
     for (path, label) in [
@@ -509,20 +582,289 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
                 .to_owned(),
         );
     }
+    if !matches!(
+        yaml_path(
+            &application.body,
+            &["settings", "base", "CODE_SIGN_ENTITLEMENTS"]
+        ),
+        Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
+    ) {
+        violations.push(
+            "the TersaMac target CODE_SIGN_ENTITLEMENTS setting must exactly match macos/TersaMac.entitlements"
+                .to_owned(),
+        );
+    }
+    violations
+}
 
-    for target in &targets {
-        if target.platform == "iOS"
-            && (target_contains_key(target, "TERSA_MACOS_APP_GROUP")
-                || target_contains_key(target, "com.apple.security.application-groups")
-                || target_contains_key(target, "keychain-access-groups"))
-        {
+fn effective_signing_configuration_violations(
+    root: &StrictYamlValue,
+    targets: &[ProjectTarget],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let Ok(root_mapping) = yaml_mapping(root, "project root") else {
+        return vec!["apple/project.yml root must be a mapping".to_owned()];
+    };
+    for key in [
+        "include",
+        "includes",
+        "targetTemplates",
+        "settingGroups",
+        "configFiles",
+        "configs",
+        "preGenCommand",
+        "postGenCommand",
+    ] {
+        if root_mapping.contains_key(key) {
             violations.push(format!(
-                "iOS target `{}` must not receive the Phase 1 macOS Keychain/App Group configuration",
-                target.name
+                "apple/project.yml unsupported signing indirection `{key}` is forbidden"
+            ));
+        }
+    }
+    inspect_settings_indirection(
+        root_mapping.get("settings"),
+        "project-wide settings",
+        &mut violations,
+    );
+
+    for target in targets {
+        let Ok(body) = yaml_mapping(&target.body, &format!("target `{}`", target.name)) else {
+            continue;
+        };
+        for key in ["templates", "configFiles"] {
+            if body.contains_key(key) {
+                violations.push(format!(
+                    "target `{}` unsupported signing indirection `{key}` is forbidden",
+                    target.name
+                ));
+            }
+        }
+        inspect_settings_indirection(
+            body.get("settings"),
+            &format!("target `{}` settings", target.name),
+            &mut violations,
+        );
+        if let Some(entitlements) = body.get("entitlements") {
+            match yaml_mapping(
+                entitlements,
+                &format!("target `{}` entitlements", target.name),
+            ) {
+                Ok(entitlements) => {
+                    if let Some(path) = entitlements.get("path") {
+                        match yaml_string(
+                            path,
+                            &format!("target `{}` entitlement path", target.name),
+                        ) {
+                            Ok(path)
+                                if !path.contains('$')
+                                    && allowed_target_entitlement_path(&target.name, path) => {}
+                            _ => violations.push(format!(
+                                "target `{}` entitlement path is outside the exact allowlist",
+                                target.name
+                            )),
+                        }
+                    }
+                }
+                Err(error) => violations.push(error),
+            }
+        }
+    }
+
+    let mut sensitive = Vec::new();
+    collect_sensitive_configuration(root, &mut Vec::new(), &mut sensitive);
+    for (path, value) in sensitive {
+        if !allowed_sensitive_configuration(&path, value) {
+            violations.push(format!(
+                "apple/project.yml sensitive signing configuration `{}` is outside the exact allowlist",
+                path.join(".")
+            ));
+        }
+    }
+
+    let mut protected_values = Vec::new();
+    collect_protected_values(root, &mut Vec::new(), &mut protected_values);
+    for path in protected_values {
+        if !allowed_protected_value_path(&path) {
+            violations.push(format!(
+                "apple/project.yml protected signing value is reused at `{}`",
+                path.join(".")
             ));
         }
     }
     violations
+}
+
+fn allowed_target_entitlement_path(target: &str, path: &str) -> bool {
+    matches!(
+        (target, path),
+        ("TersaMac", TERSA_MAC_ENTITLEMENTS)
+            | ("TersaIOS", "ios/TersaIOS.entitlements")
+            | ("TersaMimeMac", "mime-macos/TersaMimeMac.entitlements")
+    )
+}
+
+fn inspect_settings_indirection(
+    settings: Option<&StrictYamlValue>,
+    context: &str,
+    violations: &mut Vec<String>,
+) {
+    let Some(settings) = settings else {
+        return;
+    };
+    let Ok(settings) = yaml_mapping(settings, context) else {
+        violations.push(format!("{context} must be a direct mapping"));
+        return;
+    };
+    for key in ["configs", "groups"] {
+        if settings.contains_key(key) {
+            violations.push(format!(
+                "{context} unsupported signing indirection `{key}` is forbidden"
+            ));
+        }
+    }
+}
+
+fn collect_sensitive_configuration<'a>(
+    value: &'a StrictYamlValue,
+    path: &mut Vec<String>,
+    output: &mut Vec<(Vec<String>, &'a StrictYamlValue)>,
+) {
+    match value {
+        StrictYamlValue::Sequence(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(format!("[{index}]"));
+                collect_sensitive_configuration(value, path, output);
+                path.pop();
+            }
+        }
+        StrictYamlValue::Mapping(mapping) => {
+            for (key, value) in mapping {
+                path.push(key.clone());
+                if is_sensitive_signing_key(key) {
+                    output.push((path.clone(), value));
+                }
+                collect_sensitive_configuration(value, path, output);
+                path.pop();
+            }
+        }
+        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => {}
+    }
+}
+
+fn is_sensitive_signing_key(key: &str) -> bool {
+    [
+        "TERSA_MACOS_APP_GROUP",
+        "CODE_SIGN_ENTITLEMENTS",
+        "com.apple.security.application-groups",
+        "keychain-access-groups",
+    ]
+    .iter()
+    .any(|sensitive| key == *sensitive || key.starts_with(&format!("{sensitive}[")))
+}
+
+fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> bool {
+    let components = path.iter().map(String::as_str).collect::<Vec<_>>();
+    match components.as_slice() {
+        [
+            "targets",
+            "TersaMac",
+            "settings",
+            "base",
+            "TERSA_MACOS_APP_GROUP",
+        ] => {
+            matches!(value, StrictYamlValue::String(value) if value == BUILD_SETTING_GROUP)
+        }
+        [
+            "targets",
+            "TersaMac",
+            "settings",
+            "base",
+            "CODE_SIGN_ENTITLEMENTS",
+        ] => {
+            matches!(value, StrictYamlValue::String(value) if value == TERSA_MAC_ENTITLEMENTS)
+        }
+        ["targets", "TersaMac", "entitlements", "properties", key]
+            if *key == "com.apple.security.application-groups"
+                || *key == "keychain-access-groups" =>
+        {
+            yaml_exact_string_array(Some(value), SIGNING_GROUP)
+        }
+        [
+            "targets",
+            "TersaIOS",
+            "settings",
+            "base",
+            "CODE_SIGN_ENTITLEMENTS",
+        ] => {
+            matches!(value, StrictYamlValue::String(value) if value == "ios/TersaIOS.entitlements")
+        }
+        [
+            "targets",
+            "TersaMimeMac",
+            "settings",
+            "base",
+            "CODE_SIGN_ENTITLEMENTS",
+        ] => {
+            matches!(value, StrictYamlValue::String(value) if value == "mime-macos/TersaMimeMac.entitlements")
+        }
+        _ => false,
+    }
+}
+
+fn collect_protected_values(
+    value: &StrictYamlValue,
+    path: &mut Vec<String>,
+    output: &mut Vec<Vec<String>>,
+) {
+    match value {
+        StrictYamlValue::String(value)
+            if value == TERSA_MAC_ENTITLEMENTS
+                || value == SIGNING_GROUP
+                || value == BUILD_SETTING_GROUP =>
+        {
+            output.push(path.clone());
+        }
+        StrictYamlValue::Sequence(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(format!("[{index}]"));
+                collect_protected_values(value, path, output);
+                path.pop();
+            }
+        }
+        StrictYamlValue::Mapping(mapping) => {
+            for (key, value) in mapping {
+                path.push(key.clone());
+                collect_protected_values(value, path, output);
+                path.pop();
+            }
+        }
+        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => {}
+    }
+}
+
+fn allowed_protected_value_path(path: &[String]) -> bool {
+    let components = path.iter().map(String::as_str).collect::<Vec<_>>();
+    match components.as_slice() {
+        ["targets", "TersaMac", "entitlements", "path"] => true,
+        ["targets", "TersaMac", "settings", "base", key]
+            if *key == "CODE_SIGN_ENTITLEMENTS" || *key == "TERSA_MACOS_APP_GROUP" =>
+        {
+            true
+        }
+        [
+            "targets",
+            "TersaMac",
+            "entitlements",
+            "properties",
+            key,
+            "[0]",
+        ] if *key == "com.apple.security.application-groups"
+            || *key == "keychain-access-groups" =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 fn parse_plist_string_array(document: &str, key: &str) -> Result<Vec<String>, String> {
@@ -546,10 +888,18 @@ fn parse_plist_string_array(document: &str, key: &str) -> Result<Vec<String>, St
         .collect()
 }
 
+#[cfg(test)]
 fn parse_project_targets(document: &str) -> Result<Vec<ProjectTarget>, String> {
-    let root: StrictYamlValue =
-        yaml_serde::from_str(document).map_err(|error| format!("YAML parse failed: {error}"))?;
-    let root = yaml_mapping(&root, "project root")?;
+    let root = parse_project_root(document)?;
+    project_targets(&root)
+}
+
+fn parse_project_root(document: &str) -> Result<StrictYamlValue, String> {
+    yaml_serde::from_str(document).map_err(|error| format!("YAML parse failed: {error}"))
+}
+
+fn project_targets(root: &StrictYamlValue) -> Result<Vec<ProjectTarget>, String> {
+    let root = yaml_mapping(root, "project root")?;
     let targets = root
         .get("targets")
         .ok_or_else(|| "missing top-level targets mapping".to_owned())?;
@@ -574,10 +924,6 @@ fn parse_project_targets(document: &str) -> Result<Vec<ProjectTarget>, String> {
             })
         })
         .collect()
-}
-
-fn target_contains_key(target: &ProjectTarget, key: &str) -> bool {
-    yaml_contains_key(&target.body, key)
 }
 
 fn yaml_mapping<'a>(
@@ -1879,12 +2225,39 @@ mod tests {
         dependency_policy, future_macos_store_dependency_violation,
         gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
         gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, keychain_direct_dependency_set_violations, parse_identity,
-        parse_plist_string_array, parse_project_targets, reserved_future_policy_violations,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, reserved_future_policy_violations,
         resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
         signing_configuration_violations, sqlcipher_dependency_graph_violations,
         sqlcipher_manifest_dependency_violations, target_metadata_options,
     };
+
+    const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
+<key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+<key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#;
+
+    const VALID_SIGNING_PROJECT: &str = r#"
+targets:
+  TersaMac:
+    platform: macOS
+    entitlements:
+      path: macos/TersaMac.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
+    settings:
+      base:
+        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+  OtherMac:
+    platform: macOS
+  OtherIOS:
+    platform: iOS
+"#;
 
     #[test]
     fn parses_a_well_formed_identity() {
@@ -2040,6 +2413,7 @@ mod tests {
   TersaMac:
     platform: macOS
     entitlements:
+      path: macos/TersaMac.entitlements
       properties:
         com.apple.security.application-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
@@ -2048,6 +2422,7 @@ mod tests {
     settings:
       base:
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
   MiddleMac:
     platform: macOS
   LastIOS:
@@ -2085,18 +2460,18 @@ mod tests {
             "  LastIOS:\n    platform: iOS",
             "  LastIOS:\n    platform: iOS\n    settings:\n      base:\n        TERSA_MACOS_APP_GROUP: forbidden",
         );
-        assert_eq!(
-            signing_configuration_violations(entitlements, &contaminated),
-            vec![
-                "iOS target `LastIOS` must not receive the Phase 1 macOS Keychain/App Group configuration"
-            ]
+        assert!(
+            signing_configuration_violations(entitlements, &contaminated)
+                .iter()
+                .any(|violation| violation
+                    .contains("targets.LastIOS.settings.base.TERSA_MACOS_APP_GROUP"))
         );
     }
 
     #[test]
     fn signing_parser_accepts_quoted_flow_mappings_and_resolved_aliases() {
         let project = r#"
-"targets": {"TersaMac": {"platform": "macOS", "entitlements": {"properties": {"com.apple.security.application-groups": ["${TeamIdentifierPrefix}app.tersa.shared"], "keychain-access-groups": ["${TeamIdentifierPrefix}app.tersa.shared"]}}, "settings": {"base": {"TERSA_MACOS_APP_GROUP": "$(TeamIdentifierPrefix)app.tersa.shared"}}}}
+"targets": {"TersaMac": {"platform": "macOS", "entitlements": {"path": "macos/TersaMac.entitlements", "properties": {"com.apple.security.application-groups": ["${TeamIdentifierPrefix}app.tersa.shared"], "keychain-access-groups": ["${TeamIdentifierPrefix}app.tersa.shared"]}}, "settings": {"base": {"TERSA_MACOS_APP_GROUP": "$(TeamIdentifierPrefix)app.tersa.shared", "CODE_SIGN_ENTITLEMENTS": "macos/TersaMac.entitlements"}}}}
 "#;
         let targets = parse_project_targets(project).expect("quoted flow YAML must parse");
         assert_eq!(targets.len(), 1);
@@ -2112,25 +2487,26 @@ targets:
   TersaMac:
     platform: macOS
     entitlements:
+      path: macos/TersaMac.entitlements
       properties:
         com.apple.security.application-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
         keychain-access-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
     settings:
       base:
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
   AliasedIOS: *ios
 "#;
-        assert_eq!(
+        assert!(
             signing_configuration_violations(
                 r#"<plist version="1.0"><dict>
 <key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 <key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#,
                 aliased,
-            ),
-            vec![
-                "iOS target `AliasedIOS` must not receive the Phase 1 macOS Keychain/App Group configuration"
-            ]
+            )
+            .iter()
+            .any(|violation| violation.contains("targets.AliasedIOS.settings.base.TERSA_MACOS_APP_GROUP"))
         );
     }
 
@@ -2182,6 +2558,7 @@ targets:
   TersaMac:
     platform: macOS
     entitlements:
+      path: macos/TersaMac.entitlements
       properties:
         com.apple.security.application-groups: []
         keychain-access-groups:
@@ -2190,26 +2567,140 @@ targets:
     settings:
       base:
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
 "#;
         let entitlements = r#"<plist version="1.0"><dict>
 <key>com.apple.security.application-groups</key><array></array>
 <key>keychain-access-groups</key><array><string>wrong.group</string></array>
 </dict></plist>"#;
         let violations = signing_configuration_violations(entitlements, project);
-        assert_eq!(violations.len(), 4);
-        assert_eq!(
+        assert!(violations.len() >= 4);
+        assert!(
             violations
                 .iter()
                 .filter(|violation| violation.contains("com.apple.security.application-groups"))
-                .count(),
-            2
+                .count()
+                >= 2
         );
-        assert_eq!(
+        assert!(
             violations
                 .iter()
                 .filter(|violation| violation.contains("keychain-access-groups"))
-                .count(),
-            2
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn effective_signing_policy_rejects_every_unsupported_xcodegen_bypass() {
+        assert!(
+            signing_configuration_violations(VALID_ENTITLEMENTS, VALID_SIGNING_PROJECT).is_empty()
+        );
+
+        let project_wide = format!(
+            "{VALID_SIGNING_PROJECT}\nsettings:\n  base:\n    TERSA_MACOS_APP_GROUP: forbidden\n"
+        );
+        let per_config = VALID_SIGNING_PROJECT.replace(
+            "    settings:\n      base:",
+            "    settings:\n      configs:\n        Debug:\n          TERSA_MACOS_APP_GROUP: forbidden\n      base:",
+        );
+        let wrong_code_sign = VALID_SIGNING_PROJECT.replace(
+            "CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements",
+            "CODE_SIGN_ENTITLEMENTS: $(UNREVIEWED_ENTITLEMENTS)",
+        );
+        let unreviewed_entitlement_path = VALID_SIGNING_PROJECT.replace(
+            "macos/TersaMac.entitlements",
+            "macos/Unreviewed.entitlements",
+        );
+        let other_mac = VALID_SIGNING_PROJECT.replace(
+            "  OtherMac:\n    platform: macOS",
+            "  OtherMac:\n    platform: macOS\n    settings:\n      base:\n        TERSA_MACOS_APP_GROUP: forbidden",
+        );
+        let other_ios = VALID_SIGNING_PROJECT.replace(
+            "  OtherIOS:\n    platform: iOS",
+            "  OtherIOS:\n    platform: iOS\n    entitlements:\n      properties:\n        keychain-access-groups: [forbidden]",
+        );
+        let target_template =
+            format!("targetTemplates:\n  SharedSigning: {{}}\n{VALID_SIGNING_PROJECT}").replace(
+                "    platform: macOS",
+                "    platform: macOS\n    templates: [SharedSigning]",
+            );
+        let setting_group =
+            format!("settingGroups:\n  SharedSigning: {{}}\n{VALID_SIGNING_PROJECT}").replace(
+                "    settings:\n      base:",
+                "    settings:\n      groups: [SharedSigning]\n      base:",
+            );
+        let config_file = VALID_SIGNING_PROJECT.replace(
+            "    platform: macOS",
+            "    platform: macOS\n    configFiles:\n      Debug: Config/Signing.xcconfig",
+        );
+        let included = format!("include: Config/Signing.yml\n{VALID_SIGNING_PROJECT}");
+        let reused_path = VALID_SIGNING_PROJECT.replace(
+            "  OtherMac:\n    platform: macOS",
+            "  OtherMac:\n    platform: macOS\n    entitlements:\n      path: macos/TersaMac.entitlements",
+        );
+        let conditional = VALID_SIGNING_PROJECT.replace(
+            "        TERSA_MACOS_APP_GROUP: \"$(TeamIdentifierPrefix)app.tersa.shared\"",
+            "        TERSA_MACOS_APP_GROUP: \"$(TeamIdentifierPrefix)app.tersa.shared\"\n        TERSA_MACOS_APP_GROUP[sdk=macosx*]: forbidden",
+        );
+
+        for (label, project, expected) in [
+            (
+                "project-wide settings",
+                project_wide,
+                "outside the exact allowlist",
+            ),
+            ("per-config override", per_config, "indirection `configs`"),
+            (
+                "CODE_SIGN_ENTITLEMENTS",
+                wrong_code_sign,
+                "CODE_SIGN_ENTITLEMENTS",
+            ),
+            (
+                "unreviewed entitlement path",
+                unreviewed_entitlement_path,
+                "entitlement path is outside the exact allowlist",
+            ),
+            ("other macOS target", other_mac, "targets.OtherMac"),
+            ("other iOS target", other_ios, "targets.OtherIOS"),
+            ("target template", target_template, "targetTemplates"),
+            ("setting group", setting_group, "settingGroups"),
+            ("config file", config_file, "configFiles"),
+            ("include", included, "indirection `include`"),
+            (
+                "entitlement path reuse",
+                reused_path,
+                "protected signing value is reused",
+            ),
+            (
+                "conditional setting",
+                conditional,
+                "TERSA_MACOS_APP_GROUP[sdk=macosx*]",
+            ),
+        ] {
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_owner_entitlement_files_cannot_claim_the_protected_groups() {
+        let clean = r#"<plist version="1.0"><dict><key>com.apple.security.app-sandbox</key><true/></dict></plist>"#;
+        assert!(non_owner_entitlement_violations("clean.entitlements", clean).is_empty());
+
+        let contaminated = r#"<plist version="1.0"><dict>
+<key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#;
+        assert_eq!(
+            non_owner_entitlement_violations("other.entitlements", contaminated),
+            vec![
+                "other.entitlements must not contain protected entitlement `keychain-access-groups`"
+            ]
         );
     }
 

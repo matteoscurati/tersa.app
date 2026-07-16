@@ -140,9 +140,19 @@ the signed executable from the notarized app distribution; a package-manager
 entry may point to that executable but may not substitute a separately rebuilt
 binary.
 
+The signing guard treats the current direct XcodeGen declarations as an exact
+allowlist. Project-wide or per-configuration sensitive overrides, includes,
+target templates, setting groups, config files, conditional sensitive keys,
+and reuse of the protected entitlement path fail closed. Every other
+entitlement file under `apple/` is parsed and rejected if it claims either
+protected group entitlement.
+
 Provisioning must use a raw add-only operation. A duplicate discards and
 zeroizes the losing candidate, then retrieves and validates the winner; it
-never calls an add-or-update generic-password helper. The future shell-launched
+never calls an add-or-update generic-password helper. All key states use a
+private redacted `SecretKey` that zeroizes on drop. The no-copy Keychain add
+constructs and consumes its Core Foundation objects inside one synchronous
+scope so the candidate pointer cannot escape. The future shell-launched
 CLI must have its own stable bundle identifier, embedded Info.plist, Hardened
 Runtime, non-inherited App Sandbox entitlement, and the same application group.
 PR 33 must satisfy its dedicated signed-package and direct-shell-launch

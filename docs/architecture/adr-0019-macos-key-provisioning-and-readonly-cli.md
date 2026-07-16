@@ -99,13 +99,21 @@ big-endian validated account-identifier length and its UTF-8 bytes, then a
 two-byte big-endian purpose length and its ASCII bytes. Purposes are a closed,
 versioned enum; the initial value is `sqlcipher/account-database/v1`. Unknown
 versions or purposes fail closed. Root and derived key buffers use best-effort
-zeroization and never implement content-revealing `Debug` or serialization.
+zeroization through one private `SecretKey` newtype whose `Drop` implementation
+clears its bytes and whose only `Debug` representation is redacted. Root,
+candidate, retrieved, and derived keys never use a raw byte-array value across
+adapter operations and never implement serialization.
 This guarantee covers explicit buffers owned by the adapter; the internal
 state and temporary storage of the `hkdf`, `hmac`, and digest implementations
 are outside `zeroize`'s guarantee and may leave transient copies in process
 memory.
 PR 33 owns the trusted composition that will pass a privately derived key
 directly into strict database opening without returning key bytes to the CLI.
+
+The add-only Keychain boundary constructs its no-copy `CFData`, attribute
+dictionary, and synchronous `SecItemAdd` call in one private scope. Neither the
+dictionary nor any object containing the candidate pointer can escape that
+scope.
 
 PR 32 uses direct `security-framework-sys =2.17.0` with default features
 disabled and only `OSX_10_15`,
@@ -157,6 +165,13 @@ shared by the app and CLI entitlements. Resolution must verify access to the
 returned container because macOS may return an expected-form URL even for an
 invalid group. It never falls back to a normal Application Support path or
 either target's private sandbox container.
+
+The architecture check accepts the PR 32 signing configuration only at the
+exact `TersaMac` target paths. It rejects project or per-configuration
+overrides, includes, target templates, setting groups, configuration files,
+conditional sensitive keys, protected entitlement-path reuse, and protected
+groups in every other entitlement file. These indirections require a reviewed
+policy change rather than attempted partial XcodeGen resolution.
 
 PR 33 has a CLI-specific acceptance condition independent of the later macOS
 UI gate: a same-team Developer ID package must be notarized, contain the

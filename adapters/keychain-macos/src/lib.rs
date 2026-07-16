@@ -18,7 +18,7 @@ use tersa_platform::secure_storage::{
     AccountId, AccountProfileLocator, InstallationRootKeyProvisioner, KeyStorageError,
     ProfileStorageError, ProvisionOutcome,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 // Rust guideline compliant 1.0.
 
@@ -30,6 +30,44 @@ const ROOT_SALT: &[u8] = b"tersa.app/macos/root-key/v1";
 const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
 const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
+
+#[cfg_attr(test, derive(Eq, PartialEq))]
+struct SecretKey([u8; 32]);
+
+impl SecretKey {
+    #[cfg(test)]
+    fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn zeroed() -> Self {
+        Self([0; 32])
+    }
+
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8; 32] {
+        &mut self.0
+    }
+
+    fn zeroize_now(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretKey([REDACTED])")
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 /// Provisions only the fixed installation root key.
 pub struct DataProtectionRootKeyProvisioner {
@@ -95,13 +133,13 @@ fn provision_installation_root_key(
     let mut candidate = backend.random_key()?;
     match backend.add(&candidate)? {
         AddResult::Added => {
-            candidate.zeroize();
+            candidate.zeroize_now();
             backend.candidate_zeroized_before_reread(&candidate);
             backend.copy()?.ok_or(KeyStorageError::Invalid)?;
             Ok(ProvisionOutcome::Created)
         }
         AddResult::Duplicate => {
-            candidate.zeroize();
+            candidate.zeroize_now();
             backend.candidate_zeroized_before_reread(&candidate);
             backend.copy()?.ok_or(KeyStorageError::Invalid)?;
             Ok(ProvisionOutcome::Existing)
@@ -154,17 +192,17 @@ enum AccountKeyPurpose {
     )
 )]
 fn derive_account_key(
-    root: &[u8; 32],
+    root: &SecretKey,
     account_id: &AccountId,
     purpose: AccountKeyPurpose,
-) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+) -> Result<SecretKey, KeyStorageError> {
     let purpose = match purpose {
         AccountKeyPurpose::SqlCipherAccountDatabaseV1 => DATABASE_PURPOSE,
     };
     let info = framed_info(account_id, purpose)?;
-    let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root);
-    let mut output = Zeroizing::new([0_u8; 32]);
-    hkdf.expand(&info, &mut *output)
+    let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root.as_bytes());
+    let mut output = SecretKey::zeroed();
+    hkdf.expand(&info, output.as_mut_bytes())
         .map_err(|_invalid_length| KeyStorageError::Invalid)?;
     Ok(output)
 }
@@ -215,11 +253,11 @@ enum AddResult {
 }
 
 trait RootKeyBackend: Send + Sync {
-    fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError>;
-    fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError>;
-    fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError>;
+    fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError>;
+    fn random_key(&self) -> Result<SecretKey, KeyStorageError>;
+    fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError>;
 
-    fn candidate_zeroized_before_reread(&self, _candidate: &[u8; 32]) {}
+    fn candidate_zeroized_before_reread(&self, _candidate: &SecretKey) {}
 }
 
 trait ContainerLocator: Send + Sync {
@@ -241,13 +279,13 @@ impl ProductionBackend {
 }
 
 impl RootKeyBackend for ProductionBackend {
-    fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+    fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
         macos_keychain::copy(self.group)
     }
-    fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+    fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
         macos_keychain::random()
     }
-    fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
+    fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
         macos_keychain::add(self.group, candidate)
     }
 }
@@ -291,7 +329,7 @@ impl ContainerLocator for ProductionContainerLocator {
     reason = "Security.framework and Core Foundation expose this add-only Keychain contract only through audited C FFI."
 )]
 mod macos_keychain {
-    use super::{AddResult, KeyStorageError};
+    use super::{AddResult, KeyStorageError, SecretKey};
     use core_foundation::array::CFArray;
     use core_foundation::base::{
         CFEqual, CFIndexConvertible, CFRange, CFType, CFTypeRef, TCFType, kCFAllocatorDefault,
@@ -304,7 +342,6 @@ mod macos_keychain {
     use core_foundation::string::{CFString, CFStringRef};
     use security_framework_sys::{access_control, base, item, keychain_item, random};
     use std::ffi::c_void;
-    use zeroize::Zeroizing;
 
     // security-framework-sys 2.17.0 omits only this stable dictionary-key
     // symbol. All other Security constants come from the audited sys crate.
@@ -321,7 +358,7 @@ mod macos_keychain {
         };
     }
 
-    pub(super) fn copy(group: &str) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+    pub(super) fn copy(group: &str) -> Result<Option<SecretKey>, KeyStorageError> {
         let query = record_dictionary(group, None, true);
         let mut raw: CFTypeRef = std::ptr::null();
         // SAFETY: The retained query dictionary is valid for the synchronous
@@ -339,15 +376,15 @@ mod macos_keychain {
         let result = unsafe { CFType::wrap_under_create_rule(raw) };
         decode_copy_result(result, group).map(Some)
     }
-    pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
-        let mut key = Zeroizing::new([0_u8; 32]);
-        // SAFETY: The zeroizing output owns exactly `key.len()` writable bytes
-        // for the duration of the synchronous Security.framework call.
+    pub(super) fn random() -> Result<SecretKey, KeyStorageError> {
+        let mut key = SecretKey::zeroed();
+        // SAFETY: The secret output owns exactly 32 writable bytes for the
+        // duration of the synchronous Security.framework call.
         let status = unsafe {
             random::SecRandomCopyBytes(
                 random::kSecRandomDefault,
-                key.len(),
-                key.as_mut_ptr().cast::<c_void>(),
+                key.as_bytes().len(),
+                key.as_mut_bytes().as_mut_ptr().cast::<c_void>(),
             )
         };
         if status == 0 {
@@ -356,17 +393,8 @@ mod macos_keychain {
             Err(KeyStorageError::OperationFailed)
         }
     }
-    pub(super) fn add(
-        group: &str,
-        candidate: &Zeroizing<[u8; 32]>,
-    ) -> Result<AddResult, KeyStorageError> {
-        let attributes = add_dictionary(group, candidate)?;
-        // SAFETY: `attributes` and its no-copy CFData remain alive for the
-        // synchronous call. The CFData borrows `candidate`, which outlives the
-        // dictionary and call; kCFAllocatorNull never frees Rust-owned bytes.
-        let status = unsafe {
-            keychain_item::SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut())
-        };
+    pub(super) fn add(group: &str, candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
+        let status = add_no_copy(group, candidate)?;
         match status {
             base::errSecSuccess => Ok(AddResult::Added),
             base::errSecDuplicateItem => Ok(AddResult::Duplicate),
@@ -388,19 +416,16 @@ mod macos_keychain {
         )
     }
 
-    fn add_dictionary(
-        group: &str,
-        candidate: &Zeroizing<[u8; 32]>,
-    ) -> Result<CFDictionary<CFType, CFType>, KeyStorageError> {
-        // SAFETY: The CFData is scoped inside the returned dictionary and uses
-        // kCFAllocatorNull, so Core Foundation neither owns nor frees the Rust
-        // buffer. The only caller keeps `candidate` alive until after the
-        // synchronous SecItemAdd returns and then drops the dictionary first.
+    fn add_no_copy(group: &str, candidate: &SecretKey) -> Result<i32, KeyStorageError> {
+        // SAFETY: This function constructs the borrowing CFData and dictionary,
+        // performs the synchronous SecItemAdd call, and drops both before its
+        // borrow of `candidate` can end. No object containing the no-copy
+        // pointer is returned. kCFAllocatorNull never frees Rust-owned bytes.
         let data_ref = unsafe {
             CFDataCreateWithBytesNoCopy(
                 kCFAllocatorDefault,
-                candidate.as_ptr(),
-                candidate.len().to_CFIndex(),
+                candidate.as_bytes().as_ptr(),
+                candidate.as_bytes().len().to_CFIndex(),
                 kCFAllocatorNull,
             )
         };
@@ -409,7 +434,13 @@ mod macos_keychain {
         }
         // SAFETY: CFDataCreateWithBytesNoCopy returned a non-null +1 object.
         let data = unsafe { CFData::wrap_under_create_rule(data_ref) };
-        Ok(record_dictionary(group, Some(&data), false))
+        let attributes = record_dictionary(group, Some(&data), false);
+        // SAFETY: `attributes`, `data`, and `candidate` are live throughout
+        // this synchronous call. The no-copy values are dropped before this
+        // function returns, so the raw pointer cannot escape this scope.
+        Ok(unsafe {
+            keychain_item::SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut())
+        })
     }
 
     fn record_dictionary_with_optional_attributes(
@@ -474,10 +505,7 @@ mod macos_keychain {
         unsafe { CFString::wrap_under_get_rule(raw).into_CFType() }
     }
 
-    fn decode_copy_result(
-        result: CFType,
-        group: &str,
-    ) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+    fn decode_copy_result(result: CFType, group: &str) -> Result<SecretKey, KeyStorageError> {
         let array = result
             .downcast_into::<CFArray>()
             .ok_or(KeyStorageError::Invalid)?;
@@ -492,10 +520,7 @@ mod macos_keychain {
         decode_record(&dictionary, group)
     }
 
-    fn decode_record(
-        dictionary: &CFDictionary,
-        group: &str,
-    ) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+    fn decode_record(dictionary: &CFDictionary, group: &str) -> Result<SecretKey, KeyStorageError> {
         let service = CFString::new(super::SERVICE);
         let account = CFString::new(super::ACCOUNT);
         let group = CFString::new(group);
@@ -543,7 +568,7 @@ mod macos_keychain {
         if data.len() != 32 {
             return Err(KeyStorageError::Invalid);
         }
-        let mut bytes = Zeroizing::new([0_u8; 32]);
+        let mut bytes = SecretKey::zeroed();
         // SAFETY: The validated source range is exactly 32 bytes and `bytes`
         // owns exactly 32 writable bytes. CFDataGetBytes performs the sole
         // copy directly into the zeroizing destination.
@@ -551,7 +576,7 @@ mod macos_keychain {
             CFDataGetBytes(
                 data.as_concrete_TypeRef(),
                 CFRange::init(0, 32),
-                bytes.as_mut_ptr(),
+                bytes.as_mut_bytes().as_mut_ptr(),
             );
         }
         Ok(bytes)
@@ -655,8 +680,8 @@ mod macos_keychain {
 
         #[test]
         fn add_dictionary_omits_synchronizable_and_uses_data_protection_keychain() {
-            let candidate = Zeroizing::new([7; 32]);
-            let dictionary = add_dictionary("TEAM.app.tersa.shared", &candidate).unwrap();
+            let data = CFData::from_buffer(&[7; 32]);
+            let dictionary = record_dictionary("TEAM.app.tersa.shared", Some(&data), false);
             assert!(
                 dictionary
                     .find(security_string!(item::kSecAttrSynchronizable).as_CFTypeRef())
@@ -680,7 +705,9 @@ mod macos_keychain {
             let record = exact_fixture_record(group, Some(&[7; 32]));
             let one = CFArray::from_CFTypes(&[record.as_CFType()]);
             assert_eq!(
-                *decode_copy_result(one.as_CFType(), group).unwrap(),
+                *decode_copy_result(one.as_CFType(), group)
+                    .unwrap()
+                    .as_bytes(),
                 [7; 32]
             );
 
@@ -728,7 +755,9 @@ mod macos_keychain {
             let omitted = fixture_record(group, Some(&[7; 32]), None, None);
             let omitted = CFArray::from_CFTypes(&[omitted.as_CFType()]);
             assert_eq!(
-                *decode_copy_result(omitted.as_CFType(), group).unwrap(),
+                *decode_copy_result(omitted.as_CFType(), group)
+                    .unwrap()
+                    .as_bytes(),
                 [7; 32]
             );
 
@@ -760,15 +789,14 @@ mod macos_keychain {
 }
 #[cfg(not(target_os = "macos"))]
 mod macos_keychain {
-    use super::{AddResult, KeyStorageError};
-    use zeroize::Zeroizing;
-    pub(super) fn copy(_: &str) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+    use super::{AddResult, KeyStorageError, SecretKey};
+    pub(super) fn copy(_: &str) -> Result<Option<SecretKey>, KeyStorageError> {
         Err(KeyStorageError::Unavailable)
     }
-    pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+    pub(super) fn random() -> Result<SecretKey, KeyStorageError> {
         Err(KeyStorageError::Unavailable)
     }
-    pub(super) fn add(_: &str, _: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
+    pub(super) fn add(_: &str, _: &SecretKey) -> Result<AddResult, KeyStorageError> {
         Err(KeyStorageError::Unavailable)
     }
 }
@@ -829,15 +857,15 @@ mod tests {
         zeroized_before_reread: Mutex<bool>,
     }
     impl RootKeyBackend for Fake {
-        fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+        fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
             self.calls.lock().unwrap().push("copy");
-            Ok(self.item.lock().unwrap().map(Zeroizing::new))
+            Ok(self.item.lock().unwrap().map(SecretKey::new))
         }
-        fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
+        fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
             self.calls.lock().unwrap().push("random");
-            Ok(Zeroizing::new(*self.random.lock().unwrap()))
+            Ok(SecretKey::new(*self.random.lock().unwrap()))
         }
-        fn add(&self, c: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
+        fn add(&self, c: &SecretKey) -> Result<AddResult, KeyStorageError> {
             self.calls.lock().unwrap().push("add");
             let mut item = self.item.lock().unwrap();
             if self.duplicate_on_add {
@@ -846,12 +874,12 @@ mod tests {
             } else if item.is_some() {
                 Ok(AddResult::Duplicate)
             } else {
-                *item = Some(**c);
+                *item = Some(*c.as_bytes());
                 Ok(AddResult::Added)
             }
         }
-        fn candidate_zeroized_before_reread(&self, candidate: &[u8; 32]) {
-            assert_eq!(candidate, &[0; 32]);
+        fn candidate_zeroized_before_reread(&self, candidate: &SecretKey) {
+            assert_eq!(candidate.as_bytes(), &[0; 32]);
             *self.zeroized_before_reread.lock().unwrap() = true;
             self.calls.lock().unwrap().push("zeroized");
         }
@@ -866,44 +894,45 @@ mod tests {
     }
 
     impl RootKeyBackend for ConcurrentFake {
-        fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
+        fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
             if !self.first_copy.swap(true, Ordering::SeqCst) {
                 let snapshot = *self.item.lock().unwrap();
                 self.initial_copy_barrier.wait();
-                return Ok(snapshot.map(Zeroizing::new));
+                return Ok(snapshot.map(SecretKey::new));
             }
-            Ok(self.item.lock().unwrap().map(Zeroizing::new))
+            Ok(self.item.lock().unwrap().map(SecretKey::new))
         }
 
-        fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
-            Ok(Zeroizing::new(self.candidate))
+        fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
+            Ok(SecretKey::new(self.candidate))
         }
 
-        fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
+        fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
             let mut item = self.item.lock().unwrap();
             if item.is_some() {
                 Ok(AddResult::Duplicate)
             } else {
-                *item = Some(**candidate);
+                *item = Some(*candidate.as_bytes());
                 Ok(AddResult::Added)
             }
         }
     }
     #[test]
     fn hkdf_known_answer_and_info() {
-        let root: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let root = SecretKey::new(core::array::from_fn(|i| i as u8));
         assert_eq!(
             hex_encode(&framed_info(&account_id(), DATABASE_PURPOSE).unwrap()),
             "74657273612e6170702f6d61636f732f686b64662d7368613235362f7631000b616363742d746573742d31001d73716c6369706865722f6163636f756e742d64617461626173652f7631"
         );
         assert_eq!(
             hex_encode(
-                &*derive_account_key(
+                derive_account_key(
                     &root,
                     &account_id(),
                     AccountKeyPurpose::SqlCipherAccountDatabaseV1
                 )
                 .unwrap()
+                .as_bytes()
             ),
             "c822b72b2aaad045b983307618e4ea580ab2c1a219dcf379b229661f68f8c148"
         );
@@ -1088,5 +1117,11 @@ mod tests {
             format!("{:?}", ProfileStorageError::Invalid),
             "ProfileStorageError([REDACTED])"
         );
+        let secret = SecretKey::new([0xAB; 32]);
+        let formatted = format!("{secret:?}");
+        assert_eq!(formatted, "SecretKey([REDACTED])");
+        assert!(!formatted.contains("171"));
+        assert!(!formatted.contains("AB"));
+        assert!(!formatted.contains("ab"));
     }
 }
