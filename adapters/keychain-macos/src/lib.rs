@@ -15,10 +15,12 @@ use std::path::{Path, PathBuf};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use tersa_platform::secure_storage::{
-    AccountKeyProvider, AccountKeyPurpose, AccountProfileLocator, InstallationRootKeyProvisioner,
-    KeyStorageError, ProfileStorageError, ProvisionOutcome,
+    AccountId, AccountProfileLocator, InstallationRootKeyProvisioner, KeyStorageError,
+    ProfileStorageError, ProvisionOutcome,
 };
 use zeroize::{Zeroize, Zeroizing};
+
+// Rust guideline compliant 1.0.
 
 #[cfg(target_os = "macos")]
 const SERVICE: &str = "app.tersa.mac.storage-root.v1";
@@ -40,27 +42,6 @@ impl fmt::Debug for DataProtectionRootKeyProvisioner {
     }
 }
 
-/// Retrieves only the fixed root key and derives account keys from it.
-///
-/// It intentionally cannot provision the root key:
-///
-/// ```compile_fail
-/// use tersa_keychain_macos::DataProtectionAccountKeyProvider;
-/// use tersa_platform::secure_storage::InstallationRootKeyProvisioner;
-///
-/// fn require_provisioner<T: InstallationRootKeyProvisioner>() {}
-/// require_provisioner::<DataProtectionAccountKeyProvider>();
-/// ```
-pub struct DataProtectionAccountKeyProvider {
-    backend: ProductionBackend,
-}
-
-impl fmt::Debug for DataProtectionAccountKeyProvider {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("DataProtectionAccountKeyProvider([REDACTED])")
-    }
-}
-
 /// Locates only the fixed default profile in the configured App Group.
 pub struct AppGroupProfileLocator {
     locator: ProductionContainerLocator,
@@ -74,19 +55,6 @@ impl fmt::Debug for AppGroupProfileLocator {
 
 impl DataProtectionRootKeyProvisioner {
     /// Creates the fixed production provisioner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted error when the signing-time App Group is absent.
-    pub fn new() -> Result<Self, KeyStorageError> {
-        Ok(Self {
-            backend: ProductionBackend::new()?,
-        })
-    }
-}
-
-impl DataProtectionAccountKeyProvider {
-    /// Creates the fixed production retrieval-only provider.
     ///
     /// # Errors
     ///
@@ -141,39 +109,24 @@ fn provision_installation_root_key(
     }
 }
 
-impl AccountKeyProvider for DataProtectionAccountKeyProvider {
-    fn with_account_key<R>(
-        &self,
-        account_id: &str,
-        purpose: AccountKeyPurpose,
-        operation: impl FnOnce(&[u8; 32]) -> R,
-    ) -> Result<R, KeyStorageError> {
-        let root = self.backend.copy()?.ok_or(KeyStorageError::NotFound)?;
-        let mut derived = derive_account_key(&root, account_id, purpose)?;
-        let result = operation(&derived);
-        derived.zeroize();
-        Ok(result)
-    }
-}
-
 impl AccountProfileLocator for AppGroupProfileLocator {
-    fn account_database_path(&self, account_id: &str) -> Result<PathBuf, ProfileStorageError> {
+    fn account_database_path(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<PathBuf, ProfileStorageError> {
         account_database_path(&self.locator, account_id)
     }
 }
 
 fn account_database_path(
     locator: &impl ContainerLocator,
-    account_id: &str,
+    account_id: &AccountId,
 ) -> Result<PathBuf, ProfileStorageError> {
-    if account_id.is_empty() {
-        return Err(ProfileStorageError::Invalid);
-    }
     let container = locator.container()?;
     if !container.is_dir() || !is_readable_directory(&container) {
         return Err(ProfileStorageError::Unavailable);
     }
-    let digest = hex_digest(account_id.as_bytes());
+    let digest = hex_digest(account_id);
     Ok(PROFILE_PREFIX
         .iter()
         .fold(container, |path, part| path.join(part))
@@ -181,15 +134,34 @@ fn account_database_path(
         .join("mail.sqlite3"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "PR 32 validates private derivation; PR 33 will compose it directly with database opening without exporting key bytes."
+    )
+)]
+enum AccountKeyPurpose {
+    SqlCipherAccountDatabaseV1,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "PR 32 validates private derivation; PR 33 will compose it directly with database opening without exporting key bytes."
+    )
+)]
 fn derive_account_key(
     root: &[u8; 32],
-    account_id: &str,
+    account_id: &AccountId,
     purpose: AccountKeyPurpose,
 ) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
     let purpose = match purpose {
         AccountKeyPurpose::SqlCipherAccountDatabaseV1 => DATABASE_PURPOSE,
     };
-    let info = framed_info(account_id.as_bytes(), purpose)?;
+    let info = framed_info(account_id, purpose)?;
     let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root);
     let mut output = Zeroizing::new([0_u8; 32]);
     hkdf.expand(&info, &mut *output)
@@ -197,7 +169,8 @@ fn derive_account_key(
     Ok(output)
 }
 
-fn framed_info(account: &[u8], purpose: &[u8]) -> Result<Vec<u8>, KeyStorageError> {
+fn framed_info(account: &AccountId, purpose: &[u8]) -> Result<Vec<u8>, KeyStorageError> {
+    let account = account.as_str().as_bytes();
     let account_len = u16::try_from(account.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
     let purpose_len = u16::try_from(purpose.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
     let mut result = Vec::with_capacity(HKDF_PREFIX.len() + 4 + account.len() + purpose.len());
@@ -209,8 +182,8 @@ fn framed_info(account: &[u8], purpose: &[u8]) -> Result<Vec<u8>, KeyStorageErro
     Ok(result)
 }
 
-fn hex_digest(account: &[u8]) -> String {
-    let digest = Sha256::digest(account);
+fn hex_digest(account: &AccountId) -> String {
+    let digest = Sha256::digest(account.as_str().as_bytes());
     hex_encode(&digest)
 }
 
@@ -244,7 +217,7 @@ enum AddResult {
 trait RootKeyBackend: Send + Sync {
     fn copy(&self) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError>;
     fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError>;
-    fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError>;
+    fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError>;
 
     fn candidate_zeroized_before_reread(&self, _candidate: &[u8; 32]) {}
 }
@@ -274,7 +247,7 @@ impl RootKeyBackend for ProductionBackend {
     fn random_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
         macos_keychain::random()
     }
-    fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+    fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
         macos_keychain::add(self.group, candidate)
     }
 }
@@ -315,15 +288,17 @@ impl ContainerLocator for ProductionContainerLocator {
 #[expect(
     unsafe_code,
     clippy::borrow_as_ptr,
-    clippy::undocumented_unsafe_blocks,
     reason = "Security.framework and Core Foundation expose this add-only Keychain contract only through audited C FFI."
 )]
 mod macos_keychain {
     use super::{AddResult, KeyStorageError};
     use core_foundation::array::CFArray;
-    use core_foundation::base::{CFEqual, CFType, CFTypeRef, TCFType};
+    use core_foundation::base::{
+        CFEqual, CFIndexConvertible, CFRange, CFType, CFTypeRef, TCFType, kCFAllocatorDefault,
+        kCFAllocatorNull,
+    };
     use core_foundation::boolean::CFBoolean;
-    use core_foundation::data::CFData;
+    use core_foundation::data::{CFData, CFDataCreateWithBytesNoCopy, CFDataGetBytes};
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
     use core_foundation::string::{CFString, CFStringRef};
@@ -340,6 +315,8 @@ mod macos_keychain {
 
     macro_rules! security_string {
         ($symbol:path) => {
+            // SAFETY: Every accepted symbol is an immutable process-lifetime
+            // Security.framework CFString constant.
             static_string(unsafe { $symbol })
         };
     }
@@ -347,6 +324,8 @@ mod macos_keychain {
     pub(super) fn copy(group: &str) -> Result<Option<Zeroizing<[u8; 32]>>, KeyStorageError> {
         let query = record_dictionary(group, None, true);
         let mut raw: CFTypeRef = std::ptr::null();
+        // SAFETY: The retained query dictionary is valid for the synchronous
+        // call and `raw` is a writable out-parameter initialized to null.
         let status =
             unsafe { keychain_item::SecItemCopyMatching(query.as_concrete_TypeRef(), &mut raw) };
         if status == base::errSecItemNotFound {
@@ -355,11 +334,15 @@ mod macos_keychain {
         if status != base::errSecSuccess || raw.is_null() {
             return Err(KeyStorageError::OperationFailed);
         }
+        // SAFETY: A successful SecItemCopyMatching result follows the Core
+        // Foundation create rule and is non-null as checked above.
         let result = unsafe { CFType::wrap_under_create_rule(raw) };
         decode_copy_result(result, group).map(Some)
     }
     pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
         let mut key = Zeroizing::new([0_u8; 32]);
+        // SAFETY: The zeroizing output owns exactly `key.len()` writable bytes
+        // for the duration of the synchronous Security.framework call.
         let status = unsafe {
             random::SecRandomCopyBytes(
                 random::kSecRandomDefault,
@@ -373,8 +356,14 @@ mod macos_keychain {
             Err(KeyStorageError::OperationFailed)
         }
     }
-    pub(super) fn add(group: &str, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
-        let attributes = record_dictionary(group, Some(candidate), false);
+    pub(super) fn add(
+        group: &str,
+        candidate: &Zeroizing<[u8; 32]>,
+    ) -> Result<AddResult, KeyStorageError> {
+        let attributes = add_dictionary(group, candidate)?;
+        // SAFETY: `attributes` and its no-copy CFData remain alive for the
+        // synchronous call. The CFData borrows `candidate`, which outlives the
+        // dictionary and call; kCFAllocatorNull never frees Rust-owned bytes.
         let status = unsafe {
             keychain_item::SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut())
         };
@@ -387,19 +376,57 @@ mod macos_keychain {
 
     fn record_dictionary(
         group: &str,
-        data: Option<&[u8]>,
+        data: Option<&CFData>,
         returning: bool,
+    ) -> CFDictionary<CFType, CFType> {
+        record_dictionary_with_optional_attributes(
+            group,
+            data,
+            returning,
+            Some(security_string!(item::kSecClassGenericPassword)),
+            Some(CFBoolean::false_value().as_CFType()),
+        )
+    }
+
+    fn add_dictionary(
+        group: &str,
+        candidate: &Zeroizing<[u8; 32]>,
+    ) -> Result<CFDictionary<CFType, CFType>, KeyStorageError> {
+        // SAFETY: The CFData is scoped inside the returned dictionary and uses
+        // kCFAllocatorNull, so Core Foundation neither owns nor frees the Rust
+        // buffer. The only caller keeps `candidate` alive until after the
+        // synchronous SecItemAdd returns and then drops the dictionary first.
+        let data_ref = unsafe {
+            CFDataCreateWithBytesNoCopy(
+                kCFAllocatorDefault,
+                candidate.as_ptr(),
+                candidate.len().to_CFIndex(),
+                kCFAllocatorNull,
+            )
+        };
+        if data_ref.is_null() {
+            return Err(KeyStorageError::OperationFailed);
+        }
+        // SAFETY: CFDataCreateWithBytesNoCopy returned a non-null +1 object.
+        let data = unsafe { CFData::wrap_under_create_rule(data_ref) };
+        Ok(record_dictionary(group, Some(&data), false))
+    }
+
+    fn record_dictionary_with_optional_attributes(
+        group: &str,
+        data: Option<&CFData>,
+        returning: bool,
+        class: Option<CFType>,
+        synchronizable: Option<CFType>,
     ) -> CFDictionary<CFType, CFType> {
         let service = CFString::new(super::SERVICE);
         let account = CFString::new(super::ACCOUNT);
         let group = CFString::new(group);
-        let class = security_string!(item::kSecClassGenericPassword);
         let accessible_key = security_string!(kSecAttrAccessible);
         let accessible =
             security_string!(access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly);
         let data_protection_key = security_string!(item::kSecUseDataProtectionKeychain);
         let pairs = vec![
-            (security_string!(item::kSecClass), class.as_CFType()),
             (security_string!(item::kSecAttrService), service.as_CFType()),
             (security_string!(item::kSecAttrAccount), account.as_CFType()),
             (
@@ -407,13 +434,18 @@ mod macos_keychain {
                 group.as_CFType(),
             ),
             (accessible_key, accessible.as_CFType()),
-            (
-                security_string!(item::kSecAttrSynchronizable),
-                CFBoolean::false_value().as_CFType(),
-            ),
             (data_protection_key, CFBoolean::true_value().as_CFType()),
         ];
         let mut pairs = pairs;
+        if let Some(class) = class {
+            pairs.push((security_string!(item::kSecClass), class));
+        }
+        if let Some(synchronizable) = synchronizable {
+            pairs.push((
+                security_string!(item::kSecAttrSynchronizable),
+                synchronizable,
+            ));
+        }
         if returning {
             pairs.extend([
                 (
@@ -431,15 +463,14 @@ mod macos_keychain {
             ]);
         }
         if let Some(data) = data {
-            pairs.push((
-                security_string!(item::kSecValueData),
-                CFData::from_buffer(data).as_CFType(),
-            ));
+            pairs.push((security_string!(item::kSecValueData), data.as_CFType()));
         }
         CFDictionary::from_CFType_pairs(&pairs)
     }
 
     fn static_string(raw: CFStringRef) -> CFType {
+        // SAFETY: Callers pass immutable process-lifetime Core Foundation
+        // string constants, so wrapping under the get rule is correct.
         unsafe { CFString::wrap_under_get_rule(raw).into_CFType() }
     }
 
@@ -454,6 +485,7 @@ mod macos_keychain {
             return Err(KeyStorageError::Invalid);
         }
         let raw = array.get_all_values()[0];
+        // SAFETY: `raw` is retained by `array` for the duration of this decode.
         let dictionary = unsafe { CFType::wrap_under_get_rule(raw) }
             .downcast_into::<CFDictionary>()
             .ok_or(KeyStorageError::Invalid)?;
@@ -467,11 +499,7 @@ mod macos_keychain {
         let service = CFString::new(super::SERVICE);
         let account = CFString::new(super::ACCOUNT);
         let group = CFString::new(group);
-        let expected = [
-            (
-                security_string!(item::kSecClass),
-                security_string!(item::kSecClassGenericPassword),
-            ),
+        let required = [
             (security_string!(item::kSecAttrService), service.as_CFType()),
             (security_string!(item::kSecAttrAccount), account.as_CFType()),
             (
@@ -482,32 +510,66 @@ mod macos_keychain {
                 security_string!(kSecAttrAccessible),
                 security_string!(access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
             ),
-            (
-                security_string!(item::kSecAttrSynchronizable),
-                CFBoolean::false_value().as_CFType(),
-            ),
         ];
-        for (key, value) in expected {
+        for (key, value) in required {
             let actual = dictionary
                 .find(key.as_CFTypeRef())
                 .ok_or(KeyStorageError::Invalid)?;
+            // SAFETY: Both arguments are live Core Foundation objects.
             if unsafe { CFEqual(*actual, value.as_CFTypeRef()) } == 0 {
                 return Err(KeyStorageError::Invalid);
             }
         }
+        validate_optional_attribute(
+            dictionary,
+            &security_string!(item::kSecClass),
+            &security_string!(item::kSecClassGenericPassword),
+        )?;
+        validate_optional_attribute(
+            dictionary,
+            &security_string!(item::kSecAttrSynchronizable),
+            &CFBoolean::false_value().as_CFType(),
+        )?;
         let data = dictionary
             .find(security_string!(item::kSecValueData).as_CFTypeRef())
             .ok_or(KeyStorageError::Invalid)?;
+        // SAFETY: The dictionary retains its non-null values while borrowed.
         let data = unsafe { data.as_ref() };
         let data = data.ok_or(KeyStorageError::Invalid)?;
+        // SAFETY: The value remains retained by `dictionary` during decode.
         let data = unsafe { CFType::wrap_under_get_rule(data) }
             .downcast_into::<CFData>()
             .ok_or(KeyStorageError::Invalid)?;
-        let bytes: [u8; 32] = data
-            .bytes()
-            .try_into()
-            .map_err(|_wrong_length| KeyStorageError::Invalid)?;
-        Ok(Zeroizing::new(bytes))
+        if data.len() != 32 {
+            return Err(KeyStorageError::Invalid);
+        }
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        // SAFETY: The validated source range is exactly 32 bytes and `bytes`
+        // owns exactly 32 writable bytes. CFDataGetBytes performs the sole
+        // copy directly into the zeroizing destination.
+        unsafe {
+            CFDataGetBytes(
+                data.as_concrete_TypeRef(),
+                CFRange::init(0, 32),
+                bytes.as_mut_ptr(),
+            );
+        }
+        Ok(bytes)
+    }
+
+    fn validate_optional_attribute(
+        dictionary: &CFDictionary,
+        key: &CFType,
+        expected: &CFType,
+    ) -> Result<(), KeyStorageError> {
+        let Some(actual) = dictionary.find(key.as_CFTypeRef()) else {
+            return Ok(());
+        };
+        // SAFETY: Both arguments are live Core Foundation objects.
+        if unsafe { CFEqual(*actual, expected.as_CFTypeRef()) } == 0 {
+            return Err(KeyStorageError::Invalid);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -524,10 +586,35 @@ mod macos_keychain {
             expected: &CFType,
         ) {
             let actual = dictionary.find(key.as_CFTypeRef()).unwrap();
-            assert_ne!(
-                unsafe { CFEqual(actual.as_CFTypeRef(), expected.as_CFTypeRef()) },
-                0
-            );
+            // SAFETY: The dictionary value and expected fixture are live Core
+            // Foundation objects for the duration of this assertion.
+            let equal = unsafe { CFEqual(actual.as_CFTypeRef(), expected.as_CFTypeRef()) };
+            assert_ne!(equal, 0);
+        }
+
+        fn fixture_record(
+            group: &str,
+            data: Option<&[u8]>,
+            class: Option<CFType>,
+            synchronizable: Option<CFType>,
+        ) -> CFDictionary<CFType, CFType> {
+            let data = data.map(CFData::from_buffer);
+            record_dictionary_with_optional_attributes(
+                group,
+                data.as_ref(),
+                false,
+                class,
+                synchronizable,
+            )
+        }
+
+        fn exact_fixture_record(group: &str, data: Option<&[u8]>) -> CFDictionary<CFType, CFType> {
+            fixture_record(
+                group,
+                data,
+                Some(security_string!(item::kSecClassGenericPassword)),
+                Some(CFBoolean::false_value().as_CFType()),
+            )
         }
 
         #[test]
@@ -569,15 +656,15 @@ mod macos_keychain {
         #[test]
         fn copy_decoder_accepts_one_exact_record_and_rejects_ambiguous_or_malformed_results() {
             let group = "TEAM.app.tersa.shared";
-            let record = record_dictionary(group, Some(&[7; 32]), false);
+            let record = exact_fixture_record(group, Some(&[7; 32]));
             let one = CFArray::from_CFTypes(&[record.as_CFType()]);
             assert_eq!(
                 *decode_copy_result(one.as_CFType(), group).unwrap(),
                 [7; 32]
             );
 
-            let first = record_dictionary(group, Some(&[7; 32]), false);
-            let second = record_dictionary(group, Some(&[8; 32]), false);
+            let first = exact_fixture_record(group, Some(&[7; 32]));
+            let second = exact_fixture_record(group, Some(&[8; 32]));
             let duplicate = CFArray::from_CFTypes(&[first.as_CFType(), second.as_CFType()]);
             assert_eq!(
                 decode_copy_result(duplicate.as_CFType(), group),
@@ -592,24 +679,59 @@ mod macos_keychain {
         #[test]
         fn copy_decoder_rejects_wrong_attributes_and_secret_lengths() {
             let group = "TEAM.app.tersa.shared";
-            let wrong_group = record_dictionary("OTHER.app.tersa.shared", Some(&[7; 32]), false);
+            let wrong_group = exact_fixture_record("OTHER.app.tersa.shared", Some(&[7; 32]));
             let wrong_group = CFArray::from_CFTypes(&[wrong_group.as_CFType()]);
             assert_eq!(
                 decode_copy_result(wrong_group.as_CFType(), group),
                 Err(KeyStorageError::Invalid)
             );
 
-            let short = record_dictionary(group, Some(&[7; 31]), false);
+            let short = exact_fixture_record(group, Some(&[7; 31]));
             let short = CFArray::from_CFTypes(&[short.as_CFType()]);
             assert_eq!(
                 decode_copy_result(short.as_CFType(), group),
                 Err(KeyStorageError::Invalid)
             );
 
-            let missing_data = record_dictionary(group, None, false);
+            let missing_data = exact_fixture_record(group, None);
             let missing_data = CFArray::from_CFTypes(&[missing_data.as_CFType()]);
             assert_eq!(
                 decode_copy_result(missing_data.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+        }
+
+        #[test]
+        fn copy_decoder_allows_omitted_class_and_synchronizable_but_rejects_mismatch() {
+            let group = "TEAM.app.tersa.shared";
+            let omitted = fixture_record(group, Some(&[7; 32]), None, None);
+            let omitted = CFArray::from_CFTypes(&[omitted.as_CFType()]);
+            assert_eq!(
+                *decode_copy_result(omitted.as_CFType(), group).unwrap(),
+                [7; 32]
+            );
+
+            let wrong_class = fixture_record(
+                group,
+                Some(&[7; 32]),
+                Some(CFString::new("wrong-class").as_CFType()),
+                None,
+            );
+            let wrong_class = CFArray::from_CFTypes(&[wrong_class.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(wrong_class.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+
+            let wrong_sync = fixture_record(
+                group,
+                Some(&[7; 32]),
+                None,
+                Some(CFBoolean::true_value().as_CFType()),
+            );
+            let wrong_sync = CFArray::from_CFTypes(&[wrong_sync.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(wrong_sync.as_CFType(), group),
                 Err(KeyStorageError::Invalid)
             );
         }
@@ -625,7 +747,7 @@ mod macos_keychain {
     pub(super) fn random() -> Result<Zeroizing<[u8; 32]>, KeyStorageError> {
         Err(KeyStorageError::Unavailable)
     }
-    pub(super) fn add(_: &str, _: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+    pub(super) fn add(_: &str, _: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
         Err(KeyStorageError::Unavailable)
     }
 }
@@ -666,6 +788,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
+    fn account_id() -> AccountId {
+        AccountId::new("acct-test-1").unwrap()
+    }
+
     struct FakeLocator(Result<PathBuf, ProfileStorageError>);
     impl ContainerLocator for FakeLocator {
         fn container(&self) -> Result<PathBuf, ProfileStorageError> {
@@ -690,7 +816,7 @@ mod tests {
             self.calls.lock().unwrap().push("random");
             Ok(Zeroizing::new(*self.random.lock().unwrap()))
         }
-        fn add(&self, c: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+        fn add(&self, c: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
             self.calls.lock().unwrap().push("add");
             let mut item = self.item.lock().unwrap();
             if self.duplicate_on_add {
@@ -699,7 +825,7 @@ mod tests {
             } else if item.is_some() {
                 Ok(AddResult::Duplicate)
             } else {
-                *item = Some(*c);
+                *item = Some(**c);
                 Ok(AddResult::Added)
             }
         }
@@ -732,12 +858,12 @@ mod tests {
             Ok(Zeroizing::new(self.candidate))
         }
 
-        fn add(&self, candidate: &[u8; 32]) -> Result<AddResult, KeyStorageError> {
+        fn add(&self, candidate: &Zeroizing<[u8; 32]>) -> Result<AddResult, KeyStorageError> {
             let mut item = self.item.lock().unwrap();
             if item.is_some() {
                 Ok(AddResult::Duplicate)
             } else {
-                *item = Some(*candidate);
+                *item = Some(**candidate);
                 Ok(AddResult::Added)
             }
         }
@@ -746,14 +872,14 @@ mod tests {
     fn hkdf_known_answer_and_info() {
         let root: [u8; 32] = core::array::from_fn(|i| i as u8);
         assert_eq!(
-            hex_encode(&framed_info(b"acct-test-1", DATABASE_PURPOSE).unwrap()),
+            hex_encode(&framed_info(&account_id(), DATABASE_PURPOSE).unwrap()),
             "74657273612e6170702f6d61636f732f686b64662d7368613235362f7631000b616363742d746573742d31001d73716c6369706865722f6163636f756e742d64617461626173652f7631"
         );
         assert_eq!(
             hex_encode(
                 &*derive_account_key(
                     &root,
-                    "acct-test-1",
+                    &account_id(),
                     AccountKeyPurpose::SqlCipherAccountDatabaseV1
                 )
                 .unwrap()
@@ -838,7 +964,7 @@ mod tests {
     #[test]
     fn digest_is_fixed() {
         assert_eq!(
-            hex_digest(b"acct-test-1"),
+            hex_digest(&account_id()),
             "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47"
         );
     }
@@ -847,22 +973,18 @@ mod tests {
         let directory = std::env::temp_dir();
         let locator = FakeLocator(Ok(directory.clone()));
         assert_eq!(
-            account_database_path(&locator, "acct-test-1").unwrap(),
+            account_database_path(&locator, &account_id()).unwrap(),
             directory.join("profiles/default/accounts/1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47/mail.sqlite3")
         );
         let missing = FakeLocator(Ok(directory.join("tersa-missing-container")));
         assert_eq!(
-            account_database_path(&missing, "acct-test-1"),
+            account_database_path(&missing, &account_id()),
             Err(ProfileStorageError::Unavailable)
         );
         let no_config = FakeLocator(Err(ProfileStorageError::Unavailable));
         assert_eq!(
-            account_database_path(&no_config, "acct-test-1"),
+            account_database_path(&no_config, &account_id()),
             Err(ProfileStorageError::Unavailable)
-        );
-        assert_eq!(
-            account_database_path(&locator, ""),
-            Err(ProfileStorageError::Invalid)
         );
     }
 
@@ -875,7 +997,7 @@ mod tests {
         std::fs::write(&path, b"not a container").unwrap();
         let locator = FakeLocator(Ok(path.clone()));
         assert_eq!(
-            account_database_path(&locator, "acct-test-1"),
+            account_database_path(&locator, &account_id()),
             Err(ProfileStorageError::Unavailable)
         );
         std::fs::remove_file(path).unwrap();
@@ -895,7 +1017,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let locator = FakeLocator(Ok(path.clone()));
         assert_eq!(
-            account_database_path(&locator, "acct-test-1"),
+            account_database_path(&locator, &account_id()),
             Err(ProfileStorageError::Unavailable)
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -923,14 +1045,16 @@ mod tests {
         );
     }
     #[test]
-    fn framing_rejects_oversized_segments_and_separates_purpose() {
+    fn framing_rejects_oversized_purpose_and_separates_segments() {
         assert_eq!(
-            framed_info(&vec![0; usize::from(u16::MAX) + 1], DATABASE_PURPOSE),
+            framed_info(&account_id(), &vec![0; usize::from(u16::MAX) + 1]),
             Err(KeyStorageError::Invalid)
         );
+        let account_ab = AccountId::new("ab").unwrap();
+        let account_a = AccountId::new("a").unwrap();
         assert_ne!(
-            framed_info(b"ab", b"c").unwrap(),
-            framed_info(b"a", b"bc").unwrap()
+            framed_info(&account_ab, b"c").unwrap(),
+            framed_info(&account_a, b"bc").unwrap()
         );
     }
     #[test]

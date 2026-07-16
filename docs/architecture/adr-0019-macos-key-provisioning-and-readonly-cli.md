@@ -34,10 +34,11 @@ The CLI slice is divided into four independently reviewed pull requests:
    now owns persistent WAL coordination, the separately named
    `SqlCipherMailboxReader::open_read_only` constructor, and deterministic
    standalone/coexistence and fail-closed tests.
-3. **PR 32 — macOS Keychain and HKDF provider:** add
+3. **PR 32 — macOS Keychain and private HKDF boundary:** add
    `tersa-keychain-macos`, the inward platform contract it implements, and the
-   reviewed provisioning/retrieval and application-group locator split. This
-   pull request replaces and activates the Keychain reservation.
+   reviewed provisioning/retrieval internals and application-group locator.
+   It exposes no raw root or derived key and no database opener. This pull
+   request replaces and activates the Keychain reservation.
 4. **PR 33 — metadata-only JSON CLI:** add `tersa-cli-macos` with exactly the
    `inbox` and `thread` commands and replace and activate the remaining CLI
    reservation.
@@ -54,12 +55,13 @@ Apple's CSPRNG and stores them as a generic-password item with service
 `app.tersa.mac.storage-root.v1`, account `default`,
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, synchronization disabled,
 and the shared application-group identifier as `kSecAttrAccessGroup`. Every
-add, copy, update, and delete query sets `kSecUseDataProtectionKeychain` to
-true; there is no legacy-keychain fallback. Missing entitlement, unexpected
-item attributes, or a query that cannot use the Data Protection Keychain fails
-closed. Existing items are retrieved but never replaced implicitly. The CLI
-has retrieval-only access: an absent item is an error and cannot cause key
-generation, import, repair, rotation, or a second Keychain write.
+add and copy query sets `kSecUseDataProtectionKeychain` to true; update and
+delete operations are not implemented. There is no legacy-keychain fallback.
+Missing entitlement, unexpected item attributes, or a query that cannot use
+the Data Protection Keychain fails closed. Existing items are retrieved but
+never replaced implicitly. The PR 33 CLI will have retrieval-only access: an
+absent item is an error and cannot cause key generation, import, repair,
+rotation, or a second Keychain write.
 
 Provisioning uses an add-only `SecItemAdd` operation, never an add-or-update
 password helper. On `errSecDuplicateItem`, the generated losing key is
@@ -68,12 +70,13 @@ update occurs. Other add failures are terminal. PR 32 must test simultaneous
 provisioners and prove they converge on the stored winner without exposing or
 replacing either candidate.
 
-The macOS application and `mailctl` are two targets of one distribution. Both
-are signed by the same Apple Developer team, carry the registered
-`${TeamIdentifierPrefix}app.tersa.shared` application-group entitlement, and
-use that group as their shared Keychain access group. `mailctl` has the stable
-bundle identifier `app.tersa.mailctl`, an embedded Info.plist section, Hardened
-Runtime, and its own `com.apple.security.app-sandbox = true` entitlement. It is
+PR 33 must make the macOS application and `mailctl` two targets of one
+distribution. Both will be signed by the same Apple Developer team, carry the
+registered `${TeamIdentifierPrefix}app.tersa.shared` application-group
+entitlement, and use that group as their shared Keychain access group.
+`mailctl` will have the stable bundle identifier `app.tersa.mailctl`, an
+embedded Info.plist section, Hardened Runtime, and its own
+`com.apple.security.app-sandbox = true` entitlement. It is
 launched directly by the shell and therefore must not use
 `com.apple.security.inherit`. The official CLI is the signed executable shipped
 inside the app bundle; a package manager may install only a symlink to that
@@ -84,8 +87,10 @@ builds receive no production fallback and cannot claim Keychain/profile
 interoperability.
 
 The root key is never exported or accepted through arguments, environment,
-stdin, files, IPC, logs, diagnostics, or JSON. The provider derives a 32-byte
-account key with HKDF-SHA256. The salt is the literal byte string
+stdin, files, IPC, logs, diagnostics, or JSON. PR 32 keeps retrieval and
+HKDF-SHA256 derivation private to the trusted Keychain adapter; there is no
+public callback, borrowed-key API, or other raw-key capability. The salt is
+the literal byte string
 `tersa.app/macos/root-key/v1`. The `info` input is unambiguous framing of the
 literal prefix `tersa.app/macos/hkdf-sha256/v1`, followed by a two-byte
 big-endian validated account-identifier length and its UTF-8 bytes, then a
@@ -93,6 +98,8 @@ two-byte big-endian purpose length and its ASCII bytes. Purposes are a closed,
 versioned enum; the initial value is `sqlcipher/account-database/v1`. Unknown
 versions or purposes fail closed. Root and derived key buffers use best-effort
 zeroization and never implement content-revealing `Debug` or serialization.
+PR 33 owns the trusted composition that will pass a privately derived key
+directly into strict database opening without returning key bytes to the CLI.
 
 PR 32 uses direct `security-framework-sys =2.17.0` with default features
 disabled and only `OSX_10_15`,
@@ -113,15 +120,18 @@ PR 32 narrowly expands the HMAC owner set to `tersa-blob-spike` and
 `tersa-keychain-macos` after checking the exact resolved graph. ChaCha20-
 Poly1305 remains exclusive to `tersa-blob-spike`.
 
-`tersa-keychain-macos` may depend inward only on `tersa-platform`. Any needed
-portable key capability belongs in that inward port; Apple Security types do
-not cross it. Additional inward edges require a new ADR rather than an
-incidental manifest edit.
+`tersa-keychain-macos` may depend inward only on `tersa-platform`; the platform
+port in turn uses the canonical domain `AccountId` so raw account strings
+cannot reach hashing or derivation. Apple Security types do not cross the port.
+Additional inward edges require a new ADR rather than an incidental manifest
+edit.
 
 PR 32 proves simultaneous-provisioner convergence only against its fake
 backend. Real signed cross-target Data Protection Keychain interoperability is
 a PR 33 acceptance condition; this is a Fable approval condition and is not
-claimed by unsigned builds.
+claimed by unsigned builds. PR 32 also does not claim a usable database opener:
+the signed PR 33 composition is responsible for connecting private derivation
+to the strict reader without adding a key-export surface.
 
 ### Fixed profile layout
 
@@ -256,9 +266,10 @@ semantics.
 
 ## Non-claims
 
-This ADR and PR 31 implement no CLI, Keychain provider, key derivation, profile
-discovery, IPC, or `maild`. They pass no gate and leave Phase 1 roadmap item 7
-open. They do not add real Google
+PR 32 adds root provisioning, validated retrieval, private derivation, and
+fixed profile discovery, but no CLI, public raw-key provider, database-opening
+composition, IPC, or `maild`. It passes no signed runtime gate and leaves Phase
+1 roadmap item 7 open. It does not add real Google
 authorization, token persistence, sync, background work, mailbox mutation,
 search, UI, or release evidence.
 

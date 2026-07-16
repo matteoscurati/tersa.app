@@ -7,12 +7,10 @@
 use std::fmt;
 use std::path::PathBuf;
 
-/// A closed, versioned use of an account-derived key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccountKeyPurpose {
-    /// The version-one `SQLCipher` account database key.
-    SqlCipherAccountDatabaseV1,
-}
+#[doc(inline)]
+pub use tersa_domain::mailbox::AccountId;
+
+// Rust guideline compliant 1.0.
 
 /// Whether root-key provisioning created the item or found a prior winner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,29 +84,25 @@ pub trait InstallationRootKeyProvisioner {
     fn provision_installation_root_key(&self) -> Result<ProvisionOutcome, KeyStorageError>;
 }
 
-/// Borrows an account-derived key into a caller-provided operation.
-pub trait AccountKeyProvider {
-    /// Borrows the fixed-purpose account key for the duration of `operation`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted error if the fixed root key is absent, invalid, or
-    /// cannot be retrieved from the platform capability.
-    fn with_account_key<R>(
-        &self,
-        account_id: &str,
-        purpose: AccountKeyPurpose,
-        operation: impl FnOnce(&[u8; 32]) -> R,
-    ) -> Result<R, KeyStorageError>;
-}
-
 /// Resolves the one fixed local profile path for an account.
 pub trait AccountProfileLocator {
     /// Resolves the existing fixed database path without creating anything.
+    ///
+    /// The canonical [`AccountId`] boundary prevents unvalidated raw text from
+    /// reaching account hashing or profile derivation:
+    ///
+    /// ```compile_fail
+    /// use tersa_platform::secure_storage::AccountProfileLocator;
+    ///
+    /// fn locate(locator: &impl AccountProfileLocator) {
+    ///     let _ = locator.account_database_path("raw-account-id");
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns a redacted error if the configured shared container is absent or
     /// unusable, or if the account identifier cannot be represented safely.
-    fn account_database_path(&self, account_id: &str) -> Result<PathBuf, ProfileStorageError>;
+    fn account_database_path(&self, account_id: &AccountId)
+    -> Result<PathBuf, ProfileStorageError>;
 }

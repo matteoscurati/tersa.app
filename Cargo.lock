@@ -7545,6 +7545,9 @@ dependencies = [
 [[package]]
 name = "tersa-platform"
 version = "0.0.0"
+dependencies = [
+ "tersa-domain",
+]
 
 [[package]]
 name = "tersa-presentation"

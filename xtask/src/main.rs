@@ -236,6 +236,17 @@ fn check_architecture() -> TaskResult {
                 .push("tersa-blob-spike must depend directly on exact-pinned rustix".to_owned());
         }
 
+        if package_name == "tersa-keychain-macos" {
+            let direct_dependencies = package
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect();
+            violations.extend(keychain_direct_dependency_set_violations(
+                &direct_dependencies,
+            ));
+        }
+
         for dependency in &package.dependencies {
             check_slint_dependency(&package_name, dependency, &mut violations);
             check_dioxus_dependency(&package_name, dependency, &mut violations);
@@ -275,44 +286,9 @@ fn check_architecture() -> TaskResult {
 }
 
 fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> TaskResult {
-    const GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
     let entitlements = fs::read_to_string("apple/macos/TersaMac.entitlements")?;
-    for required in [
-        "<key>com.apple.security.application-groups</key>",
-        "<key>keychain-access-groups</key>",
-        &format!("<string>{GROUP}</string>"),
-    ] {
-        if !entitlements.contains(required) {
-            violations.push(format!(
-                "apple/macos/TersaMac.entitlements is missing `{required}`"
-            ));
-        }
-    }
-
     let project = fs::read_to_string("apple/project.yml")?;
-    let (macos, mobile) = project.split_once("  TersaIOS:").ok_or_else(|| {
-        io::Error::other("apple/project.yml is missing the expected TersaIOS target boundary")
-    })?;
-    for required in [
-        "com.apple.security.application-groups:",
-        "keychain-access-groups:",
-        "TERSA_MACOS_APP_GROUP: \"$(TeamIdentifierPrefix)app.tersa.shared\"",
-    ] {
-        if !macos.contains(required) {
-            violations.push(format!(
-                "the TersaMac target in apple/project.yml is missing `{required}`"
-            ));
-        }
-    }
-    if mobile.contains("TERSA_MACOS_APP_GROUP")
-        || mobile.contains("com.apple.security.application-groups")
-        || mobile.contains("keychain-access-groups")
-    {
-        violations.push(
-            "mobile Apple targets must not receive the Phase 1 macOS Keychain/App Group configuration"
-                .to_owned(),
-        );
-    }
+    violations.extend(signing_configuration_violations(&entitlements, &project));
 
     let adapter = fs::read_to_string("adapters/keychain-macos/src/lib.rs")?;
     for required in [
@@ -336,6 +312,277 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         }
     }
     Ok(())
+}
+
+const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
+const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectTarget {
+    name: String,
+    platform: String,
+    keys: Vec<Vec<String>>,
+    scalars: BTreeMap<Vec<String>, String>,
+    sequences: BTreeMap<Vec<String>, Vec<String>>,
+}
+
+fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for key in [
+        "com.apple.security.application-groups",
+        "keychain-access-groups",
+    ] {
+        match parse_plist_string_array(entitlements, key) {
+            Ok(values) if values == [SIGNING_GROUP] => {}
+            Ok(_) => violations.push(format!(
+                "apple/macos/TersaMac.entitlements `{key}` must contain exactly the registered macOS group"
+            )),
+            Err(error) => violations.push(format!(
+                "apple/macos/TersaMac.entitlements has invalid `{key}` structure: {error}"
+            )),
+        }
+    }
+
+    let targets = match parse_project_targets(project) {
+        Ok(targets) => targets,
+        Err(error) => {
+            violations.push(format!(
+                "apple/project.yml target structure is invalid: {error}"
+            ));
+            return violations;
+        }
+    };
+    let Some(application) = targets.iter().find(|target| target.name == "TersaMac") else {
+        violations.push("apple/project.yml is missing the TersaMac target".to_owned());
+        return violations;
+    };
+    if application.platform != "macOS" {
+        violations.push("the TersaMac target must declare platform macOS".to_owned());
+    }
+
+    let entitlement_prefix = ["entitlements", "properties"];
+    let application_group_path = entitlement_prefix
+        .iter()
+        .chain(["com.apple.security.application-groups"].iter())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let keychain_group_path = entitlement_prefix
+        .iter()
+        .chain(["keychain-access-groups"].iter())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let setting_path = ["settings", "base", "TERSA_MACOS_APP_GROUP"]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    for (path, label) in [
+        (
+            &application_group_path,
+            "com.apple.security.application-groups",
+        ),
+        (&keychain_group_path, "keychain-access-groups"),
+    ] {
+        if application
+            .keys
+            .iter()
+            .filter(|candidate| *candidate == path)
+            .count()
+            != 1
+            || application.sequences.get(path) != Some(&vec![SIGNING_GROUP.to_owned()])
+        {
+            violations.push(format!(
+                "the TersaMac target `{label}` must contain exactly the registered macOS group"
+            ));
+        }
+    }
+    if application
+        .keys
+        .iter()
+        .filter(|candidate| *candidate == &setting_path)
+        .count()
+        != 1
+        || application.scalars.get(&setting_path).map(String::as_str) != Some(BUILD_SETTING_GROUP)
+    {
+        violations.push(
+            "the TersaMac target TERSA_MACOS_APP_GROUP setting must exactly match its entitlement group"
+                .to_owned(),
+        );
+    }
+
+    for target in &targets {
+        if target.platform == "iOS"
+            && (target_contains_key(target, "TERSA_MACOS_APP_GROUP")
+                || target_contains_key(target, "com.apple.security.application-groups")
+                || target_contains_key(target, "keychain-access-groups"))
+        {
+            violations.push(format!(
+                "iOS target `{}` must not receive the Phase 1 macOS Keychain/App Group configuration",
+                target.name
+            ));
+        }
+    }
+    violations
+}
+
+fn parse_plist_string_array(document: &str, key: &str) -> Result<Vec<String>, String> {
+    let marker = format!("<key>{key}</key>");
+    let mut matches = document.match_indices(&marker);
+    let Some((offset, _)) = matches.next() else {
+        return Err("missing key".to_owned());
+    };
+    if matches.next().is_some() {
+        return Err("duplicate key".to_owned());
+    }
+    let mut remaining = document[offset + marker.len()..].trim_start();
+    remaining = remaining
+        .strip_prefix("<array>")
+        .ok_or_else(|| "value is not an array".to_owned())?;
+    let mut values = Vec::new();
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.starts_with("</array>") {
+            return Ok(values);
+        }
+        remaining = remaining
+            .strip_prefix("<string>")
+            .ok_or_else(|| "array contains a non-string member or is unterminated".to_owned())?;
+        let end = remaining
+            .find("</string>")
+            .ok_or_else(|| "unterminated string member".to_owned())?;
+        let value = &remaining[..end];
+        if value.contains('<') || value.contains('&') {
+            return Err("string member uses unsupported nested or escaped content".to_owned());
+        }
+        values.push(value.to_owned());
+        remaining = &remaining[end + "</string>".len()..];
+    }
+}
+
+fn parse_project_targets(document: &str) -> Result<Vec<ProjectTarget>, String> {
+    let lines = document.lines().collect::<Vec<_>>();
+    let target_start = lines
+        .iter()
+        .position(|line| *line == "targets:")
+        .ok_or_else(|| "missing top-level targets mapping".to_owned())?;
+    let mut targets = Vec::new();
+    let mut index = target_start + 1;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            index += 1;
+            continue;
+        }
+        let indent = leading_spaces(line)?;
+        if indent == 0 {
+            break;
+        }
+        if indent != 2 || !line.trim_end().ends_with(':') {
+            return Err(format!("unexpected target entry `{}`", line.trim()));
+        }
+        let name = line.trim().trim_end_matches(':').to_owned();
+        let body_start = index + 1;
+        index = body_start;
+        while index < lines.len() {
+            let candidate = lines[index];
+            if !candidate.trim().is_empty()
+                && !candidate.trim_start().starts_with('#')
+                && leading_spaces(candidate)? <= 2
+            {
+                break;
+            }
+            index += 1;
+        }
+        targets.push(parse_project_target(&name, &lines[body_start..index])?);
+    }
+    if targets.is_empty() {
+        return Err("targets mapping is empty".to_owned());
+    }
+    Ok(targets)
+}
+
+fn parse_project_target(name: &str, lines: &[&str]) -> Result<ProjectTarget, String> {
+    let mut keys = Vec::new();
+    let mut scalars = BTreeMap::new();
+    let mut sequences = BTreeMap::new();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line)?;
+        if indent < 4 {
+            return Err(format!("target `{name}` contains an invalid indentation"));
+        }
+        while stack.last().is_some_and(|(level, _)| *level >= indent) {
+            stack.pop();
+        }
+        if let Some(value) = trimmed.strip_prefix("- ") {
+            if stack.is_empty() {
+                return Err(format!("target `{name}` contains an unowned sequence item"));
+            }
+            let path = stack.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+            sequences
+                .entry(path)
+                .or_insert_with(Vec::new)
+                .push(unquote_yaml_scalar(value));
+            continue;
+        }
+        let (key, value) = trimmed.split_once(':').ok_or_else(|| {
+            format!("target `{name}` contains malformed mapping entry `{trimmed}`")
+        })?;
+        if key.is_empty() {
+            return Err(format!("target `{name}` contains an empty mapping key"));
+        }
+        let mut path = stack.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+        path.push(key.to_owned());
+        keys.push(path.clone());
+        if value.trim().is_empty() {
+            stack.push((indent, key.to_owned()));
+        } else {
+            scalars.insert(path, unquote_yaml_scalar(value.trim()));
+        }
+    }
+    let platform_path = vec!["platform".to_owned()];
+    let platform = scalars
+        .get(&platform_path)
+        .cloned()
+        .ok_or_else(|| format!("target `{name}` is missing a declared platform"))?;
+    Ok(ProjectTarget {
+        name: name.to_owned(),
+        platform,
+        keys,
+        scalars,
+        sequences,
+    })
+}
+
+fn leading_spaces(line: &str) -> Result<usize, String> {
+    if line.contains('\t') {
+        return Err("tabs are not permitted in project YAML indentation".to_owned());
+    }
+    Ok(line.len() - line.trim_start_matches(' ').len())
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+        .to_owned()
+}
+
+fn target_contains_key(target: &ProjectTarget, key: &str) -> bool {
+    target
+        .keys
+        .iter()
+        .any(|path| path.last().is_some_and(|candidate| candidate == key))
 }
 
 fn check_gmail_dependency(
@@ -554,6 +801,34 @@ fn check_keychain_dependency(
             dependency.name
         ));
     }
+}
+
+fn keychain_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
+    const REQUIRED: [&str; 7] = [
+        "core-foundation",
+        "hkdf",
+        "objc2-foundation",
+        "security-framework-sys",
+        "sha2",
+        "tersa-platform",
+        "zeroize",
+    ];
+    let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for dependency in dependencies.difference(&required) {
+        let detail = if *dependency == "hmac" {
+            "direct HMAC is forbidden; only resolved HKDF to HMAC reachability is allowed"
+        } else {
+            "dependency is outside the closed Keychain adapter set"
+        };
+        violations.push(format!("tersa-keychain-macos -> {dependency} ({detail})"));
+    }
+    for dependency in required.difference(dependencies) {
+        violations.push(format!(
+            "tersa-keychain-macos is missing required direct dependency {dependency}"
+        ));
+    }
+    violations
 }
 
 fn check_keychain_dependency_graph(
@@ -1563,10 +1838,11 @@ mod tests {
         dependency_policy, future_macos_store_dependency_violation,
         gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
         gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, parse_identity, reserved_future_policy_violations,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations, parse_identity,
+        parse_plist_string_array, parse_project_targets, reserved_future_policy_violations,
         resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        target_metadata_options,
+        signing_configuration_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, target_metadata_options,
     };
 
     #[test]
@@ -1624,6 +1900,126 @@ mod tests {
                     "tersa-store-sqlcipher-macos",
                 ][..],
             ),]
+        );
+    }
+
+    #[test]
+    fn keychain_direct_dependencies_are_a_closed_exact_set() {
+        let exact = BTreeSet::from([
+            "core-foundation",
+            "hkdf",
+            "objc2-foundation",
+            "security-framework-sys",
+            "sha2",
+            "tersa-platform",
+            "zeroize",
+        ]);
+        assert!(keychain_direct_dependency_set_violations(&exact).is_empty());
+
+        let mut unknown = exact.clone();
+        unknown.insert("unexpected-crypto");
+        assert_eq!(
+            keychain_direct_dependency_set_violations(&unknown),
+            vec![
+                "tersa-keychain-macos -> unexpected-crypto (dependency is outside the closed Keychain adapter set)"
+            ]
+        );
+
+        let mut missing = exact.clone();
+        missing.remove("zeroize");
+        assert_eq!(
+            keychain_direct_dependency_set_violations(&missing),
+            vec!["tersa-keychain-macos is missing required direct dependency zeroize"]
+        );
+
+        let mut direct_hmac = exact;
+        direct_hmac.insert("hmac");
+        assert_eq!(
+            keychain_direct_dependency_set_violations(&direct_hmac),
+            vec![
+                "tersa-keychain-macos -> hmac (direct HMAC is forbidden; only resolved HKDF to HMAC reachability is allowed)"
+            ]
+        );
+    }
+
+    #[test]
+    fn plist_array_parser_rejects_malformed_or_non_exact_arrays() {
+        let malformed = "<key>keychain-access-groups</key><string>group</string>";
+        assert_eq!(
+            parse_plist_string_array(malformed, "keychain-access-groups"),
+            Err("value is not an array".to_owned())
+        );
+        let mixed = "<key>keychain-access-groups</key><array><string>group</string><true/></array>";
+        assert_eq!(
+            parse_plist_string_array(mixed, "keychain-access-groups"),
+            Err("array contains a non-string member or is unterminated".to_owned())
+        );
+    }
+
+    #[test]
+    fn signing_parser_uses_declared_platform_with_interleaved_targets() {
+        let entitlements = r"
+<key>com.apple.security.application-groups</key>
+<array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+<key>keychain-access-groups</key>
+<array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+";
+        let project = r#"targets:
+  FirstIOS:
+    platform: iOS
+  TersaMac:
+    platform: macOS
+    entitlements:
+      properties:
+        com.apple.security.application-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.shared
+    settings:
+      base:
+        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+  MiddleMac:
+    platform: macOS
+  LastIOS:
+    platform: iOS
+"#;
+        let targets = match parse_project_targets(project) {
+            Ok(targets) => targets,
+            Err(error) => panic!("interleaved target fixture must parse: {error}"),
+        };
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.name.as_str(), target.platform.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("FirstIOS", "iOS"),
+                ("TersaMac", "macOS"),
+                ("MiddleMac", "macOS"),
+                ("LastIOS", "iOS"),
+            ]
+        );
+        assert!(signing_configuration_violations(entitlements, project).is_empty());
+
+        let malformed_array = project.replace(
+            "        keychain-access-groups:\n          - ${TeamIdentifierPrefix}app.tersa.shared",
+            "        keychain-access-groups: ${TeamIdentifierPrefix}app.tersa.shared",
+        );
+        assert!(
+            signing_configuration_violations(entitlements, &malformed_array)
+                .iter()
+                .any(|violation| violation.contains("`keychain-access-groups`"))
+        );
+
+        let contaminated = project.replace(
+            "  LastIOS:\n    platform: iOS",
+            "  LastIOS:\n    platform: iOS\n    settings:\n      base:\n        TERSA_MACOS_APP_GROUP: forbidden",
+        );
+        assert_eq!(
+            signing_configuration_violations(entitlements, &contaminated),
+            vec![
+                "iOS target `LastIOS` must not receive the Phase 1 macOS Keychain/App Group configuration"
+            ]
         );
     }
 
