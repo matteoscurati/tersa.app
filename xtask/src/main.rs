@@ -12,12 +12,31 @@ use std::error::Error;
 use std::io;
 use std::process::{Command, ExitCode};
 
-use cargo_metadata::{Metadata, MetadataCommand};
+use cargo_metadata::{Metadata, MetadataCommand, PackageId};
 
 // Rust guideline compliant 1.0.
 
 type TaskResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 type RuntimeBoundary = (&'static str, fn(&str) -> bool, &'static str);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedDependencyIdentity {
+    package_id: PackageId,
+}
+
+const SQLCIPHER_DIAGNOSTIC_OWNERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
+const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
+const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 2] = [
+    (
+        "tersa-gmail-rest-macos",
+        &["tersa-application", "tersa-domain"],
+    ),
+    (
+        "tersa-store-sqlcipher-macos",
+        &["tersa-application", "tersa-domain"],
+    ),
+];
+const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -158,14 +177,17 @@ fn run_command(label: &str, mut command: Command) -> TaskResult {
 }
 
 fn check_architecture() -> TaskResult {
-    let metadata = MetadataCommand::new().no_deps().exec()?;
+    let metadata = MetadataCommand::new()
+        .other_options(vec!["--locked".to_owned(), "--all-features".to_owned()])
+        .exec()?;
     let workspace_packages = metadata.workspace_packages();
-    let workspace_names: BTreeSet<String> = workspace_packages
-        .iter()
-        .map(|package| package.name.to_string())
-        .collect();
     let policy = dependency_policy();
     let mut violations = Vec::new();
+    let workspace_resolved_dependencies = workspace_resolved_dependencies(&metadata)?;
+
+    violations.extend(reserved_future_policy_violations(
+        &workspace_resolved_dependencies,
+    ));
 
     for package in workspace_packages {
         let package_name = package.name.to_string();
@@ -178,6 +200,19 @@ fn check_architecture() -> TaskResult {
                 "workspace crate `{package_name}` is missing from the dependency policy"
             ))
         })?;
+        let workspace_dependencies = workspace_resolved_dependencies
+            .get(&package_name)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "workspace crate `{package_name}` is missing from resolved metadata"
+                ))
+            })?;
+
+        for dependency_name in workspace_dependencies {
+            if !allowed.contains(&dependency_name.as_str()) {
+                violations.push(format!("{package_name} -> {dependency_name}"));
+            }
+        }
 
         if package_name == "tersa-blob-spike"
             && !package
@@ -190,40 +225,27 @@ fn check_architecture() -> TaskResult {
         }
 
         for dependency in &package.dependencies {
-            let dependency_name = dependency.name.clone();
-            if workspace_names.contains(&dependency_name)
-                && !allowed.contains(&dependency_name.as_str())
-            {
-                violations.push(format!("{package_name} -> {dependency_name}"));
-            }
-
             check_slint_dependency(&package_name, dependency, &mut violations);
             check_dioxus_dependency(&package_name, dependency, &mut violations);
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
             check_search_dependency(&package_name, dependency, &mut violations);
             check_mime_dependency(&package_name, dependency, &mut violations);
             check_blob_dependency(&package_name, dependency, &mut violations);
+            if let Some(violation) = future_macos_store_dependency_violation(
+                &package_name,
+                dependency.name.as_str(),
+                dependency
+                    .target
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+            ) {
+                violations.push(violation);
+            }
         }
     }
 
-    for target in [
-        "aarch64-apple-darwin",
-        "aarch64-apple-ios",
-        "aarch64-apple-ios-sim",
-    ] {
-        let dependency_graph = MetadataCommand::new()
-            .other_options(vec![
-                "--locked".to_owned(),
-                "--filter-platform".to_owned(),
-                target.to_owned(),
-            ])
-            .exec()?;
-        check_sqlcipher_dependency_graph(&dependency_graph, target, &mut violations);
-        check_search_dependency_graph(&dependency_graph, target, &mut violations);
-        check_mime_dependency_graph(&dependency_graph, target, &mut violations);
-        check_blob_dependency_graph(&dependency_graph, target, &mut violations);
-        check_diagnostic_runtime_dependency_graph(&dependency_graph, target, &mut violations);
-    }
+    check_resolved_architecture(&mut violations)?;
 
     if violations.is_empty() {
         println!("Architecture dependency boundaries passed.");
@@ -235,6 +257,33 @@ fn check_architecture() -> TaskResult {
         violations.join(", ")
     ))
     .into())
+}
+
+fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
+    for target in [
+        "aarch64-apple-darwin",
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim",
+    ] {
+        let dependency_graph = MetadataCommand::new()
+            .other_options(target_metadata_options(target))
+            .exec()?;
+        check_sqlcipher_dependency_graph(&dependency_graph, target, violations);
+        check_search_dependency_graph(&dependency_graph, target, violations);
+        check_mime_dependency_graph(&dependency_graph, target, violations);
+        check_blob_dependency_graph(&dependency_graph, target, violations);
+        check_diagnostic_runtime_dependency_graph(&dependency_graph, target, violations);
+    }
+    Ok(())
+}
+
+fn target_metadata_options(target: &str) -> Vec<String> {
+    vec![
+        "--locked".to_owned(),
+        "--all-features".to_owned(),
+        "--filter-platform".to_owned(),
+        target.to_owned(),
+    ]
 }
 
 fn check_diagnostic_runtime_dependency_graph(
@@ -370,7 +419,6 @@ fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &m
 }
 
 fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
-    const BLOB_SPIKE: &str = "tersa-blob-spike";
     const BLOB_PACKAGES: [&str; 2] = ["chacha20poly1305", "hmac"];
     let Some(resolve) = &metadata.resolve else {
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
@@ -398,22 +446,44 @@ fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &m
         .iter()
         .filter_map(|(id, name)| BLOB_PACKAGES.contains(&name.as_str()).then_some(id.clone()))
         .collect();
-    for member in &metadata.workspace_members {
-        let member_id = member.to_string();
-        let Some(member_name) = package_names.get(&member_id) else {
+    violations.extend(blob_dependency_graph_violations(
+        &package_names,
+        &metadata
+            .workspace_members
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        &dependencies,
+        &blob_packages,
+        target,
+    ));
+}
+
+fn blob_dependency_graph_violations(
+    package_names: &BTreeMap<String, String>,
+    workspace_members: &[String],
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    blob_packages: &BTreeSet<String>,
+    target: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for member_id in workspace_members {
+        let Some(member_name) = package_names.get(member_id) else {
             violations.push(format!(
                 "workspace member `{member_id}` is absent from the resolved package graph"
             ));
             continue;
         };
-        if member_name != BLOB_SPIKE
-            && dependency_reaches(&member_id, &blob_packages, &dependencies)
+        if !BLOB_DIAGNOSTIC_OWNERS.contains(&member_name.as_str())
+            && dependency_reaches(member_id, blob_packages, dependencies)
         {
             violations.push(format!(
-                "{member_name} reaches a blob-cryptography dependency outside {BLOB_SPIKE} for {target}"
+                "{member_name} reaches a blob-cryptography dependency outside {} for {target}",
+                BLOB_DIAGNOSTIC_OWNERS[0]
             ));
         }
     }
+    violations
 }
 
 fn check_search_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -487,8 +557,6 @@ fn check_sqlcipher_dependency_graph(
     target: &str,
     violations: &mut Vec<String>,
 ) {
-    const SQLCIPHER_CONSUMERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
-
     let Some(resolve) = &metadata.resolve else {
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
         return;
@@ -520,22 +588,43 @@ fn check_sqlcipher_dependency_graph(
         return;
     }
 
-    for member in &metadata.workspace_members {
-        let member_id = member.to_string();
-        let Some(member_name) = package_names.get(&member_id) else {
+    violations.extend(sqlcipher_dependency_graph_violations(
+        &package_names,
+        &metadata
+            .workspace_members
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        &dependencies,
+        &sqlite_packages,
+        target,
+    ));
+}
+
+fn sqlcipher_dependency_graph_violations(
+    package_names: &BTreeMap<String, String>,
+    workspace_members: &[String],
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    sqlite_packages: &BTreeSet<String>,
+    target: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for member_id in workspace_members {
+        let Some(member_name) = package_names.get(member_id) else {
             violations.push(format!(
                 "workspace member `{member_id}` is absent from the resolved package graph"
             ));
             continue;
         };
-        if !SQLCIPHER_CONSUMERS.contains(&member_name.as_str())
-            && dependency_reaches(&member_id, &sqlite_packages, &dependencies)
+        if !SQLCIPHER_DIAGNOSTIC_OWNERS.contains(&member_name.as_str())
+            && dependency_reaches(member_id, sqlite_packages, dependencies)
         {
             violations.push(format!(
                 "{member_name} reaches libsqlite3-sys outside the Apple SQLCipher diagnostics for {target}"
             ));
         }
     }
+    violations
 }
 
 fn dependency_reaches(
@@ -630,26 +719,39 @@ fn check_sqlcipher_dependency(
     dependency: &cargo_metadata::Dependency,
     violations: &mut Vec<String>,
 ) {
-    const SQLCIPHER_CONSUMERS: [&str; 2] = ["tersa-search-spike", "tersa-sqlcipher-spike"];
     const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
 
-    let dependency_name = dependency.name.as_str();
+    let target = dependency.target.as_ref().map(ToString::to_string);
+    violations.extend(sqlcipher_manifest_dependency_violations(
+        package_name,
+        dependency.name.as_str(),
+        target.as_deref(),
+        APPLE_TARGET,
+    ));
+}
+
+fn sqlcipher_manifest_dependency_violations(
+    package_name: &str,
+    dependency_name: &str,
+    target: Option<&str>,
+    apple_target: &str,
+) -> Vec<String> {
     if !matches!(dependency_name, "rusqlite" | "libsqlite3-sys") {
-        return;
+        return Vec::new();
     }
 
-    if !SQLCIPHER_CONSUMERS.contains(&package_name) {
+    let mut violations = Vec::new();
+    if !SQLCIPHER_DIAGNOSTIC_OWNERS.contains(&package_name) {
         violations.push(format!(
             "{package_name} -> {dependency_name} (SQLCipher is exclusive to the Apple SQLCipher diagnostics)"
         ));
     }
-
-    let target = dependency.target.as_ref().map(ToString::to_string);
-    if target.as_deref() != Some(APPLE_TARGET) {
+    if target != Some(apple_target) {
         violations.push(format!(
-            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
+            "{package_name} -> {dependency_name} must use target `{apple_target}`"
         ));
     }
+    violations
 }
 
 fn check_search_dependency(
@@ -717,34 +819,158 @@ fn check_blob_dependency(
     dependency: &cargo_metadata::Dependency,
     violations: &mut Vec<String>,
 ) {
-    const BLOB_SPIKE: &str = "tersa-blob-spike";
-    if dependency.name == "rustix" {
-        if package_name == BLOB_SPIKE && dependency.req.to_string() != "=1.1.4" {
-            violations.push(format!("{package_name} -> rustix must pin exactly 1.1.4"));
-        }
-        return;
+    violations.extend(blob_manifest_dependency_violations(
+        package_name,
+        dependency.name.as_str(),
+        &dependency.req.to_string(),
+    ));
+}
+
+fn blob_manifest_dependency_violations(
+    package_name: &str,
+    dependency_name: &str,
+    version: &str,
+) -> Vec<String> {
+    const BLOB_SPIKE: &str = BLOB_DIAGNOSTIC_OWNERS[0];
+    if dependency_name == "rustix" {
+        return (package_name == BLOB_SPIKE && version != "=1.1.4")
+            .then(|| format!("{package_name} -> rustix must pin exactly 1.1.4"))
+            .into_iter()
+            .collect();
     }
-    let expected = match dependency.name.as_str() {
+    let expected = match dependency_name {
         "chacha20poly1305" => Some("=0.10.1"),
         "hmac" => Some("=0.12.1"),
         _ => None,
     };
     let Some(expected) = expected else {
-        return;
+        return Vec::new();
     };
+    let mut violations = Vec::new();
     if package_name != BLOB_SPIKE {
         violations.push(format!(
-            "{package_name} -> {} (blob cryptography is exclusive to {BLOB_SPIKE})",
-            dependency.name
+            "{package_name} -> {dependency_name} (blob cryptography is exclusive to {BLOB_SPIKE})"
         ));
     }
-    if dependency.req.to_string() != expected {
+    if version != expected {
         violations.push(format!(
-            "{package_name} -> {} must pin exactly {}",
-            dependency.name,
+            "{package_name} -> {dependency_name} must pin exactly {}",
             expected.trim_start_matches('=')
         ));
     }
+    violations
+}
+
+fn reserved_future_policy_violations(
+    workspace_resolved_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (package_name, allowed_dependencies) in RESERVED_FUTURE_POLICY {
+        let Some(dependencies) = workspace_resolved_dependencies.get(package_name) else {
+            continue;
+        };
+
+        violations.push(format!(
+            "workspace crate `{package_name}` is reserved for a later reviewed policy change"
+        ));
+        for dependency_name in dependencies {
+            if !allowed_dependencies.contains(&dependency_name.as_str()) {
+                violations.push(format!(
+                    "reserved future crate `{package_name}` -> `{dependency_name}` exceeds its allowed inward dependencies"
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn workspace_resolved_dependencies(
+    metadata: &Metadata,
+) -> TaskResult<BTreeMap<String, BTreeSet<String>>> {
+    let workspace_member_names: BTreeMap<PackageId, String> = metadata
+        .workspace_members
+        .iter()
+        .map(|member_id| {
+            let package = metadata
+                .packages
+                .iter()
+                .find(|package| package.id == *member_id)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "workspace member `{member_id}` is missing from package metadata"
+                    ))
+                })?;
+            Ok((member_id.clone(), package.name.to_string()))
+        })
+        .collect::<TaskResult<_>>()?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| io::Error::other("cargo metadata did not return resolved dependencies"))?;
+
+    metadata
+        .workspace_members
+        .iter()
+        .map(|member_id| {
+            let package_name = workspace_member_names.get(member_id).ok_or_else(|| {
+                io::Error::other(format!(
+                    "workspace member `{member_id}` is missing from resolved member names"
+                ))
+            })?;
+            let node = resolve
+                .nodes
+                .iter()
+                .find(|node| node.id == *member_id)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "workspace member `{member_id}` is missing from resolved dependency nodes"
+                    ))
+                })?;
+            Ok((
+                package_name.clone(),
+                resolved_workspace_dependency_names(
+                    node.deps
+                        .iter()
+                        .map(|dependency| ResolvedDependencyIdentity {
+                            package_id: dependency.pkg.clone(),
+                        }),
+                    &workspace_member_names,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn resolved_workspace_dependency_names(
+    dependencies: impl IntoIterator<Item = ResolvedDependencyIdentity>,
+    workspace_member_names: &BTreeMap<PackageId, String>,
+) -> BTreeSet<String> {
+    dependencies
+        .into_iter()
+        .filter_map(|dependency| workspace_member_names.get(&dependency.package_id).cloned())
+        .collect()
+}
+
+fn future_macos_store_dependency_violation(
+    package_name: &str,
+    dependency_name: &str,
+    target: Option<&str>,
+) -> Option<String> {
+    if package_name != "tersa-store-sqlcipher-macos"
+        || !matches!(
+            dependency_name,
+            "rusqlite" | "libsqlite3-sys" | "chacha20poly1305" | "hmac"
+        )
+    {
+        return None;
+    }
+
+    if target != Some(MACOS_STORE_TARGET) {
+        return Some(format!(
+            "{package_name} -> {dependency_name} must use target `{MACOS_STORE_TARGET}`"
+        ));
+    }
+    None
 }
 
 fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
@@ -843,9 +1069,15 @@ fn parse_identity(identity: &str) -> Option<(&str, &str)> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use cargo_metadata::PackageId;
+
     use super::{
-        check_diagnostic_runtime_reachability, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, parse_identity,
+        ResolvedDependencyIdentity, blob_dependency_graph_violations,
+        blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
+        future_macos_store_dependency_violation, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, parse_identity, reserved_future_policy_violations,
+        resolved_workspace_dependency_names, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, target_metadata_options,
     };
 
     #[test]
@@ -879,6 +1111,209 @@ mod tests {
         assert!(is_slint_runtime_dependency("slint-macros"));
         assert!(is_slint_runtime_dependency("i-slint-core"));
         assert!(!is_slint_runtime_dependency("tersa-domain"));
+    }
+
+    #[test]
+    fn rejects_a_reserved_future_package_in_the_workspace() {
+        let workspace_resolved_dependencies = BTreeMap::from([(
+            "tersa-gmail-rest-macos".to_owned(),
+            BTreeSet::from(["tersa-application".to_owned()]),
+        )]);
+
+        assert_eq!(
+            reserved_future_policy_violations(&workspace_resolved_dependencies),
+            vec![
+                "workspace crate `tersa-gmail-rest-macos` is reserved for a later reviewed policy change"
+            ]
+        );
+    }
+
+    #[test]
+    fn recognizes_a_patched_dependency_resolved_to_a_workspace_member() {
+        let workspace_member_names = BTreeMap::from([
+            (
+                package_id("path+file:///workspace/apps/store"),
+                "tersa-store-sqlcipher-macos".to_owned(),
+            ),
+            (
+                package_id("path+file:///workspace/crates/application"),
+                "tersa-application".to_owned(),
+            ),
+            (
+                package_id("path+file:///workspace/crates/domain"),
+                "tersa-domain".to_owned(),
+            ),
+            (
+                package_id("path+file:///workspace/crates/platform"),
+                "tersa-platform".to_owned(),
+            ),
+        ]);
+        let workspace_resolved_dependencies = BTreeMap::from([(
+            "tersa-store-sqlcipher-macos".to_owned(),
+            resolved_workspace_dependency_names(
+                [
+                    ResolvedDependencyIdentity {
+                        package_id: package_id(
+                            "registry+https://github.com/rust-lang/crates.io-index#rusqlite@0.32.1",
+                        ),
+                    },
+                    ResolvedDependencyIdentity {
+                        package_id: package_id("path+file:///workspace/crates/application"),
+                    },
+                    ResolvedDependencyIdentity {
+                        package_id: package_id("path+file:///workspace/crates/domain"),
+                    },
+                    ResolvedDependencyIdentity {
+                        package_id: package_id("path+file:///workspace/crates/platform"),
+                    },
+                ],
+                &workspace_member_names,
+            ),
+        )]);
+
+        assert_eq!(
+            reserved_future_policy_violations(&workspace_resolved_dependencies),
+            vec![
+                "workspace crate `tersa-store-sqlcipher-macos` is reserved for a later reviewed policy change",
+                "reserved future crate `tersa-store-sqlcipher-macos` -> `tersa-platform` exceeds its allowed inward dependencies",
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_an_external_package_with_a_workspace_member_name() {
+        let workspace_member_names = BTreeMap::from([(
+            package_id("path+file:///workspace/crates/domain"),
+            "tersa-domain".to_owned(),
+        )]);
+
+        assert!(
+            resolved_workspace_dependency_names(
+                [ResolvedDependencyIdentity {
+                    package_id: package_id(
+                        "registry+https://github.com/rust-lang/crates.io-index#tersa-domain@1.0.0",
+                    ),
+                }],
+                &workspace_member_names,
+            )
+            .is_empty()
+        );
+    }
+
+    fn package_id(repr: &str) -> PackageId {
+        PackageId {
+            repr: repr.to_owned(),
+        }
+    }
+
+    #[test]
+    fn permits_future_store_dependencies_only_under_the_exact_macos_cfg() {
+        for dependency_name in ["rusqlite", "libsqlite3-sys", "chacha20poly1305", "hmac"] {
+            let violation = future_macos_store_dependency_violation(
+                "tersa-store-sqlcipher-macos",
+                dependency_name,
+                Some(r#"cfg(target_os = "macos")"#),
+            );
+            assert_eq!(violation, None, "{dependency_name}: {violation:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_untargeted_or_ios_future_store_dependencies() {
+        for target in [
+            None,
+            Some(r#"cfg(target_os = "ios")"#),
+            Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
+        ] {
+            let violation = future_macos_store_dependency_violation(
+                "tersa-store-sqlcipher-macos",
+                "rusqlite",
+                target,
+            );
+            assert!(violation.is_some(), "target: {target:?}");
+        }
+    }
+
+    #[test]
+    fn resolves_target_graphs_with_all_features() {
+        assert_eq!(
+            target_metadata_options("aarch64-apple-darwin"),
+            vec![
+                "--locked",
+                "--all-features",
+                "--filter-platform",
+                "aarch64-apple-darwin",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unauthorized_sqlcipher_and_aead_manifest_dependencies() {
+        assert_eq!(
+            sqlcipher_manifest_dependency_violations(
+                "tersa-application",
+                "rusqlite",
+                Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
+                r#"cfg(any(target_os = "macos", target_os = "ios"))"#,
+            ),
+            vec![
+                "tersa-application -> rusqlite (SQLCipher is exclusive to the Apple SQLCipher diagnostics)"
+            ]
+        );
+        assert_eq!(
+            blob_manifest_dependency_violations("tersa-application", "chacha20poly1305", "=0.10.1",),
+            vec![
+                "tersa-application -> chacha20poly1305 (blob cryptography is exclusive to tersa-blob-spike)"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unauthorized_transitive_sqlcipher_and_aead_graph_reachability() {
+        let package_names = BTreeMap::from([
+            ("application".to_owned(), "tersa-application".to_owned()),
+            ("wrapper".to_owned(), "optional-crypto-wrapper".to_owned()),
+            ("sqlite".to_owned(), "libsqlite3-sys".to_owned()),
+            ("aead".to_owned(), "chacha20poly1305".to_owned()),
+        ]);
+        let workspace_members = vec!["application".to_owned()];
+        let dependencies = BTreeMap::from([
+            (
+                "application".to_owned(),
+                BTreeSet::from(["wrapper".to_owned()]),
+            ),
+            (
+                "wrapper".to_owned(),
+                BTreeSet::from(["sqlite".to_owned(), "aead".to_owned()]),
+            ),
+        ]);
+        let sqlcipher_violations = sqlcipher_dependency_graph_violations(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            &BTreeSet::from(["sqlite".to_owned()]),
+            "aarch64-apple-darwin",
+        );
+        let blob_violations = blob_dependency_graph_violations(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            &BTreeSet::from(["aead".to_owned()]),
+            "aarch64-apple-darwin",
+        );
+
+        assert_eq!(
+            sqlcipher_violations,
+            vec![
+                "tersa-application reaches libsqlite3-sys outside the Apple SQLCipher diagnostics for aarch64-apple-darwin"
+            ]
+        );
+        assert_eq!(
+            blob_violations,
+            vec![
+                "tersa-application reaches a blob-cryptography dependency outside tersa-blob-spike for aarch64-apple-darwin"
+            ]
+        );
     }
 
     #[test]

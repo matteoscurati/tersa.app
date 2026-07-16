@@ -35,6 +35,31 @@ cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 and `hmac`
 Apple target graph. New workspace crates must be added explicitly to the policy
 in `xtask`; an unknown crate fails CI.
 
+## Reserved macOS production adapters
+
+The `RESERVED_FUTURE_POLICY` table in `xtask` reserves
+`tersa-gmail-rest-macos` and `tersa-store-sqlcipher-macos`; neither name is an
+active dependency-policy entry and neither crate exists in this change. The
+architecture check fails if either reserved name appears in workspace
+membership. This is a tripwire, not pre-authorization: the crate-introducing
+pull request must explicitly move its name from the reserved table to the
+active policy under review.
+
+When introduced, either adapter may depend inward only on
+`tersa-application` and `tersa-domain`. Mailbox and storage ports belong in
+`tersa-application`; adapters implement those inward-defined ports, while
+`tersa-application` and `tersa-domain` never depend on adapters.
+
+The future macOS store adapter must declare `rusqlite`, `libsqlite3-sys`,
+`chacha20poly1305`, and `hmac` only under the exact target cfg
+`cfg(target_os = "macos")`. Untargeted, iOS-only, and iOS-inclusive declarations
+are violations. It may own both SQLCipher and blob AEAD because both share one
+commit and crash-safety protocol.
+
+Gmail and network dependency exclusivity is intentionally not yet enforceable:
+the exact Gmail crates are selected and pinned only by the later Gmail adapter
+pull request. No generic dependency-name pattern is a network policy.
+
 The Apple bridge may call application use cases directly when the operating
 system owns the transport. The M0 OAuth adapter uses this edge for the browser
 callback while keeping PKCE and callback validation in portable Rust.
