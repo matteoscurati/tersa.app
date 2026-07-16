@@ -69,10 +69,11 @@ impl GmailMailbox {
     /// oversized, or control-character-containing token. Client construction
     /// failures return [`RemoteMailboxError::Transport`].
     pub fn new(account: AccountId, access_token: String) -> Result<Self, RemoteMailboxError> {
+        let access_token = Zeroizing::new(access_token);
         validate_access_token(&access_token)?;
         Ok(Self {
             account,
-            transport: Box::new(ReqwestTransport::new(Zeroizing::new(access_token))?),
+            transport: Box::new(ReqwestTransport::new(access_token)?),
         })
     }
 
@@ -124,6 +125,9 @@ impl RemoteMailbox for GmailMailbox {
             let list: GmailList = self
                 .request_json(list_request(size, page_token)?, JSON_LIMIT)
                 .await?;
+            if list.messages.len() > usize::from(size.get()) {
+                return Err(RemoteMailboxError::InvalidResponse);
+            }
             let next = list
                 .next_page_token
                 .map(PageToken::new)
@@ -377,6 +381,9 @@ enum MessageFormat {
 }
 
 fn message_request(id: &MessageId, format: MessageFormat) -> Result<Request, RemoteMailboxError> {
+    if matches!(id.as_str(), "." | "..") {
+        return Err(RemoteMailboxError::InvalidResponse);
+    }
     let query = match format {
         MessageFormat::Metadata => vec![
             ("format", "metadata".to_owned()),
@@ -786,6 +793,34 @@ mod tests {
         ));
         assert_eq!(result, Err(RemoteMailboxError::AuthorizationRequired));
         assert!(transport.requests().is_empty());
+    }
+
+    #[test]
+    fn rejects_a_page_larger_than_requested_before_hydration() {
+        let transport = FakeTransport::new(vec![json(
+            200,
+            r#"{"messages":[{"id":"m1","threadId":"t1"},{"id":"m2","threadId":"t2"}]}"#,
+        )]);
+        let mailbox = GmailMailbox::with_transport(account(ACCOUNT), transport.clone());
+        let result = ready(mailbox.list_recent_envelopes(
+            &account(ACCOUNT),
+            PageSize::new(1).unwrap_or_else(|error| panic!("{error}")),
+            None,
+        ));
+        assert_eq!(result, Err(RemoteMailboxError::InvalidResponse));
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[test]
+    fn rejects_dot_segment_message_ids_before_transport_work() {
+        for value in [".", ".."] {
+            let transport = FakeTransport::new(vec![]);
+            let mailbox = GmailMailbox::with_transport(account(ACCOUNT), transport.clone());
+            let selected_message = message_id(value);
+            let result = ready(mailbox.fetch_message(&account(ACCOUNT), &selected_message));
+            assert_eq!(result, Err(RemoteMailboxError::InvalidResponse));
+            assert!(transport.requests().is_empty());
+        }
     }
 
     #[test]

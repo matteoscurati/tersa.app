@@ -60,8 +60,10 @@ commit and crash-safety protocol.
 `tersa-gmail-rest-macos` is active and may depend inward only on
 `tersa-application` and `tersa-domain`. `reqwest` is pinned exactly to 0.13.4,
 declared only for `cfg(target_os = "macos")`, and exclusive to this adapter in
-the resolved graph. The adapter uses only the Gmail REST API; it does not add a
-general network capability to the shared layers.
+the resolved graph. Its direct feature set is exactly `native-tls`; resolved
+features fail closed if defaults, cookies, compression, multipart, proxy, or an
+alternate TLS backend becomes active. The adapter uses only the Gmail REST API;
+it does not add a general network capability to the shared layers.
 
 The Apple bridge may call application use cases directly when the operating
 system owns the transport. The M0 OAuth adapter uses this edge for the browser

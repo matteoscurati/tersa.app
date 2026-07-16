@@ -18,12 +18,18 @@ order. A message can be deleted after it appears in `messages.list`; a 404 from
 that hydration request is skipped, while every other hydration failure fails the
 page.
 
+A page containing more messages than its requested `maxResults` is invalid and
+is rejected before hydration. Provider-neutral message identifiers equal to
+`.` or `..` are also rejected before transport because URL path-segment APIs
+normalize those reserved values and would target the wrong resource.
+
 Each adapter instance is bound to one opaque local `AccountId` before any I/O.
 A different account returns `AuthorizationRequired`; Gmail's `users/me` result
 cannot therefore be attributed to another local account. The macOS constructor
-owns a `Zeroizing` short-lived access token. Rotation is performed by replacing
-the adapter. This adapter performs no token exchange, refresh, persistence,
-Keychain access, retries, batching, history sync, checkpointing, or logging.
+immediately wraps a short-lived access token in `Zeroizing` before validation.
+Rotation is performed by replacing the adapter. This adapter performs no token
+exchange, refresh, persistence, Keychain access, retries, batching, history
+sync, checkpointing, or logging.
 
 Metadata requests use a partial response selector and select only `From` and
 `Subject` headers. Missing singleton headers are represented by an empty

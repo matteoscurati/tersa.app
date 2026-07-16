@@ -32,6 +32,9 @@ const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 1] = [(
 )];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
+const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
+const REQWEST_RESOLVED_FEATURES: [&str; 4] =
+    ["__native-tls", "__native-tls-alpn", "__tls", "native-tls"];
 
 fn main() -> ExitCode {
     match run() {
@@ -269,6 +272,8 @@ fn check_gmail_dependency(
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
+        dependency.uses_default_features,
+        &dependency.features,
     ));
 }
 
@@ -277,6 +282,8 @@ fn gmail_manifest_dependency_violations(
     dependency_name: &str,
     requirement: &str,
     target: Option<&str>,
+    uses_default_features: bool,
+    features: &[String],
 ) -> Vec<String> {
     const OWNER: &str = "tersa-gmail-rest-macos";
     if dependency_name != "reqwest" {
@@ -294,6 +301,18 @@ fn gmail_manifest_dependency_violations(
     if target != Some(MACOS_GMAIL_TARGET) {
         violations.push(format!(
             "{package_name} -> reqwest must use target `{MACOS_GMAIL_TARGET}`"
+        ));
+    }
+    if uses_default_features {
+        violations.push(format!(
+            "{package_name} -> reqwest must disable default features"
+        ));
+    }
+    let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = REQWEST_DIRECT_FEATURES.into_iter().collect();
+    if features != expected {
+        violations.push(format!(
+            "{package_name} -> reqwest must enable only the `native-tls` feature"
         ));
     }
     violations
@@ -344,6 +363,18 @@ fn check_gmail_dependency_graph(metadata: &Metadata, target: &str, violations: &
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
         return;
     };
+    for node in &resolve.nodes {
+        if reqwest.contains(&node.id.to_string()) {
+            violations.extend(gmail_resolved_feature_violations(
+                &node
+                    .features
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                target,
+            ));
+        }
+    }
     let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
         .nodes
         .iter()
@@ -368,6 +399,17 @@ fn check_gmail_dependency_graph(metadata: &Metadata, target: &str, violations: &
         &reqwest,
         target,
     ));
+}
+
+fn gmail_resolved_feature_violations(features: &[String], target: &str) -> Vec<String> {
+    let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = REQWEST_RESOLVED_FEATURES.into_iter().collect();
+    if features == expected {
+        return Vec::new();
+    }
+    vec![format!(
+        "resolved reqwest features for {target} must be exactly native-tls without defaults, cookies, compression, multipart, proxy, or alternate TLS"
+    )]
 }
 
 fn gmail_dependency_graph_violations(
@@ -1204,10 +1246,11 @@ mod tests {
         ResolvedDependencyIdentity, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
         future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, parse_identity, reserved_future_policy_violations,
-        resolved_workspace_dependency_names, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, target_metadata_options,
+        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
+        is_dioxus_runtime_dependency, is_slint_runtime_dependency, parse_identity,
+        reserved_future_policy_violations, resolved_workspace_dependency_names,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        target_metadata_options,
     };
 
     #[test]
@@ -1406,15 +1449,53 @@ mod tests {
                 "reqwest",
                 "=0.13.4",
                 Some(r#"cfg(target_os = "macos")"#),
+                false,
+                &["native-tls".to_owned()],
             )
             .is_empty()
         );
         assert_eq!(
-            gmail_manifest_dependency_violations("tersa-application", "reqwest", "^0.13", None,),
+            gmail_manifest_dependency_violations(
+                "tersa-application",
+                "reqwest",
+                "^0.13",
+                None,
+                true,
+                &["gzip".to_owned()],
+            ),
             vec![
                 "tersa-application -> reqwest (reqwest is exclusive to tersa-gmail-rest-macos)",
                 "tersa-application -> reqwest must pin exactly 0.13.4",
                 "tersa-application -> reqwest must use target `cfg(target_os = \"macos\")`",
+                "tersa-application -> reqwest must disable default features",
+                "tersa-application -> reqwest must enable only the `native-tls` feature",
+            ]
+        );
+        assert!(
+            gmail_resolved_feature_violations(
+                &[
+                    "__native-tls".to_owned(),
+                    "__native-tls-alpn".to_owned(),
+                    "__tls".to_owned(),
+                    "native-tls".to_owned(),
+                ],
+                "aarch64-apple-darwin",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            gmail_resolved_feature_violations(
+                &[
+                    "__native-tls".to_owned(),
+                    "__native-tls-alpn".to_owned(),
+                    "__tls".to_owned(),
+                    "gzip".to_owned(),
+                    "native-tls".to_owned(),
+                ],
+                "aarch64-apple-darwin",
+            ),
+            vec![
+                "resolved reqwest features for aarch64-apple-darwin must be exactly native-tls without defaults, cookies, compression, multipart, proxy, or alternate TLS"
             ]
         );
     }
