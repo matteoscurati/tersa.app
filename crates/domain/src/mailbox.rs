@@ -26,6 +26,8 @@ pub enum MailboxInvariantError {
     },
     /// The supplied value contains a disallowed character.
     InvalidCharacter,
+    /// An account identifier looked like an email address.
+    EmailShapedAccountId,
     /// The supplied timestamp predates the Unix epoch.
     NegativeTimestamp,
 }
@@ -36,6 +38,7 @@ impl fmt::Display for MailboxInvariantError {
             Self::Empty => "the mailbox value must not be empty",
             Self::TooLong { .. } => "the mailbox value exceeds its maximum length",
             Self::InvalidCharacter => "the mailbox value contains an invalid character",
+            Self::EmailShapedAccountId => "the account identifier must not be an email address",
             Self::NegativeTimestamp => "the mailbox timestamp must not be negative",
         };
         formatter.write_str(message)
@@ -64,7 +67,7 @@ impl fmt::Display for MessageContentError {
 impl std::error::Error for MessageContentError {}
 
 macro_rules! opaque_identifier {
-    ($name:ident, $docs:literal) => {
+    ($name:ident, $docs:literal, $validate:ident) => {
         #[doc = $docs]
         #[derive(Clone, Eq, Hash, PartialEq)]
         pub struct $name(String);
@@ -75,10 +78,11 @@ macro_rules! opaque_identifier {
             /// # Errors
             ///
             /// Returns [`MailboxInvariantError`] if the identifier is empty,
-            /// too long, or not printable ASCII.
+            /// too long, or does not contain only visible non-whitespace ASCII
+            /// characters (`!` through `~`).
             pub fn new<T: Into<String>>(value: T) -> Result<Self, MailboxInvariantError> {
                 let value = value.into();
-                validate_identifier(&value)?;
+                $validate(&value)?;
                 Ok(Self(value))
             }
 
@@ -91,10 +95,7 @@ macro_rules! opaque_identifier {
 
         impl fmt::Debug for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter
-                    .debug_tuple(stringify!($name))
-                    .field(&self.0)
-                    .finish()
+                write!(formatter, "{}([REDACTED])", stringify!($name))
             }
         }
     };
@@ -102,13 +103,19 @@ macro_rules! opaque_identifier {
 
 opaque_identifier!(
     AccountId,
-    "Identifies a locally assigned opaque account, never an email address."
+    "Identifies a locally assigned opaque account, never an email address.",
+    validate_account_identifier
 );
 opaque_identifier!(
     MessageId,
-    "Identifies one provider-neutral mailbox message."
+    "Identifies one provider-neutral mailbox message.",
+    validate_identifier
 );
-opaque_identifier!(ThreadId, "Identifies one provider-neutral mailbox thread.");
+opaque_identifier!(
+    ThreadId,
+    "Identifies one provider-neutral mailbox thread.",
+    validate_identifier
+);
 
 /// Represents milliseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -355,8 +362,16 @@ fn validate_identifier(value: &str) -> Result<(), MailboxInvariantError> {
             max_len: MAX_IDENTIFIER_LEN,
         });
     }
-    if !value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+    if !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
         return Err(MailboxInvariantError::InvalidCharacter);
+    }
+    Ok(())
+}
+
+fn validate_account_identifier(value: &str) -> Result<(), MailboxInvariantError> {
+    validate_identifier(value)?;
+    if value.contains('@') {
+        return Err(MailboxInvariantError::EmailShapedAccountId);
     }
     Ok(())
 }
@@ -379,14 +394,17 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_enforce_printable_ascii_and_byte_bounds() {
-        assert_identifier_invariants(AccountId::new);
-        assert_identifier_invariants(MessageId::new);
-        assert_identifier_invariants(ThreadId::new);
+    fn identifiers_enforce_visible_ascii_and_byte_bounds() {
+        assert_identifier_invariants(AccountId::new, true);
+        assert_identifier_invariants(MessageId::new, false);
+        assert_identifier_invariants(ThreadId::new, false);
         assert_eq!(AccountId::new("account").unwrap().as_str(), "account");
     }
 
-    fn assert_identifier_invariants<T>(make: impl Fn(String) -> Result<T, MailboxInvariantError>) {
+    fn assert_identifier_invariants<T>(
+        make: impl Fn(String) -> Result<T, MailboxInvariantError>,
+        rejects_email: bool,
+    ) {
         assert!(make("a".repeat(256)).is_ok());
         assert!(matches!(
             make(String::new()),
@@ -407,6 +425,40 @@ mod tests {
             make("line\nbreak".to_owned()),
             Err(MailboxInvariantError::InvalidCharacter)
         ));
+        assert!(matches!(
+            make("space value".to_owned()),
+            Err(MailboxInvariantError::InvalidCharacter)
+        ));
+        if rejects_email {
+            assert!(matches!(
+                make("person@example.test".to_owned()),
+                Err(MailboxInvariantError::EmailShapedAccountId)
+            ));
+        }
+    }
+
+    #[test]
+    fn identifier_debug_output_redacts_every_payload() {
+        for debug in [
+            format!("{:?}", AccountId::new("account-sentinel").unwrap()),
+            format!("{:?}", MessageId::new("message-sentinel").unwrap()),
+            format!("{:?}", ThreadId::new("thread-sentinel").unwrap()),
+        ] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("sentinel"));
+        }
+        assert_eq!(
+            format!("{:?}", AccountId::new("account-sentinel").unwrap()),
+            "AccountId([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", MessageId::new("message-sentinel").unwrap()),
+            "MessageId([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", ThreadId::new("thread-sentinel").unwrap()),
+            "ThreadId([REDACTED])"
+        );
     }
 
     #[test]
@@ -452,6 +504,8 @@ mod tests {
         assert_eq!(message.content(), &content);
         let debug = format!("{message:?}");
         for sentinel in [
+            "message-1",
+            "thread-1",
             "from-sentinel",
             "subject-sentinel",
             "preview-sentinel",

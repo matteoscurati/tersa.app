@@ -4,8 +4,11 @@
 
 //! Defines runtime-free inward mailbox ports for remote and local adapters.
 //!
-//! Returned futures are owned by callers. Dropping one cancels the pending
-//! operation, so implementations must be drop-safe and release resources.
+//! Returned futures are owned by callers. Dropping one is the caller's
+//! cancellation request and releases future-owned state. An adapter should stop
+//! before dispatch or commit when possible. An already-dispatched or
+//! irreversible operation may finish once, but must not start retries or
+//! unbounded detached work after drop.
 
 use std::fmt;
 use std::pin::Pin;
@@ -29,6 +32,8 @@ pub enum MailboxContractError {
     InvalidPageToken,
     /// A requested page size was outside 1 through 500.
     InvalidPageSize { value: u16 },
+    /// A requested local result limit was outside 1 through 10,000.
+    InvalidStoreLimit { value: u16 },
 }
 
 impl fmt::Display for MailboxContractError {
@@ -38,6 +43,7 @@ impl fmt::Display for MailboxContractError {
             Self::PageTokenTooLong { .. } => "the page token exceeds its maximum length",
             Self::InvalidPageToken => "the page token contains an invalid character",
             Self::InvalidPageSize { .. } => "the page size must be between 1 and 500",
+            Self::InvalidStoreLimit { .. } => "the store limit must be between 1 and 10000",
         };
         formatter.write_str(message)
     }
@@ -84,12 +90,12 @@ impl fmt::Debug for PageToken {
     }
 }
 
-/// Limits one remote mailbox listing request.
+/// Limits one remote provider pagination request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageSize(u16);
 
 impl PageSize {
-    /// Creates a page size from 1 through 500 inclusive.
+    /// Creates a remote pagination size from 1 through 500 inclusive.
     ///
     /// # Errors
     ///
@@ -100,7 +106,34 @@ impl PageSize {
         }
         Ok(Self(value))
     }
-    /// Returns the validated page size.
+    /// Returns the validated remote pagination size.
+    #[must_use]
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Limits one local store listing result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreLimit(u16);
+
+impl StoreLimit {
+    /// The defensive maximum number of envelopes returned by one local query.
+    pub const MAX: u16 = 10_000;
+
+    /// Creates a local result limit from 1 through 10,000 inclusive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MailboxContractError::InvalidStoreLimit`] outside that range.
+    pub fn new(value: u16) -> Result<Self, MailboxContractError> {
+        if !(1..=Self::MAX).contains(&value) {
+            return Err(MailboxContractError::InvalidStoreLimit { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the validated local result limit.
     #[must_use]
     pub fn get(self) -> u16 {
         self.0
@@ -108,10 +141,20 @@ impl PageSize {
 }
 
 /// Contains one remote mailbox listing page.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Page<T> {
     items: Vec<T>,
     next_token: Option<PageToken>,
+}
+
+impl<T> fmt::Debug for Page<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Page")
+            .field("item_count", &self.items.len())
+            .field("has_next_token", &self.next_token.is_some())
+            .finish()
+    }
 }
 
 impl<T> Page<T> {
@@ -192,7 +235,10 @@ pub trait RemoteMailbox: Send + Sync {
     /// Lists recent envelopes for an account and optional continuation token.
     ///
     /// Future revision acquisition must be atomic with this listing, never a
-    /// separate post-list getter.
+    /// separate post-list getter. The returned items preserve provider page
+    /// order. Global ordering, including equal-time ordering, is provider
+    /// defined or unspecified; callers must not treat this as a lossless sync
+    /// snapshot.
     fn list_recent_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
@@ -208,6 +254,12 @@ pub trait RemoteMailbox: Send + Sync {
 }
 
 /// Persists mailbox data in a local store.
+///
+/// Store mutations must be atomic and all-or-nothing. After dropping a future,
+/// the outcome may be unknown, but partial durable state is forbidden; callers
+/// may reconcile by re-reading. Each concrete adapter must test its own
+/// cancellation and atomicity behavior. Reusable cross-crate test support is
+/// deferred.
 pub trait MailboxStore: Send + Sync {
     /// Inserts or replaces mailbox envelopes for an account.
     fn upsert_envelopes<'a>(
@@ -221,13 +273,15 @@ pub trait MailboxStore: Send + Sync {
         account: &'a AccountId,
         message: &'a Message,
     ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
-    /// Lists newest-first envelopes, limited by the requested page size.
+    /// Lists envelopes in a deterministic total order: received time descending,
+    /// then message identifier ascending, limited by the local result limit.
     fn list_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
-        size: PageSize,
+        limit: StoreLimit,
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
-    /// Lists one thread's envelopes in chronological received-time order.
+    /// Lists one thread's envelopes in a deterministic total order: received
+    /// time ascending, then message identifier ascending.
     fn thread_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
@@ -252,8 +306,13 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use tersa_domain::mailbox::{HeaderText, MessageContent, UnixTimestampMillis};
 
+    struct NonDebugItem(&'static str);
+
     fn account() -> AccountId {
         AccountId::new("account").unwrap()
+    }
+    fn named_account(name: &str) -> AccountId {
+        AccountId::new(name).unwrap()
     }
     fn envelope(id: &str, thread: &str, at: i64) -> MessageEnvelope {
         MessageEnvelope::new(
@@ -300,11 +359,27 @@ mod tests {
             PageSize::new(501),
             Err(MailboxContractError::InvalidPageSize { value: 501 })
         );
+        assert_eq!(PageSize::new(1).unwrap().get(), 1);
         assert_eq!(PageSize::new(500).unwrap().get(), 500);
-        let page = Page::new(vec![1], Some(token));
-        assert_eq!(page.items(), &[1]);
+        assert_eq!(
+            StoreLimit::new(0),
+            Err(MailboxContractError::InvalidStoreLimit { value: 0 })
+        );
+        assert_eq!(
+            StoreLimit::new(10_001),
+            Err(MailboxContractError::InvalidStoreLimit { value: 10_001 })
+        );
+        assert_eq!(StoreLimit::new(StoreLimit::MAX).unwrap().get(), 10_000);
+        let page = Page::new(vec![NonDebugItem("item-sentinel")], Some(token));
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].0, "item-sentinel");
         assert!(page.next_token().is_some());
-        assert_eq!(page.into_parts().0, vec![1]);
+        let debug = format!("{page:?}");
+        assert!(debug.contains("item_count: 1"));
+        assert!(debug.contains("has_next_token: true"));
+        assert!(!debug.contains("item-sentinel"));
+        assert!(!debug.contains("token-sentinel"));
+        assert_eq!(page.into_parts().0.len(), 1);
     }
 
     struct Noop;
@@ -356,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn ports_are_object_safe_and_dropping_a_pending_future_cancels_it() {
+    fn ports_are_object_safe_and_dropping_a_pending_future_releases_owned_state() {
         let dropped = Arc::new(AtomicBool::new(false));
         let remote: Box<dyn RemoteMailbox> = Box::new(CancellingRemote {
             dropped: Arc::clone(&dropped),
@@ -371,8 +446,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeStore {
-        envelopes: Mutex<HashMap<String, Vec<MessageEnvelope>>>,
-        messages: Mutex<HashMap<String, Message>>,
+        envelopes: Mutex<HashMap<AccountId, Vec<MessageEnvelope>>>,
+        messages: Mutex<HashMap<(AccountId, MessageId), Message>>,
     }
     impl MailboxStore for FakeStore {
         fn upsert_envelopes<'a>(
@@ -381,16 +456,26 @@ mod tests {
             values: &'a [MessageEnvelope],
         ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
             let mut map = self.envelopes.lock().unwrap();
-            map.insert(account.as_str().to_owned(), values.to_vec());
+            let stored = map.entry(account.clone()).or_default();
+            for value in values {
+                if let Some(position) = stored
+                    .iter()
+                    .position(|existing| existing.message_id() == value.message_id())
+                {
+                    stored[position] = value.clone();
+                } else {
+                    stored.push(value.clone());
+                }
+            }
             Box::pin(ready(Ok(())))
         }
         fn put_message<'a>(
             &'a self,
-            _: &'a AccountId,
+            account: &'a AccountId,
             value: &'a Message,
         ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
             self.messages.lock().unwrap().insert(
-                value.envelope().message_id().as_str().to_owned(),
+                (account.clone(), value.envelope().message_id().clone()),
                 value.clone(),
             );
             Box::pin(ready(Ok(())))
@@ -398,17 +483,22 @@ mod tests {
         fn list_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
-            size: PageSize,
+            limit: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             let mut values = self
                 .envelopes
                 .lock()
                 .unwrap()
-                .get(account.as_str())
+                .get(account)
                 .cloned()
                 .unwrap_or_default();
-            values.sort_by_key(|value| std::cmp::Reverse(value.received_at()));
-            values.truncate(usize::from(size.get()));
+            values.sort_by(|left, right| {
+                right
+                    .received_at()
+                    .cmp(&left.received_at())
+                    .then_with(|| left.message_id().as_str().cmp(right.message_id().as_str()))
+            });
+            values.truncate(usize::from(limit.get()));
             Box::pin(ready(Ok(values)))
         }
         fn thread_envelopes<'a>(
@@ -420,25 +510,29 @@ mod tests {
                 .envelopes
                 .lock()
                 .unwrap()
-                .get(account.as_str())
+                .get(account)
                 .into_iter()
                 .flatten()
                 .filter(|value| value.thread_id() == thread)
                 .cloned()
                 .collect();
-            values.sort_by_key(MessageEnvelope::received_at);
+            values.sort_by(|left, right| {
+                left.received_at()
+                    .cmp(&right.received_at())
+                    .then_with(|| left.message_id().as_str().cmp(right.message_id().as_str()))
+            });
             Box::pin(ready(Ok(values)))
         }
         fn message<'a>(
             &'a self,
-            _: &'a AccountId,
+            account: &'a AccountId,
             id: &'a MessageId,
         ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
             Box::pin(ready(Ok(self
                 .messages
                 .lock()
                 .unwrap()
-                .get(id.as_str())
+                .get(&(account.clone(), id.clone()))
                 .cloned())))
         }
     }
@@ -449,12 +543,13 @@ mod tests {
         let account = account();
         let values = [
             envelope("old", "thread", 1),
-            envelope("new", "thread", 3),
+            envelope("thread-b", "thread", 3),
+            envelope("thread-a", "thread", 3),
             envelope("middle", "other", 2),
         ];
         let mut stored = store.upsert_envelopes(&account, &values);
         assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let mut listed = store.list_envelopes(&account, PageSize::new(500).unwrap());
+        let mut listed = store.list_envelopes(&account, StoreLimit::new(500).unwrap());
         let Poll::Ready(Ok(listed)) = poll_once(&mut listed) else {
             panic!("the fake is immediately ready");
         };
@@ -463,7 +558,7 @@ mod tests {
                 .iter()
                 .map(|value| value.message_id().as_str())
                 .collect::<Vec<_>>(),
-            ["new", "middle", "old"]
+            ["thread-a", "thread-b", "middle", "old"]
         );
         let thread = ThreadId::new("thread").unwrap();
         let mut threaded = store.thread_envelopes(&account, &thread);
@@ -475,7 +570,7 @@ mod tests {
                 .iter()
                 .map(|value| value.message_id().as_str())
                 .collect::<Vec<_>>(),
-            ["old", "new"]
+            ["old", "thread-a", "thread-b"]
         );
         let value = message("complete", "thread", 4);
         let expected = value.clone();
@@ -483,5 +578,74 @@ mod tests {
         assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
         let mut found = store.message(&account, value.envelope().message_id());
         assert_eq!(poll_once(&mut found), Poll::Ready(Ok(Some(expected))));
+    }
+
+    #[test]
+    fn fake_store_upserts_by_account_and_message_id() {
+        let store = FakeStore::default();
+        let account = account();
+        let initial = [
+            envelope("replace", "thread", 1),
+            envelope("preserve", "thread", 2),
+        ];
+        let mut stored = store.upsert_envelopes(&account, &initial);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+
+        let replacement = [envelope("replace", "thread", 4)];
+        let mut stored = store.upsert_envelopes(&account, &replacement);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+
+        let mut listed = store.list_envelopes(&account, StoreLimit::new(10).unwrap());
+        let Poll::Ready(Ok(listed)) = poll_once(&mut listed) else {
+            panic!("the fake is immediately ready");
+        };
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].message_id().as_str(), "replace");
+        assert_eq!(listed[0].received_at().as_millis(), 4);
+        assert_eq!(listed[1].message_id().as_str(), "preserve");
+    }
+
+    #[test]
+    fn fake_store_isolates_envelopes_and_complete_messages_by_account() {
+        let store = FakeStore::default();
+        let first = named_account("first-account");
+        let second = named_account("second-account");
+        let first_envelope = envelope("shared-id", "thread", 1);
+        let second_envelope = envelope("shared-id", "thread", 2);
+        let first_values = [first_envelope.clone()];
+        let mut stored = store.upsert_envelopes(&first, &first_values);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+        let second_values = [second_envelope.clone()];
+        let mut stored = store.upsert_envelopes(&second, &second_values);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+
+        let mut first_listed = store.list_envelopes(&first, StoreLimit::new(10).unwrap());
+        assert_eq!(
+            poll_once(&mut first_listed),
+            Poll::Ready(Ok(vec![first_envelope]))
+        );
+        let mut second_listed = store.list_envelopes(&second, StoreLimit::new(10).unwrap());
+        assert_eq!(
+            poll_once(&mut second_listed),
+            Poll::Ready(Ok(vec![second_envelope]))
+        );
+
+        let first_message = message("shared-message", "thread", 3);
+        let second_message = message("shared-message", "thread", 4);
+        let mut stored = store.put_message(&first, &first_message);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+        let mut stored = store.put_message(&second, &second_message);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+        let id = MessageId::new("shared-message").unwrap();
+        let mut found = store.message(&first, &id);
+        assert_eq!(
+            poll_once(&mut found),
+            Poll::Ready(Ok(Some(first_message.clone())))
+        );
+        let mut found = store.message(&second, &id);
+        assert_eq!(
+            poll_once(&mut found),
+            Poll::Ready(Ok(Some(second_message.clone())))
+        );
     }
 }
