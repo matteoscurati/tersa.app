@@ -68,6 +68,18 @@ The Apple bridge may call application use cases directly when the operating
 system owns the transport. The M0 OAuth adapter uses this edge for the browser
 callback while keeping PKCE and callback validation in portable Rust.
 
+## Bounded sync and cache orchestration
+
+`tersa-application::sync` is the sole shared owner of bounded recent-snapshot
+orchestration. It may use only existing application mailbox ports and
+`tersa-domain`; it introduces no runtime, transport, storage, or background
+dependency. `MailboxStore` implementations own atomic envelope reconciliation
+and conditional body caching. This boundary does not authorize Gmail History or
+cursor sync, deletion reconciliation, retry, background work, mutations,
+outbox, labels, blobs, search, CLI/UI, real network or credentials tests,
+mobile code, or gate-status changes. Cache budgets remain constraints rather
+than evidence.
+
 Run the boundary check with:
 
 ```sh

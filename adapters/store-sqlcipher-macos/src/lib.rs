@@ -13,6 +13,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fmt;
     use std::fs::OpenOptions;
@@ -229,6 +230,80 @@ mod macos {
                     return Err(MailboxStoreError::Storage);
                 }
                 transaction.commit().map_err(store_error)
+            })
+        }
+
+        fn reconcile(
+            &self,
+            envelopes: &[MessageEnvelope],
+            keep_limit: StoreLimit,
+        ) -> Result<Vec<MessageId>, MailboxStoreError> {
+            if envelopes.len() > usize::from(StoreLimit::MAX) {
+                return Err(MailboxStoreError::Storage);
+            }
+            self.with_connection(|connection| {
+                let transaction = connection.transaction().map_err(store_error)?;
+                let has_null_identifier: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id IS NULL)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(store_error)?;
+                if has_null_identifier {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                for envelope in envelopes {
+                    write_envelope(&transaction, envelope, None)?;
+                    #[cfg(test)]
+                    if self.take_failpoint()? {
+                        return Err(MailboxStoreError::Storage);
+                    }
+                }
+                transaction.execute(
+                    "DELETE FROM messages WHERE message_id NOT IN (SELECT message_id FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1)",
+                    params![i64::from(keep_limit.get())],
+                ).map_err(store_error)?;
+                #[cfg(test)]
+                if self.take_failpoint()? {
+                    return Err(MailboxStoreError::Storage);
+                }
+                let mut survivors = Vec::with_capacity(envelopes.len());
+                let mut seen = HashSet::with_capacity(envelopes.len());
+                {
+                    let mut statement = transaction
+                        .prepare("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1)")
+                        .map_err(store_error)?;
+                    for envelope in envelopes {
+                        if !seen.insert(envelope.message_id().clone()) {
+                            continue;
+                        }
+                        let exists: bool = statement
+                            .query_row(params![envelope.message_id().as_str()], |row| row.get(0))
+                            .map_err(store_error)?;
+                        if exists {
+                            survivors.push(envelope.message_id().clone());
+                        }
+                    }
+                }
+                transaction.commit().map_err(store_error)?;
+                Ok(survivors)
+            })
+        }
+
+        fn cache_if_present(&self, message: &Message) -> Result<bool, MailboxStoreError> {
+            self.with_connection(|connection| {
+                let transaction = connection.transaction().map_err(store_error)?;
+                let changed = transaction.execute(
+                    "UPDATE messages SET thread_id = ?2, sender = ?3, subject = ?4, preview = ?5, received_at = ?6, unread = ?7, content = ?8 WHERE message_id = ?1",
+                    params![message.envelope().message_id().as_str(), message.envelope().thread_id().as_str(), message.envelope().from().as_str(), message.envelope().subject().as_str(), message.envelope().preview().as_str(), message.envelope().received_at().as_millis(), i64::from(message.envelope().is_unread()), message.content().as_bytes()],
+                ).map_err(store_error)?;
+                #[cfg(test)]
+                if self.take_failpoint()? {
+                    return Err(MailboxStoreError::Storage);
+                }
+                transaction.commit().map_err(store_error)?;
+                Ok(changed == 1)
             })
         }
 
@@ -471,6 +546,27 @@ mod macos {
             Box::pin(async move {
                 self.checked_account(account)?;
                 self.put(message)
+            })
+        }
+        fn reconcile_recent_envelopes<'a>(
+            &'a self,
+            account: &'a AccountId,
+            envelopes: &'a [MessageEnvelope],
+            keep_limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.reconcile(envelopes, keep_limit)
+            })
+        }
+        fn cache_message_if_present<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message: &'a Message,
+        ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.cache_if_present(message)
             })
         }
         fn list_envelopes<'a>(
@@ -1371,6 +1467,179 @@ mod macos {
                     .len(),
                 1
             );
+        }
+
+        #[test]
+        fn reconcile_prunes_in_exact_order_preserves_bodies_and_caches_conditionally() {
+            let (_database, store) = open("reconcile");
+            let retained = envelope("retained", "thread", 70);
+            let displaced = envelope("displaced", "thread", 40);
+            run(store.upsert_envelopes(&account(), &[retained.clone(), displaced.clone()]))
+                .unwrap();
+            let retained_message = Message::new(
+                retained.clone(),
+                MessageContent::new(b"retained body".to_vec()).unwrap(),
+            );
+            run(store.put_message(&account(), &retained_message)).unwrap();
+
+            let input = [
+                envelope("old", "thread", 10),
+                retained.clone(),
+                envelope("tie-b", "thread", 50),
+                envelope("tie-a", "thread", 50),
+            ];
+            let survivors = run(store.reconcile_recent_envelopes(
+                &account(),
+                &input,
+                StoreLimit::new(3).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(
+                survivors.iter().map(MessageId::as_str).collect::<Vec<_>>(),
+                ["retained", "tie-b", "tie-a"]
+            );
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["retained", "tie-a", "tie-b"]
+            );
+            assert_eq!(
+                run(store.message(&account(), retained.message_id()))
+                    .unwrap()
+                    .unwrap(),
+                retained_message
+            );
+
+            let missing = Message::new(
+                envelope("missing", "thread", 60),
+                MessageContent::new(b"missing body".to_vec()).unwrap(),
+            );
+            assert!(!run(store.cache_message_if_present(&account(), &missing)).unwrap());
+            let cached = Message::new(
+                envelope("tie-a", "thread", 50),
+                MessageContent::new(b"cached body".to_vec()).unwrap(),
+            );
+            assert!(run(store.cache_message_if_present(&account(), &cached)).unwrap());
+            assert_eq!(
+                run(store.message(&account(), cached.envelope().message_id()))
+                    .unwrap()
+                    .unwrap(),
+                cached
+            );
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+
+        #[test]
+        fn reconcile_rolls_back_on_failpoints_and_remains_exact_after_reopen() {
+            let (database, store) = open("reconcile-rollback");
+            let initial = envelope("initial", "thread", 10);
+            run(store.upsert_envelopes(&account(), std::slice::from_ref(&initial))).unwrap();
+            store.fail_next_mutation();
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[envelope("new", "thread", 20)],
+                    StoreLimit::new(1).unwrap(),
+                )),
+                Err(MailboxStoreError::Storage)
+            );
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![initial.clone()]
+            );
+            store.fail_next_mutation();
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(&account(), &[], StoreLimit::new(1).unwrap(),)),
+                Err(MailboxStoreError::Storage)
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![initial]
+            );
+        }
+
+        #[test]
+        fn conditional_cache_rolls_back_and_never_reinserts_a_missing_row() {
+            let (database, store) = open("conditional-cache-rollback");
+            let present = envelope("present", "thread", 20);
+            run(store.upsert_envelopes(&account(), std::slice::from_ref(&present))).unwrap();
+            let body = Message::new(
+                present.clone(),
+                MessageContent::new(b"sensitive body".to_vec()).unwrap(),
+            );
+            store.fail_next_mutation();
+            assert_eq!(
+                run(store.cache_message_if_present(&account(), &body)),
+                Err(MailboxStoreError::Storage)
+            );
+            drop(store);
+
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert!(
+                run(reopened.message(&account(), present.message_id()))
+                    .unwrap()
+                    .is_none()
+            );
+            run(reopened.reconcile_recent_envelopes(
+                &account(),
+                &[envelope("newer", "thread", 30)],
+                StoreLimit::new(1).unwrap(),
+            ))
+            .unwrap();
+            assert!(!run(reopened.cache_message_if_present(&account(), &body)).unwrap());
+            assert_eq!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["newer"]
+            );
+        }
+
+        #[test]
+        fn reconcile_rejects_a_null_primary_key_without_mutating_the_database() {
+            let (_database, store) = open("null-primary-key");
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (NULL, 'thread', 'sender', 'subject', 'preview', 50, 0, NULL)",
+                    [],
+                )
+                .unwrap();
+
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[envelope("new", "thread", 100)],
+                    StoreLimit::new(1).unwrap(),
+                )),
+                Err(MailboxStoreError::Corrupted)
+            );
+            let (row_count, inserted_count): (i64, i64) = store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*), COUNT(CASE WHEN message_id = 'new' THEN 1 END) FROM messages",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_count, 1);
+            assert_eq!(inserted_count, 0);
         }
 
         #[test]

@@ -273,6 +273,29 @@ pub trait MailboxStore: Send + Sync {
         account: &'a AccountId,
         message: &'a Message,
     ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
+    /// Atomically reconciles a recent envelope snapshot and returns survivors.
+    ///
+    /// The mutation upserts `envelopes` while preserving existing cached bodies,
+    /// then retains only the newest `keep_limit` rows ordered by received time
+    /// descending and message identifier ascending. Returned identifiers form a
+    /// duplicate-free subsequence of input encounter order and name only input
+    /// rows that survived that deterministic pruning.
+    /// Implementations reject an input longer than [`StoreLimit::MAX`].
+    fn reconcile_recent_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        envelopes: &'a [MessageEnvelope],
+        keep_limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>>;
+    /// Caches a complete message only if its envelope row is still present.
+    ///
+    /// This is one atomic conditional mutation. It never inserts a missing row
+    /// and reports whether the existing row was updated.
+    fn cache_message_if_present<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message: &'a Message,
+    ) -> BoxFuture<'a, Result<bool, MailboxStoreError>>;
     /// Lists envelopes in a deterministic total order: received time descending,
     /// then message identifier ascending, limited by the local result limit.
     fn list_envelopes<'a>(
@@ -481,6 +504,81 @@ mod tests {
                 value.clone(),
             );
             Box::pin(ready(Ok(())))
+        }
+        fn reconcile_recent_envelopes<'a>(
+            &'a self,
+            account: &'a AccountId,
+            values: &'a [MessageEnvelope],
+            keep_limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+            if values.len() > usize::from(StoreLimit::MAX) {
+                return Box::pin(ready(Err(MailboxStoreError::Storage)));
+            }
+            let mut map = self.envelopes.lock().unwrap();
+            let stored = map.entry(account.clone()).or_default();
+            for value in values {
+                if let Some(position) = stored
+                    .iter()
+                    .position(|existing| existing.message_id() == value.message_id())
+                {
+                    stored[position] = value.clone();
+                } else {
+                    stored.push(value.clone());
+                }
+            }
+            stored.sort_by(|left, right| {
+                right
+                    .received_at()
+                    .cmp(&left.received_at())
+                    .then_with(|| left.message_id().as_str().cmp(right.message_id().as_str()))
+            });
+            stored.truncate(usize::from(keep_limit.get()));
+            let survivors = values
+                .iter()
+                .filter(|value| {
+                    stored
+                        .iter()
+                        .any(|stored_value| stored_value.message_id() == value.message_id())
+                })
+                .fold(Vec::new(), |mut ids, value| {
+                    if !ids.iter().any(|id| id == value.message_id()) {
+                        ids.push(value.message_id().clone());
+                    }
+                    ids
+                });
+            self.messages
+                .lock()
+                .unwrap()
+                .retain(|(stored_account, id), _| {
+                    stored_account != account
+                        || stored
+                            .iter()
+                            .any(|stored_value| stored_value.message_id() == id)
+                });
+            Box::pin(ready(Ok(survivors)))
+        }
+        fn cache_message_if_present<'a>(
+            &'a self,
+            account: &'a AccountId,
+            value: &'a Message,
+        ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
+            let exists = self
+                .envelopes
+                .lock()
+                .unwrap()
+                .get(account)
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|stored| stored.message_id() == value.envelope().message_id())
+                });
+            if exists {
+                self.messages.lock().unwrap().insert(
+                    (account.clone(), value.envelope().message_id().clone()),
+                    value.clone(),
+                );
+            }
+            Box::pin(ready(Ok(exists)))
         }
         fn list_envelopes<'a>(
             &'a self,

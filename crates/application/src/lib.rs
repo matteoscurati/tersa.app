@@ -9,5 +9,7 @@
 /// Shared inward mailbox ports and pagination contracts.
 pub mod mailbox;
 pub mod oauth;
+/// Bounded recent-snapshot mailbox synchronization and cache orchestration.
+pub mod sync;
 
 // Rust guideline compliant 1.0.
