@@ -7305,6 +7305,7 @@ dependencies = [
  "getrandom 0.3.4",
  "sha2",
  "subtle",
+ "tersa-domain",
  "url",
  "zeroize",
 ]

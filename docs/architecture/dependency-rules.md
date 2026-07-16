@@ -46,9 +46,9 @@ pull request must explicitly move its name from the reserved table to the
 active policy under review.
 
 When introduced, either adapter may depend inward only on
-`tersa-application` and `tersa-domain`. Mailbox and storage ports belong in
-`tersa-application`; adapters implement those inward-defined ports, while
-`tersa-application` and `tersa-domain` never depend on adapters.
+`tersa-application` and `tersa-domain`. Remote mailbox and local mailbox-store
+ports now exist in `tersa-application`; adapters implement those inward-defined
+ports, while `tersa-application` and `tersa-domain` never depend on adapters.
 
 The future macOS store adapter must declare `rusqlite`, `libsqlite3-sys`,
 `chacha20poly1305`, and `hmac` only under the exact target cfg
