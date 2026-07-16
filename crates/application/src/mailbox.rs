@@ -9,6 +9,7 @@
 //! before dispatch or commit when possible. An already-dispatched or
 //! irreversible operation may finish once, but must not start retries or
 //! unbounded detached work after drop.
+// Rust guideline compliant 1.0.
 
 use std::fmt;
 use std::pin::Pin;
@@ -253,6 +254,41 @@ pub trait RemoteMailbox: Send + Sync {
     ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>>;
 }
 
+/// Reads envelope rows, but no complete message bodies, from a local store.
+///
+/// An envelope includes its existing body-derived preview field. This port
+/// deliberately excludes complete cached message bodies and every mutation;
+/// narrower output adapters must project away preview when their contract
+/// requires metadata only.
+pub trait MailboxReader: Send + Sync {
+    /// Lists envelopes in a deterministic total order: received time descending,
+    /// then message identifier ascending, limited by the local result limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
+    fn list_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
+    /// Lists one thread's envelopes in a deterministic total order: received
+    /// time ascending, then message identifier ascending, limited by the local
+    /// result limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
+    fn thread_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        thread_id: &'a ThreadId,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
+}
+
 /// Persists mailbox data in a local store.
 ///
 /// Store mutations must be atomic and all-or-nothing. After dropping a future,
@@ -260,7 +296,7 @@ pub trait RemoteMailbox: Send + Sync {
 /// may reconcile by re-reading. Each concrete adapter must test its own
 /// cancellation and atomicity behavior. Reusable cross-crate test support is
 /// deferred.
-pub trait MailboxStore: Send + Sync {
+pub trait MailboxStore: MailboxReader {
     /// Inserts or replaces mailbox envelopes for an account.
     fn upsert_envelopes<'a>(
         &'a self,
@@ -296,22 +332,6 @@ pub trait MailboxStore: Send + Sync {
         account: &'a AccountId,
         message: &'a Message,
     ) -> BoxFuture<'a, Result<bool, MailboxStoreError>>;
-    /// Lists envelopes in a deterministic total order: received time descending,
-    /// then message identifier ascending, limited by the local result limit.
-    fn list_envelopes<'a>(
-        &'a self,
-        account: &'a AccountId,
-        limit: StoreLimit,
-    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
-    /// Lists one thread's envelopes in a deterministic total order: received
-    /// time ascending, then message identifier ascending, limited by the local
-    /// result limit.
-    fn thread_envelopes<'a>(
-        &'a self,
-        account: &'a AccountId,
-        thread_id: &'a ThreadId,
-        limit: StoreLimit,
-    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
     /// Retrieves an optional complete message.
     fn message<'a>(
         &'a self,
@@ -466,6 +486,7 @@ mod tests {
         assert!(matches!(poll_once(&mut future), Poll::Pending));
         drop(future);
         assert!(dropped.load(Ordering::SeqCst));
+        let _: Box<dyn MailboxReader> = Box::new(FakeStore::default());
         let _: Box<dyn MailboxStore> = Box::new(FakeStore::default());
     }
 
@@ -580,6 +601,20 @@ mod tests {
             }
             Box::pin(ready(Ok(exists)))
         }
+        fn message<'a>(
+            &'a self,
+            account: &'a AccountId,
+            id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(ready(Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .get(&(account.clone(), id.clone()))
+                .cloned())))
+        }
+    }
+    impl MailboxReader for FakeStore {
         fn list_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -624,18 +659,6 @@ mod tests {
             });
             values.truncate(usize::from(limit.get()));
             Box::pin(ready(Ok(values)))
-        }
-        fn message<'a>(
-            &'a self,
-            account: &'a AccountId,
-            id: &'a MessageId,
-        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
-            Box::pin(ready(Ok(self
-                .messages
-                .lock()
-                .unwrap()
-                .get(&(account.clone(), id.clone()))
-                .cloned())))
         }
     }
 

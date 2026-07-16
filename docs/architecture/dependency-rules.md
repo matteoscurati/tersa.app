@@ -73,12 +73,15 @@ callback while keeping PKCE and callback validation in portable Rust.
 `tersa-application::sync` is the sole shared owner of bounded recent-snapshot
 orchestration. It may use only existing application mailbox ports and
 `tersa-domain`; it introduces no runtime, transport, storage, or background
-dependency. `MailboxStore` implementations own atomic envelope reconciliation
-and conditional body caching. This boundary does not authorize Gmail History or
-cursor sync, deletion reconciliation, retry, background work, mutations,
-outbox, labels, blobs, search, CLI/UI, real network or credentials tests,
-mobile code, or gate-status changes. Cache budgets remain constraints rather
-than evidence.
+dependency. The envelope-only `MailboxReader` owns deterministic envelope
+listing, including the existing body-derived preview field. `MailboxStore:
+MailboxReader` adds atomic envelope reconciliation, conditional body caching,
+complete-message access, and mutations. The strict macOS reader implements only
+`MailboxReader`; metadata-only consumers must project preview away. This
+boundary does not authorize Gmail History or cursor sync, deletion
+reconciliation, retry, background work, mutations, outbox, labels, blobs,
+search, CLI/UI, real network or credentials tests, mobile code, or gate-status
+changes. Cache budgets remain constraints rather than evidence.
 
 ## Reserved macOS key and CLI boundaries
 
@@ -135,15 +138,26 @@ non-inherited App Sandbox entitlement, and the same application group. PR 33
 must satisfy its dedicated signed-package and direct-shell-launch evidence
 condition without depending on or passing the later UI acceptance gate.
 
-The future store activation must keep WAL and shared-memory sidecars persistent
+The active PR 31 store boundary keeps WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The
-reader may coordinate through an existing `-shm`, but it may not create,
-replace, delete, or repair the main database or either sidecar. Missing or
-ordinarily replaced sidecars that remain observable at the post-open check fail
-closed until the owning writer establishes a valid state. The Unix VFS does not
-descriptor-bind its internally opened `-shm` identity to the caller's pathname
-preflight; swap-in/open/swap-back by local malware remains an explicit
-unlocked-device residual, not a prevented attack or release claim.
+reader may coordinate through an existing `-shm`, but it exposes no create,
+replace, delete, or repair operation for the main database or either sidecar.
+Missing or ordinarily replaced sidecars that remain observable at the post-open
+check fail closed until the owning writer establishes a valid state. The Unix
+VFS does not descriptor-bind its internally opened `-shm` identity to the
+caller's pathname preflight and opens sidecars with create-capable internal
+flags. Same-user swap-in/open/swap-back and deletion/recreation races remain
+explicit unlocked-device residuals, not prevented attacks or release claims.
+
+The strict reader opens only existing regular main, WAL, and shared-memory
+files with read-only/no-mutex/no-follow SQLite flags. It validates key, owner,
+schema, SQLCipher and SQLite integrity, account binding, bounded metadata
+decoding, connection-local persistent-WAL state, `journal_size_limit = -1`, and
+pre/post pathname identities. It disables and verifies checkpoint-on-close. It
+has no complete-body API, migration, checkpoint, repair, journal-mode,
+creation, or mutation operation. A missing sidecar at preflight does not enter
+SQLite; deletion after preflight can be recreated internally before the reader
+fails its post-read identity check.
 
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
 Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,

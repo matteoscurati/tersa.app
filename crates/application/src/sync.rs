@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 use tersa_domain::mailbox::AccountId;
 
+#[cfg(test)]
+use crate::mailbox::MailboxReader;
 use crate::mailbox::{
     BoxFuture, MailboxStore, MailboxStoreError, PageSize, RemoteMailbox, RemoteMailboxError,
     StoreLimit,
@@ -500,6 +502,15 @@ mod tests {
             };
             Box::pin(ready(result))
         }
+        fn message<'a>(
+            &'a self,
+            _: &'a AccountId,
+            _: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(ready(Ok(None)))
+        }
+    }
+    impl MailboxReader for TestStore {
         fn list_envelopes<'a>(
             &'a self,
             _: &'a AccountId,
@@ -514,13 +525,6 @@ mod tests {
             _: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(ready(Ok(Vec::new())))
-        }
-        fn message<'a>(
-            &'a self,
-            _: &'a AccountId,
-            _: &'a MessageId,
-        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
-            Box::pin(ready(Ok(None)))
         }
     }
     fn account() -> AccountId {

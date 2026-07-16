@@ -30,9 +30,10 @@ The CLI slice is divided into four independently reviewed pull requests:
 1. **PR 30 — policy:** this ADR, dependency documentation, and fail-closed
    reservations only. It adds no crate, dependency, key access, store opening,
    command, or gate evidence.
-2. **PR 31 — strict read-only SQLCipher open:** extend the existing macOS store
-   adapter with persistent WAL coordination, a separately named read-only
-   constructor, and deterministic standalone/coexistence tests.
+2. **PR 31 — strict read-only SQLCipher open:** the existing macOS store adapter
+   now owns persistent WAL coordination, the separately named
+   `SqlCipherMailboxReader::open_read_only` constructor, and deterministic
+   standalone/coexistence and fail-closed tests.
 3. **PR 32 — macOS Keychain and HKDF provider:** add
    `tersa-keychain-macos`, the inward platform contract it implements, and the
    reviewed provisioning/retrieval and application-group locator split. This
@@ -151,7 +152,7 @@ adapter paths directly, but the production CLI composition exposes no override.
 
 ### Strict read-only store contract
 
-PR 31 must open an existing regular database only and fail when the file is
+PR 31 opens an existing regular database only and fails when the file is
 absent. The read path must preserve the current canonical parent, no-follow
 leaf, path identity, account ownership, exact schema, SQLCipher version,
 SQLite/SQLCipher integrity, bounded decode, and opaque error validation. It
@@ -159,39 +160,44 @@ must not create or claim a database, migrate schema, begin a write transaction,
 fall back to read-write, or repair any state. Opening the CLI is never an
 ownership or migration event.
 
-Every validated read-write store connection sets
+Every validated read-write store connection sets and verifies
 `SQLITE_FCNTL_PERSIST_WAL = 1` after ownership is established, so a clean final
 checkpoint retains both `-wal` and `-shm` for a later reader. The read-only path
 requires the main database and both sidecars to exist with the expected file
-identities before it opens. It never creates, replaces, deletes, or repairs a
-sidecar. If a legacy profile lacks the pair, a crash requires recovery, or a
+identities before it opens. It exposes no create, replace, delete, or repair
+operation. If a legacy profile lacks the pair, a crash requires recovery, or a
 sidecar replacement remains observable during the post-open identity check,
 the reader fails closed until the owning read-write application opens and
 establishes a valid persistent-WAL state.
 
-The live connection uses SQLite read-only mode without `immutable=1` and
-without a private copy. SQLite may update lock and WAL-index coordination in
-the existing `-shm` file; that is not mailbox persistence authority. The main
-database and WAL content must remain unchanged, and no new filesystem entry may
-be created. Deterministic tests must prove both supported states: a standalone
-reader after a clean writer close, and a reader while a writer holds WAL mode
-and commits data that remains in the WAL. They must also prove that missing or
-ordinarily replaced sidecars that remain observable at the post-open check fail
-without creation or database/WAL mutation. The swap-in/open/swap-back race
-fixture records the accepted non-detection instead of asserting prevention.
-Busy, moved-path, wrong-key, foreign-owner, unknown-schema, and integrity
-failures remain fail closed and redacted.
+The live connection uses SQLite read-only/no-mutex/no-follow mode without
+`immutable=1` and without a private copy. It disables and verifies
+checkpoint-on-close. SQLite may update lock and WAL-index coordination in the
+existing `-shm` file; that is not mailbox persistence authority. In uncontended
+operation, main and WAL content remain unchanged and no entry is created.
+Deterministic tests prove both supported states: a standalone reader after a
+clean writer close, and a reader while a writer holds WAL mode and commits data
+that remains in the WAL. Missing sidecars at preflight and ordinary replacements
+that remain observable at the post-open check fail without database/WAL
+mutation. The bundled VFS opens WAL/SHM with create-capable internal flags, so
+same-user deletion after preflight can recreate an entry before the post-read
+identity check fails closed. Fixtures record that deletion/recreation residual
+and the swap-in/open/swap-back non-detection instead of asserting prevention.
+The reader verifies connection-local persistent-WAL state and requires
+`journal_size_limit = -1`. Busy, moved-path, wrong-key, foreign-owner,
+unknown-schema, and integrity failures remain fail closed and redacted.
 
 The current bundled Unix VFS does not expose a supported handle that binds its
 internally opened `-shm` inode to the caller's preflight identity. Pre-open and
 post-open pathname identity checks detect ordinary replacement but cannot prove
-defense against a same-user regular-file swap-in/open/swap-back race. PR 31
-must include the deterministic race fixture and document that limitation; it
-must not claim the sidecar handle is descriptor-bound. A process able to race
-files inside the signed App Group container is treated as the existing
-unlocked-device/local-malware residual threat. If review expands that attacker
-into scope, direct SQLite access stops and the design moves to an owning host
-or a reviewed VFS rather than overstating the check.
+defense against same-user regular-file swap-in/open/swap-back or
+deletion/recreation races. PR 31 includes deterministic fixtures for both
+limitations and does not claim that sidecar handles are descriptor-bound or
+non-create-capable. A process able to race files inside the signed App Group
+container is treated as the existing unlocked-device/local-malware residual
+threat. If review expands that attacker into scope, direct SQLite access stops
+and the design moves to an owning host or a reviewed VFS rather than overstating
+the check.
 
 ### CLI and JSON contract
 
@@ -245,9 +251,9 @@ semantics.
 
 ## Non-claims
 
-This ADR and PR 30 implement no CLI, Keychain provider, key derivation,
-read-only SQLCipher constructor, profile discovery, IPC, or `maild`. They pass
-no gate and leave Phase 1 roadmap item 7 open. They do not add real Google
+This ADR and PR 31 implement no CLI, Keychain provider, key derivation, profile
+discovery, IPC, or `maild`. They pass no gate and leave Phase 1 roadmap item 7
+open. They do not add real Google
 authorization, token persistence, sync, background work, mailbox mutation,
 search, UI, or release evidence.
 

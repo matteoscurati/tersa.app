@@ -41,6 +41,25 @@ been established; a foreign file is rejected unchanged. The adapter's only
 synchronous call. Raw keying avoids the non-zeroizing SQL builder that a key
 PRAGMA would otherwise use.
 
+The adapter also implements the envelope-only `MailboxReader` port through
+`SqlCipherMailboxReader::open_read_only`. This type opens only an existing
+regular main database with existing regular `-wal` and `-shm` sidecars, uses
+SQLite read-only/no-mutex/no-follow flags, and has no complete-message-body or
+mutation capability. It performs exact key, owner, schema, SQLCipher, integrity,
+account, bounded-decode, and pre/post pathname-identity checks inside a live
+read transaction. It disables and verifies checkpoint-on-close and exposes no
+creation, claim, migration, repair, checkpoint, or journal-mode operation. It
+does not use `immutable=1` or a private copy. `MessageEnvelope` still contains
+the existing body-derived preview; the later CLI projection excludes it.
+
+Every validated writer sets and reads back `SQLITE_FCNTL_PERSIST_WAL = 1` only
+after ownership is established. The reader independently sets and reads back
+the same connection-local flag before validation and requires
+`journal_size_limit = -1`. This prevents a clean writer close or reader close
+from deleting the sidecar pair. Missing or observably replaced sidecars fail
+closed. SQLite may update coordination bytes in the existing `-shm`; tests
+prove that metadata reads do not change main-database or WAL bytes.
+
 The adapter is synchronous internally but returns lazy, runtime-free futures.
 Later orchestration must poll it on a bounded blocking executor; it must not be
 run on a latency-sensitive async executor thread. Each write is one SQLCipher
@@ -76,9 +95,22 @@ denial, and absence of plaintext sentinels from the database and sidecars. A
 broader process-crash harness is deferred until the store adds a commit protocol
 beyond one SQLCipher transaction.
 
+Reader tests additionally cover clean standalone use, coexistence with a live
+writer and WAL-resident commits, missing, non-regular, symlinked, and ordinarily
+replaced sidecars, rollback journals, fresh/zero-length candidates, wrong keys
+and owners, unknown schemas, invalid row values, redacted failures,
+journal-size policy, unpolled futures, unchanged main/WAL bytes, and stable
+main/WAL/SHM pathname identities. The bundled Unix VFS cannot descriptor-bind
+the internally opened `-shm` inode to the preflight pathname and internally
+opens WAL/SHM with create-capable flags. Deterministic fixtures record the
+accepted same-user swap-in/open/swap-back non-detection and deletion/recreation
+residual instead of claiming prevention. An absent sidecar at preflight still
+fails without creation; deletion after preflight can be recreated by the VFS
+before the post-read identity check fails closed.
+
 ## Consequences
 
-The adapter is macOS-only and has no keychain, global database, cache, search,
+The adapter is macOS-only and has no keychain, global database, search,
 mobile, retry, pool, or sync-orchestration behavior. Its path, key, account,
 headers, identifiers, and message bodies are never included in errors or debug
 output.
