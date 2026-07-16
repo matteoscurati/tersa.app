@@ -5,11 +5,11 @@
 //! Bounded recent-snapshot synchronization without a runtime or background work.
 // Rust guideline compliant 1.0.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Mutex;
 
-use tersa_domain::mailbox::{AccountId, MessageEnvelope};
+use tersa_domain::mailbox::AccountId;
 
 use crate::mailbox::{
     BoxFuture, MailboxStore, MailboxStoreError, PageSize, RemoteMailbox, RemoteMailboxError,
@@ -269,7 +269,9 @@ where
     ) -> Result<SyncReport, SyncFailure> {
         let mut progress = SyncProgress::default();
         let capacity = usize::from(policy.keep_limit.get());
-        let mut envelopes = Vec::with_capacity(capacity);
+        let page_capacity = usize::from(policy.page_size.get());
+        let mut envelopes = Vec::with_capacity(capacity.saturating_add(page_capacity));
+        let mut envelope_positions = HashMap::with_capacity(capacity.saturating_add(page_capacity));
         let mut tokens = Vec::with_capacity(usize::from(policy.max_pages));
         let mut next_token = None;
 
@@ -288,11 +290,8 @@ where
                 ));
             }
             for envelope in items {
-                if let Some(existing) = envelopes
-                    .iter()
-                    .find(|item: &&MessageEnvelope| item.message_id() == envelope.message_id())
-                {
-                    if existing != &envelope {
+                if let Some(position) = envelope_positions.get(envelope.message_id()) {
+                    if envelopes[*position] != envelope {
                         return Err(failure(
                             SyncFailureSource::Protocol(SyncProtocolError::ConflictingDuplicate),
                             progress,
@@ -300,25 +299,31 @@ where
                     }
                     continue;
                 }
+                envelope_positions.insert(envelope.message_id().clone(), envelopes.len());
                 envelopes.push(envelope);
-                progress.envelopes += 1;
-                if envelopes.len() == capacity {
-                    progress.snapshot_truncated = true;
-                    break;
+                if envelopes.len() <= capacity {
+                    progress.envelopes += 1;
                 }
             }
-            if progress.snapshot_truncated {
-                break;
+            let reached_keep_limit = envelopes.len() >= capacity;
+            if envelopes.len() > capacity {
+                envelopes.truncate(capacity);
             }
-            let Some(token) = continuation else {
-                break;
-            };
-            if tokens.iter().any(|seen| seen == &token) {
+            if let Some(token) = continuation.as_ref()
+                && tokens.iter().any(|seen| seen == token)
+            {
                 return Err(failure(
                     SyncFailureSource::Protocol(SyncProtocolError::RepeatedContinuation),
                     progress,
                 ));
             }
+            if reached_keep_limit {
+                progress.snapshot_truncated = true;
+                break;
+            }
+            let Some(token) = continuation else {
+                break;
+            };
             tokens.push(token.clone());
             if progress.pages == policy.max_pages {
                 progress.snapshot_truncated = true;
@@ -388,7 +393,9 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
-    use tersa_domain::mailbox::{HeaderText, Message, MessageId, ThreadId, UnixTimestampMillis};
+    use tersa_domain::mailbox::{
+        HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+    };
 
     use super::*;
     use crate::mailbox::Page;
@@ -632,6 +639,59 @@ mod tests {
         assert_eq!(
             error.category(),
             SyncFailureSource::Protocol(SyncProtocolError::ConflictingDuplicate)
+        );
+        assert_eq!(*coordinator.store.reconciles.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn keep_limit_does_not_bypass_validation_of_the_rest_of_the_page() {
+        let coordinator = SyncCoordinator::new(
+            TestRemote::new(vec![Ok(Page::new(
+                vec![envelope("same", 1), envelope("same", 2)],
+                None,
+            ))]),
+            TestStore::default(),
+        );
+        let keep_one = SyncPolicy::new(
+            PageSize::new(2).unwrap(),
+            1,
+            StoreLimit::new(1).unwrap(),
+            StoreLimit::new(1).unwrap(),
+        )
+        .unwrap();
+
+        let error = run(coordinator.sync_recent(&account(), keep_one)).unwrap_err();
+
+        assert_eq!(
+            error.category(),
+            SyncFailureSource::Protocol(SyncProtocolError::ConflictingDuplicate)
+        );
+        assert_eq!(*coordinator.store.reconciles.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn keep_limit_does_not_bypass_repeated_continuation_validation() {
+        let repeated = crate::mailbox::PageToken::new("repeat-at-limit").unwrap();
+        let coordinator = SyncCoordinator::new(
+            TestRemote::new(vec![
+                Ok(Page::new(Vec::new(), Some(repeated.clone()))),
+                Ok(Page::new(vec![envelope("fills-limit", 1)], Some(repeated))),
+            ]),
+            TestStore::default(),
+        );
+        let keep_one = SyncPolicy::new(
+            PageSize::new(1).unwrap(),
+            2,
+            StoreLimit::new(1).unwrap(),
+            StoreLimit::new(1).unwrap(),
+        )
+        .unwrap();
+
+        let error = run(coordinator.sync_recent(&account(), keep_one)).unwrap_err();
+
+        assert_eq!(
+            error.category(),
+            SyncFailureSource::Protocol(SyncProtocolError::RepeatedContinuation)
         );
         assert_eq!(*coordinator.store.reconciles.lock().unwrap(), 0);
     }
@@ -893,7 +953,6 @@ mod tests {
 
     #[test]
     fn failures_and_reports_do_not_format_mailbox_content() {
-        let marker = "private-message-marker";
         let failure = failure(
             SyncFailureSource::Protocol(SyncProtocolError::ConflictingDuplicate),
             SyncProgress {
@@ -905,7 +964,17 @@ mod tests {
         let report = SyncReport {
             progress: failure.progress(),
         };
-        assert!(!format!("{failure:?} {failure}").contains(marker));
-        assert!(!format!("{report:?}").contains(marker));
+        assert_eq!(
+            format!("{failure:?}"),
+            "SyncFailure { source: Protocol(ConflictingDuplicate), progress: SyncProgress { pages: 1, envelopes: 2, body_requests: 0, bodies_cached: 0, bodies_skipped: 0, snapshot_truncated: false } }"
+        );
+        assert_eq!(
+            failure.to_string(),
+            "bounded mailbox synchronization failed"
+        );
+        assert_eq!(
+            format!("{report:?}"),
+            "SyncReport { progress: SyncProgress { pages: 1, envelopes: 2, body_requests: 0, bodies_cached: 0, bodies_skipped: 0, snapshot_truncated: false } }"
+        );
     }
 }

@@ -13,6 +13,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fmt;
     use std::fs::OpenOptions;
@@ -242,6 +243,16 @@ mod macos {
             }
             self.with_connection(|connection| {
                 let transaction = connection.transaction().map_err(store_error)?;
+                let has_null_identifier: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id IS NULL)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(store_error)?;
+                if has_null_identifier {
+                    return Err(MailboxStoreError::Corrupted);
+                }
                 for envelope in envelopes {
                     write_envelope(&transaction, envelope, None)?;
                     #[cfg(test)]
@@ -258,17 +269,21 @@ mod macos {
                     return Err(MailboxStoreError::Storage);
                 }
                 let mut survivors = Vec::with_capacity(envelopes.len());
-                for envelope in envelopes {
-                    if survivors.iter().any(|id: &MessageId| id == envelope.message_id()) {
-                        continue;
-                    }
-                    let exists: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1)",
-                        params![envelope.message_id().as_str()],
-                        |row| row.get(0),
-                    ).map_err(store_error)?;
-                    if exists {
-                        survivors.push(envelope.message_id().clone());
+                let mut seen = HashSet::with_capacity(envelopes.len());
+                {
+                    let mut statement = transaction
+                        .prepare("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1)")
+                        .map_err(store_error)?;
+                    for envelope in envelopes {
+                        if !seen.insert(envelope.message_id().clone()) {
+                            continue;
+                        }
+                        let exists: bool = statement
+                            .query_row(params![envelope.message_id().as_str()], |row| row.get(0))
+                            .map_err(store_error)?;
+                        if exists {
+                            survivors.push(envelope.message_id().clone());
+                        }
                     }
                 }
                 transaction.commit().map_err(store_error)?;
@@ -1590,6 +1605,41 @@ mod macos {
                     .collect::<Vec<_>>(),
                 ["newer"]
             );
+        }
+
+        #[test]
+        fn reconcile_rejects_a_null_primary_key_without_mutating_the_database() {
+            let (_database, store) = open("null-primary-key");
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (NULL, 'thread', 'sender', 'subject', 'preview', 50, 0, NULL)",
+                    [],
+                )
+                .unwrap();
+
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[envelope("new", "thread", 100)],
+                    StoreLimit::new(1).unwrap(),
+                )),
+                Err(MailboxStoreError::Corrupted)
+            );
+            let (row_count, inserted_count): (i64, i64) = store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*), COUNT(CASE WHEN message_id = 'new' THEN 1 END) FROM messages",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row_count, 1);
+            assert_eq!(inserted_count, 0);
         }
 
         #[test]
