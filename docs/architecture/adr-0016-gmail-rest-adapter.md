@@ -1,0 +1,59 @@
+# ADR 0016: Gmail REST mailbox adapter
+
+- Status: Accepted
+- Date: 2026-07-16
+
+## Context
+
+The application mailbox port needs a macOS production adapter without making
+the application or domain depend on a networking runtime or Gmail DTOs.
+
+## Decision
+
+`tersa-gmail-rest-macos` implements the existing `RemoteMailbox` port. It is
+read-only and uses only authenticated `GET` requests below the fixed production
+base `https://gmail.googleapis.com/gmail/v1/users/me`. It lists message IDs,
+then hydrates them sequentially with metadata requests, preserving the provider
+order. A message can be deleted after it appears in `messages.list`; a 404 from
+that hydration request is skipped, while every other hydration failure fails the
+page.
+
+A page containing more messages than its requested `maxResults` is invalid and
+is rejected before hydration. Provider-neutral message identifiers equal to
+`.` or `..` are also rejected before transport because URL path-segment APIs
+normalize those reserved values and would target the wrong resource.
+
+Each adapter instance is bound to one opaque local `AccountId` before any I/O.
+A different account returns `AuthorizationRequired`; Gmail's `users/me` result
+cannot therefore be attributed to another local account. The macOS constructor
+immediately wraps a short-lived access token in `Zeroizing` before validation.
+Rotation is performed by replacing the adapter. This adapter performs no token
+exchange, refresh, persistence, Keychain access, retries, batching, history
+sync, checkpointing, or logging.
+
+Metadata requests use a partial response selector and select only `From` and
+`Subject` headers. Missing singleton headers are represented by an empty
+`HeaderText`; duplicate case-insensitive
+singleton headers are invalid. Raw fetches verify the requested message and
+thread identity across metadata and raw responses, accept padded or unpadded
+base64url raw data, and return only decoded RFC 5322 bytes as `MessageContent`.
+Label changes are tolerated. All DTO strings, JSON bodies, encoded raw input,
+and decoded data are bounded. Errors are deliberately provider-data-free.
+
+The reqwest client is macOS-only, HTTPS-only, has redirects and proxies
+disabled, uses bounded timeouts, and does not compile cookie, decompression, or
+multipart features. Response data is checked while it is accumulated; a
+content-length is only an early rejection hint. Only bounded 403 error JSON is
+read; bodies for statuses whose mapping is body-independent are discarded.
+
+## Consequences
+
+`reqwest` 0.13.4 is an exact, target-scoped dependency exclusive to this
+adapter. Shared layers remain std-only at the mailbox boundary. The adapter is
+not an iPhone or iPad product claim.
+
+## References
+
+- [Gmail messages.list](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list)
+- [Gmail messages.get](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get)
+- [Gmail Message resource](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages#Message)
