@@ -485,7 +485,7 @@ mod macos {
                     WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?3 THEN sql
                 END
              FROM sqlite_schema
-             WHERE name NOT LIKE 'sqlite_%'
+             WHERE name NOT GLOB 'sqlite_*'
              ORDER BY type, name
              LIMIT ?4",
         )?;
@@ -697,7 +697,7 @@ mod macos {
             let connection = open_connection(unknown.path()).unwrap();
             apply_key(&connection, &key(7).0).unwrap();
             connection
-                .execute_batch("CREATE TABLE foreign_owner (value TEXT NOT NULL);")
+                .execute_batch("CREATE TABLE sqliteX (value TEXT NOT NULL);")
                 .unwrap();
             let unknown_schema = schema(&connection).unwrap();
             let unknown_journal: String = connection
@@ -719,6 +719,20 @@ mod macos {
                 unknown_journal
             );
             drop(unchanged);
+
+            let (hidden_extra_database, hidden_extra) = open("hidden-extra-schema");
+            hidden_extra
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch("CREATE TABLE sqliteX (value TEXT NOT NULL);")
+                .unwrap();
+            drop(hidden_extra);
+            assert_corrupted(SqlCipherMailboxStore::open(
+                account(),
+                hidden_extra_database.path(),
+                key(7),
+            ));
 
             let excessive = TestDatabase::new("excessive-schema");
             let excessive_connection = open_connection(excessive.path()).unwrap();
