@@ -31,8 +31,8 @@ The CLI slice is divided into four independently reviewed pull requests:
    reservations only. It adds no crate, dependency, key access, store opening,
    command, or gate evidence.
 2. **PR 31 — strict read-only SQLCipher open:** extend the existing macOS store
-   adapter with a separately named read-only constructor and deterministic
-   coexistence tests.
+   adapter with persistent WAL coordination, a separately named read-only
+   constructor, and deterministic standalone/coexistence tests.
 3. **PR 32 — macOS Keychain and HKDF provider:** add
    `tersa-keychain-macos`, the inward platform contract it implements, and the
    reviewed provisioning/retrieval split.
@@ -49,10 +49,24 @@ The product application, never the CLI, provisions exactly one installation
 root key when the fixed Keychain item is absent. It generates 32 bytes with
 Apple's CSPRNG and stores them as a generic-password item with service
 `app.tersa.mac.storage-root.v1`, account `default`,
-`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and synchronization
-disabled. Existing items are retrieved but never replaced implicitly. The CLI
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, synchronization disabled,
+and the shared application-group identifier as `kSecAttrAccessGroup`. Every
+add, copy, update, and delete query sets `kSecUseDataProtectionKeychain` to
+true; there is no legacy-keychain fallback. Missing entitlement, unexpected
+item attributes, or a query that cannot use the Data Protection Keychain fails
+closed. Existing items are retrieved but never replaced implicitly. The CLI
 has retrieval-only access: an absent item is an error and cannot cause key
 generation, import, repair, rotation, or a second Keychain write.
+
+The macOS application and `mailctl` are two targets of one distribution. Both
+are signed by the same Apple Developer team, carry the same registered
+application-group entitlement, and use that group as their shared Keychain
+access group. The official CLI is the signed executable shipped inside the app
+bundle; a package manager may install only a symlink to that exact executable,
+not rebuild or re-sign it independently. Community distributions must register
+and inject their own group under their own signing team. Unsigned, differently
+signed, missing-entitlement, or mismatched-group builds receive no production
+fallback and cannot claim Keychain/profile interoperability.
 
 The root key is never exported or accepted through arguments, environment,
 stdin, files, IPC, logs, diagnostics, or JSON. The provider derives a 32-byte
@@ -83,20 +97,26 @@ incidental manifest edit.
 ### Fixed profile layout
 
 Production resolution accepts no database path, profile-root, Keychain
-service, or derivation-purpose override from command-line flags, environment,
-configuration, or test hooks. The only Phase 1 production profile is `default`
-under the user's application-support directory:
+service, access group, or derivation-purpose override from command-line flags,
+environment, configuration, or test hooks. The only Phase 1 production profile
+is `default` under the shared application-group container returned by
+`FileManager.containerURL(forSecurityApplicationGroupIdentifier:)`:
 
 ```text
-~/Library/Application Support/tersa.app/profiles/default/
+<shared-group-container>/profiles/default/
   accounts/<sha256-account-id>/mail.sqlite3
 ```
 
+The application-group identifier is a required signing-time setting shared by
+the app and CLI entitlements. Resolution must verify access to the returned
+container because macOS may return an expected-form URL even for an invalid
+group. It never falls back to a normal Application Support path or either
+target's private sandbox container. Official distribution must be notarized
+and satisfy the Phase 1 App Sandbox gate before PR 33 can land.
+
 `<sha256-account-id>` is the 64-character lowercase hexadecimal SHA-256 digest
-of the validated opaque `AccountId` UTF-8 bytes. Platform APIs resolve the home
-application-support directory; literal tilde expansion is not the
-implementation. Tests may construct isolated adapter paths directly, but the
-production CLI composition exposes no override.
+of the validated opaque `AccountId` UTF-8 bytes. Tests may construct isolated
+adapter paths directly, but the production CLI composition exposes no override.
 
 ### Strict read-only store contract
 
@@ -104,16 +124,29 @@ PR 31 must open an existing regular database only and fail when the file is
 absent. The read path must preserve the current canonical parent, no-follow
 leaf, path identity, account ownership, exact schema, SQLCipher version,
 SQLite/SQLCipher integrity, bounded decode, and opaque error validation. It
-must not create or claim a database, migrate schema, configure durable pragmas,
-begin a write transaction, fall back to read-write, or repair any state.
-Opening the CLI is never an ownership or migration event.
+must not create or claim a database, migrate schema, begin a write transaction,
+fall back to read-write, or repair any state. Opening the CLI is never an
+ownership or migration event.
+
+Every validated read-write store connection sets
+`SQLITE_FCNTL_PERSIST_WAL = 1` after ownership is established, so a clean final
+checkpoint retains both `-wal` and `-shm` for a later reader. The read-only path
+requires the main database and both sidecars to exist with the expected file
+identities before it opens. It never creates, replaces, deletes, or repairs a
+sidecar. If a legacy profile lacks the pair, a crash requires recovery, or a
+sidecar changes during open, the reader fails closed until the owning
+read-write application opens and establishes a valid persistent-WAL state.
 
 The live connection uses SQLite read-only mode without `immutable=1` and
-without a private copy. Deterministic tests must hold a read-write connection
-open in WAL mode, commit data that remains in the WAL, and prove that the
-read-only connection observes the committed state while producing no durable
-mutation. Busy, sidecar, moved-path, wrong-key, foreign-owner, unknown-schema,
-and integrity failures remain fail closed and redacted.
+without a private copy. SQLite may update lock and WAL-index coordination in
+the existing `-shm` file; that is not mailbox persistence authority. The main
+database and WAL content must remain unchanged, and no new filesystem entry may
+be created. Deterministic tests must prove both supported states: a standalone
+reader after a clean writer close, and a reader while a writer holds WAL mode
+and commits data that remains in the WAL. They must also prove that missing or
+replaced sidecars fail without creation or database/WAL mutation. Busy,
+moved-path, wrong-key, foreign-owner, unknown-schema, and integrity failures
+remain fail closed and redacted.
 
 ### CLI and JSON contract
 
@@ -154,7 +187,8 @@ stderr contract is:
 | 7 | `mailctl: operation failed` |
 
 Serialization is completed before the first stdout write. A broken pipe or
-partial stdout write returns 7 without retrying or printing content to stderr.
+partial stdout write returns 7 without retrying and emits the same fixed
+`mailctl: operation failed` stderr line; it never emits mailbox content.
 
 `tersa-cli-macos` may depend inward on `tersa-application`, `tersa-domain`,
 `tersa-platform`, `tersa-store-sqlcipher-macos`, and
@@ -180,7 +214,9 @@ evidence closes a mobile or mobile-inclusive gate.
 ## Consequences
 
 The first CLI is intentionally narrow and locally replaceable. Key generation
-has one owner, direct database reads cannot mutate or silently ignore live WAL,
-and JSON output has a defined privacy boundary. Future commands, renderers,
-profiles, key rotation, path overrides, and IPC require separately reviewed
-contracts rather than compatibility assumptions.
+has one owner, the Data Protection Keychain and application-group boundaries
+are shared only by same-team signed targets, direct database reads cannot
+mutate or silently ignore live WAL, and JSON output has a defined privacy
+boundary. Future commands, renderers, profiles, key rotation, path overrides,
+and IPC require separately reviewed contracts rather than compatibility
+assumptions.

@@ -114,6 +114,22 @@ edges without separately accepted ADR reasoning. `tersa-cli-macos` receives no
 general Apple-framework, SQLCipher, key export, database-path override, or
 transport capability from its reservation.
 
+The future adapter must opt every macOS Keychain operation into the Data
+Protection Keychain, disable synchronization, and name the registered
+application group shared by the same-team signed app and bundled `mailctl`
+target. The same group owns their shared filesystem container. Neither target
+may fall back to the legacy Keychain, a private sandbox container, or ordinary
+Application Support when the entitlement, group, or container is unavailable.
+The official CLI is the signed executable from the notarized app distribution;
+a package-manager entry may point to it but may not substitute a separately
+rebuilt binary.
+
+The future store activation must keep WAL and shared-memory sidecars persistent
+from the validated writer before authorizing a standalone read-only open. The
+reader may coordinate through an existing `-shm`, but it may not create,
+replace, delete, or repair the main database or either sidecar. Missing or
+changed sidecars fail closed until the owning writer establishes a valid state.
+
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
 Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,
 Phase 1 roadmap item 7 remains open. The CLI's direct store reader is an interim

@@ -1436,6 +1436,16 @@ mod tests {
     }
 
     #[test]
+    fn ignores_reservations_while_the_future_crates_are_absent() {
+        let resolved = BTreeMap::from([
+            ("tersa-application".to_owned(), BTreeSet::new()),
+            ("tersa-platform".to_owned(), BTreeSet::new()),
+        ]);
+
+        assert!(reserved_future_policy_violations(&resolved).is_empty());
+    }
+
+    #[test]
     fn reports_dependencies_beyond_a_reserved_boundary() {
         let resolved = BTreeMap::from([(
             "tersa-keychain-macos".to_owned(),
