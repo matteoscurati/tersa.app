@@ -14,7 +14,7 @@ production-security claim.
 |---|---|
 | OAuth authorization codes, refresh tokens, and AI provider keys | Short lifetime where applicable; device-only Keychain storage; never logs, process arguments, or repository files |
 | Gmail messages, headers, addresses, labels, drafts, and local intent | Authenticated transport; encrypted local persistence; account isolation; bounded retention |
-| Root and derived encryption keys | CSPRNG generation; Keychain wrapping; domain-separated derivation; no export or diagnostics |
+| Root and derived encryption keys | CSPRNG generation; device-only Data Protection Keychain storage; domain-separated derivation; no export or diagnostics |
 | SQLCipher databases, WAL/journals, blobs, thumbnails, and search indexes | Application encryption at rest; controlled temporary storage; integrity checks; crypto-erasure |
 | MIME, HTML, inline resources, and attachments | Bounded parsing; typed sanitized output; deny-by-default rendering; no automatic remote fetch |
 | Exports, clipboard data, and notifications | Explicit user declassification; minimum disclosure; no claim of encryption after export |

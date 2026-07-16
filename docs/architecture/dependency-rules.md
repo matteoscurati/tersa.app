@@ -128,22 +128,26 @@ export API. PR 33 also owns the same-team signed runtime evidence; PR 32 fake
 concurrency tests are not that evidence.
 
 The active adapter opts every macOS Keychain operation into the Data
-Protection Keychain, disable synchronization, and name the registered
-application group shared by the same-team signed app and bundled `mailctl`
-target. The same group owns their shared filesystem container. Neither target
-may fall back to the legacy Keychain, a private sandbox container, or ordinary
-Application Support when the entitlement, group, or container is unavailable.
-The official CLI is the signed executable from the notarized app distribution;
-a package-manager entry may point to it but may not substitute a separately
-rebuilt binary.
+Protection Keychain, omits `kSecAttrSynchronizable` from add and copy queries,
+and names the registered application group currently carried by the macOS app
+target. That group also identifies the app's filesystem container. The active
+adapter does not fall back to the legacy Keychain, the app's private sandbox
+container, or ordinary Application Support when the entitlement, group, or
+container is unavailable. PR 33 will add the separately signed bundled
+`mailctl` target, give both targets the same registered group, and supply the
+cross-target runtime evidence. Only then may the official CLI be described as
+the signed executable from the notarized app distribution; a package-manager
+entry may point to that executable but may not substitute a separately rebuilt
+binary.
 
 Provisioning must use a raw add-only operation. A duplicate discards and
 zeroizes the losing candidate, then retrieves and validates the winner; it
-never calls an add-or-update generic-password helper. The shell-launched CLI
-has its own stable bundle identifier, embedded Info.plist, Hardened Runtime,
-non-inherited App Sandbox entitlement, and the same application group. PR 33
-must satisfy its dedicated signed-package and direct-shell-launch evidence
-condition without depending on or passing the later UI acceptance gate.
+never calls an add-or-update generic-password helper. The future shell-launched
+CLI must have its own stable bundle identifier, embedded Info.plist, Hardened
+Runtime, non-inherited App Sandbox entitlement, and the same application group.
+PR 33 must satisfy its dedicated signed-package and direct-shell-launch
+evidence condition without depending on or passing the later UI acceptance
+gate.
 
 The active PR 31 store boundary keeps WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The

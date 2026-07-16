@@ -55,7 +55,9 @@ Apple's CSPRNG and stores them as a generic-password item with service
 `app.tersa.mac.storage-root.v1`, account `default`,
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, synchronization disabled,
 and the shared application-group identifier as `kSecAttrAccessGroup`. Every
-add and copy query sets `kSecUseDataProtectionKeychain` to true; update and
+add and copy query omits `kSecAttrSynchronizable` and sets
+`kSecUseDataProtectionKeychain` to true; an attribute-returning copy accepts
+the synchronization attribute only when it is absent or false. Update and
 delete operations are not implemented. There is no legacy-keychain fallback.
 Missing entitlement, unexpected item attributes, or a query that cannot use
 the Data Protection Keychain fails closed. Existing items are retrieved but
@@ -78,13 +80,13 @@ entitlement, and use that group as their shared Keychain access group.
 embedded Info.plist section, Hardened Runtime, and its own
 `com.apple.security.app-sandbox = true` entitlement. It is
 launched directly by the shell and therefore must not use
-`com.apple.security.inherit`. The official CLI is the signed executable shipped
-inside the app bundle; a package manager may install only a symlink to that
-exact executable, not rebuild or re-sign it independently. Community
-distributions must register and inject their own group under their own signing
-team. Unsigned, differently signed, missing-entitlement, or mismatched-group
-builds receive no production fallback and cannot claim Keychain/profile
-interoperability.
+`com.apple.security.inherit`. After PR 33, the official CLI will be the signed
+executable shipped inside the app bundle; a package manager may then install
+only a symlink to that exact executable, not rebuild or re-sign it
+independently. Community distributions must register and inject their own
+group under their own signing team. Unsigned, differently signed,
+missing-entitlement, or mismatched-group builds receive no production fallback
+and cannot claim Keychain/profile interoperability.
 
 The root key is never exported or accepted through arguments, environment,
 stdin, files, IPC, logs, diagnostics, or JSON. PR 32 keeps retrieval and
@@ -98,6 +100,10 @@ two-byte big-endian purpose length and its ASCII bytes. Purposes are a closed,
 versioned enum; the initial value is `sqlcipher/account-database/v1`. Unknown
 versions or purposes fail closed. Root and derived key buffers use best-effort
 zeroization and never implement content-revealing `Debug` or serialization.
+This guarantee covers explicit buffers owned by the adapter; the internal
+state and temporary storage of the `hkdf`, `hmac`, and digest implementations
+are outside `zeroize`'s guarantee and may leave transient copies in process
+memory.
 PR 33 owns the trusted composition that will pass a privately derived key
 directly into strict database opening without returning key bytes to the CLI.
 

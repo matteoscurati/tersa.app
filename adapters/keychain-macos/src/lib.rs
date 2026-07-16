@@ -384,7 +384,7 @@ mod macos_keychain {
             data,
             returning,
             Some(security_string!(item::kSecClassGenericPassword)),
-            Some(CFBoolean::false_value().as_CFType()),
+            None,
         )
     }
 
@@ -618,7 +618,7 @@ mod macos_keychain {
         }
 
         #[test]
-        fn copy_query_is_fixed_to_data_protection_non_sync_group_and_limit_two() {
+        fn copy_query_omits_synchronizable_and_fixes_data_protection_group_and_limit() {
             let group = "TEAM.app.tersa.shared";
             let query = record_dictionary(group, None, true);
             assert_dictionary_value(
@@ -631,10 +631,10 @@ mod macos_keychain {
                 &security_string!(item::kSecUseDataProtectionKeychain),
                 &CFBoolean::true_value().as_CFType(),
             );
-            assert_dictionary_value(
-                &query,
-                &security_string!(item::kSecAttrSynchronizable),
-                &CFBoolean::false_value().as_CFType(),
+            assert!(
+                query
+                    .find(security_string!(item::kSecAttrSynchronizable).as_CFTypeRef())
+                    .is_none()
             );
             assert_dictionary_value(
                 &query,
@@ -650,6 +650,27 @@ mod macos_keychain {
                 &query,
                 &security_string!(item::kSecReturnAttributes),
                 &CFBoolean::true_value().as_CFType(),
+            );
+        }
+
+        #[test]
+        fn add_dictionary_omits_synchronizable_and_uses_data_protection_keychain() {
+            let candidate = Zeroizing::new([7; 32]);
+            let dictionary = add_dictionary("TEAM.app.tersa.shared", &candidate).unwrap();
+            assert!(
+                dictionary
+                    .find(security_string!(item::kSecAttrSynchronizable).as_CFTypeRef())
+                    .is_none()
+            );
+            assert_dictionary_value(
+                &dictionary,
+                &security_string!(item::kSecUseDataProtectionKeychain),
+                &CFBoolean::true_value().as_CFType(),
+            );
+            assert_dictionary_value(
+                &dictionary,
+                &security_string!(item::kSecValueData),
+                &CFData::from_buffer(&[7; 32]).as_CFType(),
             );
         }
 

@@ -39,6 +39,7 @@ getrandom = "0.3.4"
 hmac = "=0.12.1"
 hkdf = "=0.12.4"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSFileManager", "NSString", "NSURL"] }
+plist = { version = "=1.10.0", default-features = false, features = ["serde"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["native-tls"] }
 rusqlite = { version = "=0.39.0", default-features = false }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
@@ -52,6 +53,7 @@ tersa-application = { path = "crates/application", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 url = "2.5.8"
 zeroize = "1.9.0"
+yaml_serde = { version = "=0.10.4", default-features = false }
 
 [patch.crates-io]
 dioxus-desktop = { path = "vendor/dioxus-desktop-0.7.9" }

@@ -9,11 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::process::{Command, ExitCode};
 
 use cargo_metadata::{Metadata, MetadataCommand, PackageId};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // Rust guideline compliant 1.0.
 
@@ -317,13 +319,128 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
 const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
 const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ProjectTarget {
     name: String,
     platform: String,
-    keys: Vec<Vec<String>>,
-    scalars: BTreeMap<Vec<String>, String>,
-    sequences: BTreeMap<Vec<String>, Vec<String>>,
+    body: StrictYamlValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum StrictYamlValue {
+    Null,
+    OtherScalar,
+    String(String),
+    Sequence(Vec<Self>),
+    Mapping(BTreeMap<String, Self>),
+}
+
+impl<'de> Deserialize<'de> for StrictYamlValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictYamlValueVisitor)
+    }
+}
+
+struct StrictYamlValueVisitor;
+
+impl<'de> Visitor<'de> for StrictYamlValueVisitor {
+    type Value = StrictYamlValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an untagged YAML value with string-only mapping keys")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::Null)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::OtherScalar)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::OtherScalar)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::OtherScalar)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::OtherScalar)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::String(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(StrictYamlValue::Sequence(values))
+    }
+
+    fn visit_map<A>(self, mut mapping: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = BTreeMap::new();
+        while let Some(StrictYamlKey(key)) = mapping.next_key()? {
+            if key == "<<" {
+                return Err(de::Error::custom("YAML merge keys are forbidden"));
+            }
+            let value = mapping.next_value()?;
+            if values.insert(key.clone(), value).is_some() {
+                return Err(de::Error::custom(format!("duplicate mapping key `{key}`")));
+            }
+        }
+        Ok(StrictYamlValue::Mapping(values))
+    }
+}
+
+struct StrictYamlKey(String);
+
+impl<'de> Deserialize<'de> for StrictYamlKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictYamlKeyVisitor)
+    }
+}
+
+struct StrictYamlKeyVisitor;
+
+impl Visitor<'_> for StrictYamlKeyVisitor {
+    type Value = StrictYamlKey;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YAML string mapping key")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictYamlKey(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictYamlKey(value))
+    }
 }
 
 fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<String> {
@@ -360,50 +477,33 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         violations.push("the TersaMac target must declare platform macOS".to_owned());
     }
 
-    let entitlement_prefix = ["entitlements", "properties"];
-    let application_group_path = entitlement_prefix
-        .iter()
-        .chain(["com.apple.security.application-groups"].iter())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let keychain_group_path = entitlement_prefix
-        .iter()
-        .chain(["keychain-access-groups"].iter())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let setting_path = ["settings", "base", "TERSA_MACOS_APP_GROUP"]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
     for (path, label) in [
         (
-            &application_group_path,
+            &[
+                "entitlements",
+                "properties",
+                "com.apple.security.application-groups",
+            ][..],
             "com.apple.security.application-groups",
         ),
-        (&keychain_group_path, "keychain-access-groups"),
+        (
+            &["entitlements", "properties", "keychain-access-groups"][..],
+            "keychain-access-groups",
+        ),
     ] {
-        if application
-            .keys
-            .iter()
-            .filter(|candidate| *candidate == path)
-            .count()
-            != 1
-            || application.sequences.get(path) != Some(&vec![SIGNING_GROUP.to_owned()])
-        {
+        if !yaml_exact_string_array(yaml_path(&application.body, path), SIGNING_GROUP) {
             violations.push(format!(
                 "the TersaMac target `{label}` must contain exactly the registered macOS group"
             ));
         }
     }
-    if application
-        .keys
-        .iter()
-        .filter(|candidate| *candidate == &setting_path)
-        .count()
-        != 1
-        || application.scalars.get(&setting_path).map(String::as_str) != Some(BUILD_SETTING_GROUP)
-    {
+    if !matches!(
+        yaml_path(
+            &application.body,
+            &["settings", "base", "TERSA_MACOS_APP_GROUP"]
+        ),
+        Some(StrictYamlValue::String(value)) if value == BUILD_SETTING_GROUP
+    ) {
         violations.push(
             "the TersaMac target TERSA_MACOS_APP_GROUP setting must exactly match its entitlement group"
                 .to_owned(),
@@ -426,163 +526,104 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
 }
 
 fn parse_plist_string_array(document: &str, key: &str) -> Result<Vec<String>, String> {
-    let marker = format!("<key>{key}</key>");
-    let mut matches = document.match_indices(&marker);
-    let Some((offset, _)) = matches.next() else {
-        return Err("missing key".to_owned());
+    let root: StrictYamlValue = plist::from_bytes(document.as_bytes())
+        .map_err(|error| format!("plist parse failed: {error}"))?;
+    let root = yaml_mapping(&root, "plist root")?;
+    let value = root
+        .get(key)
+        .ok_or_else(|| "missing top-level key".to_owned())?;
+    let StrictYamlValue::Sequence(array) = value else {
+        return Err("top-level value is not an array".to_owned());
     };
-    if matches.next().is_some() {
-        return Err("duplicate key".to_owned());
-    }
-    let mut remaining = document[offset + marker.len()..].trim_start();
-    remaining = remaining
-        .strip_prefix("<array>")
-        .ok_or_else(|| "value is not an array".to_owned())?;
-    let mut values = Vec::new();
-    loop {
-        remaining = remaining.trim_start();
-        if remaining.starts_with("</array>") {
-            return Ok(values);
-        }
-        remaining = remaining
-            .strip_prefix("<string>")
-            .ok_or_else(|| "array contains a non-string member or is unterminated".to_owned())?;
-        let end = remaining
-            .find("</string>")
-            .ok_or_else(|| "unterminated string member".to_owned())?;
-        let value = &remaining[..end];
-        if value.contains('<') || value.contains('&') {
-            return Err("string member uses unsupported nested or escaped content".to_owned());
-        }
-        values.push(value.to_owned());
-        remaining = &remaining[end + "</string>".len()..];
-    }
+    array
+        .iter()
+        .map(|value| {
+            let StrictYamlValue::String(value) = value else {
+                return Err("array contains a non-string member".to_owned());
+            };
+            Ok(value.clone())
+        })
+        .collect()
 }
 
 fn parse_project_targets(document: &str) -> Result<Vec<ProjectTarget>, String> {
-    let lines = document.lines().collect::<Vec<_>>();
-    let target_start = lines
-        .iter()
-        .position(|line| *line == "targets:")
+    let root: StrictYamlValue =
+        yaml_serde::from_str(document).map_err(|error| format!("YAML parse failed: {error}"))?;
+    let root = yaml_mapping(&root, "project root")?;
+    let targets = root
+        .get("targets")
         .ok_or_else(|| "missing top-level targets mapping".to_owned())?;
-    let mut targets = Vec::new();
-    let mut index = target_start + 1;
-    while index < lines.len() {
-        let line = lines[index];
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            index += 1;
-            continue;
-        }
-        let indent = leading_spaces(line)?;
-        if indent == 0 {
-            break;
-        }
-        if indent != 2 || !line.trim_end().ends_with(':') {
-            return Err(format!("unexpected target entry `{}`", line.trim()));
-        }
-        let name = line.trim().trim_end_matches(':').to_owned();
-        let body_start = index + 1;
-        index = body_start;
-        while index < lines.len() {
-            let candidate = lines[index];
-            if !candidate.trim().is_empty()
-                && !candidate.trim_start().starts_with('#')
-                && leading_spaces(candidate)? <= 2
-            {
-                break;
-            }
-            index += 1;
-        }
-        targets.push(parse_project_target(&name, &lines[body_start..index])?);
-    }
+    let targets = yaml_mapping(targets, "top-level targets")?;
     if targets.is_empty() {
         return Err("targets mapping is empty".to_owned());
     }
-    Ok(targets)
-}
-
-fn parse_project_target(name: &str, lines: &[&str]) -> Result<ProjectTarget, String> {
-    let mut keys = Vec::new();
-    let mut scalars = BTreeMap::new();
-    let mut sequences = BTreeMap::new();
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indent = leading_spaces(line)?;
-        if indent < 4 {
-            return Err(format!("target `{name}` contains an invalid indentation"));
-        }
-        while stack.last().is_some_and(|(level, _)| *level >= indent) {
-            stack.pop();
-        }
-        if let Some(value) = trimmed.strip_prefix("- ") {
-            if stack.is_empty() {
-                return Err(format!("target `{name}` contains an unowned sequence item"));
-            }
-            let path = stack.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-            sequences
-                .entry(path)
-                .or_insert_with(Vec::new)
-                .push(unquote_yaml_scalar(value));
-            continue;
-        }
-        let (key, value) = trimmed.split_once(':').ok_or_else(|| {
-            format!("target `{name}` contains malformed mapping entry `{trimmed}`")
-        })?;
-        if key.is_empty() {
-            return Err(format!("target `{name}` contains an empty mapping key"));
-        }
-        let mut path = stack.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-        path.push(key.to_owned());
-        keys.push(path.clone());
-        if value.trim().is_empty() {
-            stack.push((indent, key.to_owned()));
-        } else {
-            scalars.insert(path, unquote_yaml_scalar(value.trim()));
-        }
-    }
-    let platform_path = vec!["platform".to_owned()];
-    let platform = scalars
-        .get(&platform_path)
-        .cloned()
-        .ok_or_else(|| format!("target `{name}` is missing a declared platform"))?;
-    Ok(ProjectTarget {
-        name: name.to_owned(),
-        platform,
-        keys,
-        scalars,
-        sequences,
-    })
-}
-
-fn leading_spaces(line: &str) -> Result<usize, String> {
-    if line.contains('\t') {
-        return Err("tabs are not permitted in project YAML indentation".to_owned());
-    }
-    Ok(line.len() - line.trim_start_matches(' ').len())
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            value
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
+    targets
+        .iter()
+        .map(|(name, body)| {
+            let body_mapping = yaml_mapping(body, &format!("target `{name}`"))?;
+            let platform = yaml_string(
+                body_mapping
+                    .get("platform")
+                    .ok_or_else(|| format!("target `{name}` is missing a declared platform"))?,
+                &format!("target `{name}` platform"),
+            )?;
+            Ok(ProjectTarget {
+                name: name.clone(),
+                platform: platform.to_owned(),
+                body: body.clone(),
+            })
         })
-        .unwrap_or(value)
-        .to_owned()
+        .collect()
 }
 
 fn target_contains_key(target: &ProjectTarget, key: &str) -> bool {
-    target
-        .keys
-        .iter()
-        .any(|path| path.last().is_some_and(|candidate| candidate == key))
+    yaml_contains_key(&target.body, key)
+}
+
+fn yaml_mapping<'a>(
+    value: &'a StrictYamlValue,
+    context: &str,
+) -> Result<&'a BTreeMap<String, StrictYamlValue>, String> {
+    match value {
+        StrictYamlValue::Mapping(mapping) => Ok(mapping),
+        _ => Err(format!("{context} is not a mapping")),
+    }
+}
+
+fn yaml_string<'a>(value: &'a StrictYamlValue, context: &str) -> Result<&'a str, String> {
+    match value {
+        StrictYamlValue::String(value) => Ok(value),
+        _ => Err(format!("{context} is not a string")),
+    }
+}
+
+fn yaml_path<'a>(value: &'a StrictYamlValue, path: &[&str]) -> Option<&'a StrictYamlValue> {
+    path.iter().try_fold(value, |current, component| {
+        let StrictYamlValue::Mapping(mapping) = current else {
+            return None;
+        };
+        mapping.get(*component)
+    })
+}
+
+fn yaml_exact_string_array(value: Option<&StrictYamlValue>, expected: &str) -> bool {
+    matches!(
+        value,
+        Some(StrictYamlValue::Sequence(values))
+            if matches!(values.as_slice(), [StrictYamlValue::String(value)] if value == expected)
+    )
+}
+
+fn yaml_contains_key(value: &StrictYamlValue, key: &str) -> bool {
+    match value {
+        StrictYamlValue::Sequence(values) => {
+            values.iter().any(|value| yaml_contains_key(value, key))
+        }
+        StrictYamlValue::Mapping(mapping) => {
+            mapping.contains_key(key) || mapping.values().any(|value| yaml_contains_key(value, key))
+        }
+        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => false,
+    }
 }
 
 fn check_gmail_dependency(
@@ -1944,26 +1985,55 @@ mod tests {
 
     #[test]
     fn plist_array_parser_rejects_malformed_or_non_exact_arrays() {
-        let malformed = "<key>keychain-access-groups</key><string>group</string>";
+        let malformed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>keychain-access-groups</key><string>group</string>
+</dict></plist>"#;
         assert_eq!(
             parse_plist_string_array(malformed, "keychain-access-groups"),
-            Err("value is not an array".to_owned())
+            Err("top-level value is not an array".to_owned())
         );
-        let mixed = "<key>keychain-access-groups</key><array><string>group</string><true/></array>";
+        let mixed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>keychain-access-groups</key><array><string>group</string><true/></array>
+</dict></plist>"#;
         assert_eq!(
             parse_plist_string_array(mixed, "keychain-access-groups"),
-            Err("array contains a non-string member or is unterminated".to_owned())
+            Err("array contains a non-string member".to_owned())
+        );
+
+        let nested = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>nested</key><dict>
+    <key>keychain-access-groups</key><array><string>group</string></array>
+  </dict>
+</dict></plist>"#;
+        assert_eq!(
+            parse_plist_string_array(nested, "keychain-access-groups"),
+            Err("missing top-level key".to_owned())
+        );
+
+        let duplicate = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>keychain-access-groups</key><array><string>first</string></array>
+  <key>keychain-access-groups</key><array><string>second</string></array>
+</dict></plist>"#;
+        assert!(
+            parse_plist_string_array(duplicate, "keychain-access-groups")
+                .expect_err("duplicate plist keys must fail")
+                .contains("duplicate mapping key `keychain-access-groups`")
         );
     }
 
     #[test]
     fn signing_parser_uses_declared_platform_with_interleaved_targets() {
-        let entitlements = r"
-<key>com.apple.security.application-groups</key>
-<array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
-<key>keychain-access-groups</key>
-<array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
-";
+        let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>com.apple.security.application-groups</key>
+  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+  <key>keychain-access-groups</key>
+  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#;
         let project = r#"targets:
   FirstIOS:
     platform: iOS
@@ -1994,9 +2064,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("FirstIOS", "iOS"),
-                ("TersaMac", "macOS"),
-                ("MiddleMac", "macOS"),
                 ("LastIOS", "iOS"),
+                ("MiddleMac", "macOS"),
+                ("TersaMac", "macOS"),
             ]
         );
         assert!(signing_configuration_violations(entitlements, project).is_empty());
@@ -2020,6 +2090,126 @@ mod tests {
             vec![
                 "iOS target `LastIOS` must not receive the Phase 1 macOS Keychain/App Group configuration"
             ]
+        );
+    }
+
+    #[test]
+    fn signing_parser_accepts_quoted_flow_mappings_and_resolved_aliases() {
+        let project = r#"
+"targets": {"TersaMac": {"platform": "macOS", "entitlements": {"properties": {"com.apple.security.application-groups": ["${TeamIdentifierPrefix}app.tersa.shared"], "keychain-access-groups": ["${TeamIdentifierPrefix}app.tersa.shared"]}}, "settings": {"base": {"TERSA_MACOS_APP_GROUP": "$(TeamIdentifierPrefix)app.tersa.shared"}}}}
+"#;
+        let targets = parse_project_targets(project).expect("quoted flow YAML must parse");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "TersaMac");
+
+        let aliased = r#"
+ios: &ios
+  platform: iOS
+  settings:
+    base:
+      TERSA_MACOS_APP_GROUP: forbidden
+targets:
+  TersaMac:
+    platform: macOS
+    entitlements:
+      properties:
+        com.apple.security.application-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
+        keychain-access-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
+    settings:
+      base:
+        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+  AliasedIOS: *ios
+"#;
+        assert_eq!(
+            signing_configuration_violations(
+                r#"<plist version="1.0"><dict>
+<key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+<key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#,
+                aliased,
+            ),
+            vec![
+                "iOS target `AliasedIOS` must not receive the Phase 1 macOS Keychain/App Group configuration"
+            ]
+        );
+    }
+
+    #[test]
+    fn signing_parser_fails_closed_on_ambiguous_or_extended_yaml() {
+        let duplicate = r"
+targets:
+  TersaMac: { platform: macOS }
+  TersaMac: { platform: macOS }
+";
+        assert!(
+            parse_project_targets(duplicate)
+                .expect_err("duplicate target must fail")
+                .contains("duplicate mapping key `TersaMac`")
+        );
+
+        let merge = r"
+base: &base { platform: macOS }
+targets:
+  TersaMac:
+    <<: *base
+";
+        assert!(
+            parse_project_targets(merge)
+                .expect_err("merge keys must fail")
+                .contains("YAML merge keys are forbidden")
+        );
+
+        let tagged = r"
+targets:
+  TersaMac:
+    platform: !platform macOS
+";
+        assert!(parse_project_targets(tagged).is_err());
+
+        let non_string_key = r"
+targets:
+  TersaMac:
+    platform: macOS
+    1: forbidden
+";
+        assert!(parse_project_targets(non_string_key).is_err());
+    }
+
+    #[test]
+    fn signing_configuration_requires_one_exact_nonempty_group_in_each_array() {
+        let project = r#"
+targets:
+  TersaMac:
+    platform: macOS
+    entitlements:
+      properties:
+        com.apple.security.application-groups: []
+        keychain-access-groups:
+          - wrong.group
+          - ${TeamIdentifierPrefix}app.tersa.shared
+    settings:
+      base:
+        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
+"#;
+        let entitlements = r#"<plist version="1.0"><dict>
+<key>com.apple.security.application-groups</key><array></array>
+<key>keychain-access-groups</key><array><string>wrong.group</string></array>
+</dict></plist>"#;
+        let violations = signing_configuration_violations(entitlements, project);
+        assert_eq!(violations.len(), 4);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.contains("com.apple.security.application-groups"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.contains("keychain-access-groups"))
+                .count(),
+            2
         );
     }
 
