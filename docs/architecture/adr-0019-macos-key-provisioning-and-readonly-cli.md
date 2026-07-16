@@ -35,9 +35,11 @@ The CLI slice is divided into four independently reviewed pull requests:
    constructor, and deterministic standalone/coexistence tests.
 3. **PR 32 — macOS Keychain and HKDF provider:** add
    `tersa-keychain-macos`, the inward platform contract it implements, and the
-   reviewed provisioning/retrieval split.
+   reviewed provisioning/retrieval and application-group locator split. This
+   pull request replaces and activates the Keychain reservation.
 4. **PR 33 — metadata-only JSON CLI:** add `tersa-cli-macos` with exactly the
-   `inbox` and `thread` commands and activate both reserved dependency entries.
+   `inbox` and `thread` commands and replace and activate the remaining CLI
+   reservation.
 
 Each later pull request requires exact-head independent review and must replace
 its reservation with an explicitly activated policy. Merely adding either
@@ -58,15 +60,27 @@ closed. Existing items are retrieved but never replaced implicitly. The CLI
 has retrieval-only access: an absent item is an error and cannot cause key
 generation, import, repair, rotation, or a second Keychain write.
 
+Provisioning uses an add-only `SecItemAdd` operation, never an add-or-update
+password helper. On `errSecDuplicateItem`, the generated losing key is
+zeroized, the process retrieves and validates the single winning item, and no
+update occurs. Other add failures are terminal. PR 32 must test simultaneous
+provisioners and prove they converge on the stored winner without exposing or
+replacing either candidate.
+
 The macOS application and `mailctl` are two targets of one distribution. Both
-are signed by the same Apple Developer team, carry the same registered
-application-group entitlement, and use that group as their shared Keychain
-access group. The official CLI is the signed executable shipped inside the app
-bundle; a package manager may install only a symlink to that exact executable,
-not rebuild or re-sign it independently. Community distributions must register
-and inject their own group under their own signing team. Unsigned, differently
-signed, missing-entitlement, or mismatched-group builds receive no production
-fallback and cannot claim Keychain/profile interoperability.
+are signed by the same Apple Developer team, carry the registered
+`${TeamIdentifierPrefix}app.tersa.shared` application-group entitlement, and
+use that group as their shared Keychain access group. `mailctl` has the stable
+bundle identifier `app.tersa.mailctl`, an embedded Info.plist section, Hardened
+Runtime, and its own `com.apple.security.app-sandbox = true` entitlement. It is
+launched directly by the shell and therefore must not use
+`com.apple.security.inherit`. The official CLI is the signed executable shipped
+inside the app bundle; a package manager may install only a symlink to that
+exact executable, not rebuild or re-sign it independently. Community
+distributions must register and inject their own group under their own signing
+team. Unsigned, differently signed, missing-entitlement, or mismatched-group
+builds receive no production fallback and cannot claim Keychain/profile
+interoperability.
 
 The root key is never exported or accepted through arguments, environment,
 stdin, files, IPC, logs, diagnostics, or JSON. The provider derives a 32-byte
@@ -80,14 +94,23 @@ versions or purposes fail closed. Root and derived key buffers use best-effort
 zeroization and never implement content-revealing `Debug` or serialization.
 
 The reviewed future pins are `security-framework =3.7.0` with default features
-disabled, `hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`, all declared
-only for the exact macOS target where applicable. crates.io metadata identifies
-3.7.0 as the current `security-framework` release. The current HKDF release,
-0.13.0, resolves HMAC 0.13; 0.12.4 is deliberately selected because it uses
-the already reviewed `hmac =0.12.1`. This policy does not weaken the existing
-exclusive HMAC ownership. PR 32 must explicitly and narrowly expand that owner
-set after reviewing the exact resolved graph; PR 30 changes no manifest or
-lockfile.
+disabled and only `OSX_10_15` enabled, `security-framework-sys =2.17.0`,
+`core-foundation =0.10.1`, `objc2-foundation =0.3.2` with default features
+disabled and only `std`, `NSFileManager`, `NSString`, and `NSURL` enabled,
+`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. They are declared only
+for the exact macOS target where applicable. The explicit Security/Core
+Foundation surface exists so PR 32 can build add-only and attribute-returning
+Keychain dictionaries; the public generic-password setter is forbidden because
+its duplicate-item path updates existing data. `OSX_10_15` is required for the
+Data Protection Keychain API on macOS. The Foundation surface resolves and
+validates the application-group container through the inward platform port.
+
+crates.io metadata identifies 3.7.0 as the current `security-framework`
+release. The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
+deliberately selected because it uses the already reviewed `hmac =0.12.1`.
+This policy does not weaken the existing exclusive HMAC ownership. PR 32 must
+explicitly and narrowly expand that owner set after reviewing the exact
+resolved graph; PR 30 changes no manifest or lockfile.
 
 `tersa-keychain-macos` may depend inward only on `tersa-platform`. Any needed
 portable key capability belongs in that inward port; Apple Security types do
@@ -107,12 +130,20 @@ is `default` under the shared application-group container returned by
   accounts/<sha256-account-id>/mail.sqlite3
 ```
 
-The application-group identifier is a required signing-time setting shared by
-the app and CLI entitlements. Resolution must verify access to the returned
-container because macOS may return an expected-form URL even for an invalid
-group. It never falls back to a normal Application Support path or either
-target's private sandbox container. Official distribution must be notarized
-and satisfy the Phase 1 App Sandbox gate before PR 33 can land.
+The expanded application-group identifier is a required signing-time setting
+shared by the app and CLI entitlements. Resolution must verify access to the
+returned container because macOS may return an expected-form URL even for an
+invalid group. It never falls back to a normal Application Support path or
+either target's private sandbox container.
+
+PR 33 has a CLI-specific acceptance condition independent of the later macOS
+UI gate: a same-team Developer ID package must be notarized, contain the
+embedded signed `mailctl`, expose only a symlink to that exact binary, and prove
+a direct shell launch under its own non-inherited sandbox. Captured evidence
+must verify the app and CLI code-signing identifiers and entitlements, App
+Group container access, cross-target add/read of the non-synchronizable Data
+Protection Keychain item, and denial after a group or signature mismatch. This
+condition passes no UI, mobile, M0, or Phase 1 release gate.
 
 `<sha256-account-id>` is the 64-character lowercase hexadecimal SHA-256 digest
 of the validated opaque `AccountId` UTF-8 bytes. Tests may construct isolated
@@ -147,6 +178,17 @@ and commits data that remains in the WAL. They must also prove that missing or
 replaced sidecars fail without creation or database/WAL mutation. Busy,
 moved-path, wrong-key, foreign-owner, unknown-schema, and integrity failures
 remain fail closed and redacted.
+
+The current bundled Unix VFS does not expose a supported handle that binds its
+internally opened `-shm` inode to the caller's preflight identity. Pre-open and
+post-open pathname identity checks detect ordinary replacement but cannot prove
+defense against a same-user regular-file swap-in/open/swap-back race. PR 31
+must include the deterministic race fixture and document that limitation; it
+must not claim the sidecar handle is descriptor-bound. A process able to race
+files inside the signed App Group container is treated as the existing
+unlocked-device/local-malware residual threat. If review expands that attacker
+into scope, direct SQLite access stops and the design moves to an owning host
+or a reviewed VFS rather than overstating the check.
 
 ### CLI and JSON contract
 

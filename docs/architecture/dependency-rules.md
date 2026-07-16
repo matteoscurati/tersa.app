@@ -86,7 +86,7 @@ ADR 0019 reserves two future workspace crate names without activating them:
 
 | Reserved crate | Planned responsibility | Maximum reserved inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | Retrieval/provisioning-separated macOS Keychain root provider and versioned HKDF derivation | `tersa-platform` |
+| `tersa-keychain-macos` | Retrieval/provisioning-separated macOS Keychain root provider, versioned HKDF derivation, and signed App Group container locator | `tersa-platform` |
 | `tersa-cli-macos` | Fixed-profile composition and metadata-only JSON rendering | `tersa-application`, `tersa-domain`, `tersa-keychain-macos`, `tersa-platform`, `tersa-store-sqlcipher-macos` |
 
 The `RESERVED_FUTURE_POLICY` tripwire fails if either crate appears, even when
@@ -98,13 +98,16 @@ byte-identical.
 
 When `tersa-keychain-macos` is activated, its external dependencies are planned
 as exact macOS-only pins: `security-framework =3.7.0` with default features
-disabled, `hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. crates.io
-metadata lists `security-framework` 3.7.0 as the current release. HKDF 0.12.4
-is deliberately selected instead of current 0.13.0 because 0.12.4 uses the
-already pinned `hmac =0.12.1`, while 0.13.0 moves to HMAC 0.13. The activation
-pull request must verify these facts again, pin every direct dependency
-exactly, restrict Apple dependencies to exact `cfg(target_os = "macos")`, and
-add resolved-graph feature/ownership checks before changing a manifest.
+disabled and only `OSX_10_15` enabled, `security-framework-sys =2.17.0`,
+`core-foundation =0.10.1`, `objc2-foundation =0.3.2` with default features
+disabled and only `std`, `NSFileManager`, `NSString`, and `NSURL` enabled,
+`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. crates.io metadata lists
+`security-framework` 3.7.0 as the current release. HKDF 0.12.4 is deliberately
+selected instead of current 0.13.0 because 0.12.4 uses the already pinned
+`hmac =0.12.1`, while 0.13.0 moves to HMAC 0.13. The activation pull request
+must verify these facts again, pin every direct dependency exactly, restrict
+Apple dependencies to exact `cfg(target_os = "macos")`, and add resolved-graph
+feature/ownership checks before changing a manifest.
 
 The current `hmac =0.12.1` exclusivity to `tersa-blob-spike` remains unchanged
 in PR 30. The Keychain/HKDF activation must deliberately expand the owner set
@@ -124,11 +127,22 @@ The official CLI is the signed executable from the notarized app distribution;
 a package-manager entry may point to it but may not substitute a separately
 rebuilt binary.
 
+Provisioning must use a raw add-only operation. A duplicate discards and
+zeroizes the losing candidate, then retrieves and validates the winner; it
+never calls an add-or-update generic-password helper. The shell-launched CLI
+has its own stable bundle identifier, embedded Info.plist, Hardened Runtime,
+non-inherited App Sandbox entitlement, and the same application group. PR 33
+must satisfy its dedicated signed-package and direct-shell-launch evidence
+condition without depending on or passing the later UI acceptance gate.
+
 The future store activation must keep WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The
 reader may coordinate through an existing `-shm`, but it may not create,
 replace, delete, or repair the main database or either sidecar. Missing or
 changed sidecars fail closed until the owning writer establishes a valid state.
+The Unix VFS does not descriptor-bind its internally opened `-shm` identity to
+the caller's pathname preflight; swap-in/open/swap-back by local malware remains
+an explicit unlocked-device residual, not a prevented attack or release claim.
 
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
 Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,
