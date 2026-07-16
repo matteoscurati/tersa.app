@@ -695,7 +695,8 @@ mod macos {
             | rusqlite::Error::IntegralValueOutOfRange(..)
             | rusqlite::Error::InvalidColumnType(..)
             | rusqlite::Error::InvalidQuery
-            | rusqlite::Error::QueryReturnedNoRows => OpenFailure::Corrupted,
+            | rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::Utf8Error(..) => OpenFailure::Corrupted,
             _ => OpenFailure::Storage,
         }
     }
@@ -1095,6 +1096,22 @@ mod macos {
                 )),
                 OpenFailure::Corrupted
             );
+
+            let (database, store) = open("invalid-owner-utf8");
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE account_binding SET account_id = CAST(X'80' AS TEXT) WHERE singleton = 1;",
+                )
+                .unwrap();
+            drop(store);
+            assert_corrupted(SqlCipherMailboxStore::open(
+                account(),
+                database.path(),
+                key(7),
+            ));
         }
 
         #[test]
