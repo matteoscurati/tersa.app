@@ -8,6 +8,7 @@
 //! futures. Callers must poll it on a bounded blocking executor rather than a
 //! latency-sensitive async executor thread. It deliberately owns neither blob
 //! encryption nor cross-file commit orchestration.
+// Rust guideline compliant 1.0.
 
 #![deny(unsafe_code)]
 
@@ -25,7 +26,9 @@ mod macos {
     use std::time::Duration;
 
     use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
-    use tersa_application::mailbox::{BoxFuture, MailboxStore, MailboxStoreError, StoreLimit};
+    use tersa_application::mailbox::{
+        BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
+    };
     use tersa_domain::mailbox::{
         AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
         UnixTimestampMillis,
@@ -71,6 +74,103 @@ mod macos {
     impl fmt::Debug for SqlCipherMailboxStore {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("SqlCipherMailboxStore([REDACTED])")
+        }
+    }
+
+    /// Reads metadata-only envelopes from one existing account database.
+    ///
+    /// This type intentionally implements `MailboxReader`, not `MailboxStore`:
+    ///
+    /// ```compile_fail
+    /// use tersa_application::mailbox::MailboxStore;
+    /// use tersa_store_sqlcipher_macos::SqlCipherMailboxReader;
+    ///
+    /// fn require_store<T: MailboxStore>() {}
+    /// require_store::<SqlCipherMailboxReader>();
+    /// ```
+    pub struct SqlCipherMailboxReader {
+        account: AccountId,
+        connection: Mutex<Connection>,
+    }
+
+    impl fmt::Debug for SqlCipherMailboxReader {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SqlCipherMailboxReader([REDACTED])")
+        }
+    }
+
+    impl SqlCipherMailboxReader {
+        /// Opens an existing persistent-WAL account database without write authority.
+        ///
+        /// The main database, WAL, and shared-memory sidecar must already be
+        /// regular files. This path never creates, migrates, checkpoints,
+        /// repairs, or changes journal mode.
+        ///
+        /// # Errors
+        ///
+        /// Returns opaque corruption for an invalid key, owner, schema, row,
+        /// or integrity result. Missing, moved, or unusable files return an
+        /// opaque storage error.
+        pub fn open_read_only<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+        ) -> Result<Self, MailboxStoreError> {
+            Self::open_read_only_with_hooks(
+                account,
+                path.as_ref(),
+                key,
+                |_path| {},
+                |_path| {},
+                |_path| {},
+            )
+        }
+
+        fn open_read_only_with_hooks(
+            account: AccountId,
+            path: &Path,
+            mut key: DatabaseKey,
+            after_preflight: impl FnOnce(&Path),
+            before_live_read: impl FnOnce(&Path),
+            after_live_read: impl FnOnce(&Path),
+        ) -> Result<Self, MailboxStoreError> {
+            let outcome = (|| {
+                let canonical_path = canonical_database_path(path)?;
+                let identities = preflight_read_only_files(&canonical_path)?;
+                after_preflight(&canonical_path);
+                let connection = open_read_only_connection(&canonical_path)?;
+                opened_file_has_moved(&connection)?;
+                verify_read_only_file_identities(&canonical_path, identities)?;
+                set_and_verify_persistent_wal(&connection)?;
+                before_live_read(&canonical_path);
+                configure_read_only(&connection, &account, &key.0)?;
+                after_live_read(&canonical_path);
+                verify_read_only_file_identities(&canonical_path, identities)?;
+                Ok(Self {
+                    account,
+                    connection: Mutex::new(connection),
+                })
+            })();
+            key.0.zeroize();
+            outcome.map_err(mailbox_open_error)
+        }
+
+        fn checked_account(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
+            (self.account == *account)
+                .then_some(())
+                .ok_or(MailboxStoreError::Storage)
+        }
+
+        fn list(
+            &self,
+            thread: Option<&ThreadId>,
+            limit: StoreLimit,
+        ) -> Result<Vec<MessageEnvelope>, MailboxStoreError> {
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_poison| MailboxStoreError::Storage)?;
+            list_envelopes(&mut connection, thread, limit)
         }
     }
 
@@ -312,23 +412,7 @@ mod macos {
             thread: Option<&ThreadId>,
             limit: StoreLimit,
         ) -> Result<Vec<MessageEnvelope>, MailboxStoreError> {
-            self.with_connection(|connection| {
-                let sql = if thread.is_some() {
-                    "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE thread_id = ?1 ORDER BY received_at ASC, message_id ASC LIMIT ?2"
-                } else {
-                    "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1"
-                };
-                let mut statement = connection.prepare(sql).map_err(store_error)?;
-                let mut rows = match thread {
-                    Some(thread_id) => statement.query(params![thread_id.as_str(), i64::from(limit.get())]),
-                    None => statement.query(params![i64::from(limit.get())]),
-                }.map_err(store_error)?;
-                let mut result = Vec::new();
-                while let Some(row) = rows.next().map_err(store_error)? {
-                    result.push(envelope_from_row(row)?);
-                }
-                Ok(result)
-            })
+            self.with_connection(|connection| list_envelopes(connection, thread, limit))
         }
 
         fn get_message(&self, id: &MessageId) -> Result<Option<Message>, MailboxStoreError> {
@@ -365,6 +449,13 @@ mod macos {
     struct PreparedLeaf {
         created: bool,
         identity: FileIdentity,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ReadOnlyFileIdentities {
+        main: FileIdentity,
+        wal: FileIdentity,
+        shm: FileIdentity,
     }
 
     fn canonical_database_path(path: &Path) -> Result<PathBuf, OpenFailure> {
@@ -432,6 +523,44 @@ mod macos {
         Ok(identity_from_metadata(&metadata))
     }
 
+    fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    fn preflight_read_only_files(path: &Path) -> Result<ReadOnlyFileIdentities, OpenFailure> {
+        let main_metadata =
+            std::fs::symlink_metadata(path).map_err(|_error| OpenFailure::Storage)?;
+        if !main_metadata.file_type().is_file() || main_metadata.len() < 512 {
+            return Err(OpenFailure::Storage);
+        }
+        match std::fs::symlink_metadata(sidecar_path(path, "-journal")) {
+            Ok(_metadata) => return Err(OpenFailure::Storage),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_error) => return Err(OpenFailure::Storage),
+        }
+        Ok(ReadOnlyFileIdentities {
+            main: identity_from_metadata(&main_metadata),
+            wal: file_identity(&sidecar_path(path, "-wal"))?,
+            shm: file_identity(&sidecar_path(path, "-shm"))?,
+        })
+    }
+
+    fn verify_read_only_file_identities(
+        path: &Path,
+        expected: ReadOnlyFileIdentities,
+    ) -> Result<(), OpenFailure> {
+        let actual = ReadOnlyFileIdentities {
+            main: file_identity(path)?,
+            wal: file_identity(&sidecar_path(path, "-wal"))?,
+            shm: file_identity(&sidecar_path(path, "-shm"))?,
+        };
+        (actual == expected)
+            .then_some(())
+            .ok_or(OpenFailure::Storage)
+    }
+
     fn identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
         FileIdentity {
             device: metadata.dev(),
@@ -443,6 +572,13 @@ mod macos {
         let base_flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         Connection::open_with_flags(path, base_flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
             .map_err(|_error| OpenFailure::Storage)
+    }
+
+    fn open_read_only_connection(path: &Path) -> Result<Connection, OpenFailure> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Connection::open_with_flags(path, flags).map_err(|_error| OpenFailure::Storage)
     }
 
     #[allow(
@@ -527,6 +663,29 @@ mod macos {
         Ok(false)
     }
 
+    fn list_envelopes(
+        connection: &mut Connection,
+        thread: Option<&ThreadId>,
+        limit: StoreLimit,
+    ) -> Result<Vec<MessageEnvelope>, MailboxStoreError> {
+        let sql = if thread.is_some() {
+            "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE thread_id = ?1 ORDER BY received_at ASC, message_id ASC LIMIT ?2"
+        } else {
+            "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1"
+        };
+        let mut statement = connection.prepare(sql).map_err(store_error)?;
+        let mut rows = match thread {
+            Some(thread_id) => statement.query(params![thread_id.as_str(), i64::from(limit.get())]),
+            None => statement.query(params![i64::from(limit.get())]),
+        }
+        .map_err(store_error)?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(store_error)? {
+            result.push(envelope_from_row(row)?);
+        }
+        Ok(result)
+    }
+
     impl MailboxStore for SqlCipherMailboxStore {
         fn upsert_envelopes<'a>(
             &'a self,
@@ -569,6 +728,19 @@ mod macos {
                 self.cache_if_present(message)
             })
         }
+        fn message<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.get_message(message_id)
+            })
+        }
+    }
+
+    impl MailboxReader for SqlCipherMailboxStore {
         fn list_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -590,14 +762,29 @@ mod macos {
                 self.list(Some(thread_id), limit)
             })
         }
-        fn message<'a>(
+    }
+
+    impl MailboxReader for SqlCipherMailboxReader {
+        fn list_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
-            message_id: &'a MessageId,
-        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
-                self.get_message(message_id)
+                self.list(None, limit)
+            })
+        }
+
+        fn thread_envelopes<'a>(
+            &'a self,
+            account: &'a AccountId,
+            thread_id: &'a ThreadId,
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.list(Some(thread_id), limit)
             })
         }
     }
@@ -684,7 +871,77 @@ mod macos {
         } else {
             configure_owned_storage(connection)?;
         }
+        set_and_verify_persistent_wal(connection)?;
         validate_health(connection)
+    }
+
+    fn configure_read_only(
+        connection: &Connection,
+        account: &AccountId,
+        key: &[u8; 32],
+    ) -> Result<(), OpenFailure> {
+        apply_key(connection, key).map_err(classify_key)?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(|_error| OpenFailure::Storage)?;
+        connection
+            .execute_batch(
+                "PRAGMA cipher_memory_security = ON;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA temp_store = MEMORY;",
+            )
+            .map_err(classify_open)?;
+        let journal_size_limit: i64 = connection
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .map_err(classify_open)?;
+        if journal_size_limit != -1 {
+            return Err(OpenFailure::Corrupted);
+        }
+
+        connection.execute_batch("BEGIN;").map_err(classify_open)?;
+        let validation = (|| {
+            if validate_identity(connection, account)? {
+                return Err(OpenFailure::Corrupted);
+            }
+            validate_health(connection)
+        })();
+        if validation.is_ok() {
+            connection.execute_batch("COMMIT;").map_err(classify_open)?;
+        } else {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        validation
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "SQLite PERSIST_WAL file control accepts a mutable integer pointer"
+    )]
+    fn persistent_wal_control(connection: &Connection, value: &mut i32) -> Result<(), OpenFailure> {
+        // SAFETY: `connection.handle()` remains valid for this synchronous call;
+        // `main` is a static NUL-terminated database name; and `value` is a
+        // writable `i32` whose address remains valid until SQLite returns.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                connection.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                std::ptr::from_mut(value).cast::<std::ffi::c_void>(),
+            )
+        };
+        if result == rusqlite::ffi::SQLITE_OK {
+            Ok(())
+        } else {
+            Err(OpenFailure::Storage)
+        }
+    }
+
+    fn set_and_verify_persistent_wal(connection: &Connection) -> Result<(), OpenFailure> {
+        let mut enabled = 1;
+        persistent_wal_control(connection, &mut enabled)?;
+        let mut current = -1;
+        persistent_wal_control(connection, &mut current)?;
+        (current == 1).then_some(()).ok_or(OpenFailure::Storage)
     }
 
     fn validate_identity(
@@ -834,6 +1091,12 @@ mod macos {
         // operational setup failure, most notably `SQLITE_NOMEM`.
         OpenFailure::Storage
     }
+    fn mailbox_open_error(kind: OpenFailure) -> MailboxStoreError {
+        match kind {
+            OpenFailure::Corrupted => MailboxStoreError::Corrupted,
+            OpenFailure::Storage => MailboxStoreError::Storage,
+        }
+    }
     fn schema(connection: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut statement = connection.prepare(
             "SELECT
@@ -967,11 +1230,13 @@ mod macos {
             }
 
             fn files(&self) -> Vec<std::path::PathBuf> {
-                fs::read_dir(&self.directory)
+                let mut files = fs::read_dir(&self.directory)
                     .unwrap()
                     .map(|entry| entry.unwrap().path())
                     .filter(|path| path.is_file())
-                    .collect()
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
             }
         }
 
@@ -1007,6 +1272,7 @@ mod macos {
                 Poll::Pending => panic!("store future must complete synchronously"),
             }
         }
+        fn accepts_reader<T: MailboxReader>(_reader: &T) {}
         fn open(name: &str) -> (TestDatabase, SqlCipherMailboxStore) {
             let database = TestDatabase::new(name);
             let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
@@ -1025,9 +1291,15 @@ mod macos {
         }
 
         fn journal_path(database: &TestDatabase) -> PathBuf {
-            let mut name = database.path().as_os_str().to_os_string();
-            name.push("-journal");
-            PathBuf::from(name)
+            sidecar_path(database.path(), "-journal")
+        }
+
+        fn wal_path(database: &TestDatabase) -> PathBuf {
+            sidecar_path(database.path(), "-wal")
+        }
+
+        fn shm_path(database: &TestDatabase) -> PathBuf {
+            sidecar_path(database.path(), "-shm")
         }
 
         fn leave_foreign_hot_journal(database: &TestDatabase) {
@@ -1158,6 +1430,11 @@ mod macos {
 
         #[test]
         fn identity_queries_classify_operational_sqlite_failures_as_storage() {
+            let memory = Connection::open_in_memory().unwrap();
+            assert_eq!(
+                set_and_verify_persistent_wal(&memory),
+                Err(OpenFailure::Storage)
+            );
             for code in [
                 rusqlite::ffi::SQLITE_NOMEM,
                 rusqlite::ffi::SQLITE_IOERR,
@@ -1799,6 +2076,360 @@ mod macos {
         }
 
         #[test]
+        fn persistent_writer_supports_a_clean_standalone_metadata_reader() {
+            let (database, store) = open("standalone-reader");
+            let values = [envelope("new", "thread", 20), envelope("old", "thread", 10)];
+            run(store.upsert_envelopes(&account(), &values)).unwrap();
+            let mut persistent_wal = -1;
+            persistent_wal_control(&store.connection.lock().unwrap(), &mut persistent_wal).unwrap();
+            assert_eq!(persistent_wal, 1);
+            drop(store);
+            assert!(wal_path(&database).is_file());
+            assert!(shm_path(&database).is_file());
+
+            let files_before = database.files();
+            let identities_before = ReadOnlyFileIdentities {
+                main: file_identity(database.path()).unwrap(),
+                wal: file_identity(&wal_path(&database)).unwrap(),
+                shm: file_identity(&shm_path(&database)).unwrap(),
+            };
+            let main_before = fs::read(database.path()).unwrap();
+            let wal_before = fs::read(wal_path(&database)).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            accepts_reader(&reader);
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["new", "old"]
+            );
+            assert_eq!(
+                run(reader.thread_envelopes(
+                    &account(),
+                    values[0].thread_id(),
+                    StoreLimit::new(10).unwrap(),
+                ))
+                .unwrap()
+                .len(),
+                2
+            );
+            assert_eq!(
+                reader
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row("PRAGMA journal_size_limit", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                -1
+            );
+            let foreign_account = AccountId::new("foreign-account").unwrap();
+            assert_eq!(
+                run(reader.list_envelopes(&foreign_account, StoreLimit::new(10).unwrap(),)),
+                Err(MailboxStoreError::Storage)
+            );
+            assert!(!format!("{reader:?}").contains("account"));
+            drop(reader);
+            assert_eq!(database.files(), files_before);
+            assert_eq!(
+                ReadOnlyFileIdentities {
+                    main: file_identity(database.path()).unwrap(),
+                    wal: file_identity(&wal_path(&database)).unwrap(),
+                    shm: file_identity(&shm_path(&database)).unwrap(),
+                },
+                identities_before
+            );
+            assert_eq!(fs::read(database.path()).unwrap(), main_before);
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
+        }
+
+        #[test]
+        fn read_only_reader_coexists_with_wal_resident_writer_commits() {
+            let (database, store) = open("live-reader");
+            let first = envelope("first", "thread", 10);
+            run(store.upsert_envelopes(&account(), std::slice::from_ref(&first))).unwrap();
+            let wal_before = fs::read(wal_path(&database)).unwrap();
+            let second = envelope("second", "thread", 20);
+            run(store.upsert_envelopes(&account(), std::slice::from_ref(&second))).unwrap();
+            let wal_after = fs::read(wal_path(&database)).unwrap();
+            assert!(wal_after.len() > wal_before.len());
+
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["second", "first"]
+            );
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_after);
+            drop(reader);
+            drop(store);
+            assert!(wal_path(&database).exists());
+            assert!(shm_path(&database).exists());
+        }
+
+        #[test]
+        fn read_only_open_requires_nonempty_main_and_both_existing_sidecars() {
+            let absent = TestDatabase::new("reader-absent");
+            let absent_before = absent.files();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), absent.path(), key(7)),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert_eq!(absent.files(), absent_before);
+
+            let fresh = TestDatabase::new("reader-fresh");
+            fs::File::create(fresh.path()).unwrap();
+            fs::write(wal_path(&fresh), b"existing-wal").unwrap();
+            fs::write(shm_path(&fresh), b"existing-shm").unwrap();
+            let before = fresh.files();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), fresh.path(), key(7)),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert_eq!(fresh.files(), before);
+            assert_eq!(fs::read(wal_path(&fresh)).unwrap(), b"existing-wal");
+            assert_eq!(fs::read(shm_path(&fresh)).unwrap(), b"existing-shm");
+
+            for suffix in ["-wal", "-shm"] {
+                let (database, store) = open(&format!("reader-missing{suffix}"));
+                run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+                drop(store);
+                fs::remove_file(sidecar_path(database.path(), suffix)).unwrap();
+                let files_before = database.files();
+                let main_before = fs::read(database.path()).unwrap();
+                assert!(matches!(
+                    SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)),
+                    Err(MailboxStoreError::Storage)
+                ));
+                assert_eq!(database.files(), files_before);
+                assert_eq!(fs::read(database.path()).unwrap(), main_before);
+            }
+        }
+
+        #[test]
+        fn read_only_open_rejects_rollback_journal_and_nonregular_sidecars_unchanged() {
+            let (journal_database, journal_store) = open("reader-journal");
+            drop(journal_store);
+            fs::write(journal_path(&journal_database), b"foreign-journal").unwrap();
+            let journal_files = journal_database.files();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), journal_database.path(), key(7),),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert_eq!(journal_database.files(), journal_files);
+            assert_eq!(
+                fs::read(journal_path(&journal_database)).unwrap(),
+                b"foreign-journal"
+            );
+
+            let (symlink_database, symlink_store) = open("reader-symlink-wal");
+            drop(symlink_store);
+            let original_wal = symlink_database.directory.join("original-wal");
+            fs::rename(wal_path(&symlink_database), &original_wal).unwrap();
+            std::os::unix::fs::symlink(&original_wal, wal_path(&symlink_database)).unwrap();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), symlink_database.path(), key(7),),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert!(
+                fs::symlink_metadata(wal_path(&symlink_database))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(original_wal.is_file());
+
+            let (directory_database, directory_store) = open("reader-directory-shm");
+            drop(directory_store);
+            fs::remove_file(shm_path(&directory_database)).unwrap();
+            fs::create_dir(shm_path(&directory_database)).unwrap();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(
+                    account(),
+                    directory_database.path(),
+                    key(7),
+                ),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert!(shm_path(&directory_database).is_dir());
+        }
+
+        #[test]
+        fn read_only_open_rejects_wrong_key_owner_schema_and_invalid_rows_redacted() {
+            let (database, store) = open("reader-validation");
+            run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+            drop(store);
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(8)),
+                Err(MailboxStoreError::Corrupted)
+            ));
+            let foreign = AccountId::new("foreign-account").unwrap();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(foreign, database.path(), key(7)),
+                Err(MailboxStoreError::Corrupted)
+            ));
+
+            let (integrity_database, integrity_store) = open("reader-integrity");
+            run(integrity_store.upsert_envelopes(
+                &account(),
+                &[envelope("integrity", "thread", 1)],
+            ))
+            .unwrap();
+            integrity_store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            drop(integrity_store);
+            let mut corrupted_bytes = fs::read(integrity_database.path()).unwrap();
+            assert!(corrupted_bytes.len() > 100);
+            corrupted_bytes[100] ^= 0x80;
+            fs::write(integrity_database.path(), corrupted_bytes).unwrap();
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(
+                    account(),
+                    integrity_database.path(),
+                    key(7),
+                ),
+                Err(MailboxStoreError::Corrupted)
+            ));
+
+            let writer = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            writer
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE messages SET subject = ?1",
+                    params!["x".repeat(1_025)],
+                )
+                .unwrap();
+            drop(writer);
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let error =
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap_err();
+            assert_eq!(error, MailboxStoreError::Corrupted);
+            assert!(!error.to_string().contains("account"));
+            drop(reader);
+
+            let writer = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            writer
+                .connection
+                .lock()
+                .unwrap()
+                .execute("UPDATE messages SET subject = 'valid'", [])
+                .unwrap();
+            writer
+                .connection
+                .lock()
+                .unwrap()
+                .execute("CREATE TABLE unexpected(value INTEGER)", [])
+                .unwrap();
+            drop(writer);
+            assert!(matches!(
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)),
+                Err(MailboxStoreError::Corrupted)
+            ));
+        }
+
+        #[test]
+        fn read_only_open_detects_observable_sidecar_replacement() {
+            let (database, store) = open("reader-sidecar-replacement");
+            run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+            drop(store);
+            let replacement = database.directory.join("replacement-shm");
+            fs::copy(shm_path(&database), &replacement).unwrap();
+            let original = database.directory.join("original-shm");
+            let result = SqlCipherMailboxReader::open_read_only_with_hooks(
+                account(),
+                database.path(),
+                key(7),
+                |_path| {
+                    fs::rename(shm_path(&database), &original).unwrap();
+                    fs::rename(&replacement, shm_path(&database)).unwrap();
+                },
+                |_path| {},
+                |_path| {},
+            );
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+
+            let (main_database, main_store) = open("reader-main-replacement");
+            drop(main_store);
+            let (foreign_database, foreign_store) = open("reader-main-foreign");
+            drop(foreign_store);
+            let original_main = main_database.directory.join("original-main");
+            let result = SqlCipherMailboxReader::open_read_only_with_hooks(
+                account(),
+                main_database.path(),
+                key(7),
+                |_path| {
+                    fs::rename(main_database.path(), &original_main).unwrap();
+                    fs::copy(foreign_database.path(), main_database.path()).unwrap();
+                },
+                |_path| {},
+                |_path| {},
+            );
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+        }
+
+        #[test]
+        fn read_only_sidecar_swap_in_open_swap_back_is_an_accepted_residual() {
+            let (database, store) = open("reader-sidecar-race");
+            run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+            drop(store);
+            let replacement = database.directory.join("replacement-shm");
+            fs::copy(shm_path(&database), &replacement).unwrap();
+            let original = database.directory.join("original-shm");
+            let reader = SqlCipherMailboxReader::open_read_only_with_hooks(
+                account(),
+                database.path(),
+                key(7),
+                |_path| {},
+                |_path| {
+                    fs::rename(shm_path(&database), &original).unwrap();
+                    fs::rename(&replacement, shm_path(&database)).unwrap();
+                },
+                |_path| {
+                    fs::remove_file(shm_path(&database)).unwrap();
+                    fs::rename(&original, shm_path(&database)).unwrap();
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(1).unwrap()))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn dropping_an_unpolled_reader_future_performs_no_query() {
+            let (database, store) = open("reader-unpolled");
+            run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+            drop(store);
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let local_account = account();
+            let future = reader.list_envelopes(&local_account, StoreLimit::new(1).unwrap());
+            drop(future);
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(1).unwrap()))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
         fn symlink_leaf_and_poisoned_connection_are_opaque_storage_failures() {
             let target_database = TestDatabase::new("symlink-target");
             let target =
@@ -1832,4 +2463,4 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{DatabaseKey, SqlCipherMailboxStore};
+pub use macos::{DatabaseKey, SqlCipherMailboxReader, SqlCipherMailboxStore};

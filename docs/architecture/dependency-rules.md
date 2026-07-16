@@ -73,8 +73,10 @@ callback while keeping PKCE and callback validation in portable Rust.
 `tersa-application::sync` is the sole shared owner of bounded recent-snapshot
 orchestration. It may use only existing application mailbox ports and
 `tersa-domain`; it introduces no runtime, transport, storage, or background
-dependency. `MailboxStore` implementations own atomic envelope reconciliation
-and conditional body caching. This boundary does not authorize Gmail History or
+dependency. The metadata-only `MailboxReader` owns deterministic envelope
+listing only. `MailboxStore: MailboxReader` adds atomic envelope reconciliation,
+conditional body caching, complete-message access, and mutations. The strict
+macOS reader implements only `MailboxReader`. This boundary does not authorize Gmail History or
 cursor sync, deletion reconciliation, retry, background work, mutations,
 outbox, labels, blobs, search, CLI/UI, real network or credentials tests,
 mobile code, or gate-status changes. Cache budgets remain constraints rather
@@ -135,7 +137,7 @@ non-inherited App Sandbox entitlement, and the same application group. PR 33
 must satisfy its dedicated signed-package and direct-shell-launch evidence
 condition without depending on or passing the later UI acceptance gate.
 
-The future store activation must keep WAL and shared-memory sidecars persistent
+The active PR 31 store boundary keeps WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The
 reader may coordinate through an existing `-shm`, but it may not create,
 replace, delete, or repair the main database or either sidecar. Missing or
@@ -144,6 +146,13 @@ closed until the owning writer establishes a valid state. The Unix VFS does not
 descriptor-bind its internally opened `-shm` identity to the caller's pathname
 preflight; swap-in/open/swap-back by local malware remains an explicit
 unlocked-device residual, not a prevented attack or release claim.
+
+The strict reader opens only existing regular main, WAL, and shared-memory
+files with read-only/no-mutex/no-follow SQLite flags. It validates key, owner,
+schema, SQLCipher and SQLite integrity, account binding, bounded metadata
+decoding, connection-local persistent-WAL state, `journal_size_limit = -1`, and
+pre/post pathname identities. It has no body API, migration, checkpoint,
+repair, journal-mode, creation, or mutation authority.
 
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
 Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,
