@@ -46,12 +46,12 @@ may depend inward only on
 ports now exist in `tersa-application`; adapters implement those inward-defined
 ports, while `tersa-application` and `tersa-domain` never depend on adapters.
 
-The adapter must declare `rusqlite` only under the exact target cfg
+The adapter must pin `rusqlite` exactly to 0.39.0 under the exact target cfg
 `cfg(target_os = "macos")`, disable its default features, and select only
-`bundled-sqlcipher`. Untargeted, iOS-only, and iOS-inclusive declarations are
-violations. Blob/attachment encryption is deliberately deferred: this adapter
-does not own `chacha20poly1305` or `hmac` until a real blob/attachment port and
-cross-file commit protocol are accepted.
+`bundled-sqlcipher`. Version, feature, untargeted, iOS-only, and iOS-inclusive
+deviations are violations. Blob/attachment encryption is deliberately deferred:
+this adapter does not own `chacha20poly1305` or `hmac` until a real
+blob/attachment port and cross-file commit protocol are accepted.
 
 `tersa-gmail-rest-macos` is active and may depend inward only on
 `tersa-application` and `tersa-domain`. `reqwest` is pinned exactly to 0.13.4,

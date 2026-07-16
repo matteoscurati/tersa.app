@@ -39,6 +39,8 @@ opaque corruption errors; operational failures map to opaque storage errors.
 An envelope without content is a valid partial cache entry, so `message`
 returns `None` until complete content is stored. Reads preflight SQLite types
 and byte lengths before materializing user-controlled text or message bytes.
+Schema inspection likewise reads at most the canonical object count plus one
+and bounds every schema field before allocation.
 
 Blob and attachment encryption are intentionally deferred. This adapter does
 not use `chacha20poly1305` or `hmac` until a real blob/attachment port and a

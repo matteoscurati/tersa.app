@@ -29,6 +29,10 @@ mod macos {
     // Fixed ownership marker for this product account-store schema.
     const APPLICATION_ID: i64 = 0x5453_4D31;
     const VERSION: i64 = 1;
+    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 4;
+    const MAX_SCHEMA_KIND_LEN: i64 = 16;
+    const MAX_SCHEMA_NAME_LEN: i64 = 256;
+    const MAX_SCHEMA_SQL_LEN: i64 = 16 * 1_024;
     // Bounds lock waits without introducing retries or background work.
     const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
     const MIGRATION: &str = include_str!("../migrations/0001_account_mailbox.sql");
@@ -453,6 +457,10 @@ mod macos {
             {
                 OpenFailure::Corrupted
             }
+            rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::InvalidQuery => OpenFailure::Corrupted,
             _ => OpenFailure::Storage,
         }
     }
@@ -468,16 +476,39 @@ mod macos {
         connection.pragma_update(None, "key", literal.as_str())
     }
     fn schema(connection: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
-        let mut statement = connection.prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    normalize(&row.get::<_, String>(2)?),
-                ))
-            })?
-            .collect()
+        let mut statement = connection.prepare(
+            "SELECT
+                CASE WHEN typeof(type) = 'text' AND length(CAST(type AS BLOB)) <= ?1 THEN type END,
+                CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?2 THEN name END,
+                CASE
+                    WHEN sql IS NULL THEN ''
+                    WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?3 THEN sql
+                END
+             FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name
+             LIMIT ?4",
+        )?;
+        let row_limit = i64::try_from(CANONICAL_SCHEMA_OBJECT_COUNT + 1)
+            .map_err(|_error| rusqlite::Error::InvalidQuery)?;
+        let mut rows = statement.query(params![
+            MAX_SCHEMA_KIND_LEN,
+            MAX_SCHEMA_NAME_LEN,
+            MAX_SCHEMA_SQL_LEN,
+            row_limit
+        ])?;
+        let mut objects = Vec::with_capacity(CANONICAL_SCHEMA_OBJECT_COUNT);
+        while let Some(row) = rows.next()? {
+            if objects.len() == CANONICAL_SCHEMA_OBJECT_COUNT {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            objects.push((
+                row.get(0)?,
+                row.get(1)?,
+                normalize(&row.get::<_, String>(2)?),
+            ));
+        }
+        Ok(objects)
     }
     fn canonical_schema() -> Vec<(String, String, String)> {
         vec![
@@ -688,6 +719,41 @@ mod macos {
                 unknown_journal
             );
             drop(unchanged);
+
+            let excessive = TestDatabase::new("excessive-schema");
+            let excessive_connection = open_connection(excessive.path()).unwrap();
+            apply_key(&excessive_connection, &key(7).0).unwrap();
+            excessive_connection
+                .execute_batch(
+                    "CREATE TABLE one (value TEXT);
+                     CREATE TABLE two (value TEXT);
+                     CREATE TABLE three (value TEXT);
+                     CREATE TABLE four (value TEXT);
+                     CREATE TABLE five (value TEXT);",
+                )
+                .unwrap();
+            drop(excessive_connection);
+            assert_corrupted(SqlCipherMailboxStore::open(
+                account(),
+                excessive.path(),
+                key(7),
+            ));
+
+            let oversized = TestDatabase::new("oversized-schema");
+            let oversized_connection = open_connection(oversized.path()).unwrap();
+            apply_key(&oversized_connection, &key(7).0).unwrap();
+            oversized_connection
+                .execute_batch(&format!(
+                    "CREATE TABLE oversized_sql (value TEXT CHECK (value != '{}'));",
+                    "x".repeat(usize::try_from(MAX_SCHEMA_SQL_LEN).unwrap() + 1)
+                ))
+                .unwrap();
+            drop(oversized_connection);
+            assert_corrupted(SqlCipherMailboxStore::open(
+                account(),
+                oversized.path(),
+                key(7),
+            ));
 
             let (modified_database, modified) = open("modified-schema");
             modified

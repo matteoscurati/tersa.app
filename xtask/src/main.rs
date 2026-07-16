@@ -904,16 +904,22 @@ fn check_sqlcipher_dependency(
     violations.extend(sqlcipher_manifest_dependency_violations(
         package_name,
         dependency.name.as_str(),
+        &dependency.req.to_string(),
         target.as_deref(),
         expected_target,
+        dependency.uses_default_features,
+        &dependency.features,
     ));
 }
 
 fn sqlcipher_manifest_dependency_violations(
     package_name: &str,
     dependency_name: &str,
+    requirement: &str,
     target: Option<&str>,
     apple_target: &str,
+    uses_default_features: bool,
+    features: &[String],
 ) -> Vec<String> {
     if !matches!(dependency_name, "rusqlite" | "libsqlite3-sys") {
         return Vec::new();
@@ -929,6 +935,24 @@ fn sqlcipher_manifest_dependency_violations(
         violations.push(format!(
             "{package_name} -> {dependency_name} must use target `{apple_target}`"
         ));
+    }
+    if dependency_name == "rusqlite" {
+        if requirement != "=0.39.0" {
+            violations.push(format!(
+                "{package_name} -> rusqlite must pin exactly 0.39.0"
+            ));
+        }
+        if uses_default_features {
+            violations.push(format!(
+                "{package_name} -> rusqlite must disable default features"
+            ));
+        }
+        let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+        if features != BTreeSet::from(["bundled-sqlcipher"]) {
+            violations.push(format!(
+                "{package_name} -> rusqlite must enable only the `bundled-sqlcipher` feature"
+            ));
+        }
     }
     violations
 }
@@ -1436,8 +1460,11 @@ mod tests {
             sqlcipher_manifest_dependency_violations(
                 "tersa-application",
                 "rusqlite",
+                "=0.39.0",
                 Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
                 r#"cfg(any(target_os = "macos", target_os = "ios"))"#,
+                false,
+                &["bundled-sqlcipher".to_owned()],
             ),
             vec![
                 "tersa-application -> rusqlite (SQLCipher is exclusive to approved Apple SQLCipher owners)"
@@ -1447,6 +1474,38 @@ mod tests {
             blob_manifest_dependency_violations("tersa-application", "chacha20poly1305", "=0.10.1",),
             vec![
                 "tersa-application -> chacha20poly1305 (blob cryptography is exclusive to tersa-blob-spike)"
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_exact_rusqlite_version_and_features() {
+        assert!(
+            sqlcipher_manifest_dependency_violations(
+                "tersa-store-sqlcipher-macos",
+                "rusqlite",
+                "=0.39.0",
+                Some(r#"cfg(target_os = "macos")"#),
+                r#"cfg(target_os = "macos")"#,
+                false,
+                &["bundled-sqlcipher".to_owned()],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            sqlcipher_manifest_dependency_violations(
+                "tersa-store-sqlcipher-macos",
+                "rusqlite",
+                "^0.39",
+                Some(r#"cfg(target_os = "macos")"#),
+                r#"cfg(target_os = "macos")"#,
+                true,
+                &["bundled-sqlcipher".to_owned(), "load_extension".to_owned()],
+            ),
+            vec![
+                "tersa-store-sqlcipher-macos -> rusqlite must pin exactly 0.39.0",
+                "tersa-store-sqlcipher-macos -> rusqlite must disable default features",
+                "tersa-store-sqlcipher-macos -> rusqlite must enable only the `bundled-sqlcipher` feature",
             ]
         );
     }
