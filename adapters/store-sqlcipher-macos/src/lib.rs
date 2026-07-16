@@ -95,8 +95,18 @@ mod macos {
         fn open_inner(
             account: AccountId,
             path: &Path,
+            key: DatabaseKey,
+            after_preflight: impl FnOnce(&Path),
+        ) -> Result<Self, MailboxStoreError> {
+            Self::open_inner_with_hooks(account, path, key, after_preflight, |_path| {})
+        }
+
+        fn open_inner_with_hooks(
+            account: AccountId,
+            path: &Path,
             mut key: DatabaseKey,
             after_preflight: impl FnOnce(&Path),
+            after_open: impl FnOnce(&Path),
         ) -> Result<Self, MailboxStoreError> {
             let canonical_path = canonical_database_path(path).map_err(|kind| match kind {
                 OpenFailure::Corrupted => MailboxStoreError::Corrupted,
@@ -121,6 +131,11 @@ mod macos {
                 OpenFailure::Corrupted => MailboxStoreError::Corrupted,
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
+            after_open(&canonical_path);
+            if opened_file_has_moved(&connection).is_err() {
+                key.0.zeroize();
+                return Err(MailboxStoreError::Storage);
+            }
             if file_identity(&canonical_path).map_err(|kind| match kind {
                 OpenFailure::Corrupted => MailboxStoreError::Corrupted,
                 OpenFailure::Storage => MailboxStoreError::Storage,
@@ -355,6 +370,32 @@ mod macos {
             .map_err(|_error| OpenFailure::Storage)
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "SQLite requires a mutable integer pointer for SQLITE_FCNTL_HAS_MOVED"
+    )]
+    fn opened_file_has_moved(connection: &Connection) -> Result<(), OpenFailure> {
+        let mut has_moved = 0;
+        // SAFETY: `connection.handle()` remains valid for this synchronous call;
+        // `main` is a static NUL-terminated database name; and `has_moved` is a
+        // writable `i32` whose address remains valid until SQLite returns.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                connection.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&raw mut has_moved).cast::<std::ffi::c_void>(),
+            )
+        };
+        if result == rusqlite::ffi::SQLITE_OK && has_moved == 0 {
+            Ok(())
+        } else {
+            // Unsupported file controls, unexpected VFS results, and a moved
+            // opened file all fail closed before the key or database is read.
+            Err(OpenFailure::Storage)
+        }
+    }
+
     fn preflight_existing(
         path: &Path,
         account: &AccountId,
@@ -556,7 +597,7 @@ mod macos {
     ) -> Result<bool, OpenFailure> {
         let cipher_version: String = connection
             .query_row("PRAGMA cipher_version", [], |row| row.get(0))
-            .map_err(|_error| OpenFailure::Corrupted)?;
+            .map_err(classify_open)?;
         if cipher_version.is_empty() {
             return Err(OpenFailure::Corrupted);
         }
@@ -583,7 +624,7 @@ mod macos {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|_error| OpenFailure::Corrupted)?;
+            .map_err(classify_open)?;
         if AccountId::new(owner).ok().as_ref() != Some(account) {
             return Err(OpenFailure::Corrupted);
         }
@@ -653,7 +694,8 @@ mod macos {
             rusqlite::Error::FromSqlConversionFailure(..)
             | rusqlite::Error::IntegralValueOutOfRange(..)
             | rusqlite::Error::InvalidColumnType(..)
-            | rusqlite::Error::InvalidQuery => OpenFailure::Corrupted,
+            | rusqlite::Error::InvalidQuery
+            | rusqlite::Error::QueryReturnedNoRows => OpenFailure::Corrupted,
             _ => OpenFailure::Storage,
         }
     }
@@ -1018,6 +1060,44 @@ mod macos {
         }
 
         #[test]
+        fn identity_queries_classify_operational_sqlite_failures_as_storage() {
+            for code in [
+                rusqlite::ffi::SQLITE_NOMEM,
+                rusqlite::ffi::SQLITE_IOERR,
+                rusqlite::ffi::SQLITE_BUSY,
+                rusqlite::ffi::SQLITE_FULL,
+                rusqlite::ffi::SQLITE_CANTOPEN,
+            ] {
+                assert_eq!(
+                    classify_open(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(code),
+                        None,
+                    )),
+                    OpenFailure::Storage
+                );
+            }
+            assert_eq!(
+                classify_open(rusqlite::Error::QueryReturnedNoRows),
+                OpenFailure::Corrupted
+            );
+            assert_eq!(
+                classify_open(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "cipher_version".into(),
+                    rusqlite::types::Type::Integer,
+                )),
+                OpenFailure::Corrupted
+            );
+            assert_eq!(
+                classify_open(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+                    None,
+                )),
+                OpenFailure::Corrupted
+            );
+        }
+
+        #[test]
         fn unknown_noncanonical_and_future_schemas_are_rejected() {
             let unknown = TestDatabase::new("unknown-owner");
             let connection = raw_connection(&unknown);
@@ -1170,6 +1250,38 @@ mod macos {
                 fs::read(original_journal_path).unwrap(),
                 replacement_journal
             );
+        }
+
+        #[test]
+        fn moved_opened_file_is_rejected_before_key_or_database_reads() {
+            let original = TestDatabase::new("moved-opened-original");
+            let store = SqlCipherMailboxStore::open(account(), original.path(), key(7)).unwrap();
+            drop(store);
+            let original_bytes = fs::read(original.path()).unwrap();
+
+            let replacement = TestDatabase::new("moved-opened-replacement");
+            fs::write(replacement.path(), b"replacement remains unchanged").unwrap();
+            let replacement_bytes = fs::read(replacement.path()).unwrap();
+            let original_backup = original.directory.join("original-backup.sqlite3");
+            let replacement_backup = replacement.directory.join("replacement-backup.sqlite3");
+
+            let result = SqlCipherMailboxStore::open_inner_with_hooks(
+                account(),
+                original.path(),
+                key(7),
+                |_canonical_path| {
+                    fs::rename(original.path(), &original_backup).unwrap();
+                    fs::rename(replacement.path(), original.path()).unwrap();
+                },
+                |_canonical_path| {
+                    fs::rename(original.path(), &replacement_backup).unwrap();
+                    fs::rename(&original_backup, original.path()).unwrap();
+                },
+            );
+
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert_eq!(fs::read(original.path()).unwrap(), original_bytes);
+            assert_eq!(fs::read(&replacement_backup).unwrap(), replacement_bytes);
         }
 
         #[test]

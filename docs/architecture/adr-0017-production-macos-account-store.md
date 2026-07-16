@@ -26,14 +26,20 @@ checks, and no-follow opening of the canonicalized database leaf.
 An existing file is first inspected through an immutable read-only SQLite URI,
 so rollback-journal recovery cannot modify it before ownership is established.
 An empty candidate with any SQLite sidecar is rejected rather than claimed.
-Only then is the canonical path reopened read-write, and its device/inode
-identity is checked before the first database read. Connection-local
-safeguards are applied before the second ownership check, but durable WAL and
-secure-delete configuration occurs only after a fresh or already-owned
-canonical store has been established; a foreign file is rejected unchanged.
-The adapter's only `unsafe` block is the documented `sqlite3_key` call. It
-borrows the live rusqlite handle and fixed-size key for one synchronous call,
-avoiding the non-zeroizing SQL builder that a key PRAGMA would otherwise use.
+Only then is the canonical path reopened read-write. Before key application or
+database reads, `SQLITE_FCNTL_HAS_MOVED` is issued for SQLite's `main`
+database; on the bundled Unix VFS, this compares SQLite's held file with the
+current pathname. A moved result, unsupported control, or control failure is a
+storage failure. The pathname device/inode comparison remains defense in depth.
+This closes the deterministic swap-in/open/swap-back gap without claiming that
+all later path races are eliminated. Connection-local safeguards are applied
+before the second ownership check, but durable WAL and secure-delete
+configuration occurs only after a fresh or already-owned canonical store has
+been established; a foreign file is rejected unchanged. The adapter's only
+`unsafe` blocks are documented calls to `sqlite3_key` and
+`sqlite3_file_control`; each borrows the live rusqlite handle only for its
+synchronous call. Raw keying avoids the non-zeroizing SQL builder that a key
+PRAGMA would otherwise use.
 
 The adapter is synchronous internally but returns lazy, runtime-free futures.
 Later orchestration must poll it on a bounded blocking executor; it must not be
@@ -42,8 +48,11 @@ transaction, and a dropped unpolled future has no effect.
 
 Schema v1 owns a singleton account binding and message envelopes with nullable
 RFC 5322 content. Only an exactly empty database may be claimed. Ownership,
-version, schema, integrity, and decoded domain values are revalidated and map to
-opaque corruption errors; operational failures map to opaque storage errors.
+version, schema, integrity, missing identity rows, invalid SQLite types or
+conversions, empty cipher versions, and decoded domain values are revalidated
+and map to opaque corruption errors. SQLite operational failures, including
+`NOMEM`, `IOERR`, `BUSY`, `FULL`, and `CANTOPEN`, map to opaque storage errors,
+including when they occur while reading `cipher_version` or the account binding.
 This includes non-OK raw-key setup results such as `SQLITE_NOMEM`; a wrong key
 instead succeeds at setup and maps to corruption when the first read fails.
 An envelope without content is a valid partial cache entry, so `message`
@@ -60,11 +69,12 @@ the applicable SQLCipher engine evidence until that protocol exists.
 
 Deterministic adapter tests cover exact schema convergence and no-op reopen,
 wrong-key and foreign/future/noncanonical schema rejection, orphan-sidecar and
-foreign hot-journal non-mutation, preflight/reopen replacement rejection,
-transaction rollback, lazy cancellation, corrupted row rejection, mutex
-poisoning, symlink denial, and absence of plaintext sentinels from the database
-and sidecars. A broader process-crash harness is deferred until the store adds a
-commit protocol beyond one SQLCipher transaction.
+foreign hot-journal non-mutation, preflight/reopen replacement rejection, an
+opened-file swap-in/open/swap-back rejection before keying, transaction
+rollback, lazy cancellation, corrupted row rejection, mutex poisoning, symlink
+denial, and absence of plaintext sentinels from the database and sidecars. A
+broader process-crash harness is deferred until the store adds a commit protocol
+beyond one SQLCipher transaction.
 
 ## Consequences
 
