@@ -254,14 +254,20 @@ pub trait RemoteMailbox: Send + Sync {
     ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>>;
 }
 
-/// Reads metadata-only mailbox envelopes from a local store.
+/// Reads envelope rows, but no complete message bodies, from a local store.
 ///
-/// This port deliberately excludes cached message bodies and every mutation.
-/// Read-only surfaces such as the initial macOS CLI receive only this narrower
-/// capability.
+/// An envelope includes its existing body-derived preview field. This port
+/// deliberately excludes complete cached message bodies and every mutation;
+/// narrower output adapters must project away preview when their contract
+/// requires metadata only.
 pub trait MailboxReader: Send + Sync {
     /// Lists envelopes in a deterministic total order: received time descending,
     /// then message identifier ascending, limited by the local result limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
     fn list_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
@@ -270,6 +276,11 @@ pub trait MailboxReader: Send + Sync {
     /// Lists one thread's envelopes in a deterministic total order: received
     /// time ascending, then message identifier ascending, limited by the local
     /// result limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
     fn thread_envelopes<'a>(
         &'a self,
         account: &'a AccountId,

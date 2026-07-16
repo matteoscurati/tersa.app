@@ -25,6 +25,7 @@ mod macos {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use rusqlite::config::DbConfig;
     use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
     use tersa_application::mailbox::{
         BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
@@ -77,7 +78,7 @@ mod macos {
         }
     }
 
-    /// Reads metadata-only envelopes from one existing account database.
+    /// Reads envelope rows, but no complete message bodies, from one account database.
     ///
     /// This type intentionally implements `MailboxReader`, not `MailboxStore`:
     ///
@@ -103,8 +104,11 @@ mod macos {
         /// Opens an existing persistent-WAL account database without write authority.
         ///
         /// The main database, WAL, and shared-memory sidecar must already be
-        /// regular files. This path never creates, migrates, checkpoints,
-        /// repairs, or changes journal mode.
+        /// regular files. It exposes no creation, migration, checkpoint,
+        /// repair, or journal-mode operation. The bundled VFS can internally
+        /// recreate a sidecar if same-user malware deletes it after preflight;
+        /// the post-read identity check fails that open, but cannot undo the
+        /// already-created entry.
         ///
         /// # Errors
         ///
@@ -139,6 +143,7 @@ mod macos {
                 let identities = preflight_read_only_files(&canonical_path)?;
                 after_preflight(&canonical_path);
                 let connection = open_read_only_connection(&canonical_path)?;
+                disable_and_verify_checkpoint_on_close(&connection)?;
                 opened_file_has_moved(&connection)?;
                 verify_read_only_file_identities(&canonical_path, identities)?;
                 set_and_verify_persistent_wal(&connection)?;
@@ -581,7 +586,21 @@ mod macos {
         Connection::open_with_flags(path, flags).map_err(|_error| OpenFailure::Storage)
     }
 
-    #[allow(
+    fn disable_and_verify_checkpoint_on_close(connection: &Connection) -> Result<(), OpenFailure> {
+        let config = DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
+        if !connection
+            .set_db_config(config, true)
+            .map_err(|_error| OpenFailure::Storage)?
+            || !connection
+                .db_config(config)
+                .map_err(|_error| OpenFailure::Storage)?
+        {
+            return Err(OpenFailure::Storage);
+        }
+        Ok(())
+    }
+
+    #[expect(
         unsafe_code,
         reason = "SQLite requires a mutable integer pointer for SQLITE_FCNTL_HAS_MOVED"
     )]
@@ -913,7 +932,7 @@ mod macos {
         validation
     }
 
-    #[allow(
+    #[expect(
         unsafe_code,
         reason = "SQLite PERSIST_WAL file control accepts a mutable integer pointer"
     )]
@@ -1054,7 +1073,7 @@ mod macos {
         }
     }
 
-    #[allow(
+    #[expect(
         unsafe_code,
         reason = "SQLCipher's raw-key API avoids copying the key into an ordinary SQL string"
     )]
@@ -2125,6 +2144,14 @@ mod macos {
                     .unwrap(),
                 -1
             );
+            assert!(
+                reader
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+                    .unwrap()
+            );
             let foreign_account = AccountId::new("foreign-account").unwrap();
             assert_eq!(
                 run(reader.list_envelopes(&foreign_account, StoreLimit::new(10).unwrap(),)),
@@ -2409,6 +2436,25 @@ mod macos {
                     .len(),
                 1
             );
+        }
+
+        #[test]
+        fn read_only_sidecar_delete_recreate_is_an_accepted_residual() {
+            let (database, store) = open("reader-sidecar-delete-race");
+            run(store.upsert_envelopes(&account(), &[envelope("one", "thread", 1)])).unwrap();
+            drop(store);
+            let original_wal = file_identity(&wal_path(&database)).unwrap();
+            let result = SqlCipherMailboxReader::open_read_only_with_hooks(
+                account(),
+                database.path(),
+                key(7),
+                |_path| {},
+                |_path| fs::remove_file(wal_path(&database)).unwrap(),
+                |_path| {},
+            );
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert!(wal_path(&database).is_file());
+            assert_ne!(file_identity(&wal_path(&database)).unwrap(), original_wal);
         }
 
         #[test]

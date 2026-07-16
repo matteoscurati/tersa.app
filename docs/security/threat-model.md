@@ -32,7 +32,7 @@ production-security claim.
 3. The shared Rust core owns domain invariants. Platform adapters own only
    unavoidable OS capabilities and may not leak Apple or UI types inward.
 4. Each account database and blob namespace is an isolation boundary. The
-   interim macOS CLI composition may receive only the metadata-only
+   interim macOS CLI composition may receive only the envelope-only
    `MailboxReader`; UI, future CLI mutations, and future MCP access must go
    through authorized application use cases rather than widening direct store
    authority.
@@ -58,7 +58,7 @@ passcode, Google credentials, signing identity, or an authorized local process.
 | Threat | Required controls | Residual risk or open gate |
 |---|---|---|
 | OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, system authentication session on iOS, refresh token in device-only Keychain | Real Google exchange, Keychain persistence, revocation, and physical-device flow remain open |
-| Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict metadata-only read capability, chunked blob AEAD, Keychain root key, Apple File Protection, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; the bundled VFS cannot detect same-user `-shm` swap-in/open/swap-back |
+| Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, Keychain root key, Apple File Protection, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; the bundled VFS cannot prevent same-user sidecar swap-in/open/swap-back or deletion/recreation races |
 | Malicious MIME/HTML and tracking pixels | Size/depth/part limits, attachment exclusion, typed `SafeHtml`, nonpersistent WKWebView, JavaScript/network/navigation denial, remote images blocked | Parser/WebKit zero-days and physical-device containment remain open |
 | Malicious attachment or decompression bomb | On-demand fetch, byte/ratio/time/memory limits, no macro execution, sandboxed short-lived worker when needed | Complex production parsers and sandbox evidence are not implemented |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, stable RFC Message-ID, server reconciliation after ambiguous timeout | Production sync/outbox is not implemented |
