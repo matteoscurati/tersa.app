@@ -281,11 +281,13 @@ pub trait MailboxStore: Send + Sync {
         limit: StoreLimit,
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
     /// Lists one thread's envelopes in a deterministic total order: received
-    /// time ascending, then message identifier ascending.
+    /// time ascending, then message identifier ascending, limited by the local
+    /// result limit.
     fn thread_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
         thread_id: &'a ThreadId,
+        limit: StoreLimit,
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
     /// Retrieves an optional complete message.
     fn message<'a>(
@@ -505,6 +507,7 @@ mod tests {
             &'a self,
             account: &'a AccountId,
             thread: &'a ThreadId,
+            limit: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             let mut values: Vec<_> = self
                 .envelopes
@@ -521,6 +524,7 @@ mod tests {
                     .cmp(&right.received_at())
                     .then_with(|| left.message_id().as_str().cmp(right.message_id().as_str()))
             });
+            values.truncate(usize::from(limit.get()));
             Box::pin(ready(Ok(values)))
         }
         fn message<'a>(
@@ -561,7 +565,7 @@ mod tests {
             ["thread-a", "thread-b", "middle", "old"]
         );
         let thread = ThreadId::new("thread").unwrap();
-        let mut threaded = store.thread_envelopes(&account, &thread);
+        let mut threaded = store.thread_envelopes(&account, &thread, StoreLimit::new(2).unwrap());
         let Poll::Ready(Ok(threaded)) = poll_once(&mut threaded) else {
             panic!("the fake is immediately ready");
         };
@@ -570,7 +574,7 @@ mod tests {
                 .iter()
                 .map(|value| value.message_id().as_str())
                 .collect::<Vec<_>>(),
-            ["old", "thread-a", "thread-b"]
+            ["old", "thread-a"]
         );
         let value = message("complete", "thread", 4);
         let expected = value.clone();

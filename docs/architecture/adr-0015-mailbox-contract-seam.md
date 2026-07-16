@@ -34,7 +34,9 @@ Remote `PageSize` is only a provider pagination size (1 through 500). Local
 preserves provider page order; global and equal-time ordering is provider-defined
 or unspecified, so it is not a lossless sync snapshot. Local listings use stable
 total orders: newest-first by received time then message ID, and thread listings
-oldest-first by received time then message ID.
+oldest-first by received time then message ID. Both local listing operations
+require a `StoreLimit`, including thread listings, so no local query contract
+returns an unbounded envelope collection.
 
 Each concrete adapter must provide its own cancellation, atomicity, and contract
 conformance tests. Reusable cross-crate test support is deferred.
