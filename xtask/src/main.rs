@@ -30,7 +30,19 @@ const SQLCIPHER_OWNERS: [&str; 3] = [
     "tersa-store-sqlcipher-macos",
 ];
 const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 0] = [];
+const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 2] = [
+    (
+        "tersa-cli-macos",
+        &[
+            "tersa-application",
+            "tersa-domain",
+            "tersa-keychain-macos",
+            "tersa-platform",
+            "tersa-store-sqlcipher-macos",
+        ],
+    ),
+    ("tersa-keychain-macos", &["tersa-platform"]),
+];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
@@ -1323,14 +1335,15 @@ mod tests {
     use cargo_metadata::PackageId;
 
     use super::{
-        ResolvedDependencyIdentity, blob_dependency_graph_violations,
+        RESERVED_FUTURE_POLICY, ResolvedDependencyIdentity, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
         dependency_policy, future_macos_store_dependency_violation,
         gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
         gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, parse_identity, resolved_workspace_dependency_names,
-        rusqlite_resolved_feature_violations, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, target_metadata_options,
+        is_slint_runtime_dependency, parse_identity, reserved_future_policy_violations,
+        resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        target_metadata_options,
     };
 
     #[test]
@@ -1371,6 +1384,80 @@ mod tests {
         assert_eq!(
             dependency_policy()["tersa-store-sqlcipher-macos"],
             BTreeSet::from(["tersa-application", "tersa-domain"])
+        );
+    }
+
+    #[test]
+    fn reserves_exact_macos_keychain_and_cli_dependency_boundaries() {
+        assert_eq!(
+            RESERVED_FUTURE_POLICY,
+            [
+                (
+                    "tersa-cli-macos",
+                    &[
+                        "tersa-application",
+                        "tersa-domain",
+                        "tersa-keychain-macos",
+                        "tersa-platform",
+                        "tersa-store-sqlcipher-macos",
+                    ][..],
+                ),
+                ("tersa-keychain-macos", &["tersa-platform"][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_a_reserved_crate_appears() {
+        let resolved = BTreeMap::from([
+            (
+                "tersa-cli-macos".to_owned(),
+                BTreeSet::from([
+                    "tersa-application".to_owned(),
+                    "tersa-domain".to_owned(),
+                    "tersa-keychain-macos".to_owned(),
+                    "tersa-platform".to_owned(),
+                    "tersa-store-sqlcipher-macos".to_owned(),
+                ]),
+            ),
+            (
+                "tersa-keychain-macos".to_owned(),
+                BTreeSet::from(["tersa-platform".to_owned()]),
+            ),
+        ]);
+
+        assert_eq!(
+            reserved_future_policy_violations(&resolved),
+            vec![
+                "workspace crate `tersa-cli-macos` is reserved for a later reviewed policy change",
+                "workspace crate `tersa-keychain-macos` is reserved for a later reviewed policy change",
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_reservations_while_the_future_crates_are_absent() {
+        let resolved = BTreeMap::from([
+            ("tersa-application".to_owned(), BTreeSet::new()),
+            ("tersa-platform".to_owned(), BTreeSet::new()),
+        ]);
+
+        assert!(reserved_future_policy_violations(&resolved).is_empty());
+    }
+
+    #[test]
+    fn reports_dependencies_beyond_a_reserved_boundary() {
+        let resolved = BTreeMap::from([(
+            "tersa-keychain-macos".to_owned(),
+            BTreeSet::from(["tersa-application".to_owned(), "tersa-platform".to_owned()]),
+        )]);
+
+        assert_eq!(
+            reserved_future_policy_violations(&resolved),
+            vec![
+                "workspace crate `tersa-keychain-macos` is reserved for a later reviewed policy change",
+                "reserved future crate `tersa-keychain-macos` -> `tersa-application` exceeds its allowed inward dependencies",
+            ]
         );
     }
 
