@@ -11,8 +11,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
+use std::sync::Mutex;
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
