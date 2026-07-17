@@ -7496,6 +7496,7 @@ name = "tersa-apple-bridge"
 version = "0.0.0"
 dependencies = [
  "tersa-application",
+ "tersa-keychain-macos",
  "tersa-presentation",
  "url",
  "zeroize",
@@ -7571,6 +7572,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "hkdf",
  "objc2-foundation 0.3.2",
+ "rustix 1.1.4",
  "security-framework-sys",
  "sha2",
  "tersa-platform",
@@ -7630,6 +7632,7 @@ name = "tersa-store-sqlcipher-macos"
 version = "0.0.0"
 dependencies = [
  "rusqlite",
+ "rustix 1.1.4",
  "tersa-application",
  "tersa-domain",
  "zeroize",

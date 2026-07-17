@@ -201,6 +201,11 @@ bootstrap calls before Keychain or filesystem access. The implementation must
 update the exact Foundation feature policy and its positive and negative
 fixtures; no other Foundation type or feature is authorized.
 
+The Rust FFI harness proves public ABI rejection for null, zero-length, and
+oversized inputs plus background-thread boundary status mapping without touching
+Keychain. It does not reliably execute a valid main-thread bootstrap call; that
+runtime dispatch claim remains PR 33b evidence.
+
 PR 33a.5 authorizes `rustix =1.1.4` as the sole new external package, with exact
 direct macOS declarations in both `tersa-keychain-macos` and
 `tersa-store-sqlcipher-macos`. Both use the canonical atomic target structure
@@ -309,7 +314,8 @@ can replace that entry between `statat`, `chmodat`, open, and final `fstat`; the
 identity check detects an observable replacement but cannot prevent chmod from
 affecting the replacement. This is an explicit unlocked-device/local-malware
 residual. Deterministic hooks exercise both gaps and record the non-prevention
-case without claiming atomicity.
+case without claiming atomicity. A separate post-open mode-race hook proves that
+the descriptor-bound final `fstat` still requires exact `0600` and fails closed.
 
 The synchronous bootstrap C ABI runs only on the dedicated bounded `TersaMac`
 bootstrap worker, never on the AppKit/main thread. The worker has concurrency
@@ -324,28 +330,31 @@ process-local mutex attempt and covers mutex, lock-file open/validation, and
 advisory-lock acquisition. Mutex acquisition and the exclusive advisory lock use
 nonblocking attempts with a fixed 10-millisecond backoff capped by the remaining
 deadline. `EINTR` retries within the same remaining budget; would-block retries
-after the backoff; poisoning, any other error, or deadline expiry returns
-`bootstrap_busy_or_unavailable` without entering bootstrap state and releases
-every guard or descriptor acquired by that attempt. After both guards are
-acquired, they remain held through Keychain root retrieval, the absent-root
-profile preflight, any authorized root provisioning, fixed-directory work,
-store claim and migration, all pre- and post-open identity checks, every
-authorized failure-cleanup attempt, and construction of the final closed
-status.
+after the backoff. Deadline expiry during process-local or advisory-lock
+acquisition returns `bootstrap_busy_or_unavailable`. A poisoned process mutex,
+malformed or unsafe lock entry, and operational lock open, normalization, or
+validation failure return `bootstrap_unavailable`; they are never presented as
+contention. Every failure releases each guard or descriptor acquired by that
+attempt. After both guards are acquired, they remain held through Keychain root
+retrieval, the absent-root profile preflight, any authorized root provisioning,
+fixed-directory work, store claim and migration, all pre- and post-open identity
+checks, every authorized failure-cleanup attempt, and construction of the final
+closed status.
 
 Every cooperative `TersaMac` bootstrap must enter through this worker and lock
 protocol; the CLI never bootstraps and receives no lock or repair authority.
 PR 33a.5 proves the concurrency-one, one-pending worker contract through exact
 review of `apple/macos/BootstrapWorker.swift` and its sole application call site
 in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin those
-bounds and paths, and only credentialless build and analyze of the existing
+bounds and paths, and only a credentialless build of the existing
 `TersaMac` Xcode target. It adds no Xcode test target, scheme test action,
 entitlement or signing-policy exception, and this source evidence passes no
 runtime or device-signed gate. Runtime worker dispatch and overflow evidence
 belongs to PR 33b. Rust deterministic tests in PR 33a.5 cover the C ABI's
 `NSThread`-based main-thread rejection, timeout, injected `EINTR`, restrictive
 umasks, a crash after lock-file creation but before `fchmod`, concurrent
-normalization, rejection of any execute/group/other permission bit, crash
+normalization, rejection of any execute/group/other permission bit, an
+existing-lock mode race after descriptor binding, crash
 release of the advisory lock, and adversarial two-thread and two-process
 interleavings around directory creation and
 main/rollback-journal/WAL/shared-memory cleanup. The
@@ -411,31 +420,82 @@ merely because any sidecar is absent.
 
 | Main | Rollback journal / WAL / SHM | Required behavior |
 |---|---|---|
-| Absent | All three absent | Fresh leaf: invoke the existing opener and permit bounded fresh-failure cleanup. |
+| Absent | All three absent | Fresh leaf: invoke the existing opener; bounded fresh-failure cleanup begins only after its `O_EXCL` main-file claim succeeds. |
 | Present | Any combination, including all absent | Existing leaf: invoke the existing opener and migration path; never permit fresh-failure cleanup. The opener may still reject it. |
 | Absent | Any one or more present | Fail closed before store open; perform no cleanup. |
 
-This four-entry pre-open classification augments and must not weaken the
-existing `database_sidecar_exists` invariant over the three suffixes
+This four-entry pre-open classification is enforced over the three suffixes
 `-journal`, `-wal`, and `-shm`. In particular, the existing
 `absent_with_sidecar` and `empty_with_sidecar` rollback-journal fixtures retain
 their behavior: an orphan journal with no main file is preserved and fails
 before open, while an empty present main plus journal enters the existing-leaf
 opener and preserves the journal when that opener rejects it.
 
-On any fresh-leaf failure before successful claim and migration, the store
-first closes all SQLite handles while retaining the validated parent descriptor.
+An existing main, WAL, or SHM must be a same-owner regular file at exact mode
+`0600`; the writer checks those modes before SQLite access and revalidates the
+pre-open identities and modes after open. An existing canonical main without
+sidecars may re-establish its WAL/SHM pair through the owning writer. The writer
+normalizes only those newly created sidecars through identity-bound descriptors
+to exact `0600`, including under process umasks `0777`, `0577`, and `0377`; it
+never normalizes or adopts a sidecar that was present in the snapshot. A fresh
+logical database left in WAL mode by a crash immediately before migration is a
+recoverable existing state, with or without SHM. Its owning writer completes
+migration without receiving snapshot-present cleanup authority.
+
+An existing main is first validated without mutation through the immutable
+main-file view. If the snapshot contains the complete WAL/SHM pair, a second
+read-only/no-follow connection with checkpoint-on-close disabled validates the
+logical WAL-resident database. If WAL exists but SHM was lost, SQLite cannot
+open either immutable or ordinary read-only state. The store selects the first
+available name from exactly eight fixed staging slots,
+`.tersa-wal-recovery-v1-0` through `.tersa-wal-recovery-v1-7`, beneath the
+retained account descriptor. It creates the selected directory exclusively,
+binds its identity, normalizes that same object to exact `0700` with
+descriptor-relative no-follow `chmodat`, and only then opens it no-follow. This
+converges even when the creation umask initially produces mode `0000`, `0200`,
+or `0400`.
+
+The store copies the still-encrypted main and WAL from identity-bound no-follow
+descriptors into exclusive, descriptor-normalized `0600` staging files and
+creates only a `0600` staging SHM. Before database key or page reads, it binds
+the parent-resolved directory identity to the opened directory descriptor,
+binds all three copied identities, opens the staging main with actual SQLite
+read-only/no-follow flags, disables and verifies checkpoint-on-close, verifies
+that the opened main has not moved, and revalidates the directory and copied
+identities. The same key, account, canonical-schema, foreign-key, SQLCipher, and
+SQLite integrity checks then run on that read-only handle. The original main/WAL
+identities are revalidated before and after validation.
+
+Normal setup, copy, wrong-key, corrupt-WAL, schema, or integrity failures remove
+only the provably created, identity-revalidated stage. An observed identity,
+type, owner, or mode mismatch fails closed and preserves the unknown or tampered
+residue. A process crash may leave at most the eight encrypted, owner-only
+staging directories. Retry may use another empty fixed slot but never adopts or
+deletes a pre-existing slot; exhaustion fails closed without creating an
+unbounded ninth name. After successful cleanup, the owning writer reopens the
+unchanged original pair and creates a new exact-`0600` SHM. No original fixed
+entry is cleaned, checkpointed, adopted, or repaired by preflight, and this
+WAL-aware path never grants fresh-cleanup authority to a snapshot-present main.
+
+On a fresh-leaf failure after the store has successfully claimed the main file
+with `O_EXCL`, but before migration is accepted, the store first closes all
+SQLite handles while retaining the validated parent descriptor.
 For each fixed name that was absent in the pre-open snapshot and is newly
 present after close, the store may treat it as a cleanup candidate under the
-cooperative-writer assumption. It uses descriptor-relative no-follow `statat`,
-records identity, type, owner, and permissions after close, and revalidates
-immediately before descriptor-relative `unlinkat` beneath that same retained
-parent. Cleanup may remove only a same-user restrictive regular file whose
-post-close identity still matches. It must never call `std::fs::remove_file`,
-re-resolve the account path, remove an entry present in the pre-open snapshot,
-remove an entry with changed identity, or remove a profile directory. Cleanup
-failure preserves the original redacted failure and may leave restrictive
-residual store files. A retry never reclassifies a nonempty residual as fresh:
+cooperative-writer assumption. Without the proven exclusive main-file claim,
+no main or sidecar cleanup runs; a racing main with WAL/SHM is preserved. The
+authorized cleanup uses descriptor-relative no-follow `statat`, records
+identity, type, owner, and permissions after close, and revalidates immediately
+before descriptor-relative `unlinkat` beneath that same retained parent. Before
+each candidate unlink, including after deterministic race hooks, the fixed main
+name must still resolve to the recorded `O_EXCL`-created main identity; a main
+replacement or deletion preserves every remaining candidate.
+Cleanup may remove only a same-user restrictive regular file whose post-close
+identity still matches. It must never call `std::fs::remove_file`, re-resolve
+the account path, remove an entry present in the pre-open snapshot, remove an
+entry with changed identity, or remove a profile directory. Cleanup failure
+preserves the original redacted failure and may leave restrictive residual
+store files. A retry never reclassifies a nonempty residual as fresh:
 it re-enters the same state matrix. A main-present residual is handled only by
 the existing opener and migration path and may converge only if every existing
 key, identity, sidecar, schema, and integrity invariant passes; otherwise it
@@ -446,24 +506,27 @@ no repair authority.
 
 The retained parent descriptor removes parent-path re-resolution from this leaf
 cleanup. The global lock serializes cooperative bootstraps only. A same-user
-malicious process that ignores it can insert a fixed-name entry after the absent
-snapshot but before post-close recording; the store cannot prove whether SQLite
-or that process created the candidate. It can also replace the mutable fixed
-final name after final identity revalidation and before `unlinkat`. macOS
+malicious process that ignores it can insert a sidecar after the proven
+`O_EXCL` main claim but before post-close recording; the store cannot prove
+whether SQLite or that process created the candidate. Insertion of a racing
+main before the claim makes `O_EXCL` fail and causes no cleanup. The process can
+also replace a mutable fixed final name after final identity revalidation and
+before `unlinkat`. macOS
 provides neither creation provenance for the first gap nor an unlink-if-inode
 primitive for the second. These two mutable-final-name gaps are the stated
 store-cleanup residuals; no parent-path cleanup race is claimed. Deterministic
-hooks must exercise insertion between snapshot and post-close recording,
-replacement between recording and revalidation, and replacement in the exact
-revalidation-to-`unlinkat` gap for the main file, rollback journal, WAL, and
-shared-memory file. The insertion and final replacement hooks record
-non-prevention rather than claiming safety; the middle hook proves that an
-observable identity mismatch is preserved. The retained parent descriptor is
-released on every return after the snapshot, open, and any authorized cleanup
-sequence.
+hooks must exercise sidecar insertion after the exclusive main claim and before
+post-close recording, replacement between recording and revalidation, and
+replacement in the exact revalidation-to-`unlinkat` gap. The insertion and
+final replacement hooks record non-prevention rather than claiming safety; the
+middle hook proves that an observable identity mismatch is preserved. A
+separate race fixture proves that main-file `O_EXCL` failure preserves a racing
+main and its WAL/SHM. The retained parent descriptor is released on every return
+after the snapshot, open, and any authorized cleanup sequence.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
-or migration boundary; cover the all-absent fresh state, every main-present
+or migration boundary, including WAL-resident crashes before migration with and
+without SHM; cover the all-absent fresh state, every main-present
 combination of the three sidecars, and every main-absent orphan-sidecar
 combination; preserve the existing `absent_with_sidecar` and
 `empty_with_sidecar` journal behavior; and replace each recorded entry before
@@ -472,7 +535,11 @@ must also retry every nonempty cleanup-residual subset and prove the matrix abov
 main-present subsets may converge only through all existing-opener invariants,
 while sidecar-only subsets fail before open. Pre-existing entries and profile
 directories survive every failure, and cleanup uses only the retained
-descriptor plus fixed names.
+descriptor plus fixed names. Recovery-stage tests must cover restrictive umasks,
+wrong keys, corrupt WAL, setup and copy boundaries, copied-leaf mode drift,
+original identity drift, directory replacement, and exhaustion of all eight
+fixed slots. Normal failures leave no staging residue; observed tampering is
+preserved and remains fail closed.
 This is a hardening of the existing pathname-based SQLite opener, not a new
 descriptor-bound SQLite API, opener, composition crate, or
 workspace-to-workspace dependency edge. The only new external-package edges are
@@ -635,12 +702,13 @@ ownership or migration event.
 Every validated read-write store connection sets and verifies
 `SQLITE_FCNTL_PERSIST_WAL = 1` after ownership is established, so a clean final
 checkpoint retains both `-wal` and `-shm` for a later reader. The read-only path
-requires the main database and both sidecars to exist with the expected file
-identities before it opens. It exposes no create, replace, delete, or repair
-operation. If a legacy profile lacks the pair, a crash requires recovery, or a
-sidecar replacement remains observable during the post-open identity check,
-the reader fails closed until the owning read-write application opens and
-establishes a valid persistent-WAL state.
+requires the main database and both sidecars to exist as same-owner regular
+files at exact mode `0600`, with the expected file identities before it opens.
+It exposes no create, replace, delete, or repair operation. If a legacy profile
+lacks the pair, a crash requires recovery, permissions are not exactly
+restrictive, or a sidecar replacement remains observable during the post-open
+identity check, the reader fails closed until the owning read-write application
+opens and establishes a valid persistent-WAL state.
 
 The live connection uses SQLite read-only/no-mutex/no-follow mode without
 `immutable=1` and without a private copy. It disables and verifies

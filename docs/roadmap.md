@@ -120,7 +120,7 @@ satisfies `M1-UI-001` and never changes the mobile-inclusive
 passes. Real Google authorization and verification also remain open until their
 own reviewed evidence exists.
 
-The bootstrap-source authorization does not edit or pass the M0 gate register,
+The bootstrap-source implementation does not edit or pass the M0 gate register,
 add a new executable, Xcode, signing, entitlement, package, or distribution
 surface, or imply OAuth, token, network, or real-account behavior. Its fake and
 deterministic evidence cannot satisfy runtime, signing, App Group, Data
@@ -149,7 +149,7 @@ which alone owns identity-checked cleanup of fresh leaf files. Each slice
 requires independent review with zero unresolved actionable findings on its
 exact head.
 
-PR 33a.5 reuses exact `rustix =1.1.4` as its sole newly authorized external
+PR 33a.5 reuses exact `rustix =1.1.4` as its sole newly activated external
 package and adds direct macOS declarations to Keychain and SQLCipher-store. The
 two declarations use canonical atomic `cfg(target_os = "macos")`. The Keychain
 member directly adds only `process` atop workspace `fs`/`std` for `geteuid`;
@@ -176,10 +176,15 @@ creation requests `O_EXCL` mode `0600` and normalizes its returned descriptor.
 For an existing same-user regular lock, no-follow `statat`, bounded no-follow
 `chmodat` recovery of `0000`, `0200`, or `0400`, then no-follow open and exact
 identity/mode revalidation precede locking. Execute/group/other bits or any type,
-owner, or identity drift fail without repair. This converges after restrictive
+owner, identity, or final-mode drift fail without repair. A deterministic
+post-open mode-race fixture proves exact `0600` remains mandatory. This
+converges after restrictive
 umasks or a crash before `fchmod`, including an otherwise unopenable `0000`
 file, and all work remains inside the deadline. Mutable-name normalization gaps
 remain an explicit same-user local-malware residual.
+Only deadline expiry or bounded process/advisory-lock contention maps to
+`bootstrap_busy_or_unavailable`; a poisoned process mutex and malformed,
+unsafe, or operational lock failure map to `bootstrap_unavailable`.
 After validated Keychain item-not-found and before provisioning, only an absent
 tree or empty fixed profile skeleton is accepted; any existing state returns
 `root_missing_with_existing_profile` without Keychain, profile-tree, or store
@@ -189,9 +194,11 @@ filesystem effect.
 PR 33a.5 pins the worker's concurrency-one and one-pending source contract with
 `apple/macos/BootstrapWorker.swift`, its sole call site in
 `apple/macos/AppDelegate.swift`, and `xtask` fixtures, then only
-credentiallessly builds/analyzes the existing target. It adds no Xcode test
-target or policy exception. Runtime dispatch/overflow evidence remains PR 33b;
-PR 33a.5 Rust tests cover C ABI main-thread rejection and locking.
+credentiallessly builds the existing target. It adds no Xcode test
+target or policy exception. Runtime dispatch/overflow evidence remains PR 33b.
+PR 33a.5 Rust tests prove invalid C ABI null/zero/oversized input mapping and
+background-thread boundary mapping without Keychain access; they do not execute
+a valid main-thread bootstrap call. They also cover locking.
 
 Before SQLite open, the store retains a validated account-directory descriptor
 and snapshots exactly `mail.sqlite3`, `mail.sqlite3-journal`,
@@ -200,20 +207,42 @@ absent is a fresh leaf eligible for bounded failed-open cleanup. A present main
 with any combination of the three sidecars uses the existing opener/migration
 path, which may still reject it, and is never cleanup eligible. An absent main
 with any sidecar fails before open without cleanup.
-This augments the existing `database_sidecar_exists` three-suffix invariant;
-fixtures preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
+This classification is enforced over all three sidecar suffixes; fixtures
+preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
 and cover every relevant combination.
 
-After a failed fresh open closes SQLite handles, the store may clean any of the
-four fixed entries that was absent pre-open and newly present after close under
-the cooperative-writer assumption. It uses rustix `statat` and `unlinkat`
+After a failed fresh open closes SQLite handles, the store may clean fixed
+entries that were absent pre-open only when it first proved main-file authorship
+with `O_EXCL`. Without that proof no main or sidecar cleanup runs, preserving a
+racing main plus WAL/SHM. The authorized path uses rustix `statat` and `unlinkat`
 beneath the retained descriptor and never re-resolves a parent pathname or calls
-`std::fs::remove_file`. SQLite remains pathname-based; no descriptor-bound
-SQLite opener is claimed. The stated cleanup residuals are same-user insertion
-between snapshot and recording, which can be misattributed to SQLite, and
-same-user replacement between revalidation and `unlinkat`; deterministic hooks
-cover both non-prevention gaps and intermediate mismatch preservation for all
-four entries. A retry re-enters the same matrix: a main-present residual may
+`std::fs::remove_file`. Candidate cleanup also revalidates the recorded
+`O_EXCL` main identity inside the unlink helper immediately before every unlink;
+a main replacement preserves all remaining candidates. SQLite remains
+pathname-based; no descriptor-bound SQLite opener is claimed. An immutable
+main-file preflight falls back to a non-checkpointing read-only logical
+validation when a fresh main has a complete WAL/SHM pair. If SHM is missing,
+the store validates identity-bound encrypted main/WAL copies in O_EXCL `0600`
+staging files beneath one exclusively created directory selected from exactly
+eight fixed `.tersa-wal-recovery-v1-*` slots. The directory is identity-bound,
+normalized to exact `0700`, and opened no-follow even under umasks `0777`,
+`0577`, or `0377`. Directory and copied-file identities are bound before the
+actual read-only/no-follow SQLite handle and revalidated with the opened-main
+moved check before key or page reads; checkpoint-on-close is disabled. Normal
+setup, copy, key, and validation failures clean only the proven stage. Tampered
+or mismatched staging residue is preserved fail closed. A crash can leave at
+most eight encrypted owner-only stages; retry never adopts an occupied slot,
+and exhaustion creates no unbounded name. The owning writer then rebuilds an
+exact `0600` SHM; the staging preflight has no mutation, cleanup, or repair
+authority over the original main/WAL pair. Existing main/WAL/SHM modes are checked at exact `0600` before
+access and revalidated after open. A canonical main without sidecars normalizes
+only its newly created pair, and a logical fresh WAL state left immediately
+before migration converges with or without SHM. The
+stated cleanup residuals are same-user sidecar insertion after
+the proven main claim, which can be misattributed to SQLite, and same-user
+replacement between revalidation and `unlinkat`; deterministic hooks cover both
+non-prevention gaps and intermediate mismatch preservation. A retry re-enters
+the same matrix: a main-present residual may
 converge only through all existing-opener invariants, while any sidecar-only
 residual fails before open; tests cover every nonempty subset. No retry receives
 fresh-cleanup or repair authority. The descriptor is released on every return.

@@ -12,7 +12,7 @@ and feasibility adapters:
 | `tersa-application` | Commands, queries, and use cases | `tersa-domain` |
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
-| `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-presentation` |
+| `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-keychain-macos` on macOS, `tersa-presentation` |
 | `tersa-slint-spike` | Apple-only diagnostic Slint executable | `tersa-presentation` |
 | `tersa-dioxus-spike` | Apple-only diagnostic Dioxus executable | `tersa-presentation` |
 | `tersa-sqlcipher-spike` | Apple-only diagnostic encrypted-storage executable | None |
@@ -24,19 +24,16 @@ and feasibility adapters:
 | `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only macOS CLI source adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
-This table is the active workspace graph. The governance-only PR 33a.5
-amendment authorizes, but does not activate, one future
+This table is the active workspace graph. PR 33a.5 activates one
 `cfg(target_os = "macos")` edge from `tersa-apple-bridge` to
-`tersa-keychain-macos`. The implementation pull request must add that exact
-manifest edge, its name allowance in `dependency_policy`, and its exact tuple in
-the `protected_edge` branch of `future_macos_store_dependency_violation`
-together. Tests must accept only the canonical atomic macOS target structure
+`tersa-keychain-macos`, its name allowance in `dependency_policy`, and its exact
+tuple in the `protected_edge` branch of
+`future_macos_store_dependency_violation`. Tests accept only the canonical atomic macOS target structure
 and reject untargeted, iOS, combined-platform, nested `all`/`any`/`not`,
 feature-conditioned, or otherwise broadened target structures. Equivalent
 whitespace and quote spelling canonicalized by `cargo_metadata` is not a policy
-distinction. Until then, the active bridge dependencies remain only
-`tersa-application` and `tersa-presentation`; this document changes no manifest,
-`xtask` policy, or passing gate.
+distinction. This source-only activation changes no signing, distribution, or
+product gate.
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -134,7 +131,7 @@ solely for an `isMainThread` rejection before bootstrap state is touched. Exact
 member-declaration and effective-feature policy tests must reject every other
 Foundation feature.
 
-PR 33a.5 authorizes `rustix =1.1.4` as its sole new external package and adds
+PR 33a.5 activates `rustix =1.1.4` as its sole new external package and adds
 exact direct macOS declarations to both `tersa-keychain-macos` and
 `tersa-store-sqlcipher-macos`. Both use the canonical atomic
 `cfg(target_os = "macos")` target and disable default features. The workspace
@@ -155,17 +152,16 @@ declarations, alternate workspace parents or paths, iOS, and other targets
 fail. Unrelated third-party rustix reachability remains outside this scoped
 rule.
 
-The implementation must update both closed direct sets and enforce exact
+The active policy updates both closed direct sets and enforces exact
 declarations, versions, canonical targets, default-feature states,
 member-requested features, allowed resolved paths, and target graphs in `xtask`.
 Fixtures accept the three owners and both CLI/bridge transitive paths and reject
 direct `process` on blob/store, wrong owners, direct CLI/bridge dependencies,
-alternate parents, broadened targets, iOS, and non-macOS graphs. This governance
-amendment leaves active manifests and policy unchanged.
+alternate parents, broadened targets, iOS, and non-macOS graphs.
 
 The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
-`tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
-Keychain composition chain. ChaCha20-Poly1305 remains
+`tersa-keychain-macos`; the macOS-only CLI and Apple bridge may reach it only
+through their exact active Keychain composition chains. ChaCha20-Poly1305 remains
 exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
 `tersa-keychain-macos` may not add direct application or domain edges. ADR 0019
 accepts one macOS-gated PR 33a edge to `tersa-store-sqlcipher-macos` so the
@@ -183,7 +179,7 @@ The CLI's reviewed production source invokes only
 `open_default_read_only_mailbox` and inspects `ReadOnlyMailboxOpenError`, so its
 behavior remains retrieval-only. Crate visibility is not a security sandbox:
 the public provisioner is compile-reachable through the Keychain dependency.
-PR 33a.5 must add a narrow Git-index tracked-source inventory for
+PR 33a.5 adds a narrow Git-index tracked-source inventory for
 `apps/cli-macos` that allows only those retrieval-item references and rejects
 provisioning/bootstrap references, imports, reexports, wildcards, crate aliases,
 and item aliases. New public bootstrap symbols must enter the rejected inventory
@@ -198,7 +194,7 @@ trusted database-opening composition and must feed the privately derived key
 directly into the strict SQLCipher reader without creating a callback or key
 export API.
 
-PR 33a.5 is a future authorized, inactive macOS-only edge from the existing
+PR 33a.5 is an active macOS-only edge from the existing
 `tersa-apple-bridge` composition root to `tersa-keychain-macos`. The existing
 `TersaMac` target is its sole production invoker through exactly one new
 macOS-gated C ABI bootstrap call. That call accepts only an opaque account
@@ -258,7 +254,9 @@ The synchronous C ABI runs only on the bounded dedicated worker, never the main
 thread. A fixed 30-second monotonic deadline covers nonblocking process-mutex,
 lock-file creation/open, normalization, validation, and exclusive advisory-lock
 acquisition; `EINTR` and would-block retry only within the remaining budget.
-Other errors and timeout return the fixed busy/unavailable status and release
+Deadline expiry or bounded lock contention returns the fixed busy/unavailable
+status. A poisoned process mutex and malformed, unsafe, or operational lock
+failure return the fixed unavailable status instead; both mappings release
 attempt-local resources. Both guards span Keychain retrieval, absent-root
 profile preflight, any authorized provisioning, directory establishment, store
 opening and migration, identity checks, cleanup, and final status. The CLI never
@@ -267,14 +265,17 @@ performs bootstrap.
 PR 33a.5 proves the worker's concurrency-one and one-pending bounds through the
 exact `apple/macos/BootstrapWorker.swift` implementation and its sole call site
 in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin those
-bounds and paths, and only credentialless build/analyze of the existing
+bounds and paths, and only a credentialless build of the existing
 `TersaMac` target. It adds no test target, scheme test action, or
 signing/entitlement exception and passes no runtime gate. PR 33b owns runtime
-dispatch and overflow evidence. PR 33a.5 Rust tests cover the C ABI main-thread
-rejection and locking behavior, including timeout, `EINTR`, a crash between
+dispatch and overflow evidence. PR 33a.5 Rust tests cover invalid C ABI
+null/zero/oversized input mapping and background-thread boundary mapping without
+touching Keychain; they do not execute a valid main-thread bootstrap call.
+They also cover locking behavior, including timeout, `EINTR`, a crash between
 lock creation and `fchmod`, concurrent normalization, rejection of excess
 permission bits, crash release, and adversarial two-thread/two-process
-serialization.
+serialization. A post-open mode-race fixture proves that the existing lock's
+descriptor-bound final validation still requires exact `0600`.
 
 Before provisioning an absent root, the locked composition accepts only an
 absent profile tree or the exact empty `profiles/default/accounts` skeleton.
@@ -310,36 +311,73 @@ and cleanup. Through its direct rustix dependency it snapshots exactly the main,
 rollback-journal, WAL, and shared-memory names: `mail.sqlite3`,
 `mail.sqlite3-journal`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. All four
 absent is a fresh leaf that enters the existing opener and permits bounded
-fresh-failure cleanup. A present main file with any combination of the three
+fresh-failure cleanup only after its `O_EXCL` main-file claim succeeds. A
+present main file with any combination of the three
 sidecars is an existing leaf: it enters the existing opener/migration path,
 which may still reject it, and never permits fresh cleanup. An absent main with
 any journal, WAL, or shared-memory name present fails before open and performs
 no cleanup.
 
-This classification augments and must not weaken the existing
-`database_sidecar_exists` three-suffix invariant. Fixtures preserve the current
+This classification is enforced over all three sidecar suffixes. Fixtures
+preserve the current
 `absent_with_sidecar` and `empty_with_sidecar` rollback-journal behavior and
 cover the all-absent state, every main-present sidecar combination, and every
 main-absent orphan-sidecar combination. Only after a failed fresh open closes
-all SQLite handles may the store consider any of the four fixed entries that
-was absent pre-open and is newly present after close. Under the cooperative-writer
-assumption it records and revalidates each candidate's identity through
+all SQLite handles, and only with a proven exclusive main-file claim, may the
+store consider any fixed entry that was absent pre-open and is newly present
+after close. Without that proof no main or sidecar cleanup runs, so a racing
+main plus WAL/SHM is preserved. The recorded `O_EXCL` main identity is
+revalidated inside the unlink helper immediately before every candidate unlink;
+a main replacement or deletion preserves every remaining candidate. Under the
+cooperative-writer assumption the
+authorized path records and revalidates each candidate's identity through
 descriptor-relative no-follow `statat`, then uses rustix `unlinkat` beneath the
 same retained parent descriptor. It never uses `std::fs::remove_file`,
 re-resolves the parent path, removes a pre-existing or mismatched entry, or
 removes a profile directory.
 
+Every existing main, WAL, and SHM accepted by the writer is a same-owner regular
+file at exact `0600`, checked before SQLite access and revalidated after open.
+A canonical main without sidecars may create a new WAL/SHM pair through the
+owning writer. Newly created sidecars are identity-bound and normalized to exact
+`0600`, including under restrictive umasks; snapshot-present sidecars are never
+normalized or adopted. A logical fresh database left in WAL mode by a crash
+before migration is recoverable with or without SHM, and completes migration
+without snapshot-present cleanup authority. An existing main is first checked through the
+immutable main-file view. A complete WAL/SHM pair is validated with a
+non-checkpointing read-only/no-follow logical connection. If an abruptly
+terminated first migration retains WAL but loses SHM, the store copies the
+identity-bound encrypted main/WAL pair into O_EXCL `0600` files in a private
+directory selected from exactly `.tersa-wal-recovery-v1-0` through
+`.tersa-wal-recovery-v1-7`. The exclusive directory identity is bound before an
+identity-preserving no-follow normalization to exact `0700`, then bound again to
+the opened directory descriptor. SHM is created only in staging. The copied
+main/WAL/SHM identities and directory identity are validated before the actual
+SQLite read-only/no-follow open and again, together with the opened-main moved
+check, before key or page reads. Checkpoint-on-close is disabled and verified.
+Key, account, schema, foreign-key, SQLCipher, and SQLite integrity checks then
+run on that handle, and the original pair is revalidated before and after them.
+Normal setup, copy, validation, and key failures identity-clean only the created
+stage. Identity, type, owner, mode, or directory drift fails closed and preserves
+the unknown residue. A process crash can leave at most eight encrypted
+owner-only staging directories. Retry may select an unused fixed slot but never
+adopts or removes an occupied slot; slot exhaustion creates no further name and
+fails closed. The owning writer then creates a new original exact-`0600` SHM.
+Preflight never cleans, checkpoints, repairs, or adopts an original fixed entry.
+
 The retained descriptor eliminates a parent-path cleanup race; SQLite itself
 remains pathname-based and no descriptor-bound SQLite opener is claimed. The
 stated store-cleanup residuals are limited to mutable final names: a same-user
-insertion after the absent snapshot but before post-close recording can be
-misattributed to SQLite, and a same-user replacement after revalidation but
-before `unlinkat` cannot be atomically excluded. macOS supplies neither creation
-provenance nor unlink-if-inode. Deterministic hooks cover snapshot-to-record
-insertion, record-to-revalidation replacement, and revalidation-to-`unlinkat`
-replacement for all four fixed entries; the first and last record
-non-prevention, while the middle proves mismatch preservation. The retained
-descriptor is released on every return after the snapshot/open/cleanup sequence.
+sidecar insertion after the proven main claim but before post-close recording
+can be misattributed to SQLite, and a same-user replacement after revalidation
+but before `unlinkat` cannot be atomically excluded. macOS supplies neither
+sidecar creation provenance nor unlink-if-inode. Deterministic hooks cover
+post-claim sidecar insertion, record-to-revalidation replacement, and
+revalidation-to-`unlinkat` replacement; the first and last record
+non-prevention, while the middle proves mismatch preservation. A separate race
+fixture proves that failed `O_EXCL` preserves the racing main and WAL/SHM. The
+retained descriptor is released on every return after the
+snapshot/open/cleanup sequence.
 On retry, a nonempty residual re-enters the same matrix and is never
 fresh-cleanup eligible. A main-present subset may converge only through every
 existing-opener invariant; any sidecar-only subset fails before open. Tests
@@ -406,11 +444,12 @@ caller's pathname preflight and opens sidecars with create-capable internal
 flags. Same-user swap-in/open/swap-back and deletion/recreation races remain
 explicit unlocked-device residuals, not prevented attacks or release claims.
 
-The strict reader opens only existing regular main, WAL, and shared-memory
-files with read-only/no-mutex/no-follow SQLite flags. It validates key, owner,
-schema, SQLCipher and SQLite integrity, account binding, bounded metadata
-decoding, connection-local persistent-WAL state, `journal_size_limit = -1`, and
-pre/post pathname identities. It disables and verifies checkpoint-on-close. It
+The strict reader opens only existing same-owner regular main, WAL, and
+shared-memory files at exact mode `0600` with read-only/no-mutex/no-follow
+SQLite flags. It validates key, owner, mode, schema, SQLCipher and SQLite
+integrity, account binding, bounded metadata decoding, connection-local
+persistent-WAL state, `journal_size_limit = -1`, and pre/post pathname
+identities. It disables and verifies checkpoint-on-close. It
 has no complete-body API, migration, checkpoint, repair, journal-mode,
 creation, or mutation operation. A missing sidecar at preflight does not enter
 SQLite; deletion after preflight can be recreated internally before the reader
@@ -420,10 +459,10 @@ The reviewed delivery changes are policy, strict read-only SQLCipher open,
 macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
 source, credentialless product-application bootstrap source, then real signed
 CLI distribution evidence. PR 33a activates CLI source and dependency policy
-but does not create the official CLI. PR 33a.5 must activate only the authorized
+but does not create the official CLI. PR 33a.5 activates only the authorized
 macOS-gated bridge edge, exact rustix dependency and policies, and fixed locked
-bootstrap composition; this governance amendment activates none of them. Phase
-1 roadmap item 7 remains open until PR 33b passes. The CLI's trusted direct-store
+bootstrap composition. Phase 1 roadmap item 7 remains open until PR 33b passes.
+The CLI's trusted direct-store
 composition is an interim adapter
 boundary replaceable by future `maild` IPC; it does not authorize `maild` in the
 MVP. iPhone and iPad implementation remains in Phase 2, and no reservation or
