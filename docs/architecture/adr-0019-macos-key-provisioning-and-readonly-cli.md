@@ -156,6 +156,18 @@ setter is forbidden because its duplicate-item path can update existing data.
 Data Protection Keychain API on macOS. The Foundation surface resolves and
 validates the application-group container through the inward platform port.
 
+PR 33a.5 authorizes `rustix =1.1.4` as the sole new external direct dependency
+of `tersa-keychain-macos`. It must be declared only under the exact
+`cfg(target_os = "macos")`, with default features disabled and the direct feature
+set exactly `fs` and `std`. It supplies the safe descriptor-relative filesystem
+and advisory-lock operations required by the fixed bootstrap. No direct `libc`
+dependency, handwritten syscall binding, or new unsafe POSIX FFI is authorized.
+The implementation pull request must update the Keychain adapter's closed
+direct-dependency set and enforce the exact rustix version, target,
+default-feature state, and feature set in `xtask`, with positive and negative
+policy tests. This governance amendment changes no manifest, active dependency
+graph, or gate.
+
 The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
 PR 32 narrowly expands the HMAC owner set to `tersa-blob-spike` and
@@ -195,6 +207,28 @@ shared by the app and CLI entitlements. Resolution must verify access to the
 returned container because macOS may return an expected-form URL even for an
 invalid group. It never falls back to a normal Application Support path or
 either target's private sandbox container.
+
+Every product-application bootstrap uses one non-configurable global lock file
+at `<shared-group-container>/.tersa-profile-bootstrap-v1.lock`. After opening
+and validating the existing App Group container, `tersa-keychain-macos` first
+acquires its process-local bootstrap mutex, then opens the lock file
+descriptor-relatively with no-follow and `O_CLOEXEC` semantics. Initial creation
+uses create-new mode and `0600`; an already-existing result converges only by
+opening without creation and validating the same-user regular-file type and
+exact `0600` permissions. Symlinks, unexpected objects or attributes, open or
+lock errors, and process-local mutex poisoning fail closed. The lock file is
+never deleted, renamed, repaired, or made configurable.
+
+The composition then takes an exclusive blocking advisory lock and holds both
+guards through Keychain root provisioning or retrieval, fixed-directory work,
+the store claim and migration, all pre- and post-open identity checks, every
+authorized failure-cleanup attempt, and construction of the final closed status.
+Every cooperative `TersaMac` bootstrap must enter through this lock protocol;
+the CLI never bootstraps and receives no lock or repair authority. Deterministic
+two-thread and two-process tests must force adversarial interleavings around
+directory creation and main/WAL/shared-memory cleanup and prove that cooperative
+bootstraps serialize through final status rather than deleting or replacing one
+another's state.
 
 PR 33a.5 makes the product application the logical profile owner and assigns
 the directory-establishment operation exclusively to the trusted composition
@@ -254,6 +288,17 @@ profile directories. Cleanup failure preserves the original redacted failure
 and may leave restrictive residual store files. Those residuals block or fail
 closed on retry and require recovery by the owning product application through
 a later reviewed path; the CLI gains no repair authority.
+
+The identity checks and global lock prevent ordinary observable changes and
+serialize cooperative bootstraps only. They do not prevent a same-user malicious
+process from ignoring the advisory lock and replacing an entry after the final
+identity revalidation but before the pathname unlink. macOS provides no
+unlink-if-inode primitive for transferring that check atomically into removal.
+This revalidation/unlink gap is an explicit unlocked-device/local-malware
+residual for directory cleanup and main/WAL/shared-memory cleanup; no prevention
+claim is made. A deterministic hook fixture must perform the replacement in
+that exact gap, record the non-prevention outcome, and preserve it as an explicit
+residual test analogous to the existing SQLite sidecar swap fixtures.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
 or migration boundary, cover main/WAL/shared-memory creation, and replace each
@@ -340,6 +385,15 @@ override crosses the bridge boundary or is returned to it. The bridge may not
 depend directly on the SQLCipher store or add another platform, application,
 domain, or executable edge. The implementation PR must activate this exact edge
 in the dependency policy; no other manifest edge is implied by this amendment.
+Name-only allowance in `dependency_policy` is insufficient. The implementation
+must also add `tersa-apple-bridge -> tersa-keychain-macos` to the exact
+`protected_edge` match enforced by
+`future_macos_store_dependency_violation`, so only the literal
+`cfg(target_os = "macos")` is accepted. Policy tests must prove that exact macOS
+form passes and that an untargeted edge, an iOS edge, a macOS-and-iOS edge, and
+every other cfg spelling or expression fail. This governance pull request does
+not add the edge or change `xtask`; PR 33a.5 must activate the manifest and both
+policy layers atomically.
 
 Only the canonical domain `AccountId` may select an account. Production uses
 only the fixed `default` profile and the fixed paths, Keychain attributes, and

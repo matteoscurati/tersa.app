@@ -28,9 +28,13 @@ This table is the active workspace graph. The governance-only PR 33a.5
 amendment authorizes, but does not activate, one future
 `cfg(target_os = "macos")` edge from `tersa-apple-bridge` to
 `tersa-keychain-macos`. The implementation pull request must add that exact
-manifest edge and its exact `xtask` policy entry together. Until then, the
+manifest edge, its name allowance in `dependency_policy`, and its exact tuple in
+the `protected_edge` branch of `future_macos_store_dependency_violation`
+together. Positive and negative tests must accept only the literal macOS cfg and
+reject untargeted, iOS, macOS-and-iOS, and every other cfg form. Until then, the
 active bridge dependencies remain only `tersa-application` and
-`tersa-presentation`; this document changes no manifest or passing gate.
+`tersa-presentation`; this document changes no manifest, `xtask` policy, or
+passing gate.
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -120,6 +124,16 @@ The direct dependency set is closed and exact: an unknown dependency, a
 missing required dependency, or direct `hmac` is rejected. Resolved
 HKDF-to-HMAC reachability remains allowed and separately checked.
 
+PR 33a.5 authorizes one future external addition to that closed direct set:
+`rustix =1.1.4`, only under the exact `cfg(target_os = "macos")`, with default
+features disabled and features exactly `fs` and `std`. It is used only for safe
+descriptor-relative filesystem and advisory-lock operations. No direct `libc`,
+handwritten syscall binding, or new unsafe POSIX FFI is authorized. The
+implementation must activate the manifest declaration and exact version,
+target, default-feature, feature-set, direct-owner, and resolved-target checks
+in `xtask` together, with pass and fail fixtures. This governance amendment
+leaves the current manifest and closed active set unchanged.
+
 The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
 `tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
 Keychain composition chain. ChaCha20-Poly1305 remains
@@ -152,6 +166,17 @@ bootstrap. It receives no raw key, caller-selected path, profile or
 configuration override, database handle, store object, or returned storage
 capability and gains no direct edge to `tersa-store-sqlcipher-macos`.
 
+All cooperative product-application bootstraps must first serialize on the
+fixed App Group lock file `.tersa-profile-bootstrap-v1.lock`. The trusted
+Keychain adapter opens or converges on it descriptor-relatively with no-follow,
+`O_CLOEXEC`, same-user regular-file, and exact `0600` validation, never deletes
+it, and takes an exclusive blocking advisory lock after its process-local mutex.
+Both guards span Keychain provisioning/retrieval, directory establishment,
+store opening and migration, identity checks, cleanup, and final status. The CLI
+never performs bootstrap. Two-thread and two-process interleaving tests must
+prove cooperative serialization around directory and main/WAL/shared-memory
+cleanup.
+
 The trusted `tersa-keychain-macos` composition is the sole filesystem-directory
 establisher on behalf of the product application. It may create only the fixed
 owner-only profile components through descriptor-relative no-follow operations,
@@ -172,7 +197,12 @@ created by that invocation whose identities and restrictive file properties
 still match. It never removes pre-existing or mismatched entries, and profile
 directory cleanup stops before the store is invoked. Residual cleanup failures
 remain fail-closed owning-application recovery work and grant no CLI repair
-authority. Activating the future bridge edge or its policy before the
+authority. Identity checks and the advisory lock cover ordinary and cooperative
+races, not a same-user malicious replacement between revalidation and pathname
+unlink. Because macOS has no unlink-if-inode operation and the lock is
+cooperative, that gap remains an explicit unlocked-device residual. A
+deterministic fixture must record this non-prevention rather than asserting the
+replacement is safe. Activating the future bridge edge or its policy before the
 implementation pull request is forbidden. PR 33b owns the same-team signed
 runtime evidence; PR 32 fake concurrency tests, PR 33a deterministic tests, and
 PR 33a.5 credentialless tests are not that evidence.
@@ -248,9 +278,10 @@ macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
 source, credentialless product-application bootstrap source, then real signed
 CLI distribution evidence. PR 33a activates CLI source and dependency policy
 but does not create the official CLI. PR 33a.5 must activate only the authorized
-macOS-gated bridge edge and fixed bootstrap composition; this governance
-amendment activates neither. Phase 1 roadmap item 7 remains open until PR 33b
-passes. The CLI's trusted direct-store composition is an interim adapter
+macOS-gated bridge edge, exact rustix dependency and policies, and fixed locked
+bootstrap composition; this governance amendment activates none of them. Phase
+1 roadmap item 7 remains open until PR 33b passes. The CLI's trusted direct-store
+composition is an interim adapter
 boundary replaceable by future `maild` IPC; it does not authorize `maild` in the
 MVP. iPhone and iPad implementation remains in Phase 2, and no reservation or
 macOS evidence changes a mobile gate.

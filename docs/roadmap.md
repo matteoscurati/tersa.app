@@ -142,6 +142,17 @@ which alone owns identity-checked cleanup of fresh leaf files. Each slice
 requires independent review with zero unresolved actionable findings on its
 exact head.
 
+PR 33a.5 must add the exact macOS-only `rustix =1.1.4` `fs`/`std` dependency to
+the Keychain adapter and enforce both the closed dependency set and the exact
+protected bridge edge in `xtask`; name-only allowance is insufficient. Every
+cooperative product bootstrap serializes from Keychain provisioning through
+final status on the fixed `.tersa-profile-bootstrap-v1.lock` App Group file;
+the CLI never bootstraps. This lock and the identity checks cover cooperative
+races only. A same-user replacement between revalidation and pathname unlink
+remains an explicit local-malware residual and requires a deterministic
+non-prevention fixture. This governance slice activates no manifest, policy,
+runtime edge, or gate.
+
 ## Phase 2 — iPhone and iPad implementation
 
 Phase 2 contains all iPhone and iPad product implementation. It resumes under
