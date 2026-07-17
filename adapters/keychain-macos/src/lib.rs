@@ -241,7 +241,7 @@ fn is_readable_directory(path: &Path) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "Non-macOS builds retain the portable capability shape but fail before constructing a Keychain add result."
