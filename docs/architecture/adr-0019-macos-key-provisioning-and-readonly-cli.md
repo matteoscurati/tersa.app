@@ -8,6 +8,7 @@ one at https://mozilla.org/MPL/2.0/.
 
 - Status: Accepted
 - Date: 2026-07-16
+- Amended: 2026-07-17
 
 ## Context
 
@@ -25,7 +26,10 @@ replace the direct reader without changing the CLI's public JSON contract.
 
 ## Decision
 
-The CLI slice is divided into four independently reviewed pull requests:
+The CLI work is divided into independently reviewed pull requests. The final
+slice was split after the repository preflight found no usable Developer ID
+Application identity or configured notarization authority. Ad-hoc signing and
+unsigned builds cannot substitute for that evidence:
 
 1. **PR 30 — policy:** this ADR, dependency documentation, and fail-closed
    reservations only. It adds no crate, dependency, key access, store opening,
@@ -39,13 +43,20 @@ The CLI slice is divided into four independently reviewed pull requests:
    reviewed provisioning/retrieval internals and application-group locator.
    It exposes no raw root or derived key and no database opener. This pull
    request replaces and activates the Keychain reservation.
-4. **PR 33 — metadata-only JSON CLI:** add `tersa-cli-macos` with exactly the
-   `inbox` and `thread` commands and replace and activate the remaining CLI
-   reservation.
+4. **PR 33a — deterministic metadata-only JSON CLI source:** add
+   `tersa-cli-macos` with exactly the `inbox` and `thread` commands, activate
+   its dependency policy, and compose private Keychain retrieval and derivation
+   directly with strict read-only SQLCipher opening. This slice adds no Apple
+   distribution target and makes no signed interoperability claim.
+5. **PR 33b — signed CLI distribution evidence:** add the bundled `mailctl`
+   target and its closed signing, entitlement, packaging, and symlink policy;
+   then capture the real same-team Developer ID, notarization, sandbox, App
+   Group, and cross-target Data Protection Keychain evidence.
 
 Each later pull request requires exact-head independent review and must replace
-its reservation with an explicitly activated policy. Merely adding either
-reserved crate makes the architecture check fail.
+its reservation with an explicitly activated policy. Merely adding a reserved
+crate makes the architecture check fail. Phase 1 roadmap item 7 remains open
+after PR 33a and closes only when PR 33b satisfies its external evidence gate.
 
 ### Root-key lifecycle and derivation
 
@@ -61,7 +72,7 @@ the synchronization attribute only when it is absent or false. Update and
 delete operations are not implemented. There is no legacy-keychain fallback.
 Missing entitlement, unexpected item attributes, or a query that cannot use
 the Data Protection Keychain fails closed. Existing items are retrieved but
-never replaced implicitly. The PR 33 CLI will have retrieval-only access: an
+never replaced implicitly. The PR 33a CLI has retrieval-only access: an
 absent item is an error and cannot cause key generation, import, repair,
 rotation, or a second Keychain write.
 
@@ -72,7 +83,7 @@ update occurs. Other add failures are terminal. PR 32 must test simultaneous
 provisioners and prove they converge on the stored winner without exposing or
 replacing either candidate.
 
-PR 33 must make the macOS application and `mailctl` two targets of one
+PR 33b must make the macOS application and `mailctl` two targets of one
 distribution. Both will be signed by the same Apple Developer team, carry the
 registered `${TeamIdentifierPrefix}app.tersa.shared` application-group
 entitlement, and use that group as their shared Keychain access group.
@@ -80,7 +91,7 @@ entitlement, and use that group as their shared Keychain access group.
 embedded Info.plist section, Hardened Runtime, and its own
 `com.apple.security.app-sandbox = true` entitlement. It is
 launched directly by the shell and therefore must not use
-`com.apple.security.inherit`. After PR 33, the official CLI will be the signed
+`com.apple.security.inherit`. After PR 33b, the official CLI will be the signed
 executable shipped inside the app bundle; a package manager may then install
 only a symlink to that exact executable, not rebuild or re-sign it
 independently. Community distributions must register and inject their own
@@ -107,8 +118,17 @@ This guarantee covers explicit buffers owned by the adapter; the internal
 state and temporary storage of the `hkdf`, `hmac`, and digest implementations
 are outside `zeroize`'s guarantee and may leave transient copies in process
 memory.
-PR 33 owns the trusted composition that will pass a privately derived key
+PR 33a owns the trusted composition that passes a privately derived key
 directly into strict database opening without returning key bytes to the CLI.
+The composition lives inside `tersa-keychain-macos`, because the crate that
+owns the private `SecretKey` must consume it into the database opener without a
+public accessor, callback, borrowed-key API, or cross-crate key capability.
+`tersa-keychain-macos` may therefore depend inward on
+`tersa-store-sqlcipher-macos` for this one composition. The store edge is
+macOS-gated and its transitive SQLCipher reachability is explicitly allowed;
+the Keychain adapter must not declare `rusqlite` or `libsqlite3-sys` directly.
+Replacing the direct reader with `maild` requires a new reviewed boundary and
+must not expose the derived bytes during that replacement.
 
 The add-only Keychain boundary constructs its no-copy `CFData`, attribute
 dictionary, and synchronous `SecItemAdd` call in one private scope. Neither the
@@ -134,7 +154,9 @@ PR 32 narrowly expands the HMAC owner set to `tersa-blob-spike` and
 `tersa-keychain-macos` after checking the exact resolved graph. ChaCha20-
 Poly1305 remains exclusive to `tersa-blob-spike`.
 
-`tersa-keychain-macos` may depend inward only on `tersa-platform`; the platform
+Before PR 33a, `tersa-keychain-macos` depends inward only on `tersa-platform`.
+PR 33a activates the exact additional edge to
+`tersa-store-sqlcipher-macos` described above and no other edge. The platform
 port in turn uses the canonical domain `AccountId` so raw account strings
 cannot reach hashing or derivation. Apple Security types do not cross the port.
 Additional inward edges require a new ADR rather than an incidental manifest
@@ -142,10 +164,10 @@ edit.
 
 PR 32 proves simultaneous-provisioner convergence only against its fake
 backend. Real signed cross-target Data Protection Keychain interoperability is
-a PR 33 acceptance condition; this is a Fable approval condition and is not
-claimed by unsigned builds. PR 32 also does not claim a usable database opener:
-the signed PR 33 composition is responsible for connecting private derivation
-to the strict reader without adding a key-export surface.
+a PR 33b acceptance condition; this is a Fable approval condition and is not
+claimed by unsigned builds or by PR 33a. PR 32 also does not claim a usable
+database opener: PR 33a is responsible for connecting private derivation to the
+strict reader without adding a key-export surface.
 
 ### Fixed profile layout
 
@@ -197,7 +219,7 @@ command only in the byte-exact wrapper.
 These surfaces require a reviewed policy change rather than attempted partial
 XcodeGen resolution.
 
-PR 33 has a CLI-specific acceptance condition independent of the later macOS
+PR 33b has a CLI-specific acceptance condition independent of the later macOS
 UI gate: a same-team Developer ID package must be notarized, contain the
 embedded signed `mailctl`, expose only a symlink to that exact binary, and prove
 a direct shell launch under its own non-inherited sandbox. Captured evidence
@@ -205,6 +227,13 @@ must verify the app and CLI code-signing identifiers and entitlements, App
 Group container access, cross-target add/read of the non-synchronizable Data
 Protection Keychain item, and denial after a group or signature mismatch. This
 condition passes no UI, mobile, M0, or Phase 1 release gate.
+
+PR 33b does not begin until a real Developer ID Application identity, registered
+application group, and notarization authority are available to the release
+operator. The product application must also have a reviewed production path
+that provisions the fixed root and establishes the account profile used by the
+cross-target fixture. Credentialless CI may verify policy and package structure
+but cannot close any of these runtime conditions.
 
 `<sha256-account-id>` is the 64-character lowercase hexadecimal SHA-256 digest
 of the validated opaque `AccountId` UTF-8 bytes. Tests may construct isolated
@@ -261,7 +290,7 @@ the check.
 
 ### CLI and JSON contract
 
-PR 33 exposes only these operations, both with a validated `StoreLimit`
+PR 33a exposes only these operations, both with a validated `StoreLimit`
 (`1..=10_000`) and a default of 50:
 
 ```text
@@ -276,7 +305,7 @@ contains only `message_id`, `thread_id`, `from`, `subject`,
 `received_at_millis`, and `unread`; the body-derived preview and cached content
 are excluded. Arrays preserve the store contract's deterministic order.
 
-Before any string reaches stdout, PR 33 must encode every C0 control
+Before any string reaches stdout, PR 33a must encode every C0 control
 (`U+0000..U+001F`), DEL (`U+007F`), and C1 control (`U+0080..U+009F`) as a
 JSON `\uXXXX` escape, even if current domain validation would reject it. This
 is a terminal-safety boundary, not a substitute for JSON serialization.
@@ -299,22 +328,36 @@ stderr contract is:
 
 Serialization is completed before the first stdout write. A broken pipe or
 partial stdout write returns 7 without retrying and emits the same fixed
-`mailctl: operation failed` stderr line; it never emits mailbox content.
+`mailctl: operation failed` stderr line. The process does not attempt another
+stdout write, but bytes already accepted by the operating system cannot be
+retracted and may contain a prefix of the serialized document.
 
-`tersa-cli-macos` may depend inward on `tersa-application`, `tersa-domain`,
-`tersa-platform`, `tersa-store-sqlcipher-macos`, and
-`tersa-keychain-macos`. It owns only composition and stable rendering. The
-application use cases and JSON DTOs must remain independent of concrete Apple,
-SQLCipher, and future IPC types. Replacing the direct adapters with `maild` IPC
-must preserve commands, limits, ordering, JSON, exit codes, and declassification
-semantics.
+The mapping is closed: invocation and domain validation failures use exit 2;
+Keychain retrieval or validation failures use exit 3; profile location and
+`MailboxStoreError::Storage` use exit 4; an empty `thread` result uses exit 5,
+while an empty inbox is successful; `MailboxStoreError::Corrupted` uses exit 6;
+and serialization or process-I/O failures use exit 7. New error variants require
+a reviewed contract amendment rather than a catch-all content-bearing message.
+
+`tersa-cli-macos` may depend inward only on `tersa-application`,
+`tersa-domain`, and `tersa-keychain-macos`. It owns only fixed composition and
+stable rendering; it does not depend directly on the platform or SQLCipher
+adapters. The metadata-listing use cases and JSON DTO shape live in
+`tersa-application` against `MailboxReader` and remain independent of concrete
+Apple, SQLCipher, serialization, and future IPC types. The CLI adapter owns
+argument parsing, the fixed JSON serializer, terminal-safe escaping, process
+I/O, and stable exit mapping; serde is not added to the application boundary.
+Replacing the direct adapters with `maild` IPC must preserve commands, limits,
+ordering, JSON, exit codes, and declassification semantics.
 
 ## Non-claims
 
 PR 32 adds root provisioning, validated retrieval, private derivation, and
 fixed profile discovery, but no CLI, public raw-key provider, database-opening
-composition, IPC, or `maild`. It passes no signed runtime gate and leaves Phase
-1 roadmap item 7 open. It does not add real Google
+composition, IPC, or `maild`. PR 33a adds source composition and deterministic
+CLI behavior but passes no signed runtime or distribution gate, is not the
+official CLI, and leaves Phase 1 roadmap item 7 open until PR 33b. Neither slice
+adds real Google
 authorization, token persistence, sync, background work, mailbox mutation,
 search, UI, or release evidence.
 

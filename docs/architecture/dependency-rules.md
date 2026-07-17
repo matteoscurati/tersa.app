@@ -85,14 +85,14 @@ reconciliation, retry, background work, mutations, outbox, labels, blobs,
 search, CLI/UI, real network or credentials tests, mobile code, or gate-status
 changes. Cache budgets remain constraints rather than evidence.
 
-## Active macOS key boundary and reserved CLI boundary
+## Active macOS key boundary and split CLI boundary
 
 ADR 0019 defines one active adapter and one reserved future crate:
 
 | Crate | Responsibility | Maximum inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | Active macOS Keychain root provisioning, private versioned HKDF derivation, and App Group container locator | `tersa-platform` |
-| `tersa-cli-macos` | Fixed-profile composition and metadata-only JSON rendering | `tersa-application`, `tersa-domain`, `tersa-keychain-macos`, `tersa-platform`, `tersa-store-sqlcipher-macos` |
+| `tersa-keychain-macos` | Active macOS Keychain root provisioning, private versioned HKDF derivation, and App Group container locator; PR 33a adds the trusted read-only database composition | Currently `tersa-platform`; after PR 33a, exactly `tersa-platform` and `tersa-store-sqlcipher-macos` |
+| `tersa-cli-macos` | Fixed-profile metadata-only JSON process adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
 `tersa-keychain-macos` is active and has an explicit `xtask` policy entry. The
 `RESERVED_FUTURE_POLICY` tripwire now reserves only the CLI crate.
@@ -114,18 +114,22 @@ HKDF-to-HMAC reachability remains allowed and separately checked.
 The active `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
 `tersa-keychain-macos`; no other crate may reach HMAC. ChaCha20-Poly1305 remains
 exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
-`tersa-keychain-macos` may not add direct application or domain edges without
-separately accepted ADR reasoning. Its platform port accepts only the canonical
-domain `AccountId`; raw strings cannot enter account hashing or derivation.
-`tersa-cli-macos` receives no general Apple-framework, SQLCipher, key export,
+`tersa-keychain-macos` may not add direct application or domain edges. ADR 0019
+accepts one macOS-gated PR 33a edge to `tersa-store-sqlcipher-macos` so the
+private `SecretKey` owner can consume a derived key directly into
+`SqlCipherMailboxReader::open_read_only`. The adapter may reach SQLCipher only
+through that store edge and may not declare `rusqlite` or `libsqlite3-sys`
+directly. Its platform port accepts only the canonical domain `AccountId`; raw
+strings cannot enter account hashing or derivation. `tersa-cli-macos` receives
+no direct platform, SQLCipher, general Apple-framework, key export,
 database-path override, or transport capability from its reservation.
 
 PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
-It exposes neither raw root/derived bytes nor a database opener. PR 33 owns the
+It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
 trusted database-opening composition and must feed the privately derived key
 directly into the strict SQLCipher reader without creating a callback or key
-export API. PR 33 also owns the same-team signed runtime evidence; PR 32 fake
-concurrency tests are not that evidence.
+export API. PR 33b owns the same-team signed runtime evidence; PR 32 fake
+concurrency tests and PR 33a deterministic tests are not that evidence.
 
 The active adapter opts every macOS Keychain operation into the Data
 Protection Keychain, omits `kSecAttrSynchronizable` from add and copy queries,
@@ -133,7 +137,7 @@ and names the registered application group currently carried by the macOS app
 target. That group also identifies the app's filesystem container. The active
 adapter does not fall back to the legacy Keychain, the app's private sandbox
 container, or ordinary Application Support when the entitlement, group, or
-container is unavailable. PR 33 will add the separately signed bundled
+container is unavailable. PR 33b will add the separately signed bundled
 `mailctl` target, give both targets the same registered group, and supply the
 cross-target runtime evidence. Only then may the official CLI be described as
 the signed executable from the notarized app distribution; a package-manager
@@ -168,7 +172,7 @@ constructs and consumes its Core Foundation objects inside one synchronous
 scope so the candidate pointer cannot escape. The future shell-launched
 CLI must have its own stable bundle identifier, embedded Info.plist, Hardened
 Runtime, non-inherited App Sandbox entitlement, and the same application group.
-PR 33 must satisfy its dedicated signed-package and direct-shell-launch
+PR 33b must satisfy its dedicated signed-package and direct-shell-launch
 evidence condition without depending on or passing the later UI acceptance
 gate.
 
@@ -193,9 +197,11 @@ creation, or mutation operation. A missing sidecar at preflight does not enter
 SQLite; deletion after preflight can be recreated internally before the reader
 fails its post-read identity check.
 
-The four reviewed changes are policy, strict read-only SQLCipher open, macOS
-Keychain/private-HKDF boundary, then the metadata-only JSON CLI. Until all four land,
-Phase 1 roadmap item 7 remains open. The CLI's direct store reader is an interim
+The reviewed delivery changes are policy, strict read-only SQLCipher open,
+macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
+source, then real signed CLI distribution evidence. PR 33a activates source and
+dependency policy but does not create the official CLI. Phase 1 roadmap item 7
+remains open until PR 33b passes. The CLI's direct store reader is an interim
 adapter composition replaceable by future `maild` IPC; it does not authorize
 `maild` in the MVP. iPhone and iPad implementation remains in Phase 2, and no
 reservation or macOS evidence changes a mobile gate.
