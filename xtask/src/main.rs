@@ -445,6 +445,7 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     for product_root in ["adapters", "apple/rust-bridge", "apps", "crates"] {
         keychain_authority_sources.extend(tracked_source_documents(Path::new("."), product_root)?);
     }
+    keychain_authority_sources.extend(tracked_source_documents(Path::new("."), "apple/macos")?);
     violations.extend(keychain_mutation_boundary_violations(
         &keychain_owner_sources,
         &keychain_authority_sources,
@@ -636,6 +637,10 @@ fn keychain_mutation_boundary_violations(
     const FORBIDDEN: [&str; 3] = ["SecItemUpdate", "SecItemDelete", "set_generic_password"];
     let mut violations = Vec::new();
     let mut production_owner_sources = Vec::new();
+    let owner_paths = owner_sources
+        .iter()
+        .map(|(path, _document)| path)
+        .collect::<BTreeSet<_>>();
     for (path, document) in owner_sources {
         if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
             continue;
@@ -645,20 +650,32 @@ fn keychain_mutation_boundary_violations(
         production_owner_sources.push(production);
     }
     for (path, document) in authority_sources {
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
-        }
-        let code = strip_rust_non_code(document);
-        let production = strip_rust_test_modules(&code);
-        for forbidden in FORBIDDEN {
-            if contains_identifier(&production, forbidden) {
-                violations.push(format!(
-                    "{} contains forbidden Keychain mutation boundary `{forbidden}`",
-                    path.display()
-                ));
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rs") => {
+                let code = strip_rust_non_code(document);
+                let production = strip_rust_test_modules(&code);
+                for forbidden in FORBIDDEN {
+                    if contains_identifier(&production, forbidden) {
+                        violations.push(format!(
+                            "{} contains forbidden Keychain mutation boundary `{forbidden}`",
+                            path.display()
+                        ));
+                    }
+                }
+                if !owner_paths.contains(path) && contains_identifier(&production, "SecItemAdd") {
+                    violations.push(format!(
+                        "{} contains Keychain insertion authority outside the owning adapter",
+                        path.display()
+                    ));
+                }
+                violations.extend(rust_authority_dynamic_alias_violations(path, document));
             }
+            Some("swift") => {
+                violations.extend(swift_keychain_authority_violations(path, document));
+                violations.extend(swift_source_lexical_violations(path, document));
+            }
+            _ => {}
         }
-        violations.extend(rust_authority_dynamic_alias_violations(path, document));
     }
     let aggregate = production_owner_sources.join("\n");
     for required in REQUIRED {
@@ -669,6 +686,22 @@ fn keychain_mutation_boundary_violations(
         }
     }
     violations
+}
+
+fn swift_keychain_authority_violations(path: &Path, document: &str) -> Vec<String> {
+    const FORBIDDEN_MUTATIONS: [&str; 3] = ["SecItemAdd", "SecItemUpdate", "SecItemDelete"];
+    let code = strip_swift_non_code(document);
+
+    FORBIDDEN_MUTATIONS
+        .into_iter()
+        .filter(|mutation| contains_identifier(&code, mutation))
+        .map(|mutation| {
+            format!(
+                "{} contains forbidden Swift Keychain mutation boundary `{mutation}`",
+                path.display()
+            )
+        })
+        .collect()
 }
 
 fn rust_authority_source_surface_violations(path: &Path, document: &str) -> Vec<String> {
@@ -2071,6 +2104,8 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
         "CFBundleGetFunctionPointerForName",
         "NSAddressOfSymbol",
         "NSLookupSymbolInImage",
+        "_cdecl",
+        "_silgen_name",
         "convention",
         "dlopen",
         "dlsym",
@@ -5692,6 +5727,16 @@ fn boundary() {
             );
         }
 
+        let mut unauthorized_insertion = clean.clone();
+        unauthorized_insertion.push((
+            PathBuf::from("apple/rust-bridge/src/injected.rs"),
+            "fn provision() { SecItemAdd(); }".to_owned(),
+        ));
+        assert!(
+            !keychain_mutation_boundary_violations(&clean, &unauthorized_insertion).is_empty(),
+            "Keychain insertion authority must remain exclusive to the owning adapter"
+        );
+
         let comments_only = vec![(
             PathBuf::from("adapters/keychain-macos/src/lib.rs"),
             "// SecItemAdd SecItemCopyMatching SecRandomCopyBytes kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly kSecUseDataProtectionKeychain"
@@ -5702,6 +5747,105 @@ fn boundary() {
             5,
             "comments must not satisfy required production boundaries"
         );
+    }
+
+    #[test]
+    fn swift_product_sources_cannot_mutate_the_protected_keychain_record() {
+        let owner = vec![(
+            PathBuf::from("adapters/keychain-macos/src/lib.rs"),
+            r"
+fn boundary() {
+    SecItemAdd();
+    SecItemCopyMatching();
+    SecRandomCopyBytes();
+    kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly();
+    kSecUseDataProtectionKeychain();
+}
+"
+            .to_owned(),
+        )];
+        let protected_record = r#"
+import Security
+
+let protectedRecord: [CFString: Any] = [
+    kSecClass: kSecClassGenericPassword,
+    kSecAttrService: "app.tersa.mac.storage-root.v1",
+    kSecAttrAccount: "default",
+]
+"#;
+        for (mutation, call) in [
+            (
+                "SecItemAdd",
+                "SecItemAdd(protectedRecord as CFDictionary, nil)",
+            ),
+            (
+                "SecItemUpdate",
+                "SecItemUpdate(protectedRecord as CFDictionary, [kSecValueData: Data()] as CFDictionary)",
+            ),
+            (
+                "SecItemDelete",
+                "SecItemDelete(protectedRecord as CFDictionary)",
+            ),
+        ] {
+            let app_delegate = vec![(
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                format!("{protected_record}\nfunc mutateProtectedRecord() {{ {call} }}"),
+            )];
+            let violations = keychain_mutation_boundary_violations(&owner, &app_delegate);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(mutation)),
+                "direct Swift mutation must fail closed for {mutation}: {violations:?}"
+            );
+        }
+
+        let inert = vec![(
+            PathBuf::from("apple/macos/AppDelegate.swift"),
+            r#"
+import Security
+// SecItemDelete(protectedRecord as CFDictionary)
+let diagnostic = "SecItemAdd SecItemUpdate SecItemDelete"
+"#
+            .to_owned(),
+        )];
+        assert!(
+            keychain_mutation_boundary_violations(&owner, &inert).is_empty(),
+            "inert Swift comments and strings must not create authority"
+        );
+    }
+
+    #[test]
+    fn swift_keychain_authority_rejects_dynamic_aliases_and_source_expansion() {
+        let owner = vec![(
+            PathBuf::from("adapters/keychain-macos/src/lib.rs"),
+            r"
+fn boundary() {
+    SecItemAdd();
+    SecItemCopyMatching();
+    SecRandomCopyBytes();
+    kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly();
+    kSecUseDataProtectionKeychain();
+}
+"
+            .to_owned(),
+        )];
+        for source in [
+            "let mutation = SecItemDelete",
+            "let symbol = dlsym(nil, \"SecItemDelete\")",
+            "@_silgen_name(\"SecItemUpdate\") func updateAlias() -> OSStatus",
+            "let symbol = CFBundleGetFunctionPointerForName(bundle, \"SecItemAdd\" as CFString)",
+        ] {
+            let expanded_sources = vec![(
+                PathBuf::from("apple/macos/Injected.swift"),
+                source.to_owned(),
+            )];
+            let violations = keychain_mutation_boundary_violations(&owner, &expanded_sources);
+            assert!(
+                !violations.is_empty(),
+                "expanded Swift authority source must fail closed: {source}"
+            );
+        }
     }
 
     #[test]

@@ -1311,6 +1311,17 @@ mod macos {
         Ok(())
     }
 
+    fn finish_recovery_validation(
+        validation: Result<bool, OpenFailure>,
+        cleanup_hook: Result<(), OpenFailure>,
+        cleanup: Result<(), OpenFailure>,
+    ) -> Result<bool, OpenFailure> {
+        match validation {
+            Err(error) => Err(error),
+            Ok(fresh) => cleanup_hook.and(cleanup).map(|()| fresh),
+        }
+    }
+
     fn validate_wal_without_shm_from_private_copy(
         canonical_path: &Path,
         account: &AccountId,
@@ -1423,7 +1434,6 @@ mod macos {
             Ok(fresh)
         })();
         let cleanup_hook = hook(RecoveryHook::BeforeCleanup, &stage_path);
-        let result = validation.and_then(|fresh| cleanup_hook.map(|()| fresh));
         let cleanup = cleanup_recovery_stage(
             leaf,
             &directory,
@@ -1431,8 +1441,7 @@ mod macos {
             directory_identity,
             created_leaves,
         );
-        cleanup?;
-        result
+        finish_recovery_validation(validation, cleanup_hook, cleanup)
     }
 
     fn preflight_read_only_files(path: &Path) -> Result<ReadOnlyFileIdentities, OpenFailure> {
@@ -2936,6 +2945,33 @@ mod macos {
                 assert_eq!(canonical_pair_state(&database), before);
                 assert_no_recovery_stages(&database);
             }
+        }
+
+        #[test]
+        fn missing_shm_recovery_preserves_validation_classification_when_cleanup_fails() {
+            let database = crashed_missing_shm("recovery-corrupted-with-tampered-stage");
+            let before = canonical_pair_state(&database);
+            let mut tampered_stage = None;
+            let result = validate_missing_shm_with_hook(&database, 8, &mut |point, stage| {
+                if point == RecoveryHook::BeforeCleanup {
+                    write_restrictive(&stage.join("mail.sqlite3-journal"), b"unexpected-journal");
+                    tampered_stage = Some(stage.to_path_buf());
+                }
+                Ok(())
+            });
+
+            assert_eq!(result, Err(OpenFailure::Corrupted));
+            assert_eq!(canonical_pair_state(&database), before);
+            let tampered_stage = tampered_stage.unwrap();
+            assert!(tampered_stage.join("mail.sqlite3").is_file());
+            assert!(tampered_stage.join("mail.sqlite3-wal").is_file());
+            assert!(tampered_stage.join("mail.sqlite3-shm").is_file());
+            let unexpected_journal = tampered_stage.join("mail.sqlite3-journal");
+            assert!(unexpected_journal.is_file());
+            assert_eq!(
+                fs::metadata(unexpected_journal).unwrap().mode() & 0o777,
+                0o600
+            );
         }
 
         #[test]
