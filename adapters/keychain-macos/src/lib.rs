@@ -802,7 +802,11 @@ fn open_optional_directory(
         Mode::empty(),
     ) {
         Ok(directory) => {
-            validate_directory(&fs::fstat(&directory)?, None)?;
+            let stat = fs::fstat(&directory)?;
+            validate_directory(&stat, None)?;
+            if Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
+                return Err(rustix::io::Errno::PERM);
+            }
             Ok(Some(directory))
         }
         Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
@@ -2499,6 +2503,32 @@ mod tests {
             ),
             ProductBootstrapStatus::Unavailable
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsafe_empty_skeleton_never_provisions_the_root_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = BootstrapFixture::new("orchestration-unsafe-empty-skeleton");
+        fixture.create_directory("profiles");
+        std::fs::set_permissions(
+            fixture.path.join("profiles"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        let backend = Fake::default();
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account_id(),
+                &backend,
+                &FakeLocator(Ok(fixture.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open for an unsafe skeleton"),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+        assert_eq!(*backend.calls.lock().unwrap(), vec!["copy"]);
     }
 
     #[cfg(target_os = "macos")]
