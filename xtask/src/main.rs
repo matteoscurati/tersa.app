@@ -45,6 +45,10 @@ const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
 const REQWEST_RESOLVED_FEATURES: [&str; 4] =
     ["__native-tls", "__native-tls-alpn", "__tls", "native-tls"];
 const RUSQLITE_RESOLVED_FEATURES: [&str; 3] = ["bundled", "bundled-sqlcipher", "modern_sqlite"];
+const RUSTIX_RESOLVED_FEATURES: [&str; 12] = [
+    "alloc", "default", "event", "fs", "mm", "net", "pipe", "process", "shm", "std", "system",
+    "time",
+];
 
 fn main() -> ExitCode {
     match run() {
@@ -243,6 +247,17 @@ fn check_architecture() -> TaskResult {
             ));
         }
 
+        if package_name == "tersa-apple-bridge" {
+            let direct_dependencies = package
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect();
+            violations.extend(apple_bridge_direct_dependency_set_violations(
+                &direct_dependencies,
+            ));
+        }
+
         if package_name == "tersa-cli-macos" {
             let direct_dependencies = package
                 .dependencies
@@ -261,6 +276,7 @@ fn check_architecture() -> TaskResult {
             check_blob_dependency(&package_name, dependency, &mut violations);
             check_gmail_dependency(&package_name, dependency, &mut violations);
             check_keychain_dependency(&package_name, dependency, &mut violations);
+            check_rustix_dependency(&package_name, dependency, &mut violations);
             if let Some(violation) = future_macos_store_dependency_violation(
                 &package_name,
                 dependency.name.as_str(),
@@ -278,16 +294,20 @@ fn check_architecture() -> TaskResult {
     check_macos_keychain_signing_configuration(&mut violations)?;
     check_resolved_architecture(&mut violations)?;
 
+    finish_architecture_check(&violations)
+}
+
+fn finish_architecture_check(violations: &[String]) -> TaskResult {
     if violations.is_empty() {
         println!("Architecture dependency boundaries passed.");
-        return Ok(());
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "architecture dependency violations: {}",
+            violations.join(", ")
+        ))
+        .into())
     }
-
-    Err(io::Error::other(format!(
-        "architecture dependency violations: {}",
-        violations.join(", ")
-    ))
-    .into())
 }
 
 fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> TaskResult {
@@ -348,7 +368,253 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &evidence,
     ));
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
+    violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
     Ok(())
+}
+
+fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec<String>> {
+    let mut violations = Vec::new();
+    for (path, document) in tracked_source_documents(repository_root, "apps/cli-macos")? {
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            violations.extend(cli_keychain_source_violations(
+                &path.to_string_lossy(),
+                &document,
+            ));
+        }
+    }
+
+    let bridge_sources = tracked_source_documents(repository_root, "apple/rust-bridge/src")?;
+    let bridge_document = bridge_sources
+        .iter()
+        .filter(|(path, _document)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        })
+        .map(|(_path, document)| document.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    violations.extend(bridge_bootstrap_source_violations(&bridge_document));
+
+    let worker_path = repository_root.join("apple/macos/BootstrapWorker.swift");
+    let app_delegate_path = repository_root.join("apple/macos/AppDelegate.swift");
+    let tracked_macos_sources = tracked_source_documents(repository_root, "apple/macos")?
+        .into_iter()
+        .map(|(path, _document)| path)
+        .collect::<BTreeSet<_>>();
+    for required in [
+        PathBuf::from("apple/macos/BootstrapWorker.swift"),
+        PathBuf::from("apple/macos/AppDelegate.swift"),
+    ] {
+        if !tracked_macos_sources.contains(&required) {
+            violations.push(format!(
+                "reviewed macOS bootstrap source `{}` must be tracked",
+                required.display()
+            ));
+        }
+    }
+    if !worker_path.is_file() || !app_delegate_path.is_file() {
+        violations.push("the reviewed macOS bootstrap worker sources are missing".to_owned());
+    } else {
+        let worker = fs::read_to_string(worker_path)?;
+        let app_delegate = fs::read_to_string(app_delegate_path)?;
+        violations.extend(swift_bootstrap_source_violations(&worker, &app_delegate));
+    }
+    Ok(violations)
+}
+
+fn tracked_source_documents(
+    repository_root: &Path,
+    prefix: &str,
+) -> io::Result<Vec<(PathBuf, String)>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["ls-files", "--stage", "-z", "--", prefix])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git ls-files failed while inventorying `{prefix}` sources"
+        )));
+    }
+    let entries = String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut documents = Vec::new();
+    for entry in entries.split('\0').filter(|entry| !entry.is_empty()) {
+        let Some((metadata, path)) = entry.split_once('\t') else {
+            return Err(io::Error::other("malformed tracked source index entry"));
+        };
+        let mode = metadata
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| io::Error::other("tracked source index entry has no mode"))?;
+        if !matches!(mode, "100644" | "100755") {
+            return Err(io::Error::other(format!(
+                "tracked source `{path}` has forbidden git mode `{mode}`"
+            )));
+        }
+        let path = PathBuf::from(path);
+        let document = fs::read_to_string(repository_root.join(&path))?;
+        documents.push((path, document));
+    }
+    Ok(documents)
+}
+
+fn referenced_items<'a>(document: &'a str, prefix: &str) -> Vec<&'a str> {
+    document
+        .match_indices(prefix)
+        .map(|(index, _matched)| {
+            let rest = &document[index + prefix.len()..];
+            let length = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            &rest[..length]
+        })
+        .collect()
+}
+
+fn cli_keychain_source_violations(path: &str, document: &str) -> Vec<String> {
+    const ALLOWED: [&str; 2] = ["ReadOnlyMailboxOpenError", "open_default_read_only_mailbox"];
+    const FORBIDDEN_BOOTSTRAP: [&str; 4] = [
+        "DataProtectionRootKeyProvisioner",
+        "InstallationRootKeyProvisioner",
+        "ProductBootstrapStatus",
+        "bootstrap_default_account_bytes",
+    ];
+    let mut violations = Vec::new();
+    for item in referenced_items(document, "tersa_keychain_macos::") {
+        if !ALLOWED.contains(&item) {
+            violations.push(format!(
+                "{path} references forbidden Keychain adapter item `{item}`"
+            ));
+        }
+    }
+    for line in document
+        .lines()
+        .filter(|line| line.contains("tersa_keychain_macos"))
+    {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("use ")
+            || trimmed.starts_with("pub use ")
+            || trimmed.starts_with("extern crate ")
+            || line.contains(" as ")
+            || line.contains("::*")
+        {
+            violations.push(format!(
+                "{path} must use only fully qualified, non-aliased Keychain retrieval items"
+            ));
+        }
+    }
+    for symbol in FORBIDDEN_BOOTSTRAP {
+        if document.contains(symbol) {
+            violations.push(format!(
+                "{path} contains forbidden bootstrap symbol `{symbol}`"
+            ));
+        }
+    }
+    violations
+}
+
+fn bridge_bootstrap_source_violations(document: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for forbidden in [
+        "tersa_domain",
+        "use tersa_keychain_macos",
+        "pub use tersa_keychain_macos",
+        "extern crate tersa_keychain_macos",
+    ] {
+        if document.contains(forbidden) {
+            violations.push(format!(
+                "the Apple bridge contains forbidden bootstrap boundary `{forbidden}`"
+            ));
+        }
+    }
+    if contains_identifier(document, "AccountId") {
+        violations
+            .push("the Apple bridge contains forbidden bootstrap boundary `AccountId`".to_owned());
+    }
+    for item in referenced_items(document, "tersa_keychain_macos::") {
+        if !matches!(
+            item,
+            "ProductBootstrapStatus" | "bootstrap_default_account_bytes"
+        ) {
+            violations.push(format!(
+                "the Apple bridge references forbidden Keychain adapter item `{item}`"
+            ));
+        }
+    }
+    if document
+        .matches("tersa_keychain_macos::bootstrap_default_account_bytes(")
+        .count()
+        != 1
+    {
+        violations.push(
+            "the Apple bridge must call exactly one validating Keychain bootstrap entry".to_owned(),
+        );
+    }
+    for required in [
+        "account_id.is_null()",
+        "account_id_len == 0",
+        "account_id_len > 256",
+        "slice::from_raw_parts(account_id, account_id_len)",
+        ".to_vec()",
+    ] {
+        if !document.contains(required) {
+            violations.push(format!(
+                "the Apple bridge is missing required bounded-copy source `{required}`"
+            ));
+        }
+    }
+    violations
+}
+
+fn contains_identifier(document: &str, identifier: &str) -> bool {
+    document.match_indices(identifier).any(|(index, _matched)| {
+        let before = document[..index].bytes().next_back();
+        let after = document[index + identifier.len()..].bytes().next();
+        let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        before.is_none_or(|byte| !is_identifier(byte))
+            && after.is_none_or(|byte| !is_identifier(byte))
+    })
+}
+
+fn swift_bootstrap_source_violations(worker: &str, app_delegate: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for required in [
+        "private var running = false",
+        "private var pending: (() -> Void)?",
+        "else if pending == nil",
+        "tersa_macos_bootstrap_default_account(",
+    ] {
+        if !worker.contains(required) {
+            violations.push(format!(
+                "BootstrapWorker.swift is missing bounded-worker source `{required}`"
+            ));
+        }
+    }
+    if worker.contains("[() -> Void]") || worker.contains("append(") {
+        violations.push("BootstrapWorker.swift must not implement an unbounded queue".to_owned());
+    }
+    if app_delegate.matches("bootstrapWorker.submit(").count() != 1 {
+        violations.push(
+            "AppDelegate.swift must contain exactly one product bootstrap worker call site"
+                .to_owned(),
+        );
+    }
+    if app_delegate.contains("local-profile-owner") {
+        violations.push("AppDelegate.swift must not bootstrap a placeholder account".to_owned());
+    }
+    if let Some(launch) = app_delegate.split("applicationDidFinishLaunching").nth(1) {
+        let end = ["\n    func ", "\nfunc "]
+            .into_iter()
+            .filter_map(|boundary| launch.find(boundary))
+            .min()
+            .unwrap_or(launch.len());
+        let launch = &launch[..end];
+        if launch.contains("bootstrapWorker.submit(") {
+            violations.push("AppDelegate.swift must not bootstrap an account at launch".to_owned());
+        }
+    }
+    violations
 }
 
 fn collect_entitlement_paths(
@@ -1845,9 +2111,47 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
         check_blob_dependency_graph(&dependency_graph, target, violations);
         check_gmail_dependency_graph(&dependency_graph, target, violations);
         check_keychain_dependency_graph(&dependency_graph, target, violations);
+        check_rustix_dependency_graph(&dependency_graph, target, violations);
         check_diagnostic_runtime_dependency_graph(&dependency_graph, target, violations);
     }
     Ok(())
+}
+
+fn check_rustix_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let rustix = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == "rustix")
+        .collect::<Vec<_>>();
+    if rustix.len() != 1 || rustix[0].version.to_string() != "1.1.4" {
+        violations.push(format!(
+            "resolved rustix for {target} must be exactly one package at 1.1.4"
+        ));
+        return;
+    }
+    let id = &rustix[0].id;
+    let Some(node) = resolve.nodes.iter().find(|node| node.id == *id) else {
+        violations.push(format!("resolved rustix node is missing for {target}"));
+        return;
+    };
+    let actual = node
+        .features
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let expected = RUSTIX_RESOLVED_FEATURES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        violations.push(format!(
+            "resolved rustix features for {target} changed from the reviewed lock graph"
+        ));
+    }
 }
 
 fn check_gmail_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -1942,7 +2246,7 @@ fn check_keychain_dependency(
         "objc2-foundation" => Some((
             "=0.3.2",
             true,
-            &["std", "NSFileManager", "NSString", "NSURL"][..],
+            &["std", "NSFileManager", "NSString", "NSThread", "NSURL"][..],
         )),
         "hkdf" => Some(("=0.12.4", false, &[][..])),
         "sha2" => Some(("=0.10.9", false, &[][..])),
@@ -1989,10 +2293,11 @@ fn check_keychain_dependency(
 }
 
 fn keychain_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
-    const REQUIRED: [&str; 8] = [
+    const REQUIRED: [&str; 9] = [
         "core-foundation",
         "hkdf",
         "objc2-foundation",
+        "rustix",
         "security-framework-sys",
         "sha2",
         "tersa-platform",
@@ -2012,6 +2317,100 @@ fn keychain_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> V
     for dependency in required.difference(dependencies) {
         violations.push(format!(
             "tersa-keychain-macos is missing required direct dependency {dependency}"
+        ));
+    }
+    violations
+}
+
+fn apple_bridge_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
+    let required = BTreeSet::from([
+        "tersa-application",
+        "tersa-keychain-macos",
+        "tersa-presentation",
+        "url",
+        "zeroize",
+    ]);
+    let mut violations = Vec::new();
+    for dependency in dependencies.difference(&required) {
+        violations.push(format!(
+            "tersa-apple-bridge -> {dependency} (dependency is outside the closed Apple bridge set)"
+        ));
+    }
+    for dependency in required.difference(dependencies) {
+        violations.push(format!(
+            "tersa-apple-bridge is missing required direct dependency {dependency}"
+        ));
+    }
+    violations
+}
+
+fn check_rustix_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    if dependency.name != "rustix" {
+        return;
+    }
+    violations.extend(rustix_manifest_dependency_violations(
+        package_name,
+        &dependency.req.to_string(),
+        dependency.uses_default_features,
+        dependency
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        &dependency.features,
+    ));
+}
+
+fn rustix_manifest_dependency_violations(
+    package_name: &str,
+    version: &str,
+    uses_default_features: bool,
+    target: Option<&str>,
+    features: &[String],
+) -> Vec<String> {
+    const OWNERS: [&str; 3] = [
+        "tersa-blob-spike",
+        "tersa-keychain-macos",
+        "tersa-store-sqlcipher-macos",
+    ];
+    let mut violations = Vec::new();
+    if !OWNERS.contains(&package_name) {
+        return vec![format!(
+            "{package_name} -> rustix is outside the closed direct-owner set"
+        )];
+    }
+    if version != "=1.1.4" {
+        violations.push(format!("{package_name} -> rustix must pin exactly 1.1.4"));
+    }
+    if uses_default_features {
+        violations.push(format!(
+            "{package_name} -> rustix must disable default features"
+        ));
+    }
+    if package_name == "tersa-blob-spike" {
+        if target.is_some() {
+            violations.push(
+                "tersa-blob-spike -> rustix must keep its existing untargeted declaration"
+                    .to_owned(),
+            );
+        }
+    } else if target != Some(MACOS_STORE_TARGET) {
+        violations.push(format!(
+            "{package_name} -> rustix must use target `{MACOS_STORE_TARGET}`"
+        ));
+    }
+    let actual: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected = match package_name {
+        "tersa-keychain-macos" => BTreeSet::from(["fs", "process", "std"]),
+        _ => BTreeSet::from(["fs", "std"]),
+    };
+    if actual != expected {
+        violations.push(format!(
+            "{package_name} -> rustix has an unexpected direct feature set"
         ));
     }
     violations
@@ -2330,8 +2729,21 @@ fn blob_dependency_graph_violations(
             continue;
         };
         let cli_chain = member_name == "tersa-cli-macos" && target == "aarch64-apple-darwin";
+        let bridge_chain = member_name == "tersa-apple-bridge" && target == "aarch64-apple-darwin";
+        if bridge_chain && dependency_reaches(member_id, &hmac_packages, dependencies) {
+            violations.extend(exact_dependency_path_violations(
+                member_id,
+                &hmac_packages,
+                package_names,
+                dependencies,
+                &["tersa-apple-bridge", "tersa-keychain-macos", "hkdf", "hmac"],
+                "HMAC",
+                target,
+            ));
+        }
         if !HMAC_OWNERS.contains(&member_name.as_str())
             && !cli_chain
+            && !bridge_chain
             && dependency_reaches(member_id, &hmac_packages, dependencies)
         {
             violations.push(format!(
@@ -2530,7 +2942,25 @@ fn sqlcipher_dependency_graph_violations(
             continue;
         };
         if dependency_reaches(member_id, sqlite_packages, dependencies) {
-            if !SQLCIPHER_OWNERS.contains(&member_name.as_str()) {
+            let bridge_chain =
+                member_name == "tersa-apple-bridge" && target == "aarch64-apple-darwin";
+            if bridge_chain {
+                violations.extend(exact_dependency_path_violations(
+                    member_id,
+                    sqlite_packages,
+                    package_names,
+                    dependencies,
+                    &[
+                        "tersa-apple-bridge",
+                        "tersa-keychain-macos",
+                        "tersa-store-sqlcipher-macos",
+                        "rusqlite",
+                        "libsqlite3-sys",
+                    ],
+                    "SQLCipher",
+                    target,
+                ));
+            } else if !SQLCIPHER_OWNERS.contains(&member_name.as_str()) {
                 violations.push(format!(
                     "{member_name} reaches libsqlite3-sys outside the approved Apple SQLCipher owners for {target}"
                 ));
@@ -2567,6 +2997,64 @@ fn dependency_reaches(
         }
     }
     false
+}
+
+fn exact_dependency_path_violations(
+    start: &str,
+    targets: &BTreeSet<String>,
+    package_names: &BTreeMap<String, String>,
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    expected: &[&str],
+    boundary: &str,
+    target: &str,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    dependency_paths(start, targets, dependencies, &mut Vec::new(), &mut paths);
+    if paths.is_empty() {
+        return vec![format!(
+            "{} does not reach the required {boundary} path for {target}",
+            package_names
+                .get(start)
+                .map_or("unknown workspace member", String::as_str)
+        )];
+    }
+    let mut violations = Vec::new();
+    for path in paths {
+        let names = path
+            .iter()
+            .map(|id| package_names.get(id).map_or("<unknown>", String::as_str))
+            .collect::<Vec<_>>();
+        if names != expected {
+            violations.push(format!(
+                "{} reaches {boundary} through an unapproved path for {target}",
+                package_names
+                    .get(start)
+                    .map_or("unknown workspace member", String::as_str)
+            ));
+        }
+    }
+    violations
+}
+
+fn dependency_paths(
+    current: &str,
+    targets: &BTreeSet<String>,
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    stack: &mut Vec<String>,
+    output: &mut Vec<Vec<String>>,
+) {
+    if stack.iter().any(|entry| entry == current) {
+        return;
+    }
+    stack.push(current.to_owned());
+    if targets.contains(current) {
+        output.push(stack.clone());
+    } else if let Some(children) = dependencies.get(current) {
+        for child in children {
+            dependency_paths(child, targets, dependencies, stack, output);
+        }
+    }
+    stack.pop();
 }
 
 fn check_dioxus_dependency(
@@ -2923,7 +3411,10 @@ fn future_macos_store_dependency_violation(
     let protected_edge = matches!(
         (package_name, dependency_name),
         ("tersa-keychain-macos", "tersa-store-sqlcipher-macos")
-            | ("tersa-cli-macos", "tersa-keychain-macos")
+            | (
+                "tersa-cli-macos" | "tersa-apple-bridge",
+                "tersa-keychain-macos"
+            )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
         && matches!(
@@ -2946,7 +3437,11 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     BTreeMap::from([
         (
             "tersa-apple-bridge",
-            BTreeSet::from(["tersa-application", "tersa-presentation"]),
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-keychain-macos",
+                "tersa-presentation",
+            ]),
         ),
         ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-blob-spike", BTreeSet::new()),
@@ -3061,18 +3556,20 @@ mod tests {
     use cargo_metadata::PackageId;
 
     use super::{
-        ResolvedDependencyIdentity, blob_dependency_graph_violations,
-        blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
-        cli_direct_dependency_set_violations, collect_entitlement_paths, dependency_policy,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
-        keychain_direct_dependency_set_violations, non_owner_entitlement_violations,
-        parse_identity, parse_plist_string_array, parse_project_targets,
-        project_generation_surface_violations, project_generation_wrapper,
+        ResolvedDependencyIdentity, apple_bridge_direct_dependency_set_violations,
+        blob_dependency_graph_violations, blob_manifest_dependency_violations,
+        bridge_bootstrap_source_violations, check_diagnostic_runtime_reachability,
+        cli_direct_dependency_set_violations, cli_keychain_source_violations,
+        collect_entitlement_paths, dependency_policy, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
         reserved_future_policy_violations, resolved_workspace_dependency_names,
-        rusqlite_resolved_feature_violations, signing_configuration_violations,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        rusqlite_resolved_feature_violations, rustix_manifest_dependency_violations,
+        signing_configuration_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, swift_bootstrap_source_violations,
         target_metadata_options, tracked_apple_signing_inventory,
         tracked_project_generation_violations,
     };
@@ -3215,6 +3712,7 @@ targets:
             "core-foundation",
             "hkdf",
             "objc2-foundation",
+            "rustix",
             "security-framework-sys",
             "sha2",
             "tersa-platform",
@@ -3246,6 +3744,158 @@ targets:
             vec![
                 "tersa-keychain-macos -> hmac (direct HMAC is forbidden; only resolved HKDF to HMAC reachability is allowed)"
             ]
+        );
+    }
+
+    #[test]
+    fn apple_bridge_direct_dependencies_are_a_closed_exact_set() {
+        let exact = BTreeSet::from([
+            "tersa-application",
+            "tersa-keychain-macos",
+            "tersa-presentation",
+            "url",
+            "zeroize",
+        ]);
+        assert!(apple_bridge_direct_dependency_set_violations(&exact).is_empty());
+
+        let mut broadened = exact;
+        broadened.insert("tersa-domain");
+        assert_eq!(
+            apple_bridge_direct_dependency_set_violations(&broadened),
+            vec![
+                "tersa-apple-bridge -> tersa-domain (dependency is outside the closed Apple bridge set)"
+            ]
+        );
+    }
+
+    #[test]
+    fn rustix_direct_ownership_features_and_targets_are_exact() {
+        assert!(
+            rustix_manifest_dependency_violations(
+                "tersa-blob-spike",
+                "=1.1.4",
+                false,
+                None,
+                &["fs".to_owned(), "std".to_owned()],
+            )
+            .is_empty()
+        );
+        assert!(
+            rustix_manifest_dependency_violations(
+                "tersa-keychain-macos",
+                "=1.1.4",
+                false,
+                Some(r#"cfg(target_os = "macos")"#),
+                &["fs".to_owned(), "process".to_owned(), "std".to_owned()],
+            )
+            .is_empty()
+        );
+        assert!(
+            rustix_manifest_dependency_violations(
+                "tersa-store-sqlcipher-macos",
+                "=1.1.4",
+                false,
+                Some(r#"cfg(target_os = "macos")"#),
+                &["fs".to_owned(), "std".to_owned()],
+            )
+            .is_empty()
+        );
+
+        assert!(
+            !rustix_manifest_dependency_violations(
+                "tersa-store-sqlcipher-macos",
+                "=1.1.4",
+                false,
+                Some(r#"cfg(target_os = "ios")"#),
+                &["fs".to_owned(), "process".to_owned(), "std".to_owned()],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rustix_manifest_dependency_violations(
+                "tersa-apple-bridge",
+                "=1.1.4",
+                false,
+                Some(r#"cfg(target_os = "macos")"#),
+                &["fs".to_owned(), "std".to_owned()],
+            ),
+            vec!["tersa-apple-bridge -> rustix is outside the closed direct-owner set"]
+        );
+    }
+
+    #[test]
+    fn cli_source_guard_allows_only_retrieval_items_and_rejects_aliases() {
+        let allowed = r"
+let reader = tersa_keychain_macos::open_default_read_only_mailbox(account)?;
+let error = tersa_keychain_macos::ReadOnlyMailboxOpenError::KeyAccess;
+";
+        assert!(cli_keychain_source_violations("cli.rs", allowed).is_empty());
+
+        for forbidden in [
+            "tersa_keychain_macos::bootstrap_default_account_bytes(bytes);",
+            "use tersa_keychain_macos::*;",
+            "use tersa_keychain_macos::open_default_read_only_mailbox as open;",
+            "pub use tersa_keychain_macos::ProductBootstrapStatus;",
+            "extern crate tersa_keychain_macos as keychain;",
+        ] {
+            assert!(
+                !cli_keychain_source_violations("cli.rs", forbidden).is_empty(),
+                "fixture must fail: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_source_guard_pins_the_single_bounded_validating_call() {
+        let valid = r"
+if account_id.is_null() || account_id_len == 0 || account_id_len > 256 { return 1; }
+let bytes = unsafe { slice::from_raw_parts(account_id, account_id_len) }.to_vec();
+match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
+    tersa_keychain_macos::ProductBootstrapStatus::Ready => 0,
+    _ => 1,
+}
+";
+        assert!(bridge_bootstrap_source_violations(valid).is_empty());
+
+        for forbidden in [
+            valid.replace(
+                "bootstrap_default_account_bytes",
+                "alternate_bootstrap_entry",
+            ),
+            format!("{valid}\nuse tersa_keychain_macos as keychain;"),
+            format!("{valid}\nlet _ = AccountId::new(value);"),
+            format!(
+                "{valid}\nlet _ = tersa_keychain_macos::bootstrap_default_account_bytes(&bytes);"
+            ),
+        ] {
+            assert!(!bridge_bootstrap_source_violations(&forbidden).is_empty());
+        }
+    }
+
+    #[test]
+    fn swift_source_guard_rejects_launch_bootstrap_and_unbounded_queues() {
+        let worker = r"
+private var running = false
+private var pending: (() -> Void)?
+else if pending == nil {}
+tersa_macos_bootstrap_default_account(pointer, count)
+";
+        let app = r"
+func applicationDidFinishLaunching(_ notification: Notification) { _ = version() }
+func bootstrapAccount(_ bytes: Data) { bootstrapWorker.submit(accountIdentifier: bytes) {} }
+";
+        assert!(swift_bootstrap_source_violations(worker, app).is_empty());
+        assert!(
+            !swift_bootstrap_source_violations(
+                &format!(
+                    "{worker}\nprivate var pending: [() -> Void] = []\npending.append(operation)"
+                ),
+                &app.replace(
+                    "_ = version()",
+                    "bootstrapWorker.submit(accountIdentifier: Data()) {}"
+                ),
+            )
+            .is_empty()
         );
     }
 
@@ -4449,6 +5099,7 @@ targets:
         for (owner, dependency) in [
             ("tersa-keychain-macos", "tersa-store-sqlcipher-macos"),
             ("tersa-cli-macos", "tersa-keychain-macos"),
+            ("tersa-apple-bridge", "tersa-keychain-macos"),
         ] {
             assert_eq!(
                 future_macos_store_dependency_violation(
@@ -4724,6 +5375,92 @@ targets:
             blob_violations,
             vec![
                 "tersa-application reaches ChaCha20-Poly1305 outside tersa-blob-spike for aarch64-apple-darwin"
+            ]
+        );
+    }
+
+    #[test]
+    fn permits_only_the_exact_bridge_crypto_paths_on_macos() {
+        let package_names = BTreeMap::from([
+            ("bridge".to_owned(), "tersa-apple-bridge".to_owned()),
+            ("keychain".to_owned(), "tersa-keychain-macos".to_owned()),
+            ("store".to_owned(), "tersa-store-sqlcipher-macos".to_owned()),
+            ("hkdf".to_owned(), "hkdf".to_owned()),
+            ("hmac".to_owned(), "hmac".to_owned()),
+            ("rusqlite".to_owned(), "rusqlite".to_owned()),
+            ("sqlite".to_owned(), "libsqlite3-sys".to_owned()),
+        ]);
+        let workspace_members = vec!["bridge".to_owned()];
+        let dependencies = BTreeMap::from([
+            ("bridge".to_owned(), BTreeSet::from(["keychain".to_owned()])),
+            (
+                "keychain".to_owned(),
+                BTreeSet::from(["hkdf".to_owned(), "store".to_owned()]),
+            ),
+            ("hkdf".to_owned(), BTreeSet::from(["hmac".to_owned()])),
+            ("store".to_owned(), BTreeSet::from(["rusqlite".to_owned()])),
+            ("rusqlite".to_owned(), BTreeSet::from(["sqlite".to_owned()])),
+        ]);
+        assert!(
+            blob_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &dependencies,
+                "aarch64-apple-darwin",
+            )
+            .is_empty()
+        );
+        assert!(
+            sqlcipher_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &dependencies,
+                &BTreeSet::from(["sqlite".to_owned()]),
+                "aarch64-apple-darwin",
+            )
+            .is_empty()
+        );
+
+        let mut broadened = dependencies;
+        broadened.insert(
+            "bridge".to_owned(),
+            BTreeSet::from(["hmac".to_owned(), "keychain".to_owned()]),
+        );
+        assert_eq!(
+            blob_dependency_graph_violations(
+                &package_names,
+                &workspace_members,
+                &broadened,
+                "aarch64-apple-darwin",
+            ),
+            vec![
+                "tersa-apple-bridge reaches HMAC through an unapproved path for aarch64-apple-darwin"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_bridge_crypto_reachability_outside_macos() {
+        let package_names = BTreeMap::from([
+            ("bridge".to_owned(), "tersa-apple-bridge".to_owned()),
+            ("keychain".to_owned(), "tersa-keychain-macos".to_owned()),
+            ("hkdf".to_owned(), "hkdf".to_owned()),
+            ("hmac".to_owned(), "hmac".to_owned()),
+        ]);
+        let dependencies = BTreeMap::from([
+            ("bridge".to_owned(), BTreeSet::from(["keychain".to_owned()])),
+            ("keychain".to_owned(), BTreeSet::from(["hkdf".to_owned()])),
+            ("hkdf".to_owned(), BTreeSet::from(["hmac".to_owned()])),
+        ]);
+        assert_eq!(
+            blob_dependency_graph_violations(
+                &package_names,
+                &["bridge".to_owned()],
+                &dependencies,
+                "aarch64-apple-ios",
+            ),
+            vec![
+                "tersa-apple-bridge reaches HMAC outside the approved owners for aarch64-apple-ios"
             ]
         );
     }

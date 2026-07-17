@@ -120,7 +120,7 @@ satisfies `M1-UI-001` and never changes the mobile-inclusive
 passes. Real Google authorization and verification also remain open until their
 own reviewed evidence exists.
 
-The bootstrap-source authorization does not edit or pass the M0 gate register,
+The bootstrap-source implementation does not edit or pass the M0 gate register,
 add a new executable, Xcode, signing, entitlement, package, or distribution
 surface, or imply OAuth, token, network, or real-account behavior. Its fake and
 deterministic evidence cannot satisfy runtime, signing, App Group, Data
@@ -149,7 +149,7 @@ which alone owns identity-checked cleanup of fresh leaf files. Each slice
 requires independent review with zero unresolved actionable findings on its
 exact head.
 
-PR 33a.5 reuses exact `rustix =1.1.4` as its sole newly authorized external
+PR 33a.5 reuses exact `rustix =1.1.4` as its sole newly activated external
 package and adds direct macOS declarations to Keychain and SQLCipher-store. The
 two declarations use canonical atomic `cfg(target_os = "macos")`. The Keychain
 member directly adds only `process` atop workspace `fs`/`std` for `geteuid`;

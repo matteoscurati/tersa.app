@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 uint32_t tersa_apple_bridge_version(void);
+int32_t tersa_macos_bootstrap_default_account(const uint8_t *account_id, size_t account_id_len);
 int32_t tersa_oauth_macos_begin(
     const uint8_t *client_id,
     size_t client_id_len,

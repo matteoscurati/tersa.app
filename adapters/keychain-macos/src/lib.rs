@@ -11,6 +11,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", test))]
 use hkdf::Hkdf;
@@ -30,6 +34,30 @@ pub enum ReadOnlyMailboxOpenError {
     ProfileUnavailable,
     /// The encrypted mailbox failed strict validation.
     MailboxCorrupted,
+}
+
+/// Closed result of the product-only fixed-profile bootstrap operation.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(i32)]
+pub enum ProductBootstrapStatus {
+    /// The validated fixed account profile is ready for use.
+    Ready = 0,
+    /// Opaque account bytes were not a canonical account identifier.
+    InvalidAccountIdentifier = 1,
+    /// The bridge called the synchronous operation from an invalid context.
+    InvalidExecutionContext = 2,
+    /// The bounded process or global lock could not be acquired.
+    BusyOrUnavailable = 3,
+    /// The Keychain root is absent while profile state already exists.
+    RootMissingWithExistingProfile = 4,
+    /// A Keychain, filesystem, or store invariant failed.
+    Unavailable = 5,
+}
+
+impl fmt::Debug for ProductBootstrapStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProductBootstrapStatus([REDACTED])")
+    }
 }
 
 impl fmt::Debug for ReadOnlyMailboxOpenError {
@@ -59,6 +87,12 @@ const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
 #[cfg(any(target_os = "macos", test))]
 const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_LOCK: &str = ".tersa-profile-bootstrap-v1.lock";
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_BACKOFF: Duration = Duration::from_millis(10);
 
 #[cfg_attr(test, derive(Eq, PartialEq))]
 struct SecretKey(Zeroizing<[u8; 32]>);
@@ -374,6 +408,473 @@ fn open_read_only_mailbox(
             ReadOnlyMailboxOpenError::MailboxCorrupted
         }
     })
+}
+
+/// Validates opaque bytes and establishes the one fixed product profile.
+///
+/// This is intentionally the sole public product-bootstrap entry. Validation
+/// completes before construction of Keychain or filesystem capabilities.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn bootstrap_default_account_bytes(account_bytes: &[u8]) -> ProductBootstrapStatus {
+    let account = match validate_bootstrap_account_bytes(
+        objc2_foundation::NSThread::isMainThread_class(),
+        account_bytes,
+    ) {
+        Ok(account) => account,
+        Err(status) => return status,
+    };
+    bootstrap_default_account(&account)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_bootstrap_account_bytes(
+    is_main_thread: bool,
+    account_bytes: &[u8],
+) -> Result<AccountId, ProductBootstrapStatus> {
+    if is_main_thread {
+        return Err(ProductBootstrapStatus::InvalidExecutionContext);
+    }
+    let account_text = std::str::from_utf8(account_bytes)
+        .map_err(|_error| ProductBootstrapStatus::InvalidAccountIdentifier)?;
+    AccountId::new(account_text.to_owned())
+        .map_err(|_error| ProductBootstrapStatus::InvalidAccountIdentifier)
+}
+
+#[cfg(target_os = "macos")]
+fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
+    let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+    let Some(process_guard) = acquire_process_lock(deadline) else {
+        return ProductBootstrapStatus::BusyOrUnavailable;
+    };
+    let _process_guard = process_guard;
+    let Ok(locator) = ProductionContainerLocator::new() else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    let Ok(container) = locator.container() else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    let Ok(lock) = acquire_global_lock(&container, deadline) else {
+        return ProductBootstrapStatus::BusyOrUnavailable;
+    };
+    let Ok(backend) = ProductionBackend::new() else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    let root = match backend.copy() {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            if !is_empty_profile_skeleton(lock.container_fd()) {
+                return ProductBootstrapStatus::RootMissingWithExistingProfile;
+            }
+            if provision_installation_root_key(&backend).is_err() {
+                return ProductBootstrapStatus::Unavailable;
+            }
+            match backend.copy() {
+                Ok(Some(root)) => root,
+                _ => return ProductBootstrapStatus::Unavailable,
+            }
+        }
+        Err(_error) => return ProductBootstrapStatus::Unavailable,
+    };
+    let Ok(key) = derive_account_key(
+        &root,
+        account,
+        AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+    ) else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    let digest = hex_digest(account);
+    let Ok(mut directories) = establish_account_directory(lock.container_fd(), &container, &digest)
+    else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    if directories.revalidate().is_err() {
+        directories.cleanup_before_store_open();
+        return ProductBootstrapStatus::Unavailable;
+    }
+    let result = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        account.clone(),
+        directories.path().join("mail.sqlite3"),
+        key.into_database_key(),
+    );
+    // Once store opening begins, directory cleanup is forbidden.
+    if directories.revalidate().is_err() {
+        return ProductBootstrapStatus::Unavailable;
+    }
+    match result {
+        Ok(_store) => ProductBootstrapStatus::Ready,
+        Err(_error) => ProductBootstrapStatus::Unavailable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_process_lock(deadline: Instant) -> Option<std::sync::MutexGuard<'static, ()>> {
+    acquire_mutex_until(process_lock(), deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_mutex_until(
+    mutex: &Mutex<()>,
+    deadline: Instant,
+) -> Option<std::sync::MutexGuard<'_, ()>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(_error)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    BOOTSTRAP_BACKOFF.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct BootstrapLock {
+    container: rustix::fd::OwnedFd,
+    _lock: rustix::fd::OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl BootstrapLock {
+    fn container_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.container.as_fd()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Result<BootstrapLock> {
+    use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags};
+    use std::os::fd::AsFd;
+
+    let directory = fs::openat(
+        fs::CWD,
+        container,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    validate_directory(&fs::fstat(&directory)?, None)?;
+    require_deadline(deadline)?;
+    let lock = match fs::openat(
+        directory.as_fd(),
+        BOOTSTRAP_LOCK,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(lock) => {
+            fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
+            validate_lock(&fs::fstat(&lock)?, None, true)?;
+            lock
+        }
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            require_deadline(deadline)?;
+            let expected =
+                fs::statat(directory.as_fd(), BOOTSTRAP_LOCK, AtFlags::SYMLINK_NOFOLLOW)?;
+            validate_lock(&expected, None, false)?;
+            let mode = Mode::from_raw_mode(expected.st_mode).as_raw_mode();
+            if mode != 0o600 {
+                require_deadline(deadline)?;
+                fs::chmodat(
+                    directory.as_fd(),
+                    BOOTSTRAP_LOCK,
+                    Mode::from_raw_mode(0o600),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+            }
+            require_deadline(deadline)?;
+            let lock = fs::openat(
+                directory.as_fd(),
+                BOOTSTRAP_LOCK,
+                OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            validate_lock(&fs::fstat(&lock)?, Some(&expected), true)?;
+            lock
+        }
+        Err(error) => return Err(error),
+    };
+    retry_transient_until(deadline, || {
+        fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
+    })?;
+    Ok(BootstrapLock {
+        container: directory,
+        _lock: lock,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn retry_transient_until<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> rustix::io::Result<T>,
+) -> rustix::io::Result<T> {
+    loop {
+        require_deadline(deadline)?;
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if error == rustix::io::Errno::AGAIN || error == rustix::io::Errno::INTR => {
+                std::thread::sleep(
+                    BOOTSTRAP_BACKOFF.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_lock(
+    stat: &rustix::fs::Stat,
+    expected: Option<&rustix::fs::Stat>,
+    exact_mode: bool,
+) -> rustix::io::Result<()> {
+    use rustix::fs::{FileType, Mode};
+    let mode = Mode::from_raw_mode(stat.st_mode).as_raw_mode();
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || if exact_mode {
+            mode != 0o600
+        } else {
+            mode & !0o600 != 0
+        }
+        || expected.is_some_and(|old| old.st_dev != stat.st_dev || old.st_ino != stat.st_ino)
+    {
+        return Err(rustix::io::Errno::PERM);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn require_deadline(deadline: Instant) -> rustix::io::Result<()> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(rustix::io::Errno::TIMEDOUT)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_empty_profile_skeleton(container: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsFd;
+    let profiles = match open_optional_directory(container, "profiles") {
+        Ok(Some(profiles)) => profiles,
+        Ok(None) => return true,
+        Err(_error) => return false,
+    };
+    if !directory_has_only(profiles.as_fd(), Some("default")) {
+        return false;
+    }
+    let default = match open_optional_directory(profiles.as_fd(), "default") {
+        Ok(Some(default)) => default,
+        Ok(None) => return true,
+        Err(_error) => return false,
+    };
+    if !directory_has_only(default.as_fd(), Some("accounts")) {
+        return false;
+    }
+    match open_optional_directory(default.as_fd(), "accounts") {
+        Ok(Some(accounts)) => directory_has_only(accounts.as_fd(), None),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_optional_directory(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &str,
+) -> rustix::io::Result<Option<rustix::fd::OwnedFd>> {
+    use rustix::fs::{self, Mode, OFlags};
+    match fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(directory) => {
+            validate_directory(&fs::fstat(&directory)?, None)?;
+            Ok(Some(directory))
+        }
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn directory_has_only(directory: std::os::fd::BorrowedFd<'_>, allowed: Option<&str>) -> bool {
+    let Ok(entries) = rustix::fs::Dir::read_from(directory) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        if allowed.is_none_or(|allowed| name != allowed.as_bytes()) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+struct DirectorySnapshot {
+    parent: rustix::fd::OwnedFd,
+    name: String,
+    expected: rustix::fs::Stat,
+    created: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct EstablishedDirectories {
+    path: PathBuf,
+    snapshots: Vec<DirectorySnapshot>,
+}
+
+#[cfg(target_os = "macos")]
+impl EstablishedDirectories {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn revalidate(&self) -> rustix::io::Result<()> {
+        use rustix::fs::{self, AtFlags, Mode, OFlags};
+        for snapshot in &self.snapshots {
+            let actual = fs::statat(&snapshot.parent, &snapshot.name, AtFlags::SYMLINK_NOFOLLOW)?;
+            validate_directory(&actual, Some(&snapshot.expected))?;
+            let reopened = fs::openat(
+                &snapshot.parent,
+                &snapshot.name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            validate_directory(&fs::fstat(&reopened)?, Some(&snapshot.expected))?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_before_store_open(&mut self) {
+        while let Some(snapshot) = self.snapshots.pop() {
+            if snapshot.created
+                && rustix::fs::statat(
+                    &snapshot.parent,
+                    &snapshot.name,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .is_ok_and(|actual| validate_directory(&actual, Some(&snapshot.expected)).is_ok())
+            {
+                let _ = rustix::fs::unlinkat(
+                    &snapshot.parent,
+                    &snapshot.name,
+                    rustix::fs::AtFlags::REMOVEDIR,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn establish_account_directory(
+    container: std::os::fd::BorrowedFd<'_>,
+    container_path: &Path,
+    digest: &str,
+) -> rustix::io::Result<EstablishedDirectories> {
+    establish_account_directory_with_hook(container, container_path, digest, |_boundary| Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+fn establish_account_directory_with_hook(
+    container: std::os::fd::BorrowedFd<'_>,
+    container_path: &Path,
+    digest: &str,
+    mut after_boundary: impl FnMut(usize) -> rustix::io::Result<()>,
+) -> rustix::io::Result<EstablishedDirectories> {
+    use rustix::fs::{self, Mode, OFlags};
+    use std::os::fd::AsFd;
+    let mut parent = fs::openat(
+        container,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    validate_directory(&fs::fstat(&parent)?, None)?;
+    let mut established = EstablishedDirectories {
+        path: container_path.to_path_buf(),
+        snapshots: Vec::new(),
+    };
+    let result = (|| {
+        for (boundary, component) in ["profiles", "default", "accounts", digest]
+            .into_iter()
+            .enumerate()
+        {
+            let created = match fs::mkdirat(parent.as_fd(), component, Mode::from_raw_mode(0o700)) {
+                Ok(()) => true,
+                Err(error) if error == rustix::io::Errno::EXIST => false,
+                Err(error) => return Err(error),
+            };
+            let child = fs::openat(
+                parent.as_fd(),
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            if created {
+                fs::fchmod(&child, Mode::from_raw_mode(0o700))?;
+            }
+            let stat = fs::fstat(&child)?;
+            validate_directory(&stat, None)?;
+            if created && Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
+                return Err(rustix::io::Errno::PERM);
+            }
+            established.snapshots.push(DirectorySnapshot {
+                parent: rustix::io::dup(parent.as_fd())?,
+                name: component.to_owned(),
+                expected: stat,
+                created,
+            });
+            parent = child;
+            established.path.push(component);
+            after_boundary(boundary)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        established.cleanup_before_store_open();
+        return Err(error);
+    }
+    Ok(established)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_directory(
+    stat: &rustix::fs::Stat,
+    expected: Option<&rustix::fs::Stat>,
+) -> rustix::io::Result<()> {
+    use rustix::fs::{FileType, Mode};
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || Mode::from_raw_mode(stat.st_mode).as_raw_mode() & 0o077 != 0
+        || expected.is_some_and(|old| !same_identity(old, stat))
+    {
+        return Err(rustix::io::Errno::PERM);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn same_identity(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
 }
 
 /// Internal fixed production App Group container implementation.
@@ -923,7 +1424,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
 
     #[cfg(target_os = "macos")]
     static PROFILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -985,6 +1486,55 @@ mod tests {
     impl Drop for TestProfile {
         fn drop(&mut self) {
             let _ignored = std::fs::remove_dir_all(&self.container);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct BootstrapFixture {
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl BootstrapFixture {
+        fn new(name: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let sequence = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tersa-keychain-bootstrap-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { path }
+        }
+
+        fn open(&self) -> rustix::fd::OwnedFd {
+            rustix::fs::openat(
+                rustix::fs::CWD,
+                &self.path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap()
+        }
+
+        fn create_directory(&self, relative: &str) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = self.path.join(relative);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for BootstrapFixture {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -1062,6 +1612,151 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn bootstrap_input_validation_is_closed_and_state_free() {
+        assert_eq!(
+            validate_bootstrap_account_bytes(true, b"valid-account"),
+            Err(ProductBootstrapStatus::InvalidExecutionContext)
+        );
+        for invalid in [b"".as_slice(), b"has space".as_slice(), &[0xff][..]] {
+            assert_eq!(
+                validate_bootstrap_account_bytes(false, invalid),
+                Err(ProductBootstrapStatus::InvalidAccountIdentifier)
+            );
+        }
+        assert_eq!(
+            validate_bootstrap_account_bytes(false, b"valid-account")
+                .unwrap()
+                .as_str(),
+            "valid-account"
+        );
+        assert_eq!(
+            format!("{:?}", ProductBootstrapStatus::Unavailable),
+            "ProductBootstrapStatus([REDACTED])"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_preflight_accepts_only_absent_or_empty_fixed_skeletons() {
+        use std::os::fd::AsFd;
+
+        let fixture = BootstrapFixture::new("preflight");
+        let root = fixture.open();
+        assert!(is_empty_profile_skeleton(root.as_fd()));
+        fixture.create_directory("profiles");
+        assert!(is_empty_profile_skeleton(root.as_fd()));
+        fixture.create_directory("profiles/default");
+        assert!(is_empty_profile_skeleton(root.as_fd()));
+        fixture.create_directory("profiles/default/accounts");
+        assert!(is_empty_profile_skeleton(root.as_fd()));
+
+        fixture.create_directory("profiles/default/accounts/existing-account");
+        assert!(!is_empty_profile_skeleton(root.as_fd()));
+        std::fs::remove_dir(
+            fixture
+                .path
+                .join("profiles/default/accounts/existing-account"),
+        )
+        .unwrap();
+        std::fs::write(fixture.path.join("profiles/unexpected"), b"state").unwrap();
+        assert!(!is_empty_profile_skeleton(root.as_fd()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn global_lock_normalizes_only_recoverable_modes_and_releases() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o000, 0o200, 0o400, 0o600] {
+            let fixture = BootstrapFixture::new(&format!("lock-{mode:o}"));
+            let path = fixture.path.join(BOOTSTRAP_LOCK);
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let lock = acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+            drop(lock);
+            assert!(
+                acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).is_ok()
+            );
+        }
+
+        let invalid = BootstrapFixture::new("lock-invalid-mode");
+        let path = invalid.path.join(BOOTSTRAP_LOCK);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            acquire_global_lock(&invalid.path, Instant::now() + Duration::from_secs(1)).is_err()
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bounded_lock_retries_eintr_and_process_mutex_timeout() {
+        let mut attempts = 0;
+        let result = retry_transient_until(Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            match attempts {
+                1 => Err(rustix::io::Errno::INTR),
+                2 => Err(rustix::io::Errno::AGAIN),
+                _ => Ok(7),
+            }
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts, 3);
+
+        let mutex = Mutex::new(());
+        let guard = mutex.lock().unwrap();
+        assert!(acquire_mutex_until(&mutex, Instant::now() + Duration::from_millis(20)).is_none());
+        drop(guard);
+        assert!(acquire_mutex_until(&mutex, Instant::now() + Duration::from_secs(1)).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_establishment_cleans_each_injected_boundary_and_detects_replacement() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        for failure_boundary in 0..4 {
+            let fixture = BootstrapFixture::new(&format!("directory-failure-{failure_boundary}"));
+            let root = fixture.open();
+            let result = establish_account_directory_with_hook(
+                root.as_fd(),
+                &fixture.path,
+                digest,
+                |boundary| {
+                    if boundary == failure_boundary {
+                        Err(rustix::io::Errno::IO)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(!fixture.path.join("profiles").exists());
+        }
+
+        let fixture = BootstrapFixture::new("directory-replacement");
+        let root = fixture.open();
+        let mut established =
+            establish_account_directory(root.as_fd(), &fixture.path, digest).unwrap();
+        established.revalidate().unwrap();
+        let account = established.path().to_path_buf();
+        let moved = account.with_extension("moved");
+        std::fs::rename(&account, &moved).unwrap();
+        std::fs::create_dir(&account).unwrap();
+        std::fs::set_permissions(&account, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(established.revalidate().is_err());
+        established.cleanup_before_store_open();
+        assert!(account.exists());
+        assert!(moved.exists());
+    }
+
     #[test]
     fn hkdf_known_answer_and_info() {
         let root = SecretKey::new(core::array::from_fn(|i| i as u8));

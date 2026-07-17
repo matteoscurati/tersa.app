@@ -8,9 +8,15 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let oauthAuthorizationSession = OAuthAuthorizationSession()
+    private let bootstrapWorker = BootstrapWorker()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = tersa_apple_bridge_version()
+    }
+
+    /// Receives opaque bytes only from the future owning product flow.
+    func establishOwnedAccountProfile(accountIdentifier: Data) {
+        bootstrapWorker.submit(accountIdentifier: accountIdentifier) { _ in }
     }
 
     func startOAuthAuthorization() -> Bool {

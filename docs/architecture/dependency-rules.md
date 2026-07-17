@@ -12,7 +12,7 @@ and feasibility adapters:
 | `tersa-application` | Commands, queries, and use cases | `tersa-domain` |
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
-| `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-presentation` |
+| `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-keychain-macos` on macOS, `tersa-presentation` |
 | `tersa-slint-spike` | Apple-only diagnostic Slint executable | `tersa-presentation` |
 | `tersa-dioxus-spike` | Apple-only diagnostic Dioxus executable | `tersa-presentation` |
 | `tersa-sqlcipher-spike` | Apple-only diagnostic encrypted-storage executable | None |
@@ -24,19 +24,16 @@ and feasibility adapters:
 | `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only macOS CLI source adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
-This table is the active workspace graph. The governance-only PR 33a.5
-amendment authorizes, but does not activate, one future
+This table is the active workspace graph. PR 33a.5 activates one
 `cfg(target_os = "macos")` edge from `tersa-apple-bridge` to
-`tersa-keychain-macos`. The implementation pull request must add that exact
-manifest edge, its name allowance in `dependency_policy`, and its exact tuple in
-the `protected_edge` branch of `future_macos_store_dependency_violation`
-together. Tests must accept only the canonical atomic macOS target structure
+`tersa-keychain-macos`, its name allowance in `dependency_policy`, and its exact
+tuple in the `protected_edge` branch of
+`future_macos_store_dependency_violation`. Tests accept only the canonical atomic macOS target structure
 and reject untargeted, iOS, combined-platform, nested `all`/`any`/`not`,
 feature-conditioned, or otherwise broadened target structures. Equivalent
 whitespace and quote spelling canonicalized by `cargo_metadata` is not a policy
-distinction. Until then, the active bridge dependencies remain only
-`tersa-application` and `tersa-presentation`; this document changes no manifest,
-`xtask` policy, or passing gate.
+distinction. This source-only activation changes no signing, distribution, or
+product gate.
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -134,7 +131,7 @@ solely for an `isMainThread` rejection before bootstrap state is touched. Exact
 member-declaration and effective-feature policy tests must reject every other
 Foundation feature.
 
-PR 33a.5 authorizes `rustix =1.1.4` as its sole new external package and adds
+PR 33a.5 activates `rustix =1.1.4` as its sole new external package and adds
 exact direct macOS declarations to both `tersa-keychain-macos` and
 `tersa-store-sqlcipher-macos`. Both use the canonical atomic
 `cfg(target_os = "macos")` target and disable default features. The workspace
@@ -155,17 +152,16 @@ declarations, alternate workspace parents or paths, iOS, and other targets
 fail. Unrelated third-party rustix reachability remains outside this scoped
 rule.
 
-The implementation must update both closed direct sets and enforce exact
+The active policy updates both closed direct sets and enforces exact
 declarations, versions, canonical targets, default-feature states,
 member-requested features, allowed resolved paths, and target graphs in `xtask`.
 Fixtures accept the three owners and both CLI/bridge transitive paths and reject
 direct `process` on blob/store, wrong owners, direct CLI/bridge dependencies,
-alternate parents, broadened targets, iOS, and non-macOS graphs. This governance
-amendment leaves active manifests and policy unchanged.
+alternate parents, broadened targets, iOS, and non-macOS graphs.
 
 The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
-`tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
-Keychain composition chain. ChaCha20-Poly1305 remains
+`tersa-keychain-macos`; the macOS-only CLI and Apple bridge may reach it only
+through their exact active Keychain composition chains. ChaCha20-Poly1305 remains
 exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
 `tersa-keychain-macos` may not add direct application or domain edges. ADR 0019
 accepts one macOS-gated PR 33a edge to `tersa-store-sqlcipher-macos` so the
@@ -183,7 +179,7 @@ The CLI's reviewed production source invokes only
 `open_default_read_only_mailbox` and inspects `ReadOnlyMailboxOpenError`, so its
 behavior remains retrieval-only. Crate visibility is not a security sandbox:
 the public provisioner is compile-reachable through the Keychain dependency.
-PR 33a.5 must add a narrow Git-index tracked-source inventory for
+PR 33a.5 adds a narrow Git-index tracked-source inventory for
 `apps/cli-macos` that allows only those retrieval-item references and rejects
 provisioning/bootstrap references, imports, reexports, wildcards, crate aliases,
 and item aliases. New public bootstrap symbols must enter the rejected inventory
@@ -198,7 +194,7 @@ trusted database-opening composition and must feed the privately derived key
 directly into the strict SQLCipher reader without creating a callback or key
 export API.
 
-PR 33a.5 is a future authorized, inactive macOS-only edge from the existing
+PR 33a.5 is an active macOS-only edge from the existing
 `tersa-apple-bridge` composition root to `tersa-keychain-macos`. The existing
 `TersaMac` target is its sole production invoker through exactly one new
 macOS-gated C ABI bootstrap call. That call accepts only an opaque account
@@ -420,10 +416,10 @@ The reviewed delivery changes are policy, strict read-only SQLCipher open,
 macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
 source, credentialless product-application bootstrap source, then real signed
 CLI distribution evidence. PR 33a activates CLI source and dependency policy
-but does not create the official CLI. PR 33a.5 must activate only the authorized
+but does not create the official CLI. PR 33a.5 activates only the authorized
 macOS-gated bridge edge, exact rustix dependency and policies, and fixed locked
-bootstrap composition; this governance amendment activates none of them. Phase
-1 roadmap item 7 remains open until PR 33b passes. The CLI's trusted direct-store
+bootstrap composition. Phase 1 roadmap item 7 remains open until PR 33b passes.
+The CLI's trusted direct-store
 composition is an interim adapter
 boundary replaceable by future `maild` IPC; it does not authorize `maild` in the
 MVP. iPhone and iPad implementation remains in Phase 2, and no reservation or
