@@ -1111,8 +1111,9 @@ mod transport_tests {
 
     #[test]
     fn slow_drip_upgrade_cannot_extend_the_handshake_deadline() {
-        let timeout = Duration::from_millis(100);
-        let completion_timeout = timeout * 3;
+        let timeout = Duration::from_millis(500);
+        let scheduling_tolerance = Duration::from_millis(100);
+        let harness_timeout = Duration::from_secs(2);
         let (location, listener) = start_server(0);
         let address = listener
             .local_addr()
@@ -1126,6 +1127,7 @@ mod transport_tests {
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let handler = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("test server must accept");
+            let started = Instant::now();
             EditWebsocket::handle_connection_for_location(
                 stream,
                 server_location,
@@ -1135,7 +1137,7 @@ mod transport_tests {
                 location,
             );
             completion_sender
-                .send(())
+                .send(started.elapsed())
                 .expect("test must observe handshake worker completion");
         });
 
@@ -1156,7 +1158,7 @@ mod transport_tests {
             }
         });
 
-        let completion = completion_receiver.recv_timeout(completion_timeout);
+        let completion = completion_receiver.recv_timeout(harness_timeout);
         let _ = peer_controller.shutdown(Shutdown::Both);
         writer
             .join()
@@ -1164,9 +1166,10 @@ mod transport_tests {
         handler
             .join()
             .expect("slow-drip handshake worker must not panic");
+        let elapsed = completion.expect("slow-drip handshake worker must finish before watchdog");
         assert!(
-            completion.is_ok(),
-            "slow-drip input must not extend the absolute handshake deadline"
+            elapsed <= timeout + scheduling_tolerance,
+            "slow-drip input extended the {timeout:?} handshake deadline to {elapsed:?}"
         );
         assert!(
             slots.try_acquire().is_some(),

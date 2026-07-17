@@ -1209,14 +1209,14 @@ impl EstablishedDirectories {
         use rustix::fs::{self, AtFlags, Mode, OFlags};
         for snapshot in &self.snapshots {
             let actual = fs::statat(&snapshot.parent, &snapshot.name, AtFlags::SYMLINK_NOFOLLOW)?;
-            validate_directory(&actual, Some(&snapshot.expected))?;
+            validate_established_directory(&actual, &snapshot.expected)?;
             let reopened = fs::openat(
                 &snapshot.parent,
                 &snapshot.name,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )?;
-            validate_directory(&fs::fstat(&reopened)?, Some(&snapshot.expected))?;
+            validate_established_directory(&fs::fstat(&reopened)?, &snapshot.expected)?;
         }
         Ok(())
     }
@@ -1498,6 +1498,20 @@ fn validate_directory(
         || Mode::from_raw_mode(stat.st_mode).as_raw_mode() & 0o7077 != 0
         || expected.is_some_and(|old| !same_identity(old, stat))
     {
+        return Err(rustix::io::Errno::PERM);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_established_directory(
+    stat: &rustix::fs::Stat,
+    expected: &rustix::fs::Stat,
+) -> rustix::io::Result<()> {
+    use rustix::fs::Mode;
+
+    validate_directory(stat, Some(expected))?;
+    if Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
         return Err(rustix::io::Errno::PERM);
     }
     Ok(())
@@ -2503,6 +2517,43 @@ mod tests {
             ),
             ProductBootstrapStatus::Unavailable
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_rejects_directory_mode_drift_after_store_open() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = BootstrapFixture::new("orchestration-directory-mode-drift");
+        let backend = Fake::default();
+        *backend.item.lock().unwrap() = Some([7; 32]);
+        let store_reached = Arc::new(AtomicBool::new(false));
+        let store_reached_for_call = Arc::clone(&store_reached);
+
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account_id(),
+                &backend,
+                &FakeLocator(Ok(fixture.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                move |_account, path, _key| {
+                    store_reached_for_call.store(true, Ordering::SeqCst);
+                    let account_directory = path.parent().unwrap();
+                    assert_eq!(
+                        std::fs::metadata(account_directory).unwrap().mode() & 0o777,
+                        0o700
+                    );
+                    std::fs::set_permissions(
+                        account_directory,
+                        std::fs::Permissions::from_mode(0o500),
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+        assert!(store_reached.load(Ordering::SeqCst));
     }
 
     #[cfg(target_os = "macos")]
