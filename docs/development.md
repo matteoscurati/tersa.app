@@ -234,9 +234,13 @@ None of the six diagnostic schemes is a production target.
 Install the Rust targets once, generate the Xcode project, and build unsigned
 diagnostic artifacts:
 
+The checked wrapper is the only supported XcodeGen entry point. It passes
+`--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
+literal until Xcode resolves them; CI and evidence scripts use the same path.
+
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-xcodegen generate --spec apple/project.yml --project apple
+sh apple/scripts/generate-project.sh
 
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
   -configuration Debug -destination 'platform=macOS,arch=arm64' \

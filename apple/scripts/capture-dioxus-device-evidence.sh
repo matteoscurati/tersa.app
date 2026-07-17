@@ -137,8 +137,7 @@ archive="${temporary}/TersaDioxusDevice.xcarchive"
 cleanup() { rm -rf -- "$temporary"; }
 trap cleanup EXIT HUP INT TERM
 
-command -v xcodegen >/dev/null 2>&1 || { echo 'xcodegen is required.' >&2; exit 2; }
-xcodegen generate --spec apple/project.yml --project apple >"${temporary}/xcodegen.log" 2>&1 || { echo 'Project generation failed; no log was retained.' >&2; exit 1; }
+sh apple/scripts/generate-project.sh >"${temporary}/xcodegen.log" 2>&1 || { echo 'Project generation failed; no log was retained.' >&2; exit 1; }
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS \
   -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
   -xcconfig "$config" -showBuildSettings >"${temporary}/build-settings.txt" 2>&1 || { echo 'Effective signing settings could not be inspected.' >&2; exit 1; }

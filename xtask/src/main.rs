@@ -293,7 +293,11 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     let project = fs::read_to_string("apple/project.yml")?;
     violations.extend(signing_configuration_violations(&entitlements, &project));
     let mut entitlement_paths = Vec::new();
-    collect_entitlement_paths(Path::new("apple"), &mut entitlement_paths)?;
+    collect_entitlement_paths(
+        Path::new("apple"),
+        Path::new("apple"),
+        &mut entitlement_paths,
+    )?;
     entitlement_paths.sort();
     for path in entitlement_paths {
         if path == Path::new("apple/macos/TersaMac.entitlements") {
@@ -327,16 +331,33 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
             ));
         }
     }
+    let project_generation_wrapper = fs::read_to_string("apple/scripts/generate-project.sh")?;
+    let ci = fs::read_to_string(".github/workflows/ci.yml")?;
+    let development = fs::read_to_string("docs/development.md")?;
+    let evidence = fs::read_to_string("apple/scripts/capture-dioxus-device-evidence.sh")?;
+    violations.extend(project_generation_surface_violations(
+        &project_generation_wrapper,
+        &ci,
+        &development,
+        &evidence,
+    ));
     Ok(())
 }
 
-fn collect_entitlement_paths(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+fn collect_entitlement_paths(
+    source_root: &Path,
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
+        if path == source_root.join("build") {
+            continue;
+        }
         if file_type.is_dir() {
-            collect_entitlement_paths(&path, output)?;
+            collect_entitlement_paths(source_root, &path, output)?;
         } else if file_type.is_symlink() {
             return Err(io::Error::other(format!(
                 "Apple signing inventory path `{}` must not be a symbolic link",
@@ -349,6 +370,69 @@ fn collect_entitlement_paths(directory: &Path, output: &mut Vec<PathBuf>) -> io:
         }
     }
     Ok(())
+}
+
+const PROJECT_GENERATION_WRAPPER: &str = r#"#!/bin/sh
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  echo 'Usage: sh apple/scripts/generate-project.sh' >&2
+  exit 2
+fi
+
+workspace_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+cd "$workspace_dir"
+
+command -v xcodegen >/dev/null 2>&1 || {
+  echo 'xcodegen is required.' >&2
+  exit 2
+}
+
+exec xcodegen generate --no-env --spec apple/project.yml --project apple
+"#;
+
+fn project_generation_surface_violations(
+    wrapper: &str,
+    ci: &str,
+    development: &str,
+    evidence: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if wrapper != PROJECT_GENERATION_WRAPPER {
+        violations.push(
+            "apple/scripts/generate-project.sh must remain the exact reviewed --no-env wrapper"
+                .to_owned(),
+        );
+    }
+    for (path, document, minimum_wrapper_calls) in [
+        (".github/workflows/ci.yml", ci, 3),
+        ("docs/development.md", development, 1),
+        (
+            "apple/scripts/capture-dioxus-device-evidence.sh",
+            evidence,
+            1,
+        ),
+    ] {
+        if document.contains("xcodegen generate") {
+            violations.push(format!(
+                "{path} must not bypass apple/scripts/generate-project.sh"
+            ));
+        }
+        if document
+            .matches("sh apple/scripts/generate-project.sh")
+            .count()
+            < minimum_wrapper_calls
+        {
+            violations.push(format!(
+                "{path} must invoke the reviewed project-generation wrapper"
+            ));
+        }
+    }
+    violations
 }
 
 fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
@@ -375,6 +459,8 @@ fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
 const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
 const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
 const TERSA_MAC_ENTITLEMENTS: &str = "macos/TersaMac.entitlements";
+const TERSA_MAC_BUILD_SCRIPT: &str =
+    r#"sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}""#;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ProjectTarget {
@@ -386,6 +472,7 @@ struct ProjectTarget {
 #[derive(Clone, Debug, PartialEq)]
 enum StrictYamlValue {
     Null,
+    Bool(bool),
     OtherScalar,
     String(String),
     Sequence(Vec<Self>),
@@ -418,8 +505,8 @@ impl<'de> Visitor<'de> for StrictYamlValueVisitor {
         Ok(StrictYamlValue::Null)
     }
 
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(StrictYamlValue::OtherScalar)
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictYamlValue::Bool(value))
     }
 
     fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
@@ -543,6 +630,7 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
     if application.platform != "macOS" {
         violations.push("the TersaMac target must declare platform macOS".to_owned());
     }
+    violations.extend(tersa_mac_target_surface_violations(&application.body));
     if !matches!(
         yaml_path(&application.body, &["entitlements", "path"]),
         Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
@@ -597,6 +685,148 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
     violations
 }
 
+fn validate_project_options(options: Option<&StrictYamlValue>, violations: &mut Vec<String>) {
+    let Some(options) = options else {
+        violations.push("apple/project.yml must declare the exact reviewed options".to_owned());
+        return;
+    };
+    let Ok(options) = yaml_mapping(options, "project options") else {
+        violations.push("apple/project.yml options must be a direct mapping".to_owned());
+        return;
+    };
+    let expected_keys = BTreeSet::from(["bundleIdPrefix", "deploymentTarget", "xcodeVersion"]);
+    let actual_keys = options.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        violations.push(
+            "apple/project.yml options must contain only bundleIdPrefix, deploymentTarget, and xcodeVersion"
+                .to_owned(),
+        );
+    }
+    if !matches!(
+        options.get("bundleIdPrefix"),
+        Some(StrictYamlValue::String(value)) if value == "app.tersa"
+    ) {
+        violations.push("apple/project.yml options.bundleIdPrefix must be app.tersa".to_owned());
+    }
+    if !matches!(
+        options.get("xcodeVersion"),
+        Some(StrictYamlValue::String(value)) if value == "26.0"
+    ) {
+        violations.push("apple/project.yml options.xcodeVersion must be 26.0".to_owned());
+    }
+    let Some(deployment_target) = options.get("deploymentTarget") else {
+        violations.push("apple/project.yml options.deploymentTarget is required".to_owned());
+        return;
+    };
+    let Ok(deployment_target) = yaml_mapping(deployment_target, "deploymentTarget") else {
+        violations.push("apple/project.yml options.deploymentTarget must be a mapping".to_owned());
+        return;
+    };
+    let expected_targets = BTreeMap::from([("iOS", "18.0"), ("macOS", "15.0")]);
+    let actual_targets = deployment_target
+        .iter()
+        .filter_map(|(key, value)| match value {
+            StrictYamlValue::String(value) => Some((key.as_str(), value.as_str())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    if actual_targets != expected_targets || actual_targets.len() != deployment_target.len() {
+        violations.push(
+            "apple/project.yml options.deploymentTarget must be exactly macOS 15.0 and iOS 18.0"
+                .to_owned(),
+        );
+    }
+}
+
+fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> {
+    let mut violations = Vec::new();
+    let Ok(target) = yaml_mapping(target, "TersaMac target") else {
+        return vec!["the TersaMac target must be a direct mapping".to_owned()];
+    };
+    if !matches!(
+        target.get("type"),
+        Some(StrictYamlValue::String(value)) if value == "application"
+    ) {
+        violations.push("the TersaMac target type must be exactly application".to_owned());
+    }
+    let settings = target.get("settings").and_then(|value| match value {
+        StrictYamlValue::Mapping(settings) => settings.get("base"),
+        _ => None,
+    });
+    let valid_bundle_identifier = matches!(settings, Some(StrictYamlValue::Mapping(settings))
+        if matches!(settings.get("PRODUCT_BUNDLE_IDENTIFIER"), Some(StrictYamlValue::String(value)) if value == "app.tersa.mac")
+            && !settings.keys().any(|key| key.starts_with("PRODUCT_BUNDLE_IDENTIFIER[")));
+    if !valid_bundle_identifier {
+        violations.push(
+            "the TersaMac PRODUCT_BUNDLE_IDENTIFIER must be exactly app.tersa.mac without conditional overrides"
+                .to_owned(),
+        );
+    }
+    for key in [
+        "postBuildScripts",
+        "preCompileScripts",
+        "postCompileScripts",
+        "buildRules",
+        "buildToolPlugins",
+        "buildToolPath",
+        "buildArgumentsString",
+        "passSettings",
+    ] {
+        if target.contains_key(key) {
+            violations.push(format!(
+                "the TersaMac target forbidden execution surface `{key}` is present"
+            ));
+        }
+    }
+
+    let valid_script = match target.get("preBuildScripts") {
+        Some(StrictYamlValue::Sequence(scripts)) if scripts.len() == 1 => match &scripts[0] {
+            StrictYamlValue::Mapping(script) => {
+                let expected_keys = BTreeSet::from(["basedOnDependencyAnalysis", "name", "script"]);
+                script.keys().map(String::as_str).collect::<BTreeSet<_>>() == expected_keys
+                    && matches!(
+                        script.get("name"),
+                        Some(StrictYamlValue::String(value)) if value == "Build Rust static library"
+                    )
+                    && matches!(
+                        script.get("basedOnDependencyAnalysis"),
+                        Some(StrictYamlValue::Bool(false))
+                    )
+                    && matches!(
+                        script.get("script"),
+                        Some(StrictYamlValue::String(value)) if value == TERSA_MAC_BUILD_SCRIPT
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !valid_script {
+        violations.push(
+            "the TersaMac target must contain only the exact reviewed Rust pre-build script"
+                .to_owned(),
+        );
+    }
+
+    let valid_scheme = match target.get("scheme") {
+        Some(StrictYamlValue::Mapping(scheme)) => {
+            scheme.len() == 1
+                && matches!(
+                    scheme.get("testTargets"),
+                    Some(StrictYamlValue::Sequence(targets)) if targets.is_empty()
+                )
+        }
+        _ => false,
+    };
+    if !valid_scheme {
+        violations.push(
+            "the TersaMac scheme must contain only an empty testTargets list and no executable actions"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
 fn effective_signing_configuration_violations(
     root: &StrictYamlValue,
     targets: &[ProjectTarget],
@@ -605,6 +835,7 @@ fn effective_signing_configuration_violations(
     let Ok(root_mapping) = yaml_mapping(root, "project root") else {
         return vec!["apple/project.yml root must be a mapping".to_owned()];
     };
+    validate_project_options(root_mapping.get("options"), &mut violations);
     for key in [
         "include",
         "includes",
@@ -614,6 +845,7 @@ fn effective_signing_configuration_violations(
         "configs",
         "preGenCommand",
         "postGenCommand",
+        "schemes",
     ] {
         if root_mapping.contains_key(key) {
             violations.push(format!(
@@ -747,24 +979,58 @@ fn collect_sensitive_configuration<'a>(
                 path.pop();
             }
         }
-        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => {}
+        StrictYamlValue::Null
+        | StrictYamlValue::Bool(_)
+        | StrictYamlValue::OtherScalar
+        | StrictYamlValue::String(_) => {}
     }
 }
 
 fn is_sensitive_signing_key(key: &str) -> bool {
-    [
-        "TERSA_MACOS_APP_GROUP",
-        "CODE_SIGN_ENTITLEMENTS",
-        "com.apple.security.application-groups",
-        "keychain-access-groups",
-    ]
-    .iter()
-    .any(|sensitive| key == *sensitive || key.starts_with(&format!("{sensitive}[")))
+    key.contains("CODE_SIGN")
+        || key.contains("DEVELOPMENT_TEAM")
+        || key.contains("PROVISIONING_PROFILE")
+        || key == "TeamIdentifierPrefix"
+        || key.starts_with("TeamIdentifierPrefix[")
+        || key == "AppIdentifierPrefix"
+        || key.starts_with("AppIdentifierPrefix[")
+        || key.contains("ENTITLEMENT")
+        || [
+            "TERSA_MACOS_APP_GROUP",
+            "com.apple.security.application-groups",
+            "keychain-access-groups",
+        ]
+        .iter()
+        .any(|sensitive| key == *sensitive || key.starts_with(&format!("{sensitive}[")))
 }
 
 fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> bool {
     let components = path.iter().map(String::as_str).collect::<Vec<_>>();
     match components.as_slice() {
+        [
+            "settings",
+            "base",
+            "CODE_SIGNING_ALLOWED" | "CODE_SIGNING_REQUIRED",
+        ] => {
+            matches!(value, StrictYamlValue::String(value) if value == "NO")
+        }
+        ["settings", "base", "DEVELOPMENT_TEAM"] => {
+            matches!(value, StrictYamlValue::String(value) if value.is_empty())
+        }
+        ["settings", "base", key] => match *key {
+            "TERSA_DIOXUS_CODE_SIGNING_ALLOWED" | "TERSA_DIOXUS_CODE_SIGNING_REQUIRED" => {
+                matches!(value, StrictYamlValue::String(value) if value == "NO")
+            }
+            "TERSA_DIOXUS_DEVELOPMENT_TEAM"
+            | "TERSA_DIOXUS_CODE_SIGN_IDENTITY"
+            | "TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER" => {
+                matches!(value, StrictYamlValue::String(value) if value.is_empty())
+            }
+            "TERSA_DIOXUS_CODE_SIGN_STYLE" => {
+                matches!(value, StrictYamlValue::String(value) if value == "Automatic")
+            }
+            _ => false,
+        },
         [
             "targets",
             "TersaMac",
@@ -807,6 +1073,27 @@ fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> 
         ] => {
             matches!(value, StrictYamlValue::String(value) if value == "mime-macos/TersaMimeMac.entitlements")
         }
+        ["targets", "TersaDioxusIOS", "settings", "base", key] => match *key {
+            "CODE_SIGNING_ALLOWED" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_ALLOWED)")
+            }
+            "CODE_SIGNING_REQUIRED" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_REQUIRED)")
+            }
+            "DEVELOPMENT_TEAM" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_DEVELOPMENT_TEAM)")
+            }
+            "CODE_SIGN_STYLE" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_STYLE)")
+            }
+            "CODE_SIGN_IDENTITY" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_IDENTITY)")
+            }
+            "PROVISIONING_PROFILE_SPECIFIER" => {
+                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER)")
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -819,8 +1106,10 @@ fn collect_protected_values(
     match value {
         StrictYamlValue::String(value)
             if value == TERSA_MAC_ENTITLEMENTS
-                || value == SIGNING_GROUP
-                || value == BUILD_SETTING_GROUP =>
+                || value.contains("${TeamIdentifierPrefix}")
+                || value.contains("$(TeamIdentifierPrefix)")
+                || value.contains("${AppIdentifierPrefix}")
+                || value.contains("$(AppIdentifierPrefix)") =>
         {
             output.push(path.clone());
         }
@@ -838,7 +1127,10 @@ fn collect_protected_values(
                 path.pop();
             }
         }
-        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => {}
+        StrictYamlValue::Null
+        | StrictYamlValue::Bool(_)
+        | StrictYamlValue::OtherScalar
+        | StrictYamlValue::String(_) => {}
     }
 }
 
@@ -968,7 +1260,10 @@ fn yaml_contains_key(value: &StrictYamlValue, key: &str) -> bool {
         StrictYamlValue::Mapping(mapping) => {
             mapping.contains_key(key) || mapping.values().any(|value| yaml_contains_key(value, key))
         }
-        StrictYamlValue::Null | StrictYamlValue::OtherScalar | StrictYamlValue::String(_) => false,
+        StrictYamlValue::Null
+        | StrictYamlValue::Bool(_)
+        | StrictYamlValue::OtherScalar
+        | StrictYamlValue::String(_) => false,
     }
 }
 
@@ -2216,18 +2511,22 @@ fn parse_identity(identity: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use cargo_metadata::PackageId;
 
     use super::{
-        RESERVED_FUTURE_POLICY, ResolvedDependencyIdentity, blob_dependency_graph_violations,
-        blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
-        dependency_policy, future_macos_store_dependency_violation,
-        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
-        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
-        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
-        parse_project_targets, reserved_future_policy_violations,
+        PROJECT_GENERATION_WRAPPER, RESERVED_FUTURE_POLICY, ResolvedDependencyIdentity,
+        blob_dependency_graph_violations, blob_manifest_dependency_violations,
+        check_diagnostic_runtime_reachability, collect_entitlement_paths, dependency_policy,
+        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
+        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
+        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
+        keychain_direct_dependency_set_violations, non_owner_entitlement_violations,
+        parse_identity, parse_plist_string_array, parse_project_targets,
+        project_generation_surface_violations, reserved_future_policy_violations,
         resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
         signing_configuration_violations, sqlcipher_dependency_graph_violations,
         sqlcipher_manifest_dependency_violations, target_metadata_options,
@@ -2239,8 +2538,16 @@ mod tests {
 </dict></plist>"#;
 
     const VALID_SIGNING_PROJECT: &str = r#"
+name: Tersa
+options:
+  bundleIdPrefix: app.tersa
+  deploymentTarget:
+    macOS: "15.0"
+    iOS: "18.0"
+  xcodeVersion: "26.0"
 targets:
   TersaMac:
+    type: application
     platform: macOS
     entitlements:
       path: macos/TersaMac.entitlements
@@ -2251,8 +2558,15 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
     settings:
       base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
   OtherMac:
     platform: macOS
   OtherIOS:
@@ -2407,10 +2721,15 @@ targets:
   <key>keychain-access-groups</key>
   <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#;
-        let project = r#"targets:
+        let project = r#"options:
+  bundleIdPrefix: app.tersa
+  deploymentTarget: { macOS: "15.0", iOS: "18.0" }
+  xcodeVersion: "26.0"
+targets:
   FirstIOS:
     platform: iOS
   TersaMac:
+    type: application
     platform: macOS
     entitlements:
       path: macos/TersaMac.entitlements
@@ -2421,8 +2740,15 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
     settings:
       base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
   MiddleMac:
     platform: macOS
   LastIOS:
@@ -2483,8 +2809,13 @@ ios: &ios
   settings:
     base:
       TERSA_MACOS_APP_GROUP: forbidden
+options:
+  bundleIdPrefix: app.tersa
+  deploymentTarget: { macOS: "15.0", iOS: "18.0" }
+  xcodeVersion: "26.0"
 targets:
   TersaMac:
+    type: application
     platform: macOS
     entitlements:
       path: macos/TersaMac.entitlements
@@ -2493,8 +2824,15 @@ targets:
         keychain-access-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
     settings:
       base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
   AliasedIOS: *ios
 "#;
         assert!(
@@ -2554,8 +2892,13 @@ targets:
     #[test]
     fn signing_configuration_requires_one_exact_nonempty_group_in_each_array() {
         let project = r#"
+options:
+  bundleIdPrefix: app.tersa
+  deploymentTarget: { macOS: "15.0", iOS: "18.0" }
+  xcodeVersion: "26.0"
 targets:
   TersaMac:
+    type: application
     platform: macOS
     entitlements:
       path: macos/TersaMac.entitlements
@@ -2566,8 +2909,15 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
     settings:
       base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+    preBuildScripts:
+      - name: Build Rust static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
+    scheme:
+      testTargets: []
 "#;
         let entitlements = r#"<plist version="1.0"><dict>
 <key>com.apple.security.application-groups</key><array></array>
@@ -2686,6 +3036,273 @@ targets:
                 "{label} must fail closed; got {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn xcodegen_options_reject_nested_generation_hooks_and_unknown_keys() {
+        for (label, project) in [
+            (
+                "pre-generation hook",
+                VALID_SIGNING_PROJECT.replace(
+                    "  bundleIdPrefix: app.tersa",
+                    "  bundleIdPrefix: app.tersa\n  preGenCommand: sh unreviewed.sh",
+                ),
+            ),
+            (
+                "post-generation hook",
+                VALID_SIGNING_PROJECT.replace(
+                    "  xcodeVersion: \"26.0\"",
+                    "  xcodeVersion: \"26.0\"\n  postGenCommand: sh unreviewed.sh",
+                ),
+            ),
+            (
+                "unknown option",
+                VALID_SIGNING_PROJECT.replace(
+                    "  xcodeVersion: \"26.0\"",
+                    "  xcodeVersion: \"26.0\"\n  createIntermediateGroups: true",
+                ),
+            ),
+        ] {
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains("options must contain only")),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tersa_mac_execution_and_signing_surface_is_exact() {
+        let extra_pre_build = VALID_SIGNING_PROJECT.replace(
+            "        script: 'sh \"${SRCROOT}/scripts/build-rust-staticlib.sh\" macos \"${CONFIGURATION}\"'",
+            "        script: 'sh \"${SRCROOT}/scripts/build-rust-staticlib.sh\" macos \"${CONFIGURATION}\"'\n      - name: Unreviewed\n        basedOnDependencyAnalysis: false\n        script: sh unreviewed.sh",
+        );
+        let cases = [
+            (
+                "aggregate target",
+                VALID_SIGNING_PROJECT.replace("    type: application", "    type: aggregate"),
+                "type must be exactly application",
+            ),
+            (
+                "legacy target",
+                VALID_SIGNING_PROJECT.replace("    type: application", "    type: legacy"),
+                "type must be exactly application",
+            ),
+            (
+                "changed script name",
+                VALID_SIGNING_PROJECT.replace(
+                    "name: Build Rust static library",
+                    "name: Unreviewed build",
+                ),
+                "exact reviewed Rust pre-build script",
+            ),
+            (
+                "changed script body",
+                VALID_SIGNING_PROJECT.replace(
+                    "build-rust-staticlib.sh",
+                    "unreviewed-build.sh",
+                ),
+                "exact reviewed Rust pre-build script",
+            ),
+            (
+                "extra pre-build script",
+                extra_pre_build,
+                "exact reviewed Rust pre-build script",
+            ),
+            (
+                "post-build script",
+                VALID_SIGNING_PROJECT.replace(
+                    "    scheme:\n      testTargets: []",
+                    "    postBuildScripts:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n    scheme:\n      testTargets: []",
+                ),
+                "postBuildScripts",
+            ),
+            (
+                "scheme action",
+                VALID_SIGNING_PROJECT.replace(
+                    "    scheme:\n      testTargets: []",
+                    "    scheme:\n      testTargets: []\n      preActions:\n        - script: sh unreviewed.sh",
+                ),
+                "no executable actions",
+            ),
+            (
+                "project scheme",
+                format!(
+                    "schemes:\n  Unreviewed:\n    build:\n      targets: {{ TersaMac: all }}\n    preActions:\n      - script: sh unreviewed.sh\n{VALID_SIGNING_PROJECT}"
+                ),
+                "indirection `schemes`",
+            ),
+            (
+                "build rule",
+                VALID_SIGNING_PROJECT.replace(
+                    "    preBuildScripts:",
+                    "    buildRules:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n    preBuildScripts:",
+                ),
+                "buildRules",
+            ),
+            (
+                "build-tool plugin",
+                VALID_SIGNING_PROJECT.replace(
+                    "    preBuildScripts:",
+                    "    buildToolPlugins:\n      - plugin: Unreviewed\n    preBuildScripts:",
+                ),
+                "buildToolPlugins",
+            ),
+            (
+                "conditional bundle identifier",
+                VALID_SIGNING_PROJECT.replace(
+                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac",
+                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n        PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]: app.attacker",
+                ),
+                "without conditional overrides",
+            ),
+        ];
+        for (label, project, expected) in cases {
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_signing_controls_and_expansion_roots_fail_closed() {
+        for (label, injected, expected) in [
+            (
+                "other code-sign flags",
+                "        OTHER_CODE_SIGN_FLAGS: --deep",
+                "OTHER_CODE_SIGN_FLAGS",
+            ),
+            (
+                "conditional code-signing control",
+                "        CODE_SIGNING_ALLOWED[sdk=macosx*]: YES",
+                "CODE_SIGNING_ALLOWED[sdk=macosx*]",
+            ),
+            (
+                "entitlement modification control",
+                "        CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION: YES",
+                "CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION",
+            ),
+            (
+                "expanded code-sign identity",
+                "        EXPANDED_CODE_SIGN_IDENTITY: ATTACKER",
+                "EXPANDED_CODE_SIGN_IDENTITY",
+            ),
+            (
+                "team expansion root",
+                "        TeamIdentifierPrefix: ATTACKER",
+                "TeamIdentifierPrefix",
+            ),
+            (
+                "application expansion root",
+                "        AppIdentifierPrefix: ATTACKER",
+                "AppIdentifierPrefix",
+            ),
+        ] {
+            let project = VALID_SIGNING_PROJECT.replace(
+                "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac",
+                &format!("        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n{injected}"),
+            );
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+
+        let reused_prefix = VALID_SIGNING_PROJECT.replace(
+            "  OtherMac:\n    platform: macOS",
+            "  OtherMac:\n    platform: macOS\n    settings:\n      base:\n        UNREVIEWED: ${TeamIdentifierPrefix}app.tersa.shared",
+        );
+        assert!(
+            signing_configuration_violations(VALID_ENTITLEMENTS, &reused_prefix)
+                .iter()
+                .any(|violation| violation.contains("protected signing value is reused"))
+        );
+    }
+
+    #[test]
+    fn project_generation_must_use_the_exact_no_env_wrapper() {
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        assert!(
+            project_generation_surface_violations(
+                PROJECT_GENERATION_WRAPPER,
+                &ci,
+                consumer,
+                consumer,
+            )
+            .is_empty()
+        );
+
+        let missing_no_env = PROJECT_GENERATION_WRAPPER.replace(" --no-env", "");
+        assert!(
+            project_generation_surface_violations(&missing_no_env, &ci, consumer, consumer)
+                .iter()
+                .any(|violation| violation.contains("exact reviewed --no-env wrapper"))
+        );
+        let direct = "xcodegen generate --spec apple/project.yml --project apple\n";
+        assert!(
+            project_generation_surface_violations(
+                PROJECT_GENERATION_WRAPPER,
+                &(ci + direct),
+                consumer,
+                consumer,
+            )
+            .iter()
+            .any(|violation| violation.contains("must not bypass"))
+        );
+    }
+
+    #[test]
+    fn entitlement_inventory_ignores_generated_build_only_and_rejects_source_symlinks() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tersa-entitlement-inventory-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = root.join("source");
+        let generated = root.join("build/DerivedData");
+        fs::create_dir_all(&source).expect("source inventory directory must be created");
+        fs::create_dir_all(&generated).expect("generated directory must be created");
+        let protected = r#"<plist version="1.0"><dict><key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array></dict></plist>"#;
+        let source_entitlement = source.join("Unreviewed.entitlements");
+        fs::write(&source_entitlement, protected).expect("source fixture must be written");
+        fs::write(generated.join("Copied.entitlements"), protected)
+            .expect("generated copy must be written");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source_entitlement, generated.join("Linked.entitlements"))
+            .expect("generated symlink must be created");
+
+        let mut paths = Vec::new();
+        collect_entitlement_paths(&root, &root, &mut paths)
+            .expect("generated build inventory must be ignored");
+        assert_eq!(paths, vec![source_entitlement.clone()]);
+        assert!(
+            !non_owner_entitlement_violations(&source_entitlement.to_string_lossy(), protected,)
+                .is_empty()
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                Path::new("Unreviewed.entitlements"),
+                source.join("Alias.entitlements"),
+            )
+            .expect("source symlink must be created");
+            let error = collect_entitlement_paths(&root, &root, &mut Vec::new())
+                .expect_err("source symlinks must fail closed");
+            assert!(error.to_string().contains("must not be a symbolic link"));
+        }
+        fs::remove_dir_all(&root).expect("inventory fixture must be removed");
     }
 
     #[test]

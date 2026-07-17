@@ -143,9 +143,16 @@ binary.
 The signing guard treats the current direct XcodeGen declarations as an exact
 allowlist. Project-wide or per-configuration sensitive overrides, includes,
 target templates, setting groups, config files, conditional sensitive keys,
-and reuse of the protected entitlement path fail closed. Every other
-entitlement file under `apple/` is parsed and rejected if it claims either
-protected group entitlement.
+and reuse of the protected entitlement path fail closed. The current `options`
+mapping is closed, including rejection of nested pre- and post-generation
+hooks. The `TersaMac` target type, bundle identifier, sole Rust pre-build phase,
+scheme, build rules, build-tool plugins, and additional signing controls are
+also closed exact surfaces. The checked project-generation wrapper always uses
+XcodeGen `--no-env`, preserving `${TeamIdentifierPrefix}` for Xcode rather than
+environment expansion. Every other source entitlement under `apple/` is parsed
+and rejected if it claims either protected group entitlement. The ignored
+generated `apple/build/` tree is excluded from inventory, while source symlinks
+remain forbidden.
 
 Provisioning must use a raw add-only operation. A duplicate discards and
 zeroizes the losing candidate, then retrieves and validates the winner; it

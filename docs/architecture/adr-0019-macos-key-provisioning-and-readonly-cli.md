@@ -170,8 +170,23 @@ The architecture check accepts the PR 32 signing configuration only at the
 exact `TersaMac` target paths. It rejects project or per-configuration
 overrides, includes, target templates, setting groups, configuration files,
 conditional sensitive keys, protected entitlement-path reuse, and protected
-groups in every other entitlement file. These indirections require a reviewed
-policy change rather than attempted partial XcodeGen resolution.
+groups in every other source entitlement file. The `options` mapping is closed
+to the current three entries, which rejects XcodeGen's nested `preGenCommand`
+and `postGenCommand` hooks. `TersaMac` is fixed to an application target, one
+exact Rust build phase, no post-build or compile phases, no build rules or
+build-tool plugins, and a scheme without executable actions. Signing controls,
+conditional variants, identifier expansion roots, and the bundle identifier
+are exact allowlists.
+
+All repository project generation uses the checked
+`apple/scripts/generate-project.sh` wrapper with XcodeGen `--no-env`. This keeps
+`${TeamIdentifierPrefix}` literal in the generated project until Xcode resolves
+it. The entitlement source inventory excludes only the ignored generated
+`apple/build/` tree, including local DerivedData copies and symlinks. Every
+other entitlement file under `apple/` is parsed and rejected if it claims
+either protected group entitlement, and any source-tree symlink fails closed.
+These surfaces require a reviewed policy change rather than attempted partial
+XcodeGen resolution.
 
 PR 33 has a CLI-specific acceptance condition independent of the later macOS
 UI gate: a same-team Developer ID package must be notarized, contain the
