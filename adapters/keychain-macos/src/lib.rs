@@ -504,6 +504,12 @@ fn bootstrap_default_account_with_dependencies(
         }
         Err(_error) => return ProductBootstrapStatus::Unavailable,
     };
+    // The journal belongs to the fixed profile bootstrap rather than to the
+    // requested account. Recover any complete fixed-lineage record before the
+    // requested account starts its own traversal.
+    if recover_pending_directory_creation(&lock).is_err() {
+        return ProductBootstrapStatus::Unavailable;
+    }
     let root = match backend.copy() {
         Ok(Some(root)) => root,
         Ok(None) => {
@@ -913,12 +919,7 @@ impl PendingDirectoryCreation {
             .parse()
             .map_err(|_error| rustix::io::Errno::INVAL)?;
         let component = fields.next().ok_or(rustix::io::Errno::INVAL)?;
-        if component.is_empty()
-            || component.len() > 64
-            || !component
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        {
+        if !is_fixed_lineage_component(component) {
             return Err(rustix::io::Errno::INVAL);
         }
         let phase = match phase {
@@ -951,6 +952,30 @@ impl PendingDirectoryCreation {
             phase,
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_fixed_lineage_component(component: &str) -> bool {
+    fixed_lineage_boundary(component).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn fixed_lineage_boundary(component: &str) -> Option<usize> {
+    match component {
+        "profiles" => Some(0),
+        "default" => Some(1),
+        "accounts" => Some(2),
+        component if is_canonical_account_leaf(component) => Some(3),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_canonical_account_leaf(component: &str) -> bool {
+    component.len() == 64
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[cfg(target_os = "macos")]
@@ -1058,6 +1083,109 @@ fn authorize_existing_directory(
         }
         Some(DirectoryCreationPhase::Created { .. }) => Err(rustix::io::Errno::PERM),
         None => Ok(false),
+    }
+}
+
+/// Recovers any complete fixed-lineage journal before account-specific
+/// bootstrap begins.
+#[cfg(target_os = "macos")]
+fn recover_pending_directory_creation(lock: &BootstrapLock) -> rustix::io::Result<()> {
+    use rustix::fs::{self, AtFlags, Mode, OFlags};
+    use std::os::fd::AsFd;
+
+    let Some(pending) = read_directory_creation_journal(lock.journal_fd())? else {
+        return Ok(());
+    };
+    let target_boundary =
+        fixed_lineage_boundary(&pending.component).ok_or(rustix::io::Errno::PERM)?;
+
+    let mut parent = fs::openat(
+        lock.container_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    validate_directory(&fs::fstat(&parent)?, None)?;
+    for component in PROFILE_PREFIX.iter().take(target_boundary) {
+        let child = fs::openat(
+            parent.as_fd(),
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        let child_stat = fs::fstat(&child)?;
+        validate_directory(&child_stat, None)?;
+        if Mode::from_raw_mode(child_stat.st_mode).as_raw_mode() != 0o700 {
+            return Err(rustix::io::Errno::PERM);
+        }
+        parent = child;
+    }
+
+    let parent_stat = fs::fstat(&parent)?;
+    validate_directory(&parent_stat, None)?;
+    if !pending.matches(&parent_stat, &pending.component) {
+        return Err(rustix::io::Errno::PERM);
+    }
+    let child_before = recover_pending_directory_target(lock, parent.as_fd(), &pending)?;
+
+    // Bind normalization and clearing to the identity recorded in Created.
+    fs::chmodat(
+        parent.as_fd(),
+        &pending.component,
+        Mode::from_raw_mode(0o700),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    let child = fs::openat(
+        parent.as_fd(),
+        &pending.component,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let child_after = fs::fstat(&child)?;
+    validate_directory(&child_after, Some(&child_before))?;
+    if Mode::from_raw_mode(child_after.st_mode).as_raw_mode() != 0o700 {
+        return Err(rustix::io::Errno::PERM);
+    }
+    fs::fsync(&child)?;
+    fs::fsync(&parent)?;
+    clear_directory_creation_journal(lock.journal_fd())
+}
+
+#[cfg(target_os = "macos")]
+fn recover_pending_directory_target(
+    lock: &BootstrapLock,
+    parent: std::os::fd::BorrowedFd<'_>,
+    pending: &PendingDirectoryCreation,
+) -> rustix::io::Result<rustix::fs::Stat> {
+    use rustix::fs::{self, AtFlags, Mode};
+
+    match fs::statat(parent, &pending.component, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(existing) => {
+            validate_directory(&existing, None)?;
+            if !authorize_existing_directory(Some(pending), &existing)? {
+                return Err(rustix::io::Errno::PERM);
+            }
+            Ok(existing)
+        }
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            if !matches!(pending.phase, DirectoryCreationPhase::Intent) {
+                return Err(rustix::io::Errno::PERM);
+            }
+            if let Err(error) = fs::mkdirat(parent, &pending.component, Mode::from_raw_mode(0o700))
+            {
+                if fs::statat(parent, &pending.component, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_err_and(|probe_error| probe_error == rustix::io::Errno::NOENT)
+                {
+                    clear_directory_creation_journal(lock.journal_fd())?;
+                }
+                return Err(error);
+            }
+            let created = fs::statat(parent, &pending.component, AtFlags::SYMLINK_NOFOLLOW)?;
+            validate_directory(&created, None)?;
+            advance_directory_creation_journal(lock.journal_fd(), &pending.created(&created))?;
+            Ok(created)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2793,6 +2921,167 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_account_leaf_crash_recovery_finishes_before_requested_bootstrap() {
+        use std::os::unix::fs::MetadataExt;
+
+        let account_a = AccountId::new("acct-crashed-a").unwrap();
+        let account_b = AccountId::new("acct-requested-b").unwrap();
+        let digest_a = hex_digest(&account_a);
+        let digest_b = hex_digest(&account_b);
+        let fixture = BootstrapFixture::new("cross-account-directory-crash");
+        std::fs::write(fixture.path.join("test-installation-root"), [7_u8; 32]).unwrap();
+        let checkpoint = fixture
+            .path
+            .join("cross-account-created-before-normalization");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0777; exec \"$@\"")
+            .arg("tersa-cross-account-directory-crash")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::directory_creation_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_DIRECTORY_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_DIRECTORY_READY", &checkpoint)
+            .env("TERSA_BOOTSTRAP_DIRECTORY_BOUNDARY", "3")
+            .env("TERSA_BOOTSTRAP_DIRECTORY_DIGEST", &digest_a)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut child, &checkpoint);
+        let crashed_leaf = fixture
+            .path
+            .join("profiles/default/accounts")
+            .join(&digest_a);
+        assert_eq!(
+            std::fs::metadata(&crashed_leaf).unwrap().mode() & 0o777,
+            0o000
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let opened_for_call = Arc::clone(&opened);
+        let expected_account_b = account_b.clone();
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account_b,
+                &SharedFileBackend::new(&fixture.path),
+                &FakeLocator(Ok(fixture.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                move |account, path, _key| {
+                    assert_eq!(account, expected_account_b);
+                    opened_for_call.lock().unwrap().push(path);
+                    Ok(())
+                },
+            ),
+            ProductBootstrapStatus::Ready
+        );
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![
+                fixture
+                    .path
+                    .join("profiles/default/accounts")
+                    .join(&digest_b)
+                    .join("mail.sqlite3")
+            ]
+        );
+        for leaf in [&digest_a, &digest_b] {
+            assert_eq!(
+                std::fs::metadata(fixture.path.join("profiles/default/accounts").join(leaf))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_account_leaf_intent_recovery_creates_only_the_journaled_target() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let account_a = AccountId::new("acct-intent-a").unwrap();
+        let account_b = AccountId::new("acct-intent-b").unwrap();
+        let digest_a = hex_digest(&account_a);
+        let digest_b = hex_digest(&account_b);
+        let fixture = BootstrapFixture::new("cross-account-directory-intent");
+        fixture.create_directory("profiles");
+        fixture.create_directory("profiles/default");
+        fixture.create_directory("profiles/default/accounts");
+        std::fs::write(fixture.path.join("test-installation-root"), [7_u8; 32]).unwrap();
+
+        let lock =
+            acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let accounts = rustix::fs::openat(
+            rustix::fs::CWD,
+            fixture.path.join("profiles/default/accounts"),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let intent =
+            PendingDirectoryCreation::new(&rustix::fs::fstat(accounts.as_fd()).unwrap(), &digest_a);
+        write_directory_creation_journal(lock.journal_fd(), &intent).unwrap();
+        drop(lock);
+
+        let expected_database = fixture
+            .path
+            .join("profiles/default/accounts")
+            .join(&digest_b)
+            .join("mail.sqlite3");
+        let expected_account_b = account_b.clone();
+        let mut opened = 0;
+        let status = bootstrap_default_account_with_dependencies(
+            &account_b,
+            &SharedFileBackend::new(&fixture.path),
+            &FakeLocator(Ok(fixture.path.clone())),
+            Instant::now() + Duration::from_secs(1),
+            |account, path, _key| {
+                opened += 1;
+                assert_eq!(account, expected_account_b);
+                assert_eq!(path, expected_database);
+                Ok(())
+            },
+        );
+        assert_eq!(status, ProductBootstrapStatus::Ready);
+        assert_eq!(opened, 1);
+        for leaf in [&digest_a, &digest_b] {
+            assert_eq!(
+                std::fs::metadata(fixture.path.join("profiles/default/accounts").join(leaf))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     fn crash_and_recover_directory_boundary(
         boundary: usize,
         digest: &str,
@@ -2998,11 +3287,13 @@ mod tests {
         let container = PathBuf::from(container);
         let lock =
             acquire_global_lock(&container, Instant::now() + Duration::from_secs(5)).unwrap();
-        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let digest = std::env::var("TERSA_BOOTSTRAP_DIRECTORY_DIGEST").unwrap_or_else(|_error| {
+            "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47".to_owned()
+        });
         let _result = establish_account_directory_with_hooks(
             &lock,
             &container,
-            digest,
+            &digest,
             |_boundary| Ok(()),
             |_boundary| Ok(()),
             |observed_boundary| {
@@ -3403,6 +3694,139 @@ mod tests {
                 .len()
                 > 0
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_cross_account_recovery(name: &str) -> (BootstrapFixture, super::BootstrapLock) {
+        let fixture = BootstrapFixture::new(name);
+        fixture.create_directory("profiles");
+        fixture.create_directory("profiles/default");
+        fixture.create_directory("profiles/default/accounts");
+        let lock =
+            acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        (fixture, lock)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_cross_account_directory(fixture: &BootstrapFixture) -> rustix::fd::OwnedFd {
+        rustix::fs::openat(
+            rustix::fs::CWD,
+            fixture.path.join("profiles/default/accounts"),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_created_cross_account_journal(
+        fixture: &BootstrapFixture,
+        lock: &super::BootstrapLock,
+        leaf: &str,
+    ) -> PathBuf {
+        use std::os::fd::AsFd;
+
+        let accounts = open_cross_account_directory(fixture);
+        let intent = PendingDirectoryCreation::new(&rustix::fs::fstat(&accounts).unwrap(), leaf);
+        write_directory_creation_journal(lock.journal_fd(), &intent).unwrap();
+        rustix::fs::mkdirat(
+            accounts.as_fd(),
+            leaf,
+            rustix::fs::Mode::from_raw_mode(0o700),
+        )
+        .unwrap();
+        let created = rustix::fs::statat(
+            accounts.as_fd(),
+            leaf,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        advance_directory_creation_journal(lock.journal_fd(), &intent.created(&created)).unwrap();
+        fixture.path.join("profiles/default/accounts").join(leaf)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_cross_account_journal_preserved(fixture: &BootstrapFixture) {
+        assert!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len()
+                > 0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_account_leaf_recovery_rejects_noncanonical_parent_and_intent_states() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let leaf = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let (noncanonical, noncanonical_lock) =
+            prepare_cross_account_recovery("cross-account-noncanonical-leaf");
+        let encoded = format!(
+            "{DIRECTORY_CREATION_JOURNAL_MAGIC}\ncreated\n1\n1\n{}\n1\n1\n",
+            leaf.to_ascii_uppercase()
+        );
+        rustix::io::pwrite(noncanonical_lock.journal_fd(), encoded.as_bytes(), 0).unwrap();
+        rustix::fs::fsync(noncanonical_lock.journal_fd()).unwrap();
+        assert!(recover_pending_directory_creation(&noncanonical_lock).is_err());
+        assert_cross_account_journal_preserved(&noncanonical);
+
+        let (wrong_parent, wrong_parent_lock) =
+            prepare_cross_account_recovery("cross-account-wrong-parent");
+        let accounts = open_cross_account_directory(&wrong_parent);
+        let mut pending =
+            PendingDirectoryCreation::new(&rustix::fs::fstat(accounts.as_fd()).unwrap(), leaf);
+        pending.parent_inode = pending.parent_inode.saturating_add(1);
+        write_directory_creation_journal(wrong_parent_lock.journal_fd(), &pending).unwrap();
+        assert!(recover_pending_directory_creation(&wrong_parent_lock).is_err());
+        assert_cross_account_journal_preserved(&wrong_parent);
+
+        let (intent_existing, intent_lock) =
+            prepare_cross_account_recovery("cross-account-intent-existing");
+        let accounts = open_cross_account_directory(&intent_existing);
+        let intent =
+            PendingDirectoryCreation::new(&rustix::fs::fstat(accounts.as_fd()).unwrap(), leaf);
+        write_directory_creation_journal(intent_lock.journal_fd(), &intent).unwrap();
+        let target = intent_existing
+            .path
+            .join("profiles/default/accounts")
+            .join(leaf);
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(recover_pending_directory_creation(&intent_lock).is_err());
+        assert_cross_account_journal_preserved(&intent_existing);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_account_leaf_recovery_rejects_replacement_and_wrong_mode_lineage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let leaf = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let (replaced, replaced_lock) =
+            prepare_cross_account_recovery("cross-account-created-replacement");
+        let target = write_created_cross_account_journal(&replaced, &replaced_lock, leaf);
+        std::fs::rename(&target, target.with_extension("replaced")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(recover_pending_directory_creation(&replaced_lock).is_err());
+        assert_cross_account_journal_preserved(&replaced);
+
+        let (wrong_mode, wrong_mode_lock) =
+            prepare_cross_account_recovery("cross-account-wrong-lineage-mode");
+        write_created_cross_account_journal(&wrong_mode, &wrong_mode_lock, leaf);
+        std::fs::set_permissions(
+            wrong_mode.path.join("profiles"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        assert!(recover_pending_directory_creation(&wrong_mode_lock).is_err());
+        assert_cross_account_journal_preserved(&wrong_mode);
     }
 
     #[cfg(target_os = "macos")]
