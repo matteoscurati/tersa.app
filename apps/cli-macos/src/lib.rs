@@ -58,6 +58,13 @@ struct Invocation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "These closed production failure classes are constructed by the macOS composition and deterministic tests."
+    )
+)]
 enum OpenFailure {
     KeyAccess,
     Profile,

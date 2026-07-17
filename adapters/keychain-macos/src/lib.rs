@@ -12,6 +12,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", test))]
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use tersa_platform::secure_storage::{
@@ -51,8 +52,11 @@ impl std::error::Error for ReadOnlyMailboxOpenError {}
 const SERVICE: &str = "app.tersa.mac.storage-root.v1";
 #[cfg(target_os = "macos")]
 const ACCOUNT: &str = "default";
+#[cfg(any(target_os = "macos", test))]
 const ROOT_SALT: &[u8] = b"tersa.app/macos/root-key/v1";
+#[cfg(any(target_os = "macos", test))]
 const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
+#[cfg(any(target_os = "macos", test))]
 const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 
@@ -65,14 +69,17 @@ impl SecretKey {
         Self(Zeroizing::new(bytes))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn zeroed() -> Self {
         Self(Zeroizing::new([0; 32]))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn as_mut_bytes(&mut self) -> &mut [u8; 32] {
         &mut self.0
     }
@@ -204,10 +211,12 @@ fn account_database_path(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "macos", test))]
 enum AccountKeyPurpose {
     SqlCipherAccountDatabaseV1,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn derive_account_key(
     root: &SecretKey,
     account_id: &AccountId,
@@ -224,6 +233,7 @@ fn derive_account_key(
     Ok(output)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn framed_info(account: &AccountId, purpose: &[u8]) -> Result<Vec<u8>, KeyStorageError> {
     let account = account.as_str().as_bytes();
     let account_len = u16::try_from(account.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
@@ -910,7 +920,9 @@ mod macos_container {
 )]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
     #[cfg(target_os = "macos")]
