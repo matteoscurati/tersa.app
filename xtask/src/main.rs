@@ -2308,12 +2308,7 @@ fn swift_call_argument_is_identifier(
 
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
     let code = strip_swift_non_code(document);
-    if code.match_indices("@_").any(|(index, _)| {
-        code[index + 1..]
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte == b'_')
-    }) {
+    if swift_has_underscored_attribute(&code) {
         return vec![format!(
             "{} must not use underscored Swift attributes in inventoried macOS sources",
             path.display()
@@ -2693,6 +2688,16 @@ fn project_generation_surface_violations(
         }
     }
     violations
+}
+
+fn swift_has_underscored_attribute(document: &str) -> bool {
+    document.match_indices('@').any(|(at, _)| {
+        let mut identifier = skip_ascii_whitespace(document, at + 1);
+        if document.as_bytes().get(identifier) == Some(&b'`') {
+            identifier += 1;
+        }
+        document.as_bytes().get(identifier) == Some(&b'_')
+    })
 }
 
 fn tracked_project_generation_violations(repository_root: &Path) -> io::Result<Vec<String>> {
@@ -6837,6 +6842,8 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             "@_extern(c, \"tersa_macos_bootstrap_default_account\")\nfunc hiddenBootstrapCall() {}",
             "@_expose(Cxx)\nfunc exposedBootstrapCall() {}",
             "@_dynamicReplacement(for: establishedOwner)\nfunc replacement() {}",
+            "@`_extern`(c, \"SecItemDelete\")\nfunc escapedKeychainCall() {}",
+            "@ /* hidden spacing */ `_dynamicReplacement`(for: establishedOwner)\nfunc escapedReplacement() {}",
         ] {
             let sources = vec![
                 (
@@ -6856,7 +6863,8 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
         let inert = format!(
             r#"{worker}
 // @_extern(c, "SecItemDelete")
-let note = "@_dynamicReplacement(for: establishedOwner) SecItemDelete""#
+// @`_extern`(c, "SecItemDelete")
+let note = "@_dynamicReplacement(for: establishedOwner) @`_expose`(Cxx) SecItemDelete""#
         );
         let sources = vec![
             (PathBuf::from("apple/macos/BootstrapWorker.swift"), inert),
