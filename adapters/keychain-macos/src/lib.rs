@@ -92,6 +92,10 @@ const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_LOCK: &str = ".tersa-profile-bootstrap-v1.lock";
 #[cfg(target_os = "macos")]
+const DIRECTORY_CREATION_JOURNAL_MAGIC: &str = "tersa-profile-directory-v1";
+#[cfg(target_os = "macos")]
+const DIRECTORY_CREATION_JOURNAL_LIMIT: usize = 192;
+#[cfg(target_os = "macos")]
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_BACKOFF: Duration = Duration::from_millis(10);
@@ -526,8 +530,7 @@ fn bootstrap_default_account_with_dependencies(
         return ProductBootstrapStatus::Unavailable;
     };
     let digest = hex_digest(account);
-    let Ok(mut directories) = establish_account_directory(lock.container_fd(), &container, &digest)
-    else {
+    let Ok(mut directories) = establish_account_directory(&lock, &container, &digest) else {
         return ProductBootstrapStatus::Unavailable;
     };
     if directories.revalidate().is_err() {
@@ -593,7 +596,7 @@ fn acquire_mutex_until(
 #[cfg(target_os = "macos")]
 struct BootstrapLock {
     container: rustix::fd::OwnedFd,
-    _lock: rustix::fd::OwnedFd,
+    lock: rustix::fd::OwnedFd,
 }
 
 #[cfg(target_os = "macos")]
@@ -601,6 +604,11 @@ impl BootstrapLock {
     fn container_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
         self.container.as_fd()
+    }
+
+    fn journal_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.lock.as_fd()
     }
 }
 
@@ -636,7 +644,7 @@ fn acquire_global_lock_with_hook(
     let lock = match fs::openat(
         directory.as_fd(),
         BOOTSTRAP_LOCK,
-        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     ) {
         Ok(lock) => {
@@ -667,7 +675,7 @@ fn acquire_global_lock_with_hook(
             let lock = fs::openat(
                 directory.as_fd(),
                 BOOTSTRAP_LOCK,
-                OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )?;
             hook(GlobalLockHook::AfterExistingOpen)?;
@@ -681,7 +689,7 @@ fn acquire_global_lock_with_hook(
     })?;
     Ok(BootstrapLock {
         container: directory,
-        _lock: lock,
+        lock,
     })
 }
 
@@ -819,6 +827,127 @@ struct DirectorySnapshot {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+struct PendingDirectoryCreation {
+    parent_device: i64,
+    parent_inode: u64,
+    component: String,
+}
+
+#[cfg(target_os = "macos")]
+impl PendingDirectoryCreation {
+    fn new(parent: &rustix::fs::Stat, component: &str) -> Self {
+        Self {
+            parent_device: i64::from(parent.st_dev),
+            parent_inode: parent.st_ino,
+            component: component.to_owned(),
+        }
+    }
+
+    fn matches(&self, parent: &rustix::fs::Stat, component: &str) -> bool {
+        self.parent_device == i64::from(parent.st_dev)
+            && self.parent_inode == parent.st_ino
+            && self.component == component
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{DIRECTORY_CREATION_JOURNAL_MAGIC}\n{}\n{}\n{}\n",
+            self.parent_device, self.parent_inode, self.component
+        )
+    }
+
+    fn decode(bytes: &[u8]) -> rustix::io::Result<Self> {
+        let text = std::str::from_utf8(bytes).map_err(|_error| rustix::io::Errno::INVAL)?;
+        let Some(text) = text.strip_suffix('\n') else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        let mut fields = text.split('\n');
+        if fields.next() != Some(DIRECTORY_CREATION_JOURNAL_MAGIC) {
+            return Err(rustix::io::Errno::INVAL);
+        }
+        let parent_device = fields
+            .next()
+            .ok_or(rustix::io::Errno::INVAL)?
+            .parse()
+            .map_err(|_error| rustix::io::Errno::INVAL)?;
+        let parent_inode = fields
+            .next()
+            .ok_or(rustix::io::Errno::INVAL)?
+            .parse()
+            .map_err(|_error| rustix::io::Errno::INVAL)?;
+        let component = fields.next().ok_or(rustix::io::Errno::INVAL)?;
+        if component.is_empty()
+            || component.len() > 64
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || fields.next().is_some()
+        {
+            return Err(rustix::io::Errno::INVAL);
+        }
+        Ok(Self {
+            parent_device,
+            parent_inode,
+            component: component.to_owned(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_directory_creation_journal(
+    journal: std::os::fd::BorrowedFd<'_>,
+) -> rustix::io::Result<Option<PendingDirectoryCreation>> {
+    let stat = rustix::fs::fstat(journal)?;
+    validate_lock(&stat, None, true)?;
+    let length = usize::try_from(stat.st_size).map_err(|_error| rustix::io::Errno::FBIG)?;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > DIRECTORY_CREATION_JOURNAL_LIMIT {
+        return Err(rustix::io::Errno::FBIG);
+    }
+    let mut bytes = vec![0_u8; length];
+    let read = rustix::io::pread(journal, &mut bytes[..], 0)?;
+    if read != length {
+        return Err(rustix::io::Errno::IO);
+    }
+    PendingDirectoryCreation::decode(&bytes).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn write_directory_creation_journal(
+    journal: std::os::fd::BorrowedFd<'_>,
+    pending: &PendingDirectoryCreation,
+) -> rustix::io::Result<()> {
+    if read_directory_creation_journal(journal)?.is_some() {
+        return Err(rustix::io::Errno::BUSY);
+    }
+    let bytes = pending.encode();
+    if bytes.len() > DIRECTORY_CREATION_JOURNAL_LIMIT {
+        return Err(rustix::io::Errno::FBIG);
+    }
+    rustix::fs::ftruncate(journal, 0)?;
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = rustix::io::pwrite(journal, &bytes.as_bytes()[written..], written as u64)?;
+        if count == 0 {
+            return Err(rustix::io::Errno::IO);
+        }
+        written += count;
+    }
+    rustix::fs::fsync(journal)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_directory_creation_journal(
+    journal: std::os::fd::BorrowedFd<'_>,
+) -> rustix::io::Result<()> {
+    rustix::fs::ftruncate(journal, 0)?;
+    rustix::fs::fsync(journal)
+}
+
+#[cfg(target_os = "macos")]
 struct EstablishedDirectories {
     path: PathBuf,
     snapshots: Vec<DirectorySnapshot>,
@@ -868,24 +997,31 @@ impl EstablishedDirectories {
 
 #[cfg(target_os = "macos")]
 fn establish_account_directory(
-    container: std::os::fd::BorrowedFd<'_>,
+    lock: &BootstrapLock,
     container_path: &Path,
     digest: &str,
 ) -> rustix::io::Result<EstablishedDirectories> {
-    establish_account_directory_with_hook(container, container_path, digest, |_boundary| Ok(()))
+    establish_account_directory_with_hooks(
+        lock,
+        container_path,
+        digest,
+        |_boundary| Ok(()),
+        |_boundary| Ok(()),
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn establish_account_directory_with_hook(
-    container: std::os::fd::BorrowedFd<'_>,
+fn establish_account_directory_with_hooks(
+    lock: &BootstrapLock,
     container_path: &Path,
     digest: &str,
+    mut after_mkdir: impl FnMut(usize) -> rustix::io::Result<()>,
     mut after_boundary: impl FnMut(usize) -> rustix::io::Result<()>,
 ) -> rustix::io::Result<EstablishedDirectories> {
-    use rustix::fs::{self, AtFlags, Mode, OFlags};
+    use rustix::fs::{self, Mode, OFlags};
     use std::os::fd::AsFd;
     let mut parent = fs::openat(
-        container,
+        lock.container_fd(),
         ".",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
@@ -900,42 +1036,13 @@ fn establish_account_directory_with_hook(
             .into_iter()
             .enumerate()
         {
-            let created = match fs::mkdirat(parent.as_fd(), component, Mode::from_raw_mode(0o700)) {
-                Ok(()) => true,
-                Err(error) if error == rustix::io::Errno::EXIST => false,
-                Err(error) => return Err(error),
-            };
-            let created_identity = if created {
-                let expected = fs::statat(parent.as_fd(), component, AtFlags::SYMLINK_NOFOLLOW)?;
-                validate_directory(&expected, None)?;
-                // `mkdirat` applies the process umask. A mode such as 0000
-                // cannot be opened on Darwin, so normalize by name while the
-                // retained parent descriptor and the before/after identity
-                // checks bind the operation to the directory we created.
-                fs::chmodat(
-                    parent.as_fd(),
-                    component,
-                    Mode::from_raw_mode(0o700),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )?;
-                Some(expected)
-            } else {
-                None
-            };
-            let child = fs::openat(
+            let (child, stat, created) = establish_account_component(
+                lock,
                 parent.as_fd(),
+                boundary,
                 component,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
+                &mut after_mkdir,
             )?;
-            if created {
-                fs::fchmod(&child, Mode::from_raw_mode(0o700))?;
-            }
-            let stat = fs::fstat(&child)?;
-            validate_directory(&stat, created_identity.as_ref())?;
-            if created && Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
-                return Err(rustix::io::Errno::PERM);
-            }
             established.snapshots.push(DirectorySnapshot {
                 parent: rustix::io::dup(parent.as_fd())?,
                 name: component.to_owned(),
@@ -953,6 +1060,94 @@ fn establish_account_directory_with_hook(
         return Err(error);
     }
     Ok(established)
+}
+
+#[cfg(target_os = "macos")]
+fn establish_account_component(
+    lock: &BootstrapLock,
+    parent: std::os::fd::BorrowedFd<'_>,
+    boundary: usize,
+    component: &str,
+    after_mkdir: &mut impl FnMut(usize) -> rustix::io::Result<()>,
+) -> rustix::io::Result<(rustix::fd::OwnedFd, rustix::fs::Stat, bool)> {
+    use rustix::fs::{self, AtFlags, Mode, OFlags};
+
+    let parent_stat = fs::fstat(parent)?;
+    validate_directory(&parent_stat, None)?;
+    let pending = read_directory_creation_journal(lock.journal_fd())?;
+    let mut pending_matches = pending
+        .as_ref()
+        .is_some_and(|pending| pending.matches(&parent_stat, component));
+    let existing = match fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Some(stat),
+        Err(error) if error == rustix::io::Errno::NOENT => None,
+        Err(error) => return Err(error),
+    };
+    let (created, before) = if let Some(existing) = existing {
+        (false, existing)
+    } else {
+        if pending.is_some() && !pending_matches {
+            return Err(rustix::io::Errno::PERM);
+        }
+        if pending.is_none() {
+            let intent = PendingDirectoryCreation::new(&parent_stat, component);
+            write_directory_creation_journal(lock.journal_fd(), &intent)?;
+            pending_matches = true;
+        }
+        if let Err(error) = fs::mkdirat(parent, component, Mode::from_raw_mode(0o700)) {
+            // An object that appeared after the no-follow absence check was
+            // not created by this invocation. Revoke the intent so a later
+            // retry cannot use it to normalize that unproven object.
+            if error == rustix::io::Errno::EXIST {
+                clear_directory_creation_journal(lock.journal_fd())?;
+            }
+            return Err(error);
+        }
+        after_mkdir(boundary)?;
+        (
+            true,
+            fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW)?,
+        )
+    };
+    validate_directory(&before, None)?;
+    let mode = Mode::from_raw_mode(before.st_mode).as_raw_mode();
+    let recoverable = !created && mode != 0o700;
+    if recoverable && !pending_matches {
+        return Err(rustix::io::Errno::PERM);
+    }
+    let created_identity = if created || recoverable {
+        // The durable journal authorizes only this parent/name pair. The
+        // no-follow stat/chmod/open/fstat sequence binds normalization to one
+        // identity. A same-user swap-and-restore between checks remains outside
+        // the local filesystem threat model; an observable replacement fails.
+        fs::chmodat(
+            parent,
+            component,
+            Mode::from_raw_mode(0o700),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Some(before)
+    } else {
+        None
+    };
+    let child = fs::openat(
+        parent,
+        component,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    if created {
+        fs::fchmod(&child, Mode::from_raw_mode(0o700))?;
+    }
+    let stat = fs::fstat(&child)?;
+    validate_directory(&stat, created_identity.as_ref())?;
+    if (created || recoverable) && Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
+        return Err(rustix::io::Errno::PERM);
+    }
+    if pending_matches {
+        clear_directory_creation_journal(lock.journal_fd())?;
+    }
+    Ok((child, stat, created || recoverable))
 }
 
 #[cfg(target_os = "macos")]
@@ -2359,6 +2554,84 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn crash_after_directory_mkdir_recovers_only_the_journaled_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = BootstrapFixture::new("directory-create-crash");
+        std::fs::write(fixture.path.join("test-installation-root"), [7_u8; 32]).unwrap();
+        let checkpoint = fixture.path.join("created-before-directory-normalization");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0777; exec \"$@\"")
+            .arg("tersa-directory-crash")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::directory_creation_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_DIRECTORY_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_DIRECTORY_READY", &checkpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut child, &checkpoint);
+        let profiles = fixture.path.join("profiles");
+        assert_eq!(std::fs::metadata(&profiles).unwrap().mode() & 0o777, 0o000);
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let status = bootstrap_default_account_with_dependencies(
+            &account_id(),
+            &SharedFileBackend::new(&fixture.path),
+            &FakeLocator(Ok(fixture.path.clone())),
+            Instant::now() + Duration::from_secs(1),
+            |_account, database, _key| {
+                assert_eq!(
+                    database,
+                    fixture
+                        .path
+                        .join("profiles/default/accounts")
+                        .join(digest)
+                        .join("mail.sqlite3")
+                );
+                Ok(())
+            },
+        );
+        assert_eq!(status, ProductBootstrapStatus::Ready);
+        assert_eq!(std::fs::metadata(&profiles).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let arbitrary = BootstrapFixture::new("arbitrary-zero-mode-directory");
+        std::fs::create_dir(arbitrary.path.join("profiles")).unwrap();
+        std::fs::set_permissions(
+            arbitrary.path.join("profiles"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let arbitrary_lock =
+            acquire_global_lock(&arbitrary.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(establish_account_directory(&arbitrary_lock, &arbitrary.path, digest).is_err());
+        assert_eq!(
+            std::fs::metadata(arbitrary.path.join("profiles"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o000
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "subprocess helper for the real global bootstrap lock"]
     fn global_lock_holder_child() {
         let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_CONTAINER") else {
@@ -2450,25 +2723,45 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for process-global umask coverage"]
     fn restrictive_umask_directory_child() {
-        use std::os::fd::AsFd;
-
         let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_UMASK_CONTAINER") else {
             return;
         };
         let container = PathBuf::from(container);
-        let root = rustix::fs::openat(
-            rustix::fs::CWD,
-            &container,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        )
-        .unwrap();
+        let lock =
+            acquire_global_lock(&container, Instant::now() + Duration::from_secs(5)).unwrap();
         let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
-        let established = establish_account_directory(root.as_fd(), &container, digest).unwrap();
+        let established = establish_account_directory(&lock, &container, digest).unwrap();
         established.revalidate().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "subprocess helper for a crash before directory mode normalization"]
+    fn directory_creation_crash_child() {
+        let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_DIRECTORY_CONTAINER") else {
+            return;
+        };
+        let Some(checkpoint) = std::env::var_os("TERSA_BOOTSTRAP_DIRECTORY_READY") else {
+            return;
+        };
+        let container = PathBuf::from(container);
+        let lock =
+            acquire_global_lock(&container, Instant::now() + Duration::from_secs(5)).unwrap();
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let _result = establish_account_directory_with_hooks(
+            &lock,
+            &container,
+            digest,
+            |boundary| {
+                assert_eq!(boundary, 0);
+                std::fs::write(&checkpoint, b"created").unwrap();
+                loop {
+                    thread::park();
+                }
+            },
+            |_boundary| Ok(()),
+        );
+        panic!("crash helper must be killed at the checkpoint");
     }
 
     #[cfg(target_os = "macos")]
@@ -2509,17 +2802,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn directory_establishment_cleans_each_injected_boundary_and_detects_replacement() {
-        use std::os::fd::AsFd;
         use std::os::unix::fs::PermissionsExt;
 
         let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
         for failure_boundary in 0..4 {
             let fixture = BootstrapFixture::new(&format!("directory-failure-{failure_boundary}"));
-            let root = fixture.open();
-            let result = establish_account_directory_with_hook(
-                root.as_fd(),
+            let lock = acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let result = establish_account_directory_with_hooks(
+                &lock,
                 &fixture.path,
                 digest,
+                |_boundary| Ok(()),
                 |boundary| {
                     if boundary == failure_boundary {
                         Err(rustix::io::Errno::IO)
@@ -2533,9 +2827,9 @@ mod tests {
         }
 
         let fixture = BootstrapFixture::new("directory-replacement");
-        let root = fixture.open();
-        let mut established =
-            establish_account_directory(root.as_fd(), &fixture.path, digest).unwrap();
+        let lock =
+            acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut established = establish_account_directory(&lock, &fixture.path, digest).unwrap();
         established.revalidate().unwrap();
         let account = established.path().to_path_buf();
         let moved = account.with_extension("moved");

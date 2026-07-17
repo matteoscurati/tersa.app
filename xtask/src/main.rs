@@ -668,6 +668,12 @@ fn keychain_mutation_boundary_violations(
                         path.display()
                     ));
                 }
+                if contains_identifier_with_prefix(&production, "SecKeychain") {
+                    violations.push(format!(
+                        "{} contains forbidden legacy Keychain authority",
+                        path.display()
+                    ));
+                }
                 violations.extend(rust_authority_dynamic_alias_violations(path, document));
             }
             Some("swift") => {
@@ -692,7 +698,7 @@ fn swift_keychain_authority_violations(path: &Path, document: &str) -> Vec<Strin
     const FORBIDDEN_MUTATIONS: [&str; 3] = ["SecItemAdd", "SecItemUpdate", "SecItemDelete"];
     let code = strip_swift_non_code(document);
 
-    FORBIDDEN_MUTATIONS
+    let mut violations = FORBIDDEN_MUTATIONS
         .into_iter()
         .filter(|mutation| contains_identifier(&code, mutation))
         .map(|mutation| {
@@ -701,7 +707,14 @@ fn swift_keychain_authority_violations(path: &Path, document: &str) -> Vec<Strin
                 path.display()
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if contains_identifier_with_prefix(&code, "SecKeychain") {
+        violations.push(format!(
+            "{} contains forbidden legacy Swift Keychain authority",
+            path.display()
+        ));
+    }
+    violations
 }
 
 fn rust_authority_source_surface_violations(path: &Path, document: &str) -> Vec<String> {
@@ -716,7 +729,12 @@ fn rust_authority_source_surface_violations(path: &Path, document: &str) -> Vec<
 }
 
 fn rust_authority_dynamic_alias_violations(path: &Path, document: &str) -> Vec<String> {
-    const FORBIDDEN_SYMBOLS: [&str; 3] = ["SecItemUpdate", "SecItemDelete", "set_generic_password"];
+    const FORBIDDEN_SYMBOLS: [&str; 4] = [
+        "SecItemUpdate",
+        "SecItemDelete",
+        "SecKeychain",
+        "set_generic_password",
+    ];
     const FORBIDDEN_MECHANISMS: [&str; 8] = [
         "asm",
         "dlopen",
@@ -727,7 +745,8 @@ fn rust_authority_dynamic_alias_violations(path: &Path, document: &str) -> Vec<S
         "llvm_asm",
         "naked_asm",
     ];
-    let production_document = strip_rust_test_modules(document);
+    let comments_masked = strip_rust_comments(document);
+    let production_document = strip_rust_test_modules(&comments_masked);
     let production_code = strip_rust_non_code(&production_document);
     let mut violations = Vec::new();
     for mechanism in FORBIDDEN_MECHANISMS {
@@ -828,7 +847,8 @@ fn rust_exported_c_abi_violations(package_documents: &[(PathBuf, String)]) -> Ve
         if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
             continue;
         }
-        let production_document = strip_rust_test_modules(document);
+        let comments_masked = strip_rust_comments(document);
+        let production_document = strip_rust_test_modules(&comments_masked);
         let code = strip_rust_non_code(&production_document);
         for signature_range in rust_no_mangle_signature_ranges(&code) {
             no_mangle_attributes += 1;
@@ -1311,6 +1331,69 @@ fn is_identifier_at(document: &str, index: usize, identifier: &str) -> bool {
     before.is_none_or(|byte| !is_identifier(byte)) && after.is_none_or(|byte| !is_identifier(byte))
 }
 
+/// Replaces Rust comments with spaces while preserving literals and byte offsets.
+fn strip_rust_comments(document: &str) -> String {
+    let mut output = Vec::with_capacity(document.len());
+    let bytes = document.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        if bytes[index..].starts_with(b"//") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            for byte in &bytes[start..index] {
+                output.push(if *byte == b'\n' { b'\n' } else { b' ' });
+            }
+        } else if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            let mut depth = 1_u32;
+            while index < bytes.len() && depth != 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            for byte in &bytes[start..index] {
+                output.push(if *byte == b'\n' { b'\n' } else { b' ' });
+            }
+        } else if let Some(end) = rust_raw_literal_end(bytes, index) {
+            output.extend_from_slice(&bytes[index..end]);
+            index = end;
+        } else if let Some(end) = rust_char_literal_end(bytes, index) {
+            output.extend_from_slice(&bytes[index..end]);
+            index = end;
+        } else if bytes[index] == b'"' || bytes[index..].starts_with(b"b\"") {
+            if bytes[index..].starts_with(b"b\"") {
+                index += 1;
+            }
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else {
+                    let done = bytes[index] == b'"';
+                    index += 1;
+                    if done {
+                        break;
+                    }
+                }
+            }
+            output.extend_from_slice(&bytes[start..index]);
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).expect("masking Rust comments preserves UTF-8")
+}
+
 /// Replaces comments and literals with spaces (while retaining newlines).  This is
 /// intentionally a small lexical scanner, not a Rust parser: architecture gates
 /// must never treat examples or strings as executable authority.
@@ -1569,6 +1652,13 @@ fn contains_identifier(document: &str, identifier: &str) -> bool {
         let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
         before.is_none_or(|byte| !is_identifier(byte))
             && after.is_none_or(|byte| !is_identifier(byte))
+    })
+}
+
+fn contains_identifier_with_prefix(document: &str, prefix: &str) -> bool {
+    document.match_indices(prefix).any(|(index, _matched)| {
+        let before = document[..index].bytes().next_back();
+        before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
     })
 }
 
@@ -5708,6 +5798,7 @@ fn boundary() {
         for source in [
             "fn mutate() { SecItemDelete(); }",
             "fn mutate() { SecItemUpdate(); }",
+            "fn mutate() { SecKeychainItemDelete(item); }",
             "fn mutate() { set_generic_password(); }",
             "fn mutate() { dlsym(handle, \"SecItemDelete\"); }",
             "const FORBIDDEN_SYMBOL: &str = \"SecItemDelete\";",
@@ -5715,6 +5806,14 @@ fn boundary() {
             "#[export_name = \"SecItemDelete\"] fn alias() {}",
             "global_asm!(\"call _SecItemDelete\");",
             "asm!(\"call _SecItemUpdate\");",
+            r#"
+// Historical example: #[cfg(test)] mod scratch {
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    #[link_name = "SecItemDelete"]
+    fn hidden_alias(query: *const core::ffi::c_void) -> i32;
+}
+"#,
         ] {
             let mut contaminated = clean.clone();
             contaminated.push((
@@ -5806,6 +5905,7 @@ let protectedRecord: [CFString: Any] = [
 import Security
 // SecItemDelete(protectedRecord as CFDictionary)
 let diagnostic = "SecItemAdd SecItemUpdate SecItemDelete"
+let legacyDiagnostic = "SecKeychainItemDelete"
 "#
             .to_owned(),
         )];
@@ -5835,6 +5935,7 @@ fn boundary() {
             "let symbol = dlsym(nil, \"SecItemDelete\")",
             "@_silgen_name(\"SecItemUpdate\") func updateAlias() -> OSStatus",
             "let symbol = CFBundleGetFunctionPointerForName(bundle, \"SecItemAdd\" as CFString)",
+            "SecKeychainItemDelete(item)",
         ] {
             let expanded_sources = vec![(
                 PathBuf::from("apple/macos/Injected.swift"),
@@ -5949,6 +6050,29 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
                 "export name, set, and parameter widths must remain exact"
             );
         }
+
+        let comment_mask_bypass = vec![
+            (
+                PathBuf::from("apple/rust-bridge/src/lib.rs"),
+                lib.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
+                format!(
+                    r#"{oauth}
+mod compatibility {{
+    // Historical example: #[cfg(test)] mod scratch {{
+    #[unsafe(no_mangle)]
+    pub extern "C" fn tersa_oauth_debug_dump(session_id: u64) -> i32 {{ 0 }}
+}}
+"#
+                ),
+            ),
+        ];
+        assert!(
+            !rust_exported_c_abi_violations(&comment_mask_bypass).is_empty(),
+            "a comment containing a pseudo cfg(test) module must not hide a production export"
+        );
     }
 
     #[test]
