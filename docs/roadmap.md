@@ -93,7 +93,10 @@ the accepted [macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing
    deterministic tests with no network or credentials.
 5. Add an encrypted macOS store behind ports.
 6. Add bounded sync and cache orchestration.
-7. Add a read-only macOS CLI.
+7. Add a read-only macOS CLI in two independently reviewed slices: first the
+   deterministic source contract and private Keychain-to-SQLCipher composition,
+   then the real Developer ID signed and notarized bundled distribution. The
+   roadmap item remains open between those slices.
 8. Build a macOS UI baseline and signed/notarized vertical slice only after its
    separately pinned macOS UI and release gates pass.
 
