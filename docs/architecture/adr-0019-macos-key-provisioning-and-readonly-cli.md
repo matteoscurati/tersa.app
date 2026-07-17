@@ -200,44 +200,43 @@ bootstrap calls before Keychain or filesystem access. The implementation must
 update the exact Foundation feature policy and its positive and negative
 fixtures; no other Foundation type or feature is authorized.
 
-PR 33a.5 authorizes `rustix =1.1.4` as the sole new external direct dependency
-of `tersa-keychain-macos`. It must use the canonical atomic macOS target
-structure `cfg(target_os = "macos")`, with default features disabled and the
-effective requested feature set exactly `fs`, `process`, and `std`. The
-workspace declaration remains exact-pinned with `fs` and `std`, and the
-Keychain member adds only `process` through workspace dependency inheritance.
-It supplies the safe
-descriptor-relative filesystem and advisory-lock operations required by the
-fixed bootstrap. No direct `libc` dependency, handwritten syscall binding, or
-new unsafe POSIX FFI is authorized. `process` is used solely for `geteuid`-based
-same-user validation.
-The implementation pull request must update the Keychain adapter's closed
-direct-dependency set and enforce the exact rustix version, target,
-default-feature state, and feature set in `xtask`, with positive and negative
-policy tests. This governance amendment changes no manifest, active dependency
-graph, or gate.
+PR 33a.5 authorizes `rustix =1.1.4` as the sole new external package, with exact
+direct macOS declarations in both `tersa-keychain-macos` and
+`tersa-store-sqlcipher-macos`. Both use the canonical atomic target structure
+`cfg(target_os = "macos")` and disable default features. The workspace
+declaration remains exact-pinned with `fs` and `std`; the Keychain member adds
+directly only `process`, solely for `geteuid`-based same-user validation. The
+store member inherits only workspace `fs` and `std` and must not directly
+request `process`. Rustix supplies safe descriptor-relative filesystem,
+advisory-lock, `statat`, and unlink operations. No direct `libc` dependency,
+handwritten syscall binding, or new unsafe POSIX FFI is authorized.
 
-The protected rustix direct-owner set is exactly the existing portable
-`tersa-blob-spike` diagnostic and the future macOS-gated
-`tersa-keychain-macos` declaration. `tersa-cli-macos` and
-`tersa-apple-bridge` may reach the Keychain adapter's rustix only transitively
-on `aarch64-apple-darwin`, through their exact protected workspace edges to
-`tersa-keychain-macos`. They may not declare rustix directly or reach that
-protected edge through another workspace parent or target. Resolved-path tests
-must accept the blob owner, the Keychain owner, and the exact CLI/bridge macOS
-chains and reject direct CLI/bridge declarations, another workspace owner,
-alternate workspace paths, iOS, and every non-macOS target. This policy is
-scoped to exact workspace declarations and paths into the protected Keychain
-chain; unrelated third-party packages may retain their own transitive rustix
-reachability and must not trigger a false global ban.
+The exact direct-owner set is the existing portable `tersa-blob-spike`
+diagnostic plus the future macOS-gated Keychain and SQLCipher-store declarations.
+The blob keeps its existing member declaration and inherited `fs`/`std` request
+unchanged. Policy tests must reject a direct `process` request from the blob or
+store. Cargo may unify `process` into a resolved macOS rustix package shared
+with the Keychain member; that graph-level unification does not mean the blob or
+store directly selected the feature. Direct-declaration and resolved-feature
+assertions remain separate.
 
-The existing blob diagnostic keeps its current member declaration unchanged and
-requests only the inherited `fs` and `std` features. Policy tests must prove it
-does not acquire a direct `process` feature declaration. Cargo may unify
-`process` into a resolved macOS rustix package shared with the Keychain member;
-that graph-level unification must not be misreported as the blob selecting the
-feature. Direct-declaration tests and resolved-feature tests therefore remain
-separate.
+On `aarch64-apple-darwin`, `tersa-cli-macos` and `tersa-apple-bridge` may reach
+the protected package only through their exact edge to
+`tersa-keychain-macos`, followed by either the Keychain direct rustix edge or
+`tersa-keychain-macos -> tersa-store-sqlcipher-macos -> rustix`. They gain no
+direct ownership. Alternate workspace parents or paths, direct CLI/bridge
+declarations, iOS, and every non-macOS target fail. The policy remains scoped
+to exact workspace declarations and these protected paths; unrelated
+third-party rustix reachability must not trigger a false global ban.
+
+The implementation pull request must update both closed direct-dependency sets
+and enforce exact versions, canonical targets, default-feature states,
+member-requested features, allowed resolved paths, and target-specific resolved
+features in `xtask`. Positive fixtures cover blob, Keychain, store, and both
+CLI/bridge transitive paths. Negative fixtures cover wrong owners, direct
+`process` on blob/store, direct CLI/bridge declarations, alternate parents,
+ungated or broadened targets, iOS, and non-macOS graphs. This governance
+amendment changes no manifest, active graph, or gate.
 
 The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
@@ -283,15 +282,33 @@ Every product-application bootstrap uses one non-configurable global lock file
 at `<shared-group-container>/.tersa-profile-bootstrap-v1.lock`. After opening
 and validating the existing App Group container and acquiring the process-local
 mutex under the deadline below, `tersa-keychain-macos` opens the file
-descriptor-relatively with no-follow and `O_CLOEXEC` semantics. Initial creation
-uses create-new mode with `0600`, then applies `fchmod(0600)` to the new
-descriptor and requires `fstat` to report a same-user regular file with exact
-`0600` before locking. This normalization prevents a restrictive process umask
-from bricking a newly created lock. An existing file converges only by opening
-without creation and validating the same attributes; existing mode drift fails
-closed and is never chmod-repaired. Symlinks, unexpected objects or attributes,
-and open errors fail closed. The lock file is never deleted, renamed, repaired,
-or made configurable.
+descriptor-relatively with no-follow and `O_CLOEXEC` semantics. Initial
+creation uses `O_EXCL`, requests mode `0600`, retains the returned descriptor,
+applies `fchmod(0600)`, and requires `fstat` to report the expected same-user
+regular file at exact `0600`.
+
+When create-new reports an existing name, the adapter first uses no-follow
+`statat` beneath the validated App Group descriptor and records the expected
+same-user regular-file identity and mode. A mode with no bits outside `0600` --
+exactly `0000`, `0200`, `0400`, or `0600` -- is recoverable. If owner read or
+write is missing, descriptor-relative no-follow `chmodat(0600)` normalizes the
+fixed name. The adapter then opens the fixed name no-follow, requires `fstat` to
+match the recorded identity and exact `0600`, and only then takes the advisory
+lock. This bounded path handles restrictive umasks and a prior creator crashing
+after create but before `fchmod`, including a `0000` file that cannot itself be
+opened before owner permissions are restored. Any execute, group, or other bit,
+wrong type or owner, identity change, symlink, or other attribute drift fails
+closed. Creation, convergence, normalization, revalidation, and lock acquisition
+all consume the same deadline. Open and normalization errors fail closed. The
+lock file is never deleted, renamed, or made configurable; this missing-owner-bit
+normalization is its only authorized repair.
+
+`chmodat` still names a mutable directory entry. A same-user malicious process
+can replace that entry between `statat`, `chmodat`, open, and final `fstat`; the
+identity check detects an observable replacement but cannot prevent chmod from
+affecting the replacement. This is an explicit unlocked-device/local-malware
+residual. Deterministic hooks exercise both gaps and record the non-prevention
+case without claiming atomicity.
 
 The synchronous bootstrap C ABI runs only on the dedicated bounded `TersaMac`
 bootstrap worker, never on the AppKit/main thread. The worker has concurrency
@@ -317,12 +334,21 @@ status.
 
 Every cooperative `TersaMac` bootstrap must enter through this worker and lock
 protocol; the CLI never bootstraps and receives no lock or repair authority.
-Deterministic tests must cover main-thread rejection and worker dispatch,
-bounded-queue overflow, timeout, injected `EINTR`, restrictive umasks, existing
-mode drift, crash release of the advisory lock, and adversarial two-thread and
-two-process interleavings around directory creation and main/WAL/shared-memory
-cleanup. The interleaving tests must prove cooperative serialization through
-final status rather than deletion or replacement of another bootstrap's state.
+PR 33a.5 proves the concurrency-one, one-pending worker contract through exact
+review of `apple/macos/BootstrapWorker.swift` and its sole application call site
+in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin those
+bounds and paths, and only credentialless build and analyze of the existing
+`TersaMac` Xcode target. It adds no Xcode test target, scheme test action,
+entitlement or signing-policy exception, and this source evidence passes no
+runtime or device-signed gate. Runtime worker dispatch and overflow evidence
+belongs to PR 33b. Rust deterministic tests in PR 33a.5 cover the C ABI's
+`NSThread`-based main-thread rejection, timeout, injected `EINTR`, restrictive
+umasks, a crash after lock-file creation but before `fchmod`, concurrent
+normalization, rejection of any execute/group/other permission bit, crash
+release of the advisory lock, and adversarial two-thread and two-process
+interleavings around directory creation and main/WAL/shared-memory cleanup. The
+interleaving tests must prove cooperative serialization through final status
+rather than deletion or replacement of another bootstrap's state.
 
 PR 33a.5 makes the product application the logical profile owner and assigns
 the directory-establishment operation exclusively to the trusted composition
@@ -373,24 +399,32 @@ the immediate checks remains an explicit unlocked-device/local-malware residual.
 The store remains the sole owner of database-leaf creation, claiming, schema
 migration, validation, and leaf cleanup. PR 33a.5 must harden the same existing
 `SqlCipherMailboxStore::open` API and path for a freshly created leaf. While the
-bootstrap lock is held and immediately before the store call, it records a
-descriptor-relative no-follow absence/presence snapshot for exactly
-`mail.sqlite3`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. Fresh-leaf cleanup is
-authorized only when all three were absent; an orphan sidecar or other
-inconsistent pre-store state fails closed without cleanup.
+bootstrap lock is held and immediately before the store call, the store adapter
+uses its own direct rustix dependency to record a descriptor-relative no-follow
+absence/presence snapshot for exactly `mail.sqlite3`, `mail.sqlite3-wal`, and
+`mail.sqlite3-shm`. The snapshot classifies cleanup authorization; it does not
+reject an existing main database merely because a sidecar is absent.
+
+| Main | WAL / SHM | Required behavior |
+|---|---|---|
+| Absent | Both absent | Fresh leaf: invoke the existing opener and permit bounded fresh-failure cleanup. |
+| Present | Either sidecar combination, including neither | Existing leaf: invoke the existing opener and migration path; never permit fresh-failure cleanup. |
+| Absent | Either sidecar present | Fail closed before store open; perform no cleanup. |
 
 On any failure before successful claim and migration, the store first closes
-all handles. It then uses descriptor-relative no-follow `statat` on each fixed
-name that was absent in the pre-store snapshot. If an entry is newly present,
-the store records its identity, type, owner, and permissions at that post-close
-point and revalidates them immediately before pathname unlink. The identity is
-not known or recorded at SQLite creation time. Cleanup may unlink only a
-same-user restrictive regular file whose post-close identity still matches. It
-must never remove an entry present in the pre-store snapshot, an entry with a
-changed identity, or a profile directory. Cleanup failure preserves the original
-redacted failure and may leave restrictive residual store files. Those residuals
-block or fail closed on retry and require recovery by the owning product
-application through a later reviewed path; the CLI gains no repair authority.
+all handles. Only when the snapshot classified a fresh leaf does the store use
+its direct rustix dependency for descriptor-relative no-follow `statat` and
+pathname unlink of the fixed names. If an entry is newly present, the store
+records its identity, type, owner, and permissions at that post-close point and
+revalidates them immediately before unlink. The identity is not known or
+recorded at SQLite creation time. Cleanup may unlink only a same-user
+restrictive regular file whose post-close identity still matches. It must never
+remove an entry present in the pre-store snapshot, an entry with a changed
+identity, or a profile directory. Cleanup failure preserves the original
+redacted failure and may leave restrictive residual store files. Those
+residuals block or fail closed on retry and require recovery by the owning
+product application through a later reviewed path; the CLI gains no repair
+authority.
 
 The identity checks and global lock prevent ordinary observable changes and
 serialize cooperative bootstraps only. They do not prevent a same-user malicious
@@ -407,14 +441,16 @@ revalidation, and between revalidation and unlink, for the main file and both
 sidecars.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
-or migration boundary, cover main/WAL/shared-memory creation, and replace each
-recorded entry before cleanup to prove an identity mismatch is preserved rather
-than removed. Tests must also prove that pre-existing entries and profile
-directories survive every failure. This is a hardening of the existing store
-opener, not a new descriptor-bound API, opener, composition crate, or dependency
-edge. The directory composition must not itself create, delete, replace, or
-repair `mail.sqlite3` or either sidecar and must not return the opened store or
-another storage capability across the bridge boundary.
+or migration boundary, cover all main/WAL/shared-memory snapshot combinations,
+and replace each recorded entry before cleanup to prove an identity mismatch is
+preserved rather than removed. Tests must also prove that pre-existing entries
+and profile directories survive every failure. This is a hardening of the
+existing store opener, not a new descriptor-bound API, opener, composition
+crate, or workspace-to-workspace dependency edge. The only new external-package
+edges are the exact rustix declarations authorized above. The directory
+composition must not itself create, delete, replace, or repair `mail.sqlite3` or
+either sidecar and must not return the opened store or another storage capability
+across the bridge boundary.
 
 The architecture check accepts the PR 32 signing configuration only at the
 exact `TersaMac` target paths. It rejects project or per-configuration
@@ -483,15 +519,21 @@ the sole production invoker. PR 33a.5 may add exactly one macOS-gated C ABI
 invocation to the existing bridge and the corresponding call from the existing
 `TersaMac` application source. The call accepts only opaque account-identifier
 bytes and returns only a closed success or redacted failure status. The bridge
-must validate those bytes into the canonical domain `AccountId` before invoking
-the trusted composition. It receives narrow one-shot bootstrap command
-authority, not a reusable storage capability: no raw key, store object, database
-handle, database path, profile, group, derivation input, configuration, or test
-override crosses the bridge boundary or is returned to it. The bridge may not
-depend directly on the SQLCipher store or add another platform, application,
-domain, or executable edge. The implementation PR must activate this exact edge
-in the dependency policy; no other manifest edge is implied by this amendment.
-Name-only allowance in `dependency_policy` is insufficient. The implementation
+performs only C ABI pointer/length safety, copies at most 256 opaque bytes, and
+forwards them to exactly one validating bootstrap entry in
+`tersa-keychain-macos`. That trusted entry performs UTF-8 and canonical domain
+`AccountId::new` validation before any Apple Keychain or filesystem operation.
+Empty, oversized, malformed UTF-8, or domain-invalid input returns the fixed
+redacted `invalid_account_identifier` status. The bridge must not import or
+construct `AccountId`, call a domain-validation helper, or gain a domain edge.
+It receives narrow one-shot bootstrap command authority, not a reusable storage
+capability: no raw key, store object, database handle, database path, profile,
+group, derivation input, configuration, or test override crosses the bridge
+boundary or is returned to it. The bridge may not depend directly on the
+SQLCipher store or add another platform, application, domain, or executable
+edge. The implementation PR must activate this exact edge in the dependency
+policy; no other manifest edge is implied by this amendment. Name-only
+allowance in `dependency_policy` is insufficient. The implementation
 must also add `tersa-apple-bridge -> tersa-keychain-macos` to the exact
 `protected_edge` match enforced by
 `future_macos_store_dependency_violation`, so only the canonical atomic target
@@ -503,6 +545,16 @@ feature-conditioned targets, and other semantically different or broadened
 target expressions fail. This governance pull request does not add the edge or
 change `xtask`; PR 33a.5 must activate the manifest and both policy layers
 atomically.
+
+PR 33a.5 must also make this validation boundary source-verifiable. The bridge
+tracked-source policy accepts only pointer/length checks, the 256-byte bound,
+and one call to the Keychain adapter's single validating entry. It rejects
+`tersa-domain`, `AccountId`, domain-validation helpers, alternate bootstrap
+entries, aliases, and reexports in bridge production sources. Deterministic
+fixtures cover null/nonzero pointer combinations, lengths above 256, empty and
+malformed UTF-8, canonical-domain failures, and valid identifiers. They prove
+that invalid bytes produce only `invalid_account_identifier` before Apple
+Keychain or filesystem access.
 
 PR 33a.5 must also add narrow resolved-graph exceptions for
 `tersa-apple-bridge` on `aarch64-apple-darwin` only. HMAC reachability is
