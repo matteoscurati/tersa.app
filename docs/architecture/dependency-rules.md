@@ -3,7 +3,7 @@
 tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
-The workspace has four shared architectural layers plus nine platform
+The workspace has four shared architectural layers plus eleven platform
 and feasibility adapters:
 
 | Crate | Responsibility | Allowed workspace dependencies |
@@ -21,7 +21,8 @@ and feasibility adapters:
 | `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
-| `tersa-keychain-macos` | macOS Data Protection Keychain root-key and fixed App Group profile adapter | `tersa-platform` |
+| `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
+| `tersa-cli-macos` | Fixed-profile metadata-only macOS CLI source adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -36,9 +37,9 @@ exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 Apple target gate: Linux CI exercises their deterministic tests, while Apple CI
 cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 is pinned exactly
 and exclusive to `tersa-blob-spike`; `hmac` 0.12.1 is pinned exactly and may be
-reached only by `tersa-blob-spike` and `tersa-keychain-macos` through HKDF in
-every resolved Apple target graph. New workspace crates must be added explicitly to the policy
-in `xtask`; an unknown crate fails CI.
+reached by `tersa-blob-spike`, `tersa-keychain-macos` through HKDF, and the
+macOS-only CLI through its Keychain composition chain. New workspace crates
+must be added explicitly to the policy in `xtask`; an unknown crate fails CI.
 
 ## macOS production account store
 
@@ -87,15 +88,15 @@ changes. Cache budgets remain constraints rather than evidence.
 
 ## Active macOS key boundary and split CLI boundary
 
-ADR 0019 defines one active adapter and one reserved future crate:
+ADR 0019 defines the active macOS Keychain and metadata-only CLI adapters:
 
 | Crate | Responsibility | Maximum inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | Active macOS Keychain root provisioning, private versioned HKDF derivation, and App Group container locator; PR 33a adds the trusted read-only database composition | Currently `tersa-platform`; after PR 33a, exactly `tersa-platform` and `tersa-store-sqlcipher-macos` |
+| `tersa-keychain-macos` | macOS Keychain root provisioning, private versioned HKDF derivation, App Group location, and trusted read-only database composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only JSON process adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
-`tersa-keychain-macos` is active and has an explicit `xtask` policy entry. The
-`RESERVED_FUTURE_POLICY` tripwire now reserves only the CLI crate.
+Both crates are active and have exact `xtask` policy entries. The CLI
+reservation is removed only for this reviewed metadata-only source slice.
 
 The active Keychain adapter uses direct exact pins: `security-framework-sys =2.17.0`
 with default features disabled and only `OSX_10_15`,
@@ -111,18 +112,21 @@ The direct dependency set is closed and exact: an unknown dependency, a
 missing required dependency, or direct `hmac` is rejected. Resolved
 HKDF-to-HMAC reachability remains allowed and separately checked.
 
-The active `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
-`tersa-keychain-macos`; no other crate may reach HMAC. ChaCha20-Poly1305 remains
+The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
+`tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
+Keychain composition chain. ChaCha20-Poly1305 remains
 exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
 `tersa-keychain-macos` may not add direct application or domain edges. ADR 0019
 accepts one macOS-gated PR 33a edge to `tersa-store-sqlcipher-macos` so the
-private `SecretKey` owner can consume a derived key directly into
-`SqlCipherMailboxReader::open_read_only`. The adapter may reach SQLCipher only
-through that store edge and may not declare `rusqlite` or `libsqlite3-sys`
-directly. Its platform port accepts only the canonical domain `AccountId`; raw
-strings cannot enter account hashing or derivation. `tersa-cli-macos` receives
-no direct platform, SQLCipher, general Apple-framework, key export,
-database-path override, or transport capability from its reservation.
+private `SecretKey` owner can consume a derived key directly into the strict
+`SqlCipherMailboxReader` opener. The classified constructor preserves only the
+existing storage/corruption distinction and delegates to the same strict
+read-only implementation. The adapter may reach SQLCipher only through that
+store edge and may not declare `rusqlite` or `libsqlite3-sys` directly. Its
+platform port accepts only the canonical domain `AccountId`; raw strings cannot
+enter account hashing or derivation. `tersa-cli-macos` receives no direct
+platform, SQLCipher, general Apple-framework, key export, database-path
+override, or transport capability.
 
 PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
 It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
@@ -201,8 +205,8 @@ The reviewed delivery changes are policy, strict read-only SQLCipher open,
 macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
 source, then real signed CLI distribution evidence. PR 33a activates source and
 dependency policy but does not create the official CLI. Phase 1 roadmap item 7
-remains open until PR 33b passes. The CLI's direct store reader is an interim
-adapter composition replaceable by future `maild` IPC; it does not authorize
+remains open until PR 33b passes. The CLI's trusted direct-store composition is
+an interim adapter boundary replaceable by future `maild` IPC; it does not authorize
 `maild` in the MVP. iPhone and iPad implementation remains in Phase 2, and no
 reservation or macOS evidence changes a mobile gate.
 

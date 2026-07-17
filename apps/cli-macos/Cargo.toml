@@ -1,0 +1,24 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-cli-macos"
+description = "Fixed-profile metadata-only macOS CLI for tersa.app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tersa-application = { workspace = true }
+tersa-domain = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tersa-keychain-macos = { path = "../../adapters/keychain-macos", version = "=0.0.0" }
+
+[lints]
+workspace = true

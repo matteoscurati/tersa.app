@@ -11,6 +11,7 @@ members = [
     "adapters/gmail-rest-macos",
     "adapters/keychain-macos",
     "adapters/store-sqlcipher-macos",
+    "apps/cli-macos",
     "crates/application",
     "crates/domain",
     "crates/platform",
@@ -50,6 +51,7 @@ security-framework-sys = { version = "=2.17.0", default-features = false, featur
 subtle = "2.6.1"
 tantivy = { version = "=0.26.1", default-features = false }
 tersa-application = { path = "crates/application", version = "=0.0.0" }
+tersa-domain = { path = "crates/domain", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 url = "2.5.8"
 zeroize = "1.9.0"

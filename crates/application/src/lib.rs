@@ -8,6 +8,8 @@
 
 /// Shared inward mailbox ports and pagination contracts.
 pub mod mailbox;
+/// Body-free metadata projections for explicit output adapters.
+pub mod mailbox_metadata;
 pub mod oauth;
 /// Bounded recent-snapshot mailbox synchronization and cache orchestration.
 pub mod sync;

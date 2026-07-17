@@ -20,6 +20,31 @@ use tersa_platform::secure_storage::{
 };
 use zeroize::Zeroize;
 
+/// Closed, redacted failure returned by the trusted read-only composition.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum ReadOnlyMailboxOpenError {
+    /// The existing Keychain root could not be retrieved or validated.
+    KeyAccess,
+    /// The fixed profile location or its storage is unavailable.
+    ProfileUnavailable,
+    /// The encrypted mailbox failed strict validation.
+    MailboxCorrupted,
+}
+
+impl fmt::Debug for ReadOnlyMailboxOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReadOnlyMailboxOpenError([REDACTED])")
+    }
+}
+
+impl fmt::Display for ReadOnlyMailboxOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("read-only mailbox opening failed")
+    }
+}
+
+impl std::error::Error for ReadOnlyMailboxOpenError {}
+
 // Rust guideline compliant 1.0.
 
 #[cfg(target_os = "macos")]
@@ -54,6 +79,11 @@ impl SecretKey {
 
     fn zeroize_now(&mut self) {
         self.0.zeroize();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn into_database_key(mut self) -> tersa_store_sqlcipher_macos::DatabaseKey {
+        tersa_store_sqlcipher_macos::DatabaseKey::new(std::mem::take(&mut self.0))
     }
 }
 
@@ -173,24 +203,10 @@ fn account_database_path(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "PR 32 validates private derivation; PR 33 will compose it directly with database opening without exporting key bytes."
-    )
-)]
 enum AccountKeyPurpose {
     SqlCipherAccountDatabaseV1,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "PR 32 validates private derivation; PR 33 will compose it directly with database opening without exporting key bytes."
-    )
-)]
 fn derive_account_key(
     root: &SecretKey,
     account_id: &AccountId,
@@ -252,8 +268,11 @@ enum AddResult {
     Duplicate,
 }
 
-trait RootKeyBackend: Send + Sync {
+trait RootKeyRetriever: Send + Sync {
     fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError>;
+}
+
+trait RootKeyBackend: RootKeyRetriever {
     fn random_key(&self) -> Result<SecretKey, KeyStorageError>;
     fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError>;
 
@@ -278,16 +297,72 @@ impl ProductionBackend {
     }
 }
 
-impl RootKeyBackend for ProductionBackend {
+impl RootKeyRetriever for ProductionBackend {
     fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
         macos_keychain::copy(self.group)
     }
+}
+
+impl RootKeyBackend for ProductionBackend {
     fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
         macos_keychain::random()
     }
     fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
         macos_keychain::add(self.group, candidate)
     }
+}
+
+/// Opens the one fixed account mailbox with retrieval-only Keychain access.
+///
+/// This is the only production composition that consumes the derived key. It
+/// accepts no profile, Keychain, purpose, or database-path override.
+///
+/// # Errors
+///
+/// Returns a closed redacted error when Keychain retrieval, fixed-profile
+/// resolution, or strict mailbox validation fails.
+#[cfg(target_os = "macos")]
+pub fn open_default_read_only_mailbox(
+    account: &AccountId,
+) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
+    let backend = ProductionBackend::new().map_err(|_error| ReadOnlyMailboxOpenError::KeyAccess)?;
+    let locator = ProductionContainerLocator::new()
+        .map_err(|_error| ReadOnlyMailboxOpenError::ProfileUnavailable)?;
+    open_read_only_mailbox(&backend, &locator, account)
+}
+
+#[cfg(target_os = "macos")]
+fn open_read_only_mailbox(
+    retriever: &impl RootKeyRetriever,
+    locator: &impl ContainerLocator,
+    account: &AccountId,
+) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
+    let root = retriever
+        .copy()
+        .map_err(|_error| ReadOnlyMailboxOpenError::KeyAccess)?
+        .ok_or(ReadOnlyMailboxOpenError::KeyAccess)?;
+    let key = derive_account_key(
+        &root,
+        account,
+        AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+    )
+    .map_err(|_error| ReadOnlyMailboxOpenError::KeyAccess)?;
+    drop(root);
+    let path = account_database_path(locator, account)
+        .map_err(|_error| ReadOnlyMailboxOpenError::ProfileUnavailable)?;
+    tersa_store_sqlcipher_macos::SqlCipherMailboxReader::open_read_only_classified(
+        account.clone(),
+        path,
+        key.into_database_key(),
+    )
+    .map_err(|failure| match failure {
+        tersa_store_sqlcipher_macos::ReadOnlyMailboxOpenFailure::Storage => {
+            ReadOnlyMailboxOpenError::ProfileUnavailable
+        }
+        tersa_store_sqlcipher_macos::ReadOnlyMailboxOpenFailure::Corrupted => {
+            ReadOnlyMailboxOpenError::MailboxCorrupted
+        }
+    })
 }
 
 /// Internal fixed production App Group container implementation.
@@ -834,8 +909,11 @@ mod macos_container {
 )]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
+
+    #[cfg(target_os = "macos")]
+    static PROFILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn account_id() -> AccountId {
         AccountId::new("acct-test-1").unwrap()
@@ -848,6 +926,55 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    struct RetrievalOnlyFake {
+        result: Result<Option<[u8; 32]>, KeyStorageError>,
+        copies: AtomicUsize,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RootKeyRetriever for RetrievalOnlyFake {
+        fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
+            self.copies.fetch_add(1, Ordering::SeqCst);
+            self.result.map(|value| value.map(SecretKey::new))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct TestProfile {
+        container: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TestProfile {
+        fn new(name: &str) -> Self {
+            let sequence = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let container = std::env::temp_dir().join(format!(
+                "tersa-keychain-composition-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&container).unwrap();
+            Self { container }
+        }
+
+        fn locator(&self) -> FakeLocator {
+            FakeLocator(Ok(self.container.clone()))
+        }
+
+        fn database_path(&self, account: &AccountId) -> PathBuf {
+            let path = account_database_path(&self.locator(), account).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestProfile {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.container);
+        }
+    }
+
     #[derive(Default)]
     struct Fake {
         item: Mutex<Option<[u8; 32]>>,
@@ -856,11 +983,14 @@ mod tests {
         duplicate_on_add: bool,
         zeroized_before_reread: Mutex<bool>,
     }
-    impl RootKeyBackend for Fake {
+    impl RootKeyRetriever for Fake {
         fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
             self.calls.lock().unwrap().push("copy");
             Ok(self.item.lock().unwrap().map(SecretKey::new))
         }
+    }
+
+    impl RootKeyBackend for Fake {
         fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
             self.calls.lock().unwrap().push("random");
             Ok(SecretKey::new(*self.random.lock().unwrap()))
@@ -893,7 +1023,7 @@ mod tests {
         candidate: [u8; 32],
     }
 
-    impl RootKeyBackend for ConcurrentFake {
+    impl RootKeyRetriever for ConcurrentFake {
         fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
             if !self.first_copy.swap(true, Ordering::SeqCst) {
                 let snapshot = *self.item.lock().unwrap();
@@ -902,7 +1032,9 @@ mod tests {
             }
             Ok(self.item.lock().unwrap().map(SecretKey::new))
         }
+    }
 
+    impl RootKeyBackend for ConcurrentFake {
         fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
             Ok(SecretKey::new(self.candidate))
         }
@@ -936,6 +1068,91 @@ mod tests {
             ),
             "c822b72b2aaad045b983307618e4ea580ab2c1a219dcf379b229661f68f8c148"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retrieval_only_composition_opens_a_persistent_wal_fixture() {
+        let root = [7; 32];
+        let account = account_id();
+        let profile = TestProfile::new("success");
+        let derived = derive_account_key(
+            &SecretKey::new(root),
+            &account,
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+            account.clone(),
+            profile.database_path(&account),
+            tersa_store_sqlcipher_macos::DatabaseKey::new(*derived.as_bytes()),
+        )
+        .unwrap();
+        drop(store);
+        let retriever = RetrievalOnlyFake {
+            result: Ok(Some(root)),
+            copies: AtomicUsize::new(0),
+        };
+
+        let reader = open_read_only_mailbox(&retriever, &profile.locator(), &account).unwrap();
+
+        assert_eq!(retriever.copies.load(Ordering::SeqCst), 1);
+        assert_eq!(format!("{reader:?}"), "SqlCipherMailboxReader([REDACTED])");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retrieval_only_composition_maps_missing_root_without_provisioning() {
+        let retriever = RetrievalOnlyFake {
+            result: Ok(None),
+            copies: AtomicUsize::new(0),
+        };
+        let profile = TestProfile::new("missing-root");
+
+        assert!(matches!(
+            open_read_only_mailbox(&retriever, &profile.locator(), &account_id()),
+            Err(ReadOnlyMailboxOpenError::KeyAccess)
+        ));
+        assert_eq!(retriever.copies.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retrieval_only_composition_maps_storage_and_corruption() {
+        let account = account_id();
+        let root = [7; 32];
+        let retriever = RetrievalOnlyFake {
+            result: Ok(Some(root)),
+            copies: AtomicUsize::new(0),
+        };
+        let absent = TestProfile::new("absent");
+        assert!(matches!(
+            open_read_only_mailbox(&retriever, &absent.locator(), &account),
+            Err(ReadOnlyMailboxOpenError::ProfileUnavailable)
+        ));
+
+        let profile = TestProfile::new("wrong-root");
+        let derived = derive_account_key(
+            &SecretKey::new(root),
+            &account,
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+            account.clone(),
+            profile.database_path(&account),
+            tersa_store_sqlcipher_macos::DatabaseKey::new(*derived.as_bytes()),
+        )
+        .unwrap();
+        drop(store);
+        let wrong = RetrievalOnlyFake {
+            result: Ok(Some([8; 32])),
+            copies: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            open_read_only_mailbox(&wrong, &profile.locator(), &account),
+            Err(ReadOnlyMailboxOpenError::MailboxCorrupted)
+        ));
     }
     #[test]
     fn existing_item_skips_rng_and_add() {
@@ -1117,6 +1334,14 @@ mod tests {
             format!("{:?}", ProfileStorageError::Invalid),
             "ProfileStorageError([REDACTED])"
         );
+        for error in [
+            ReadOnlyMailboxOpenError::KeyAccess,
+            ReadOnlyMailboxOpenError::ProfileUnavailable,
+            ReadOnlyMailboxOpenError::MailboxCorrupted,
+        ] {
+            assert_eq!(format!("{error:?}"), "ReadOnlyMailboxOpenError([REDACTED])");
+            assert_eq!(error.to_string(), "read-only mailbox opening failed");
+        }
         let secret = SecretKey::new([0xAB; 32]);
         let formatted = format!("{secret:?}");
         assert_eq!(formatted, "SecretKey([REDACTED])");
