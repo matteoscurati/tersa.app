@@ -56,6 +56,12 @@ mod macos {
         pub fn new(bytes: [u8; 32]) -> Self {
             Self(Zeroizing::new(bytes))
         }
+
+        /// Consumes an already protected key without materializing raw bytes.
+        #[must_use]
+        pub fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
+            Self(bytes)
+        }
     }
 
     impl fmt::Debug for DatabaseKey {
@@ -76,6 +82,15 @@ mod macos {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("SqlCipherMailboxStore([REDACTED])")
         }
+    }
+
+    /// Classifies strict read-only opening without exposing backend details.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ReadOnlyMailboxOpenFailure {
+        /// The existing profile or its coordination files are unavailable.
+        Storage,
+        /// The key, owner, schema, rows, or integrity checks were invalid.
+        Corrupted,
     }
 
     /// Reads envelope rows, but no complete message bodies, from one account database.
@@ -120,6 +135,28 @@ mod macos {
             path: P,
             key: DatabaseKey,
         ) -> Result<Self, MailboxStoreError> {
+            Self::open_read_only_classified(account, path, key).map_err(|failure| match failure {
+                ReadOnlyMailboxOpenFailure::Storage => MailboxStoreError::Storage,
+                ReadOnlyMailboxOpenFailure::Corrupted => MailboxStoreError::Corrupted,
+            })
+        }
+
+        /// Opens an existing account database and preserves the closed failure class.
+        ///
+        /// This constructor has the same strict read-only behavior as
+        /// [`Self::open_read_only`]. It exists so a trusted composition crate
+        /// can map the two approved failure classes without depending directly
+        /// on the application port crate.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an unavailable profile or coordination file and
+        /// corruption for invalid encrypted or persisted state.
+        pub fn open_read_only_classified<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+        ) -> Result<Self, ReadOnlyMailboxOpenFailure> {
             Self::open_read_only_with_hooks(
                 account,
                 path.as_ref(),
@@ -128,6 +165,10 @@ mod macos {
                 |_path| {},
                 |_path| {},
             )
+            .map_err(|error| match error {
+                MailboxStoreError::Storage => ReadOnlyMailboxOpenFailure::Storage,
+                _ => ReadOnlyMailboxOpenFailure::Corrupted,
+            })
         }
 
         fn open_read_only_with_hooks(
@@ -2509,4 +2550,6 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{DatabaseKey, SqlCipherMailboxReader, SqlCipherMailboxStore};
+pub use macos::{
+    DatabaseKey, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader, SqlCipherMailboxStore,
+};

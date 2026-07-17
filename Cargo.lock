@@ -7528,6 +7528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-cli-macos"
+version = "0.0.0"
+dependencies = [
+ "tersa-application",
+ "tersa-domain",
+ "tersa-keychain-macos",
+]
+
+[[package]]
 name = "tersa-dioxus-spike"
 version = "0.0.0"
 dependencies = [
@@ -7565,6 +7574,7 @@ dependencies = [
  "security-framework-sys",
  "sha2",
  "tersa-platform",
+ "tersa-store-sqlcipher-macos",
  "zeroize",
 ]
 

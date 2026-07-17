@@ -23,6 +23,7 @@ zeroize = { version = "=1.9.0", default-features = false }
 core-foundation = { workspace = true, default-features = false }
 objc2-foundation = { workspace = true }
 security-framework-sys = { workspace = true }
+tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0.0.0" }
 
 [lints]
 workspace = true
