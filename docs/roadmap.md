@@ -93,10 +93,15 @@ the accepted [macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing
    deterministic tests with no network or credentials.
 5. Add an encrypted macOS store behind ports.
 6. Add bounded sync and cache orchestration.
-7. Add a read-only macOS CLI in two independently reviewed slices: first the
-   deterministic source contract and private Keychain-to-SQLCipher composition,
-   then the real Developer ID signed and notarized bundled distribution. The
-   roadmap item remains open between those slices.
+7. Add a read-only macOS CLI and its owning product profile in three
+   independently reviewed slices: first the deterministic CLI source contract
+   and private retrieval-only Keychain-to-SQLCipher composition; then a
+   credentialless, source-only product-application bootstrap that reuses the
+   existing Keychain provisioner and validated read-write SQLCipher path; then
+   the real Developer ID signed and notarized bundled distribution. The
+   product application remains the sole owner and migrator, the CLI remains
+   retrieval-only and non-owning, and this item stays open until the final
+   credential-dependent evidence passes.
 8. Build a macOS UI baseline and signed/notarized vertical slice only after its
    separately pinned macOS UI and release gates pass.
 
@@ -112,6 +117,20 @@ satisfies `M1-UI-001` and never changes the mobile-inclusive
 `ui_baseline_approved` flag. The current cache budgets remain constraints, not
 passes. Real Google authorization and verification also remain open until their
 own reviewed evidence exists.
+
+The bootstrap-source authorization does not edit or pass the M0 gate register,
+add a new executable, Xcode, signing, entitlement, package, or distribution
+surface, or imply OAuth, token, network, or real-account behavior. Its fake and
+deterministic evidence cannot satisfy runtime, signing, App Group, Data
+Protection Keychain interoperability, UI, or release gates. The canonical
+`AccountId`, fixed `default` profile, existing `tersa-keychain-macos` provisioner,
+and direct validated read-write SQLCipher composition are mandatory; no
+production override or second provisioning channel is permitted. The only new
+dependency edge is the macOS-gated existing `tersa-apple-bridge` composition
+root to `tersa-keychain-macos`; the existing `TersaMac` target is the sole
+production invoker, and the bridge receives no key or storage authority. Each
+slice requires independent review with zero unresolved actionable findings on
+its exact head.
 
 ## Phase 2 — iPhone and iPad implementation
 

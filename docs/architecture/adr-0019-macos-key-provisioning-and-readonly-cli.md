@@ -48,7 +48,13 @@ unsigned builds cannot substitute for that evidence:
    its dependency policy, and compose private Keychain retrieval and derivation
    directly with strict read-only SQLCipher opening. This slice adds no Apple
    distribution target and makes no signed interoperability claim.
-5. **PR 33b — signed CLI distribution evidence:** add the bundled `mailctl`
+5. **PR 33a.5 — credentialless product-application bootstrap source:** add the
+   source-only composition that lets the product application provision the
+   fixed installation root and establish or open the fixed account profile
+   through the existing validated read-write SQLCipher path. It adds no new
+   executable, Xcode target, signing configuration, entitlement, package, or
+   distribution surface.
+6. **PR 33b — signed CLI distribution evidence:** add the bundled `mailctl`
    target and its closed signing, entitlement, packaging, and symlink policy;
    then capture the real same-team Developer ID, notarization, sandbox, App
    Group, and cross-target Data Protection Keychain evidence.
@@ -56,7 +62,9 @@ unsigned builds cannot substitute for that evidence:
 Each later pull request requires exact-head independent review and must replace
 its reservation with an explicitly activated policy. Merely adding a reserved
 crate makes the architecture check fail. Phase 1 roadmap item 7 remains open
-after PR 33a and closes only when PR 33b satisfies its external evidence gate.
+after PR 33a and PR 33a.5 and closes only when PR 33b satisfies its external
+evidence gate. This governance amendment authorizes PR 33a.5 but implements no
+bootstrap, edits no gate register, and passes no gate.
 
 ### Root-key lifecycle and derivation
 
@@ -235,6 +243,39 @@ that provisions the fixed root and establishes the account profile used by the
 cross-target fixture. Credentialless CI may verify policy and package structure
 but cannot close any of these runtime conditions.
 
+PR 33a.5 supplies that reviewed production source path without credentials.
+It must reuse the single existing add-only Keychain provisioning channel in
+`tersa-keychain-macos`; a second provisioning mechanism or key import path is
+forbidden. The private derived account-database key is consumed directly by the
+existing validated read-write SQLCipher opening path and is never returned to
+the application, CLI, or another adapter. The product application is the sole
+profile owner and migrator. The CLI remains retrieval-only and non-owning and
+must never provision, establish, claim, migrate, or repair a profile.
+
+The only new workspace dependency edge authorized for PR 33a.5 is a
+macOS-target-gated edge from the existing `tersa-apple-bridge` composition root
+to `tersa-keychain-macos`. The existing `TersaMac` product-application target is
+the sole production invoker. The bridge must validate an opaque account
+identifier into the canonical domain `AccountId` before invoking the trusted
+composition and may expose no key, database path, profile, group, derivation,
+configuration, or test override. It may not depend directly on the SQLCipher
+store or add another platform, application, domain, or executable edge. The
+implementation PR must activate this exact edge in the dependency policy; no
+other manifest edge is implied by this amendment.
+
+Only the canonical domain `AccountId` may select an account. Production uses
+only the fixed `default` profile and the fixed paths, Keychain attributes, and
+derivation purpose already defined by this ADR; command-line, environment,
+configuration, or test-hook overrides remain forbidden. PR 33a.5 adds no new
+executable, Xcode target, signing setting, entitlement, package, or distribution
+surface. Its fake or deterministic tests are source evidence only: they are not
+runtime, signing, App Group container, Data Protection Keychain interoperability,
+notarization, or distribution evidence. The slice adds no OAuth, token, network,
+or real-account behavior or implication. PR 33a.5 requires independent review
+with zero unresolved actionable findings on its exact head. Phase 1 roadmap
+item 7 remains open until PR 33b supplies the unchanged credential-dependent
+evidence.
+
 `<sha256-account-id>` is the 64-character lowercase hexadecimal SHA-256 digest
 of the validated opaque `AccountId` UTF-8 bytes. Tests may construct isolated
 adapter paths directly, but the production CLI composition exposes no override.
@@ -355,9 +396,12 @@ ordering, JSON, exit codes, and declassification semantics.
 PR 32 adds root provisioning, validated retrieval, private derivation, and
 fixed profile discovery, but no CLI, public raw-key provider, database-opening
 composition, IPC, or `maild`. PR 33a adds source composition and deterministic
-CLI behavior but passes no signed runtime or distribution gate, is not the
-official CLI, and leaves Phase 1 roadmap item 7 open until PR 33b. Neither slice
-adds real Google
+CLI behavior but passes no signed runtime or distribution gate and is not the
+official CLI. PR 33a.5 adds only the credentialless product-application
+bootstrap and profile-establishment source described above. It does not change
+the gate register or pass signed runtime, App Group, Keychain interoperability,
+distribution, M0, M1, UI, or release evidence. Phase 1 roadmap item 7 remains
+open until PR 33b. None of these slices adds real Google
 authorization, token persistence, sync, background work, mailbox mutation,
 search, UI, or release evidence.
 
