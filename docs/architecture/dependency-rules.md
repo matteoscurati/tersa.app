@@ -254,7 +254,9 @@ The synchronous C ABI runs only on the bounded dedicated worker, never the main
 thread. A fixed 30-second monotonic deadline covers nonblocking process-mutex,
 lock-file creation/open, normalization, validation, and exclusive advisory-lock
 acquisition; `EINTR` and would-block retry only within the remaining budget.
-Other errors and timeout return the fixed busy/unavailable status and release
+Deadline expiry or bounded lock contention returns the fixed busy/unavailable
+status. A poisoned process mutex and malformed, unsafe, or operational lock
+failure return the fixed unavailable status instead; both mappings release
 attempt-local resources. Both guards span Keychain retrieval, absent-root
 profile preflight, any authorized provisioning, directory establishment, store
 opening and migration, identity checks, cleanup, and final status. The CLI never
@@ -308,7 +310,8 @@ and cleanup. Through its direct rustix dependency it snapshots exactly the main,
 rollback-journal, WAL, and shared-memory names: `mail.sqlite3`,
 `mail.sqlite3-journal`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. All four
 absent is a fresh leaf that enters the existing opener and permits bounded
-fresh-failure cleanup. A present main file with any combination of the three
+fresh-failure cleanup only after its `O_EXCL` main-file claim succeeds. A
+present main file with any combination of the three
 sidecars is an existing leaf: it enters the existing opener/migration path,
 which may still reject it, and never permits fresh cleanup. An absent main with
 any journal, WAL, or shared-memory name present fails before open and performs
@@ -319,25 +322,36 @@ This classification augments and must not weaken the existing
 `absent_with_sidecar` and `empty_with_sidecar` rollback-journal behavior and
 cover the all-absent state, every main-present sidecar combination, and every
 main-absent orphan-sidecar combination. Only after a failed fresh open closes
-all SQLite handles may the store consider any of the four fixed entries that
-was absent pre-open and is newly present after close. Under the cooperative-writer
-assumption it records and revalidates each candidate's identity through
+all SQLite handles, and only with a proven exclusive main-file claim, may the
+store consider any fixed entry that was absent pre-open and is newly present
+after close. Without that proof no main or sidecar cleanup runs, so a racing
+main plus WAL/SHM is preserved. Under the cooperative-writer assumption the
+authorized path records and revalidates each candidate's identity through
 descriptor-relative no-follow `statat`, then uses rustix `unlinkat` beneath the
 same retained parent descriptor. It never uses `std::fs::remove_file`,
 re-resolves the parent path, removes a pre-existing or mismatched entry, or
 removes a profile directory.
 
+An existing main is first checked through the immutable main-file view. If that
+view is fresh and the snapshot includes the complete WAL/SHM pair, a
+non-checkpointing read-only/no-follow connection validates the logical
+WAL-resident state, after which the full snapshot is revalidated. This allows
+an abruptly terminated first migration to reopen without granting cleanup
+authority to the snapshot-present main.
+
 The retained descriptor eliminates a parent-path cleanup race; SQLite itself
 remains pathname-based and no descriptor-bound SQLite opener is claimed. The
 stated store-cleanup residuals are limited to mutable final names: a same-user
-insertion after the absent snapshot but before post-close recording can be
-misattributed to SQLite, and a same-user replacement after revalidation but
-before `unlinkat` cannot be atomically excluded. macOS supplies neither creation
-provenance nor unlink-if-inode. Deterministic hooks cover snapshot-to-record
-insertion, record-to-revalidation replacement, and revalidation-to-`unlinkat`
-replacement for all four fixed entries; the first and last record
-non-prevention, while the middle proves mismatch preservation. The retained
-descriptor is released on every return after the snapshot/open/cleanup sequence.
+sidecar insertion after the proven main claim but before post-close recording
+can be misattributed to SQLite, and a same-user replacement after revalidation
+but before `unlinkat` cannot be atomically excluded. macOS supplies neither
+sidecar creation provenance nor unlink-if-inode. Deterministic hooks cover
+post-claim sidecar insertion, record-to-revalidation replacement, and
+revalidation-to-`unlinkat` replacement; the first and last record
+non-prevention, while the middle proves mismatch preservation. A separate race
+fixture proves that failed `O_EXCL` preserves the racing main and WAL/SHM. The
+retained descriptor is released on every return after the
+snapshot/open/cleanup sequence.
 On retry, a nonempty residual re-enters the same matrix and is never
 fresh-cleanup eligible. A main-present subset may converge only through every
 existing-opener invariant; any sidecar-only subset fails before open. Tests
@@ -404,11 +418,12 @@ caller's pathname preflight and opens sidecars with create-capable internal
 flags. Same-user swap-in/open/swap-back and deletion/recreation races remain
 explicit unlocked-device residuals, not prevented attacks or release claims.
 
-The strict reader opens only existing regular main, WAL, and shared-memory
-files with read-only/no-mutex/no-follow SQLite flags. It validates key, owner,
-schema, SQLCipher and SQLite integrity, account binding, bounded metadata
-decoding, connection-local persistent-WAL state, `journal_size_limit = -1`, and
-pre/post pathname identities. It disables and verifies checkpoint-on-close. It
+The strict reader opens only existing same-owner regular main, WAL, and
+shared-memory files at exact mode `0600` with read-only/no-mutex/no-follow
+SQLite flags. It validates key, owner, mode, schema, SQLCipher and SQLite
+integrity, account binding, bounded metadata decoding, connection-local
+persistent-WAL state, `journal_size_limit = -1`, and pre/post pathname
+identities. It disables and verifies checkpoint-on-close. It
 has no complete-body API, migration, checkpoint, repair, journal-mode,
 creation, or mutation operation. A missing sidecar at preflight does not enter
 SQLite; deletion after preflight can be recreated internally before the reader

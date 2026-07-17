@@ -180,6 +180,9 @@ owner, or identity drift fail without repair. This converges after restrictive
 umasks or a crash before `fchmod`, including an otherwise unopenable `0000`
 file, and all work remains inside the deadline. Mutable-name normalization gaps
 remain an explicit same-user local-malware residual.
+Only deadline expiry or bounded process/advisory-lock contention maps to
+`bootstrap_busy_or_unavailable`; a poisoned process mutex and malformed,
+unsafe, or operational lock failure map to `bootstrap_unavailable`.
 After validated Keychain item-not-found and before provisioning, only an absent
 tree or empty fixed profile skeleton is accepted; any existing state returns
 `root_missing_with_existing_profile` without Keychain, profile-tree, or store
@@ -206,16 +209,20 @@ This augments the existing `database_sidecar_exists` three-suffix invariant;
 fixtures preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
 and cover every relevant combination.
 
-After a failed fresh open closes SQLite handles, the store may clean any of the
-four fixed entries that was absent pre-open and newly present after close under
-the cooperative-writer assumption. It uses rustix `statat` and `unlinkat`
+After a failed fresh open closes SQLite handles, the store may clean fixed
+entries that were absent pre-open only when it first proved main-file authorship
+with `O_EXCL`. Without that proof no main or sidecar cleanup runs, preserving a
+racing main plus WAL/SHM. The authorized path uses rustix `statat` and `unlinkat`
 beneath the retained descriptor and never re-resolves a parent pathname or calls
 `std::fs::remove_file`. SQLite remains pathname-based; no descriptor-bound
-SQLite opener is claimed. The stated cleanup residuals are same-user insertion
-between snapshot and recording, which can be misattributed to SQLite, and
-same-user replacement between revalidation and `unlinkat`; deterministic hooks
-cover both non-prevention gaps and intermediate mismatch preservation for all
-four entries. A retry re-enters the same matrix: a main-present residual may
+SQLite opener is claimed. An immutable main-file preflight falls back to a
+non-checkpointing read-only logical validation when a fresh main has a complete
+WAL/SHM pair, allowing abrupt first-migration recovery without cleanup
+authority. The stated cleanup residuals are same-user sidecar insertion after
+the proven main claim, which can be misattributed to SQLite, and same-user
+replacement between revalidation and `unlinkat`; deterministic hooks cover both
+non-prevention gaps and intermediate mismatch preservation. A retry re-enters
+the same matrix: a main-present residual may
 converge only through all existing-opener invariants, while any sidecar-only
 residual fails before open; tests cover every nonempty subset. No retry receives
 fresh-cleanup or repair authority. The descriptor is released on every return.

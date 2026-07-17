@@ -762,39 +762,10 @@ fn is_empty_profile_skeleton_with_probe(
         return Ok(false);
     }
     match open_optional_directory(default.as_fd(), "accounts") {
-        Ok(Some(accounts)) => accounts_have_only_empty_directories(accounts.as_fd()),
+        Ok(Some(accounts)) => directory_has_only(accounts.as_fd(), None),
         Ok(None) => Ok(true),
         Err(error) => Err(error),
     }
-}
-
-#[cfg(target_os = "macos")]
-fn accounts_have_only_empty_directories(
-    accounts: std::os::fd::BorrowedFd<'_>,
-) -> rustix::io::Result<bool> {
-    use rustix::fs::{self, Mode, OFlags};
-    use std::os::fd::AsFd;
-
-    let entries = fs::Dir::read_from(accounts)?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if matches!(name.to_bytes(), b"." | b"..") {
-            continue;
-        }
-        let directory = fs::openat(
-            accounts,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?;
-        let stat = fs::fstat(&directory)?;
-        if validate_directory(&stat, None).is_err() || !directory_has_only(directory.as_fd(), None)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -2016,9 +1987,9 @@ mod tests {
         assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
 
         fixture.create_directory("profiles/default/accounts/existing-account");
-        // An interrupted first bootstrap may leave an empty account directory;
-        // it is safe to recover only while it contains no database state.
-        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
+        // Any account child is existing profile state, even when the directory
+        // is empty. Missing-root bootstrap never receives recovery authority.
+        assert!(!is_empty_profile_skeleton(root.as_fd()).unwrap());
         std::fs::write(
             fixture
                 .path

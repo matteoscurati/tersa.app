@@ -18,7 +18,7 @@ mod macos {
     use std::ffi::{OsStr, OsString};
     use std::fmt;
     use std::io::ErrorKind;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -305,18 +305,15 @@ mod macos {
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
             if leaf.snapshot.main.is_some() {
-                match preflight_existing(&canonical_path, &account, &key.0) {
-                    Ok(true) => {
-                        if let Err(kind) = leaf.adopt_recoverable_fresh_main() {
-                            key.0.zeroize();
-                            return Err(mailbox_open_error(kind));
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(kind) => {
-                        key.0.zeroize();
-                        return Err(mailbox_open_error(kind));
-                    }
+                if let Err(kind) =
+                    preflight_existing(&canonical_path, &account, &key.0, leaf.snapshot)
+                {
+                    key.0.zeroize();
+                    return Err(mailbox_open_error(kind));
+                }
+                if let Err(kind) = leaf.require_snapshot_unchanged() {
+                    key.0.zeroize();
+                    return Err(mailbox_open_error(kind));
                 }
             }
             if let Err(kind) = hook(WriterHook::AfterSnapshot, &canonical_path) {
@@ -678,17 +675,6 @@ mod macos {
             Ok(())
         }
 
-        fn adopt_recoverable_fresh_main(&mut self) -> Result<(), OpenFailure> {
-            let expected = self.snapshot.main.ok_or(OpenFailure::Storage)?;
-            let actual = leaf_entry(&self.parent, &self.names[0], self.parent_owner)?
-                .ok_or(OpenFailure::Storage)?;
-            if actual != expected || actual.mode != OWNER_ONLY_FILE_MODE {
-                return Err(OpenFailure::Storage);
-            }
-            self.fresh_main = Some(actual);
-            Ok(())
-        }
-
         fn require_main_identity(&self) -> Result<(), OpenFailure> {
             let expected = self
                 .fresh_main
@@ -697,6 +683,12 @@ mod macos {
             let actual = leaf_entry(&self.parent, &self.names[0], self.parent_owner)?
                 .ok_or(OpenFailure::Storage)?;
             (actual == expected)
+                .then_some(())
+                .ok_or(OpenFailure::Storage)
+        }
+
+        fn require_snapshot_unchanged(&self) -> Result<(), OpenFailure> {
+            (snapshot_leaf_entries(&self.parent, self.parent_owner, &self.names)? == self.snapshot)
                 .then_some(())
                 .ok_or(OpenFailure::Storage)
         }
@@ -778,12 +770,13 @@ mod macos {
             hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
             canonical_path: &Path,
         ) {
-            let adopted_fresh_main = self.snapshot.main.is_some()
-                && self.fresh_main == self.snapshot.main
-                && self.snapshot.journal.is_none()
-                && self.snapshot.wal.is_none()
-                && self.snapshot.shm.is_none();
-            if (!self.snapshot.is_fresh() && !adopted_fresh_main) || self.fresh_migration_succeeded
+            // Cleanup authority exists only after this opener proved authorship
+            // of the main leaf with an exclusive create. A pre-existing or
+            // racing main file never grants cleanup authority for itself or for
+            // any sidecar.
+            if !self.snapshot.is_fresh()
+                || self.fresh_main.is_none()
+                || self.fresh_migration_succeeded
             {
                 return;
             }
@@ -801,7 +794,7 @@ mod macos {
                 if index == 0 && self.fresh_main.is_none() {
                     continue;
                 }
-                if before.is_none() || index == 0 {
+                if before.is_none() {
                     let _ = remove_unchanged_restrictive_leaf(
                         &self.parent,
                         name,
@@ -933,6 +926,16 @@ mod macos {
         Ok(identity_from_metadata(&metadata))
     }
 
+    fn restrictive_file_identity(
+        path: &Path,
+        parent_owner: u32,
+    ) -> Result<FileIdentity, OpenFailure> {
+        let identity = file_identity(path)?;
+        (identity.owner == parent_owner && identity.mode == OWNER_ONLY_FILE_MODE)
+            .then_some(identity)
+            .ok_or(OpenFailure::Storage)
+    }
+
     fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
@@ -940,9 +943,20 @@ mod macos {
     }
 
     fn preflight_read_only_files(path: &Path) -> Result<ReadOnlyFileIdentities, OpenFailure> {
+        let parent = path.parent().ok_or(OpenFailure::Storage)?;
+        let parent_metadata =
+            std::fs::symlink_metadata(parent).map_err(|_error| OpenFailure::Storage)?;
+        if !parent_metadata.file_type().is_dir() {
+            return Err(OpenFailure::Storage);
+        }
+        let parent_owner = parent_metadata.uid();
         let main_metadata =
             std::fs::symlink_metadata(path).map_err(|_error| OpenFailure::Storage)?;
         if !main_metadata.file_type().is_file() || main_metadata.len() < 512 {
+            return Err(OpenFailure::Storage);
+        }
+        let main = identity_from_metadata(&main_metadata);
+        if main.owner != parent_owner || main.mode != OWNER_ONLY_FILE_MODE {
             return Err(OpenFailure::Storage);
         }
         match std::fs::symlink_metadata(sidecar_path(path, "-journal")) {
@@ -951,9 +965,9 @@ mod macos {
             Err(_error) => return Err(OpenFailure::Storage),
         }
         Ok(ReadOnlyFileIdentities {
-            main: identity_from_metadata(&main_metadata),
-            wal: file_identity(&sidecar_path(path, "-wal"))?,
-            shm: file_identity(&sidecar_path(path, "-shm"))?,
+            main,
+            wal: restrictive_file_identity(&sidecar_path(path, "-wal"), parent_owner)?,
+            shm: restrictive_file_identity(&sidecar_path(path, "-shm"), parent_owner)?,
         })
     }
 
@@ -961,10 +975,11 @@ mod macos {
         path: &Path,
         expected: ReadOnlyFileIdentities,
     ) -> Result<(), OpenFailure> {
+        let parent_owner = expected.main.owner;
         let actual = ReadOnlyFileIdentities {
-            main: file_identity(path)?,
-            wal: file_identity(&sidecar_path(path, "-wal"))?,
-            shm: file_identity(&sidecar_path(path, "-shm"))?,
+            main: restrictive_file_identity(path, parent_owner)?,
+            wal: restrictive_file_identity(&sidecar_path(path, "-wal"), parent_owner)?,
+            shm: restrictive_file_identity(&sidecar_path(path, "-shm"), parent_owner)?,
         };
         (actual == expected)
             .then_some(())
@@ -1037,26 +1052,42 @@ mod macos {
         path: &Path,
         account: &AccountId,
         key: &[u8; 32],
+        snapshot: LeafSnapshot,
     ) -> Result<bool, OpenFailure> {
         let uri = immutable_file_uri(path);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags(PathBuf::from(uri), flags)
+        let main_connection = Connection::open_with_flags(PathBuf::from(uri), flags)
             .map_err(|_error| OpenFailure::Storage)?;
-        apply_key(&connection, key).map_err(classify_key)?;
-        let fresh = validate_identity(&connection, account)?;
-        if fresh && database_sidecar_exists(path)? {
+        apply_key(&main_connection, key).map_err(classify_key)?;
+        let main_is_fresh = validate_identity(&main_connection, account)?;
+        if !main_is_fresh {
+            return Ok(false);
+        }
+        if !database_sidecar_exists(path)? {
+            return Ok(true);
+        }
+        if snapshot.journal.is_some() || snapshot.wal.is_none() || snapshot.shm.is_none() {
             return Err(OpenFailure::Corrupted);
         }
-        Ok(fresh)
+
+        // `immutable=1` deliberately ignores WAL. When an otherwise fresh main
+        // has the complete WAL/SHM pair, validate the logical database through
+        // a non-checkpointing read-only connection so an abrupt first-migration
+        // exit can recover without granting write, repair, or cleanup authority.
+        let wal_connection = open_read_only_connection(path)?;
+        disable_and_verify_checkpoint_on_close(&wal_connection)?;
+        opened_file_has_moved(&wal_connection)?;
+        apply_key(&wal_connection, key).map_err(classify_key)?;
+        validate_identity(&wal_connection, account)
     }
 
     fn immutable_file_uri(path: &Path) -> OsString {
-        let mut uri = Vec::with_capacity(path.as_os_str().as_bytes().len() + 32);
+        let mut uri = Vec::with_capacity(path.as_os_str().as_encoded_bytes().len() + 32);
         uri.extend_from_slice(b"file:");
-        for byte in path.as_os_str().as_bytes() {
+        for byte in path.as_os_str().as_encoded_bytes() {
             if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
                 uri.push(*byte);
             } else {
@@ -1978,10 +2009,14 @@ mod macos {
         }
 
         #[test]
-        fn recoverable_empty_main_failure_cleans_then_retries() {
-            let database = TestDatabase::new("recoverable-empty-main");
+        fn preexisting_empty_main_failure_preserves_main_then_retries() {
+            use std::os::unix::fs::MetadataExt;
+
+            let database = TestDatabase::new("preexisting-empty-main");
             write_restrictive(database.path(), b"");
+            let main_before = fs::metadata(database.path()).unwrap();
             let mut fired = false;
+            let mut cleanup_observed = false;
             let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
                 account(),
                 database.path(),
@@ -1991,12 +2026,24 @@ mod macos {
                         fired = true;
                         return Err(OpenFailure::Storage);
                     }
+                    if matches!(
+                        point,
+                        WriterHook::CleanupBeforeRecord(_)
+                            | WriterHook::CleanupAfterRecord(_)
+                            | WriterHook::CleanupAfterRevalidate(_)
+                    ) {
+                        cleanup_observed = true;
+                    }
                     Ok(())
                 },
             );
             assert!(fired);
             assert!(matches!(result, Err(MailboxStoreError::Storage)));
-            assert!(database.files().is_empty());
+            assert!(!cleanup_observed);
+            let main_after = fs::metadata(database.path()).unwrap();
+            assert_eq!(main_after.dev(), main_before.dev());
+            assert_eq!(main_after.ino(), main_before.ino());
+            assert_eq!(main_after.mode() & 0o777, 0o600);
 
             let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert_eq!(
@@ -2006,7 +2053,7 @@ mod macos {
         }
 
         #[test]
-        fn fresh_claim_eexist_preserves_the_racing_main_leaf() {
+        fn fresh_claim_eexist_preserves_the_racing_database_and_sidecars() {
             let database = TestDatabase::new("fresh-claim-eexist");
             let mut inserted = false;
             let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
@@ -2016,6 +2063,8 @@ mod macos {
                 &mut |point, _path| {
                     if point == WriterHook::BeforeFreshClaim {
                         write_restrictive(database.path(), b"racing-owner");
+                        write_restrictive(&wal_path(&database), b"racing-wal");
+                        write_restrictive(&shm_path(&database), b"racing-shm");
                         inserted = true;
                     }
                     Ok(())
@@ -2024,7 +2073,37 @@ mod macos {
             assert!(inserted);
             assert!(matches!(result, Err(MailboxStoreError::Storage)));
             assert_eq!(fs::read(database.path()).unwrap(), b"racing-owner");
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), b"racing-wal");
+            assert_eq!(fs::read(shm_path(&database)).unwrap(), b"racing-shm");
             assert_eq!(fs::metadata(database.path()).unwrap().mode() & 0o777, 0o600);
+        }
+
+        #[test]
+        fn wal_resident_first_migration_reopens_after_abrupt_exit() {
+            let database = TestDatabase::new("wal-resident-first-migration");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::wal_resident_first_migration_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_CRASH_DATABASE", database.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(73));
+            assert!(database.path().is_file());
+            assert!(wal_path(&database).is_file());
+            assert!(shm_path(&database).is_file());
+
+            let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                schema_state(&store),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
         }
 
         #[test]
@@ -2079,10 +2158,10 @@ mod macos {
         }
 
         #[test]
-        fn cleanup_hooks_record_the_three_mutable_final_name_residuals() {
-            // Main-leaf cleanup is deliberately excluded: after a failed
-            // O_EXCL claim it has no creation provenance. The dedicated
-            // regression covers that boundary; these cases cover sidecars.
+        fn cleanup_hooks_require_an_exclusively_created_main() {
+            // Sidecar cleanup is authorized only after this opener has proved
+            // main-leaf authorship through O_EXCL. These cases exercise the
+            // remaining mutable-name gaps after that proof.
             for index in 1..4 {
                 let inserted = TestDatabase::new(&format!("cleanup-insert-{index}"));
                 let inserted_path = fixed_leaf_path(&inserted, index);
@@ -2092,7 +2171,7 @@ mod macos {
                     inserted.path(),
                     key(7),
                     &mut |point, _path| {
-                        if point == WriterHook::AfterSnapshot {
+                        if point == WriterHook::AfterFreshClaim {
                             write_restrictive(&inserted_path, b"inserted-after-snapshot");
                             injected = true;
                             return Err(OpenFailure::Storage);
@@ -2114,7 +2193,7 @@ mod macos {
                     replaced.path(),
                     key(7),
                     &mut |point, _path| {
-                        if point == WriterHook::AfterSnapshot {
+                        if point == WriterHook::AfterFreshClaim {
                             write_restrictive(&replaced_path, b"recorded");
                             return Err(OpenFailure::Storage);
                         }
@@ -2141,7 +2220,7 @@ mod macos {
                     final_gap.path(),
                     key(7),
                     &mut |point, _path| {
-                        if point == WriterHook::AfterSnapshot {
+                        if point == WriterHook::AfterFreshClaim {
                             write_restrictive(&final_path, b"revalidated");
                             return Err(OpenFailure::Storage);
                         }
@@ -2451,6 +2530,34 @@ mod macos {
             loop {
                 thread::park();
             }
+        }
+
+        #[test]
+        #[ignore = "subprocess helper for WAL-resident first-migration recovery"]
+        #[expect(
+            clippy::exit,
+            reason = "the helper must terminate without running destructors to model a crash"
+        )]
+        fn wal_resident_first_migration_crash_child() {
+            let Some(database) = std::env::var_os("TERSA_STORE_CRASH_DATABASE") else {
+                return;
+            };
+            let database = PathBuf::from(database);
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                &database,
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::AfterFreshMigration {
+                        assert!(database.is_file());
+                        assert!(sidecar_path(&database, "-wal").is_file());
+                        assert!(sidecar_path(&database, "-shm").is_file());
+                        std::process::exit(73);
+                    }
+                    Ok(())
+                },
+            );
+            panic!("crash boundary was not reached: {result:?}");
         }
 
         #[test]
@@ -3062,6 +3169,28 @@ mod macos {
                 Err(MailboxStoreError::Storage)
             ));
             assert!(shm_path(&directory_database).is_dir());
+        }
+
+        #[test]
+        fn read_only_open_requires_owner_only_modes_for_every_fixed_file() {
+            for index in [0, 2, 3] {
+                let (database, store) = open(&format!("reader-mode-{index}"));
+                drop(store);
+                let target = fixed_leaf_path(&database, index);
+                let files_before = database.files();
+                let main_before = fs::read(database.path()).unwrap();
+                let wal_before = fs::read(wal_path(&database)).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+
+                assert!(matches!(
+                    SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7),),
+                    Err(MailboxStoreError::Storage)
+                ));
+                assert_eq!(database.files(), files_before);
+                assert_eq!(fs::read(database.path()).unwrap(), main_before);
+                assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
+                assert_eq!(fs::metadata(target).unwrap().mode() & 0o777, 0o640);
+            }
         }
 
         #[test]

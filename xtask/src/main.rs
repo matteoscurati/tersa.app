@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use cargo_metadata::{Metadata, MetadataCommand, PackageId};
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // Rust guideline compliant 1.0.
@@ -248,13 +248,12 @@ fn check_architecture() -> TaskResult {
         }
 
         if package_name == "tersa-apple-bridge" {
-            let direct_dependencies = package
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.name.as_str())
-                .collect();
-            violations.extend(apple_bridge_direct_dependency_set_violations(
-                &direct_dependencies,
+            violations.extend(apple_bridge_package_violations(
+                package,
+                metadata
+                    .workspace_root
+                    .join("apple/rust-bridge/src/lib.rs")
+                    .as_str(),
             ));
         }
 
@@ -300,6 +299,38 @@ fn check_architecture() -> TaskResult {
     check_resolved_architecture(&mut violations)?;
 
     finish_architecture_check(&violations)
+}
+
+fn apple_bridge_package_violations(package: &Package, canonical_library: &str) -> Vec<String> {
+    let direct_dependencies = package
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.name.as_str())
+        .collect();
+    let mut violations = apple_bridge_direct_dependency_set_violations(&direct_dependencies);
+    if package
+        .targets
+        .iter()
+        .any(cargo_metadata::Target::is_custom_build)
+    {
+        violations
+            .push("tersa-apple-bridge must not expose a Cargo custom-build target".to_owned());
+    }
+    let mut static_libraries = package
+        .targets
+        .iter()
+        .filter(|target| target.is_staticlib());
+    let has_one_canonical_library = static_libraries
+        .next()
+        .is_some_and(|target| target.src_path.as_str() == canonical_library)
+        && static_libraries.next().is_none();
+    if !has_one_canonical_library {
+        violations.push(
+            "tersa-apple-bridge must expose exactly one static library from the canonical inventoried src/lib.rs"
+                .to_owned(),
+        );
+    }
+    violations
 }
 
 fn finish_architecture_check(violations: &[String]) -> TaskResult {
@@ -395,12 +426,17 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         .collect::<BTreeSet<_>>();
     violations.extend(canonical_cli_source_anchor_violations(&cli_paths));
 
+    let bridge_package_sources = tracked_source_documents(repository_root, "apple/rust-bridge")?;
     let bridge_sources = tracked_source_documents(repository_root, "apple/rust-bridge/src")?;
     let bridge_paths = bridge_sources
         .iter()
         .map(|(path, _document)| path.clone())
         .collect::<BTreeSet<_>>();
     let canonical_bridge = PathBuf::from("apple/rust-bridge/src/lib.rs");
+    violations.extend(bridge_package_source_surface_violations(
+        &bridge_package_sources,
+        &bridge_paths,
+    ));
     if !bridge_paths.contains(&canonical_bridge) {
         violations.push(
             "the Apple bridge canonical source `apple/rust-bridge/src/lib.rs` must be tracked"
@@ -495,20 +531,6 @@ fn tracked_source_documents(
     Ok(documents)
 }
 
-fn referenced_items<'a>(document: &'a str, prefix: &str) -> Vec<&'a str> {
-    document
-        .match_indices(prefix)
-        .map(|(index, _matched)| {
-            let rest = &document[index + prefix.len()..];
-            let length = rest
-                .bytes()
-                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                .count();
-            &rest[..length]
-        })
-        .collect()
-}
-
 fn cli_keychain_source_violations(path: &str, document: &str) -> Vec<String> {
     const ALLOWED: [&str; 2] = ["ReadOnlyMailboxOpenError", "open_default_read_only_mailbox"];
     const FORBIDDEN_BOOTSTRAP: [&str; 4] = [
@@ -518,37 +540,190 @@ fn cli_keychain_source_violations(path: &str, document: &str) -> Vec<String> {
         "bootstrap_default_account_bytes",
     ];
     let mut violations = Vec::new();
-    for item in referenced_items(document, "tersa_keychain_macos::") {
-        if !ALLOWED.contains(&item) {
-            violations.push(format!(
-                "{path} references forbidden Keychain adapter item `{item}`"
-            ));
-        }
-    }
-    for line in document
-        .lines()
-        .filter(|line| line.contains("tersa_keychain_macos"))
-    {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("use ")
-            || trimmed.starts_with("pub use ")
-            || trimmed.starts_with("extern crate ")
-            || line.contains(" as ")
-            || line.contains("::*")
+    let code = strip_rust_non_code(document);
+    let policy_code = strip_rust_test_modules(&code);
+    for reference in rust_qualified_item_uses(&policy_code, "tersa_keychain_macos") {
+        if !ALLOWED.contains(&reference.item)
+            || (reference.item == "open_default_read_only_mailbox" && !reference.is_call)
         {
             violations.push(format!(
-                "{path} must use only fully qualified, non-aliased Keychain retrieval items"
+                "{path} references forbidden Keychain adapter item `{}`",
+                reference.item
             ));
         }
     }
+    if rust_keychain_imported(&policy_code) {
+        violations.push(format!(
+            "{path} must use only fully qualified, non-aliased Keychain retrieval items"
+        ));
+    }
     for symbol in FORBIDDEN_BOOTSTRAP {
-        if document.contains(symbol) {
+        if contains_identifier(&policy_code, symbol) {
             violations.push(format!(
                 "{path} contains forbidden bootstrap symbol `{symbol}`"
             ));
         }
     }
     violations
+}
+
+fn bridge_package_source_surface_violations(
+    package_documents: &[(PathBuf, String)],
+    inventoried_sources: &BTreeSet<PathBuf>,
+) -> Vec<String> {
+    let manifest_path = Path::new("apple/rust-bridge/Cargo.toml");
+    let build_script_path = Path::new("apple/rust-bridge/build.rs");
+    let mut violations = Vec::new();
+    let Some((_path, manifest)) = package_documents
+        .iter()
+        .find(|(path, _document)| path == manifest_path)
+    else {
+        return vec!["the Apple bridge Cargo.toml must be tracked".to_owned()];
+    };
+    if toml_table_has_key(manifest, "package", "build") {
+        violations
+            .push("the Apple bridge package must not declare a Cargo build script".to_owned());
+    }
+    if toml_table_has_key(manifest, "lib", "path") {
+        violations.push(
+            "the Apple bridge library must use the canonical inventoried src/lib.rs entry"
+                .to_owned(),
+        );
+    }
+    if package_documents
+        .iter()
+        .any(|(path, _document)| path == build_script_path)
+    {
+        violations.push("the Apple bridge must not track a conventional build.rs".to_owned());
+    }
+    for (path, document) in package_documents {
+        if !inventoried_sources.contains(path) {
+            continue;
+        }
+        violations.extend(rust_external_source_expansion_violations(path, document));
+    }
+    violations
+}
+
+fn toml_table_has_key(document: &str, expected_table: &str, expected_key: &str) -> bool {
+    let mut table = None;
+    for line in document.lines() {
+        let line = toml_without_comment(line);
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            table = toml_table_name(trimmed);
+            continue;
+        }
+        if table != Some(expected_table) {
+            continue;
+        }
+        let Some((key, _value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if toml_bare_or_quoted_key(key.trim()) == Some(expected_key) {
+            return true;
+        }
+    }
+    false
+}
+
+fn toml_without_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(current) if character == current => quote = None,
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if character == '#' => return &line[..index],
+            Some(_) | None => {}
+        }
+    }
+    line
+}
+
+fn toml_table_name(header: &str) -> Option<&str> {
+    if header.starts_with("[[") || header.ends_with("]]") {
+        return None;
+    }
+    toml_bare_or_quoted_key(header.strip_prefix('[')?.strip_suffix(']')?.trim())
+}
+
+fn toml_bare_or_quoted_key(key: &str) -> Option<&str> {
+    if let Some(key) = key.strip_prefix('"').and_then(|key| key.strip_suffix('"')) {
+        return Some(key);
+    }
+    if let Some(key) = key
+        .strip_prefix('\'')
+        .and_then(|key| key.strip_suffix('\''))
+    {
+        return Some(key);
+    }
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(key)
+}
+
+fn rust_external_source_expansion_violations(path: &Path, document: &str) -> Vec<String> {
+    let code = strip_rust_non_code(document);
+    let policy_code = strip_rust_test_modules(&code);
+    let mut violations = Vec::new();
+    if rust_has_path_attribute(&policy_code) {
+        violations.push(format!(
+            "{} must not expand the production Rust source graph with #[path]",
+            path.display()
+        ));
+    }
+    if rust_has_macro_invocation(&policy_code, "include") {
+        violations.push(format!(
+            "{} must not expand the production Rust source graph with include!",
+            path.display()
+        ));
+    }
+    violations
+}
+
+fn rust_has_path_attribute(document: &str) -> bool {
+    let bytes = document.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'#' {
+            index += 1;
+            continue;
+        }
+        let opening = skip_ascii_whitespace(document, index + 1);
+        if bytes.get(opening) != Some(&b'[') {
+            index += 1;
+            continue;
+        }
+        let Some(attribute) = balanced_delimited_body(document, opening, b'[', b']') else {
+            return true;
+        };
+        let inner = &attribute[1..attribute.len() - 1];
+        let name = inner.trim_start();
+        let name_length = name
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if &name[..name_length] == "path" {
+            return true;
+        }
+        index = opening + attribute.len();
+    }
+    false
+}
+
+fn rust_has_macro_invocation(document: &str, name: &str) -> bool {
+    document.match_indices(name).any(|(index, _)| {
+        is_identifier_at(document, index, name)
+            && document
+                .as_bytes()
+                .get(skip_ascii_whitespace(document, index + name.len()))
+                == Some(&b'!')
+    })
 }
 
 fn bridge_bootstrap_source_violations(document: &str) -> Vec<String> {
@@ -692,16 +867,13 @@ fn strip_rust_test_modules(document: &str) -> String {
             search_from = attribute_end;
             continue;
         }
-        let Some(module_relative) = document[attribute_end..].find("mod ") else {
-            break;
+        let Some(opening) = rust_directly_attributed_module(document, attribute_end) else {
+            search_from = attribute_end;
+            continue;
         };
-        let module_start = attribute_end + module_relative;
-        let Some(opening_relative) = document[module_start..].find('{') else {
-            break;
-        };
-        let opening = module_start + opening_relative;
         let Some(module) = balanced_brace_body(document, opening) else {
-            break;
+            search_from = attribute_end;
+            continue;
         };
         let end = opening + module.len();
         let masked = document[attribute_start..end]
@@ -712,6 +884,41 @@ fn strip_rust_test_modules(document: &str) -> String {
         search_from = end;
     }
     output
+}
+
+fn rust_directly_attributed_module(document: &str, mut index: usize) -> Option<usize> {
+    loop {
+        index = skip_ascii_whitespace(document, index);
+        if document.as_bytes().get(index) != Some(&b'#') {
+            break;
+        }
+        let opening = skip_ascii_whitespace(document, index + 1);
+        if document.as_bytes().get(opening) != Some(&b'[') {
+            return None;
+        }
+        let attribute = balanced_delimited_body(document, opening, b'[', b']')?;
+        index = opening + attribute.len();
+    }
+    if document[index..].starts_with("pub") && is_identifier_at(document, index, "pub") {
+        index = skip_ascii_whitespace(document, index + "pub".len());
+        if document.as_bytes().get(index) == Some(&b'(') {
+            let visibility = balanced_delimited_body(document, index, b'(', b')')?;
+            index = skip_ascii_whitespace(document, index + visibility.len());
+        }
+    }
+    if !document[index..].starts_with("mod") || !is_identifier_at(document, index, "mod") {
+        return None;
+    }
+    index = skip_ascii_whitespace(document, index + "mod".len());
+    let name_length = document[index..]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_length == 0 {
+        return None;
+    }
+    index = skip_ascii_whitespace(document, index + name_length);
+    (document.as_bytes().get(index) == Some(&b'{')).then_some(index)
 }
 
 fn skip_ascii_whitespace(document: &str, mut index: usize) -> usize {
@@ -993,11 +1200,10 @@ fn swift_bootstrap_source_inventory(
 
     for (path, document) in sources {
         let extension = path.extension().and_then(|extension| extension.to_str());
-        if is_unsupported_macos_build_source_extension(extension) {
+        if !is_allowed_macos_target_source(path, extension) {
             violations.push(format!(
-                "{} has unsupported build-eligible macOS source extension .{}",
+                "{} is outside the closed TersaMac source and resource allowlist",
                 path.display(),
-                extension.unwrap_or_default()
             ));
             continue;
         }
@@ -1020,9 +1226,30 @@ fn swift_bootstrap_source_inventory(
                     path.display()
                 ));
             }
+            if contains_identifier(&code, "__asm__") || contains_identifier(&code, "asm") {
+                violations.push(format!(
+                    "{} must not declare source-level C symbol aliases",
+                    path.display()
+                ));
+            }
             0
         } else {
-            swift_call_count(&code, "tersa_macos_bootstrap_default_account")
+            if contains_identifier(&code, "_silgen_name") || contains_identifier(&code, "_cdecl") {
+                violations.push(format!(
+                    "{} must not declare source-level Swift symbol aliases",
+                    path.display()
+                ));
+            }
+            let occurrences =
+                identifier_occurrence_count(&code, "tersa_macos_bootstrap_default_account");
+            let calls = swift_call_count(&code, "tersa_macos_bootstrap_default_account");
+            if occurrences != calls {
+                violations.push(format!(
+                    "{} must not alias or reference the bootstrap C ABI outside its exact call site",
+                    path.display()
+                ));
+            }
+            calls
         };
         bridge_calls += bridge_count;
         if bridge_count > 0 && path != worker_path {
@@ -1048,18 +1275,25 @@ fn swift_bootstrap_source_inventory(
     (violations, bridge_calls, submissions, owner_entries)
 }
 
-fn is_unsupported_macos_build_source_extension(extension: Option<&str>) -> bool {
-    matches!(
-        extension,
-        Some("S" | "asm" | "c" | "cc" | "cpp" | "cxx" | "m" | "metal" | "mm" | "s")
-    )
+fn is_allowed_macos_target_source(path: &Path, extension: Option<&str>) -> bool {
+    matches!(extension, Some("swift" | "h"))
+        || matches!(
+            path.to_str(),
+            Some("apple/macos/Info.plist" | "apple/macos/TersaMac.entitlements")
+        )
+}
+
+fn identifier_occurrence_count(document: &str, identifier: &str) -> usize {
+    document
+        .match_indices(identifier)
+        .filter(|(index, _)| is_identifier_at(document, *index, identifier))
+        .count()
 }
 
 fn swift_bootstrap_launch_entry_violations(
     sources: &[(PathBuf, String)],
     owner_entries: &BTreeSet<String>,
 ) -> Vec<String> {
-    let app_delegate_path = Path::new("apple/macos/AppDelegate.swift");
     let target_code = sources
         .iter()
         .filter(|(path, _document)| {
@@ -1071,7 +1305,7 @@ fn swift_bootstrap_launch_entry_violations(
     let reachable_entries = swift_bootstrap_reachable_entries(&target_code, owner_entries);
     let mut violations = Vec::new();
     for (path, document) in sources {
-        if path != app_delegate_path {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
             continue;
         }
         let code = strip_swift_non_code(document);
@@ -1085,10 +1319,14 @@ fn swift_bootstrap_launch_entry_violations(
                     || reachable_entries.contains(name)
                 {
                     violations.push(format!(
-                        "AppDelegate.swift must not enter bootstrap from {name}"
+                        "{} must not enter bootstrap from {name}",
+                        path.display()
                     ));
                 }
             }
+        }
+        if path != Path::new("apple/macos/AppDelegate.swift") {
+            continue;
         }
         let before_first_function = code
             .find("func ")
@@ -1111,11 +1349,11 @@ fn swift_bootstrap_reachable_entries(
     document: &str,
     owner_entries: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    let functions = swift_named_function_bodies(document);
+    let entries = swift_named_entry_bodies(document);
     let mut reachable = owner_entries.clone();
     loop {
         let mut changed = false;
-        for (name, bodies) in &functions {
+        for (name, bodies) in &entries {
             if reachable.contains(name) {
                 continue;
             }
@@ -1134,35 +1372,88 @@ fn swift_bootstrap_reachable_entries(
     }
 }
 
+fn swift_named_entry_bodies(document: &str) -> BTreeMap<String, Vec<&str>> {
+    let mut entries = swift_named_function_bodies(document);
+    for (name, bodies) in swift_named_property_bodies(document) {
+        entries.entry(name).or_default().extend(bodies);
+    }
+    entries
+}
+
 fn swift_named_function_bodies(document: &str) -> BTreeMap<String, Vec<&str>> {
     let mut functions = BTreeMap::new();
-    for name in swift_function_names(document) {
-        let bodies = swift_function_bodies(document, &name);
-        if !bodies.is_empty() {
-            functions.insert(name, bodies);
-        }
+    for (name, body) in swift_function_declarations(document) {
+        functions.entry(name).or_insert_with(Vec::new).push(body);
     }
     functions
 }
 
-fn swift_function_names(document: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for signature in ["func ", "init("] {
-        for (start, _) in document.match_indices(signature) {
-            let name = if signature == "init(" {
-                "init".to_owned()
-            } else {
-                document[start + signature.len()..]
-                    .chars()
-                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                    .collect()
-            };
-            if !name.is_empty() {
-                names.insert(name);
+fn swift_named_property_bodies(document: &str) -> BTreeMap<String, Vec<&str>> {
+    let mut properties = BTreeMap::<String, Vec<&str>>::new();
+    for declaration in ["let", "var"] {
+        for (start, _) in document.match_indices(declaration) {
+            if !is_identifier_at(document, start, declaration) {
+                continue;
             }
+            let name_start = skip_ascii_whitespace(document, start + declaration.len());
+            let name_length = document[name_start..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            if name_length == 0 {
+                continue;
+            }
+            let name = &document[name_start..name_start + name_length];
+            let Some(body) = swift_property_body(document, name_start + name_length) else {
+                continue;
+            };
+            properties.entry(name.to_owned()).or_default().push(body);
         }
     }
-    names
+    properties
+}
+
+fn swift_property_body(document: &str, mut index: usize) -> Option<&str> {
+    const NEXT_DECLARATIONS: [&str; 8] = [
+        "class",
+        "enum",
+        "extension",
+        "func",
+        "init",
+        "let",
+        "struct",
+        "var",
+    ];
+    let mut parenthesis_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    while index < document.len() {
+        index = skip_ascii_whitespace(document, index);
+        if index >= document.len() {
+            return None;
+        }
+        if parenthesis_depth == 0 && bracket_depth == 0 {
+            if document.as_bytes()[index] == b'{' {
+                return balanced_brace_body(document, index);
+            }
+            if matches!(document.as_bytes()[index], b';' | b'}')
+                || NEXT_DECLARATIONS.iter().any(|keyword| {
+                    document[index..].starts_with(keyword)
+                        && is_identifier_at(document, index, keyword)
+                })
+            {
+                return None;
+            }
+        }
+        match document.as_bytes()[index] {
+            b'(' => parenthesis_depth = parenthesis_depth.saturating_add(1),
+            b')' => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn swift_call_count(document: &str, name: &str) -> usize {
@@ -1346,34 +1637,58 @@ fn strip_swift_non_code(document: &str) -> String {
 }
 
 fn swift_function_names_with(document: &str, needle: &str) -> Vec<String> {
-    document
-        .match_indices("func ")
-        .filter_map(|(start, _matched)| {
-            let rest = &document[start + 5..];
-            let name = rest
-                .chars()
-                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                .collect::<String>();
-            let opening = document[start..].find('{')? + start;
-            let body = balanced_brace_body(document, opening)?;
-            body.contains(needle).then_some(name)
-        })
+    swift_function_declarations(document)
+        .into_iter()
+        .filter_map(|(name, body)| body.contains(needle).then_some(name))
         .collect()
 }
 
 fn swift_function_bodies<'a>(document: &'a str, name: &str) -> Vec<&'a str> {
-    let signature = if name == "init" { "init(" } else { "func " };
-    document
-        .match_indices(signature)
-        .filter_map(|(start, _matched)| {
-            let rest = &document[start..];
-            if name != "init" && !rest.starts_with(&format!("func {name}")) {
-                return None;
-            }
-            let opening = rest.find('{')? + start;
-            balanced_brace_body(document, opening)
-        })
+    swift_function_declarations(document)
+        .into_iter()
+        .filter_map(|(candidate, body)| (candidate == name).then_some(body))
         .collect()
+}
+
+fn swift_function_declarations(document: &str) -> Vec<(String, &str)> {
+    let mut declarations = Vec::new();
+    for keyword in ["func", "init"] {
+        for (start, _) in document.match_indices(keyword) {
+            if !is_identifier_at(document, start, keyword) {
+                continue;
+            }
+            let mut index = skip_ascii_whitespace(document, start + keyword.len());
+            let name = if keyword == "func" {
+                let name_length = document[index..]
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    .count();
+                if name_length == 0 {
+                    continue;
+                }
+                let name = document[index..index + name_length].to_owned();
+                index += name_length;
+                name
+            } else {
+                if matches!(document.as_bytes().get(index), Some(b'?' | b'!')) {
+                    index += 1;
+                    index = skip_ascii_whitespace(document, index);
+                }
+                if document.as_bytes().get(index) != Some(&b'(') {
+                    continue;
+                }
+                "init".to_owned()
+            };
+            let Some(opening_relative) = document[index..].find('{') else {
+                continue;
+            };
+            let opening = index + opening_relative;
+            if let Some(body) = balanced_brace_body(document, opening) {
+                declarations.push((name, body));
+            }
+        }
+    }
+    declarations
 }
 
 fn collect_entitlement_paths(
@@ -4366,22 +4681,22 @@ mod tests {
     use super::{
         ResolvedDependencyIdentity, apple_bridge_direct_dependency_set_violations,
         blob_dependency_graph_violations, blob_manifest_dependency_violations,
-        bridge_bootstrap_source_violations, canonical_cli_source_anchor_violations,
-        check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
-        cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
-        keychain_direct_dependency_set_violations, non_owner_entitlement_violations,
-        parse_identity, parse_plist_string_array, parse_project_targets,
-        project_generation_surface_violations, project_generation_wrapper,
+        bridge_bootstrap_source_violations, bridge_package_source_surface_violations,
+        canonical_cli_source_anchor_violations, check_diagnostic_runtime_reachability,
+        cli_direct_dependency_set_violations, cli_keychain_source_violations,
+        collect_entitlement_paths, dependency_policy, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
         protected_keychain_dependency_rename_violations, reserved_future_policy_violations,
         resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
         rustix_manifest_dependency_violations, signing_configuration_violations,
         sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
-        target_metadata_options, tracked_apple_signing_inventory,
-        tracked_project_generation_violations,
+        strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
+        swift_bootstrap_source_violations, target_metadata_options,
+        tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -4643,10 +4958,21 @@ let reader = tersa_keychain_macos::open_default_read_only_mailbox(account)?;
 let error = tersa_keychain_macos::ReadOnlyMailboxOpenError::KeyAccess;
 ";
         assert!(cli_keychain_source_violations("cli.rs", allowed).is_empty());
+        let whitespace_equivalent = r"
+let reader = tersa_keychain_macos :: open_default_read_only_mailbox(account)?;
+let error = tersa_keychain_macos :: ReadOnlyMailboxOpenError::KeyAccess;
+";
+        assert!(
+            cli_keychain_source_violations("cli.rs", whitespace_equivalent).is_empty(),
+            "token-equivalent qualified retrieval paths must remain accepted"
+        );
 
         for forbidden in [
             "tersa_keychain_macos::bootstrap_default_account_bytes(bytes);",
+            "tersa_keychain_macos :: bootstrap_default_account_bytes(bytes);",
+            "let open = tersa_keychain_macos :: open_default_read_only_mailbox;",
             "use tersa_keychain_macos::*;",
+            "use tersa_keychain_macos :: open_default_read_only_mailbox;",
             "use tersa_keychain_macos::open_default_read_only_mailbox as open;",
             "pub use tersa_keychain_macos::ProductBootstrapStatus;",
             "extern crate tersa_keychain_macos as keychain;",
@@ -4654,6 +4980,113 @@ let error = tersa_keychain_macos::ReadOnlyMailboxOpenError::KeyAccess;
             assert!(
                 !cli_keychain_source_violations("cli.rs", forbidden).is_empty(),
                 "fixture must fail: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_test_module_masking_never_crosses_a_production_item() {
+        let directly_governed = strip_rust_non_code(
+            r#"
+#[cfg(test)]
+#[cfg_attr(target_os = "macos", expect(unsafe_code))]
+mod tests {
+    fn helper() {
+        tersa_keychain_macos::bootstrap_default_account_bytes(&[]);
+    }
+}
+fn production() { safe(); }
+"#,
+        );
+        let masked = strip_rust_test_modules(&directly_governed);
+        assert!(!masked.contains("bootstrap_default_account_bytes"));
+        assert!(masked.contains("fn production"));
+
+        let separated = strip_rust_non_code(
+            r"
+#[cfg(test)]
+const TEST_MARKER: () = ();
+fn production() {
+    tersa_keychain_macos::bootstrap_default_account_bytes(&[]);
+}
+mod later {}
+",
+        );
+        let visible = strip_rust_test_modules(&separated);
+        assert!(
+            visible.contains("bootstrap_default_account_bytes"),
+            "a cfg(test) attribute on a non-module item must not mask later production code"
+        );
+    }
+
+    #[test]
+    fn bridge_source_graph_is_closed_against_build_and_external_sources() {
+        let manifest_path = PathBuf::from("apple/rust-bridge/Cargo.toml");
+        let lib_path = PathBuf::from("apple/rust-bridge/src/lib.rs");
+        let inventory = BTreeSet::from([lib_path.clone()]);
+        let inert_source = r##"
+// include!("outside.rs");
+const EXAMPLE: &str = "#[path = \"outside.rs\"]";
+#[cfg(test)]
+mod tests {
+    include!("fixture.rs");
+    #[path = "helper.rs"] mod helper;
+}
+"##;
+        let clean = vec![
+            (
+                manifest_path.clone(),
+                "[package]\nname = \"tersa-apple-bridge\"\n[lib]\ncrate-type = [\"staticlib\"]\n"
+                    .to_owned(),
+            ),
+            (lib_path.clone(), inert_source.to_owned()),
+        ];
+        assert!(bridge_package_source_surface_violations(&clean, &inventory).is_empty());
+
+        for manifest in [
+            "[package]\nname = \"tersa-apple-bridge\"\nbuild = false\n",
+            "[package]\nname = \"tersa-apple-bridge\"\n\"build\" = \"generate.rs\"\n",
+            "[package]\nname = \"tersa-apple-bridge\"\n[lib]\npath = \"../external.rs\"\n",
+        ] {
+            let documents = vec![
+                (manifest_path.clone(), manifest.to_owned()),
+                (lib_path.clone(), String::new()),
+            ];
+            assert!(
+                !bridge_package_source_surface_violations(&documents, &inventory).is_empty(),
+                "Cargo source indirection must fail closed: {manifest}"
+            );
+        }
+
+        let build_script = vec![
+            (
+                manifest_path.clone(),
+                "[package]\nname = \"tersa-apple-bridge\"\n".to_owned(),
+            ),
+            (lib_path.clone(), String::new()),
+            (
+                PathBuf::from("apple/rust-bridge/build.rs"),
+                "fn main() {}".to_owned(),
+            ),
+        ];
+        assert!(!bridge_package_source_surface_violations(&build_script, &inventory).is_empty());
+
+        for production_source in [
+            "include!(\"../external.rs\");",
+            "include ! (concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+            "#[path = \"../external.rs\"] mod external;",
+            "# [ path = \"../external.rs\" ] mod external;",
+        ] {
+            let documents = vec![
+                (
+                    manifest_path.clone(),
+                    "[package]\nname = \"tersa-apple-bridge\"\n".to_owned(),
+                ),
+                (lib_path.clone(), production_source.to_owned()),
+            ];
+            assert!(
+                !bridge_package_source_surface_violations(&documents, &inventory).is_empty(),
+                "production source expansion must fail closed: {production_source}"
             );
         }
     }
@@ -4737,6 +5170,13 @@ match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
         assert!(
             !bridge_bootstrap_source_violations(&hidden_second_call).is_empty(),
             "a whitespace-separated second bridge call must fail closed"
+        );
+        let cfg_test_on_non_module = format!(
+            "{valid}\n#[cfg(test)]\nconst TEST_MARKER: () = ();\nfn production(bytes: &[u8]) {{ let _ = tersa_keychain_macos::bootstrap_default_account_bytes(bytes); }}\nmod later {{}}"
+        );
+        assert!(
+            !bridge_bootstrap_source_violations(&cfg_test_on_non_module).is_empty(),
+            "cfg(test) on a non-module item must not hide later production Keychain access"
         );
     }
 
@@ -4922,7 +5362,9 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             !swift_bootstrap_inventory_violations(&cross_file_chain).is_empty(),
             "launch reachability must cross inventoried Swift source files"
         );
-        for extension in ["m", "mm", "c", "cpp", "s", "S", "asm", "metal"] {
+        for extension in [
+            "m", "mm", "c", "cpp", "s", "S", "asm", "metal", "y", "l", "mig", "rs",
+        ] {
             let sources = vec![
                 (
                     PathBuf::from("apple/macos/BootstrapWorker.swift"),
@@ -4961,6 +5403,104 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
                 "Swift string bypass must fail closed: {bypass}"
             );
         }
+    }
+
+    #[test]
+    fn swift_inventory_closes_launch_properties_extensions_and_symbol_aliases() {
+        let worker = r"tersa_macos_bootstrap_default_account(pointer, count)";
+        let delegate = r"
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        let cross_file_launch_extension = vec![
+            (
+                PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                worker.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegateLaunch.swift"),
+                "extension AppDelegate { func applicationWillFinishLaunching(_ notification: Notification) { establishOwnedAccountProfile(Data(), completion: receive) } }"
+                    .to_owned(),
+            ),
+        ];
+        assert!(
+            !swift_bootstrap_inventory_violations(&cross_file_launch_extension).is_empty(),
+            "launch hooks in an inventoried Swift extension must be enforced"
+        );
+
+        for property_bridge in [
+            "var ownedRoute: (() -> Void) { { establishOwnedAccountProfile(Data(), completion: receive) } }\nfunc applicationDidFinishLaunching(_ notification: Notification) { ownedRoute() }",
+            "let ownedRoute: () -> Void = { establishOwnedAccountProfile(Data(), completion: receive) }\nfunc applicationDidFinishLaunching(_ notification: Notification) { ownedRoute() }",
+            "var ownedRoute: (() -> Void)\n{ { establishOwnedAccountProfile(Data(), completion: receive) } }\nfunc applicationDidFinishLaunching(_ notification: Notification) { ownedRoute() }",
+            "var ownedRoute:\n    (() -> Void)\n{ { establishOwnedAccountProfile(Data(), completion: receive) } }\nfunc applicationDidFinishLaunching(_ notification: Notification) { ownedRoute() }",
+        ] {
+            let sources = vec![
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/LaunchRoute.swift"),
+                    property_bridge.to_owned(),
+                ),
+            ];
+            assert!(
+                !swift_bootstrap_inventory_violations(&sources).is_empty(),
+                "computed and closure-valued launch routes must fail closed: {property_bridge}"
+            );
+        }
+
+        for alias_source in [
+            "let bootstrapAlias = tersa_macos_bootstrap_default_account",
+            "@_silgen_name(\"tersa_macos_bootstrap_default_account\") func bootstrapAlias(_ pointer: UnsafePointer<UInt8>?, _ count: Int) -> Int32",
+            "@_cdecl(\"tersa_macos_bootstrap_default_account\") func bootstrapAlias(_ pointer: UnsafePointer<UInt8>?, _ count: Int) -> Int32 { 0 }",
+        ] {
+            let sources = vec![
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/Alias.swift"),
+                    alias_source.to_owned(),
+                ),
+            ];
+            assert!(
+                !swift_bootstrap_inventory_violations(&sources).is_empty(),
+                "source-level bootstrap ABI aliases must fail closed: {alias_source}"
+            );
+        }
+
+        let header_symbol_alias = vec![
+            (
+                PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                worker.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/TersaRustBridge.h"),
+                "int32_t tersa_macos_bootstrap_default_account(const uint8_t *account_id, size_t account_id_len);\nextern int32_t alias(const uint8_t *, size_t) __asm__(\"tersa_macos_bootstrap_default_account\");"
+                    .to_owned(),
+            ),
+        ];
+        assert!(
+            !swift_bootstrap_inventory_violations(&header_symbol_alias).is_empty(),
+            "C header symbol aliases must fail closed"
+        );
     }
 
     #[test]
