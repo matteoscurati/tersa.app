@@ -156,12 +156,26 @@ The trusted `tersa-keychain-macos` composition is the sole filesystem-directory
 establisher on behalf of the product application. It may create only the fixed
 owner-only profile components through descriptor-relative no-follow operations,
 with fail-closed validation, concurrent convergence, and deterministic safe
-cleanup defined by ADR 0019. The existing validated SQLCipher write opener
-remains the sole owner and migrator of the database leaf. Activating the future
-bridge edge or its policy before the implementation pull request is forbidden.
-PR 33b owns the same-team signed runtime evidence; PR 32 fake concurrency tests,
-PR 33a deterministic tests, and PR 33a.5 credentialless tests are not that
-evidence.
+cleanup before database opening as defined by ADR 0019. It snapshots and
+descriptor-relatively revalidates every fixed component immediately before and
+after calling the existing pathname-based SQLCipher write opener. The opener
+retains its existing parent canonicalization; no directory descriptor enters
+SQLite. Observable parent changes fail closed, while same-user
+swap-in/open/swap-back between checks remains an explicit unlocked-device
+residual.
+
+The existing validated SQLCipher write opener remains the sole owner and
+migrator of the database leaf. PR 33a.5 must harden that same API's fresh-leaf
+failure cleanup, but creates no descriptor-bound opener or new dependency edge.
+After closing handles, cleanup may remove only main/WAL/shared-memory entries
+created by that invocation whose identities and restrictive file properties
+still match. It never removes pre-existing or mismatched entries, and profile
+directory cleanup stops before the store is invoked. Residual cleanup failures
+remain fail-closed owning-application recovery work and grant no CLI repair
+authority. Activating the future bridge edge or its policy before the
+implementation pull request is forbidden. PR 33b owns the same-team signed
+runtime evidence; PR 32 fake concurrency tests, PR 33a deterministic tests, and
+PR 33a.5 credentialless tests are not that evidence.
 
 The active adapter opts every macOS Keychain operation into the Data
 Protection Keychain, omits `kSecAttrSynchronizable` from add and copy queries,

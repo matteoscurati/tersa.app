@@ -134,8 +134,13 @@ production invoker. The bridge receives only narrow one-shot authority to
 request fixed-profile bootstrap for a validated `AccountId` and receive a
 closed status. It receives no raw key, caller-selected path, profile or
 configuration override, database handle, store object, or returned storage
-capability. Each slice requires independent review with zero unresolved
-actionable findings on its exact head.
+capability. Fixed-directory descriptor checks bracket the existing
+pathname-based SQLCipher opener; no directory descriptor is transferred into
+SQLite and no end-to-end descriptor-bound opener is claimed. Directory cleanup
+stops before the store is invoked; PR 33a.5 must harden the existing store,
+which alone owns identity-checked cleanup of fresh leaf files. Each slice
+requires independent review with zero unresolved actionable findings on its
+exact head.
 
 ## Phase 2 — iPhone and iPad implementation
 

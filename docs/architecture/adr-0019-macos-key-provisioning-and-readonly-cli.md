@@ -206,8 +206,10 @@ no-follow. A newly created directory must have verified owner-only `0700`
 permissions. An existing component is accepted only when it is the expected
 same-user directory with no group or other permission bits. A symlink,
 non-directory, wrong owner, permissive mode, changed identity, or any other
-unexpected existing object fails closed; path canonicalization, replacement,
-and fallback are forbidden.
+unexpected existing object fails closed; replacement and fallback are
+forbidden. These descriptor-relative guarantees apply to fixed-directory
+establishment and validation only. They do not replace the existing store
+opener's pathname and parent-canonicalization behavior.
 
 Concurrent creators converge without replacement: an already-existing result
 from a create attempt is accepted only after the same no-follow identity,
@@ -217,18 +219,51 @@ cleanup in reverse order, removing only an empty directory whose identity still
 matches beneath the validated parent. It never recursively removes content or
 removes a pre-existing directory. Cleanup failure preserves the original
 redacted failure and may leave only validated owner-only directories; it cannot
-continue into database opening. Deterministic tests must inject failure after
-each creation boundary, verify reverse cleanup and safe residuals, cover
-symlink/non-directory/permission/identity rejection, and prove concurrent
-convergence.
+continue into database opening. This reverse directory cleanup is authorized
+only for a failure before `SqlCipherMailboxStore::open` is invoked. Once that
+call begins, the composition must not remove any profile directory. Deterministic
+tests must inject failure after each directory-creation boundary, verify reverse
+cleanup and safe residuals, cover symlink/non-directory/permission/identity
+rejection, and prove concurrent convergence.
 
 After the fixed account directory is validated, the trusted composition passes
 only the fixed `mail.sqlite3` leaf path and private derived key into the existing
-validated `SqlCipherMailboxStore::open` path. That store remains the sole owner
-of database-leaf creation, claiming, schema migration, validation, and its own
-failure cleanup. The directory composition must not create, delete, replace, or
-repair `mail.sqlite3`, its WAL, or its shared-memory sidecar and must not return
-the opened store or another storage capability across the bridge boundary.
+validated, pathname-based `SqlCipherMailboxStore::open` path. The composition
+snapshots the identity, ownership, type, and permissions of every fixed
+directory component. Immediately before invoking the store, and immediately
+after it returns on either success or failure, it reopens every component
+descriptor-relatively with no-follow semantics and requires it to match the
+snapshot. An ordinary observable parent replacement or mutation fails closed.
+On a nominal store success, the composition performs this post-check before it
+returns the closed bootstrap status; a failed post-check closes the store and
+returns a redacted failure without directory cleanup.
+The store retains its existing parent canonicalization; no validated directory
+descriptor is transferred into SQLite, and this amendment does not claim an
+end-to-end descriptor-bound opener. A same-user swap-in/open/swap-back between
+the immediate checks remains an explicit unlocked-device/local-malware residual.
+
+The store remains the sole owner of database-leaf creation, claiming, schema
+migration, validation, and leaf cleanup. PR 33a.5 must harden the same existing
+`SqlCipherMailboxStore::open` API and path for a freshly created leaf. On any
+failure before successful claim and migration, the store first closes its
+handles, then may remove only the main, WAL, or shared-memory entry created by
+that invocation whose recorded identity still matches and whose regular-file
+type, owner, and restrictive permissions revalidate. It must never remove a
+pre-existing entry or an entry with a changed identity, and it must not remove
+profile directories. Cleanup failure preserves the original redacted failure
+and may leave restrictive residual store files. Those residuals block or fail
+closed on retry and require recovery by the owning product application through
+a later reviewed path; the CLI gains no repair authority.
+
+Deterministic tests must inject failures before and after each fresh-leaf claim
+or migration boundary, cover main/WAL/shared-memory creation, and replace each
+recorded entry before cleanup to prove an identity mismatch is preserved rather
+than removed. Tests must also prove that pre-existing entries and profile
+directories survive every failure. This is a hardening of the existing store
+opener, not a new descriptor-bound API, opener, composition crate, or dependency
+edge. The directory composition must not itself create, delete, replace, or
+repair `mail.sqlite3` or either sidecar and must not return the opened store or
+another storage capability across the bridge boundary.
 
 The architecture check accepts the PR 32 signing configuration only at the
 exact `TersaMac` target paths. It rejects project or per-configuration
