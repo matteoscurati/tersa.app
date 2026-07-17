@@ -71,12 +71,17 @@ sh apple/scripts/verify-oauth-feasibility.sh
 ```
 
 The verifier checks archived symbols and injected Info.plist values, ad-hoc
-signs the macOS archive with its production sandbox entitlements, then runs a
-fixed in-process loopback client/server probe. Rust tests exercise the
-deterministic callback, negative state machine, bounded HTTP parser, static
-responses, speculative-connection recovery, absolute read deadline, and
-one-shot valid callback. No evidence file contains state, verifier,
-authorization code, token, or authorization URL.
+signs a copy of the macOS archive with the exact five-key production
+entitlement shape, and captures that static signing evidence. It separately
+signs the runnable loopback probe with only App Sandbox plus network client and
+server entitlements: an ad-hoc identity cannot authorize the production
+team-bound Keychain access group. The runnable probe therefore proves only the
+OAuth sandbox networking subset; signed same-team Keychain interoperability is
+a later distribution gate. Rust tests exercise the deterministic callback,
+negative state machine, bounded HTTP parser, static responses,
+speculative-connection recovery, absolute read deadline, and one-shot valid
+callback. No evidence file contains state, verifier, authorization code, token,
+or authorization URL.
 
 The loopback peer check is not browser authentication. Any local process can
 connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
@@ -234,9 +239,15 @@ None of the six diagnostic schemes is a production target.
 Install the Rust targets once, generate the Xcode project, and build unsigned
 diagnostic artifacts:
 
+The checked wrapper is the only supported XcodeGen entry point. It passes
+`--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
+literal until Xcode resolves them; CI and evidence scripts use the same path.
+The architecture gate inventories every tracked file and rejects a direct
+XcodeGen generation command anywhere outside the byte-exact wrapper.
+
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-xcodegen generate --spec apple/project.yml --project apple
+sh apple/scripts/generate-project.sh
 
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
   -configuration Debug -destination 'platform=macOS,arch=arm64' \

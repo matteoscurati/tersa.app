@@ -48,7 +48,7 @@ jobs:
           echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
       - name: Generate Apple project
-        run: xcodegen generate --spec apple/project.yml --project apple
+        run: sh apple/scripts/generate-project.sh
       - name: Build unsigned macOS debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
@@ -179,6 +179,7 @@ jobs:
       - name: Verify device evidence schema and redaction rejection
         run: |
           python3 apple/scripts/verify-dioxus-device-evidence.py --self-test
+          sh -n apple/scripts/generate-project.sh
           sh -n apple/scripts/capture-dioxus-device-evidence.sh
           sh apple/scripts/capture-dioxus-device-evidence.sh --self-test-contract
           output=$(sh apple/scripts/capture-dioxus-device-evidence.sh)
@@ -204,7 +205,7 @@ jobs:
       - name: Test patched Dioxus behavior
         run: cargo test --locked --offline --package dioxus-desktop --lib
       - name: Generate Apple project
-        run: xcodegen generate --spec apple/project.yml --project apple
+        run: sh apple/scripts/generate-project.sh
       - name: Archive unsigned macOS Dioxus spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusMac
@@ -366,7 +367,7 @@ jobs:
           cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-ios
           cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-ios-sim
       - name: Generate Apple project
-        run: xcodegen generate --spec apple/project.yml --project apple
+        run: sh apple/scripts/generate-project.sh
       - name: Archive unsigned macOS MIME diagnostic
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeMac

@@ -21,6 +21,7 @@ and feasibility adapters:
 | `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
+| `tersa-keychain-macos` | macOS Data Protection Keychain root-key and fixed App Group profile adapter | `tersa-platform` |
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -33,9 +34,10 @@ exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 `mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
 `tersa-mime-spike`. The portable MIME and blob M0 spikes are exceptions to the
 Apple target gate: Linux CI exercises their deterministic tests, while Apple CI
-cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 and `hmac`
-0.12.1 are pinned exactly and exclusive to `tersa-blob-spike` in every resolved
-Apple target graph. New workspace crates must be added explicitly to the policy
+cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 is pinned exactly
+and exclusive to `tersa-blob-spike`; `hmac` 0.12.1 is pinned exactly and may be
+reached only by `tersa-blob-spike` and `tersa-keychain-macos` through HKDF in
+every resolved Apple target graph. New workspace crates must be added explicitly to the policy
 in `xtask`; an unknown crate fails CI.
 
 ## macOS production account store
@@ -83,60 +85,92 @@ reconciliation, retry, background work, mutations, outbox, labels, blobs,
 search, CLI/UI, real network or credentials tests, mobile code, or gate-status
 changes. Cache budgets remain constraints rather than evidence.
 
-## Reserved macOS key and CLI boundaries
+## Active macOS key boundary and reserved CLI boundary
 
-ADR 0019 reserves two future workspace crate names without activating them:
+ADR 0019 defines one active adapter and one reserved future crate:
 
-| Reserved crate | Planned responsibility | Maximum reserved inward dependencies |
+| Crate | Responsibility | Maximum inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | Retrieval/provisioning-separated macOS Keychain root provider, versioned HKDF derivation, and signed App Group container locator | `tersa-platform` |
+| `tersa-keychain-macos` | Active macOS Keychain root provisioning, private versioned HKDF derivation, and App Group container locator | `tersa-platform` |
 | `tersa-cli-macos` | Fixed-profile composition and metadata-only JSON rendering | `tersa-application`, `tersa-domain`, `tersa-keychain-macos`, `tersa-platform`, `tersa-store-sqlcipher-macos` |
 
-The `RESERVED_FUTURE_POLICY` tripwire fails if either crate appears, even when
-its dependency edges fit this table. The pull request that adds a crate must
-replace its reservation with an explicitly reviewed active policy; it may not
-silently promote a reservation. PR 30 is policy text and a tripwire only. It
-adds no crate or dependency and must leave `Cargo.lock` and the resolved graph
-byte-identical.
+`tersa-keychain-macos` is active and has an explicit `xtask` policy entry. The
+`RESERVED_FUTURE_POLICY` tripwire now reserves only the CLI crate.
 
-When `tersa-keychain-macos` is activated, its external dependencies are planned
-as exact macOS-only pins: `security-framework =3.7.0` with default features
-disabled and only `OSX_10_15` enabled, `security-framework-sys =2.17.0`,
+The active Keychain adapter uses direct exact pins: `security-framework-sys =2.17.0`
+with default features disabled and only `OSX_10_15`,
 `core-foundation =0.10.1`, `objc2-foundation =0.3.2` with default features
 disabled and only `std`, `NSFileManager`, `NSString`, and `NSURL` enabled,
-`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. crates.io metadata lists
-`security-framework` 3.7.0 as the current release. HKDF 0.12.4 is deliberately
+`hkdf =0.12.4`, `sha2 =0.10.9`, and `zeroize =1.9.0`. HKDF 0.12.4 is deliberately
 selected instead of current 0.13.0 because 0.12.4 uses the already pinned
 `hmac =0.12.1`, while 0.13.0 moves to HMAC 0.13. The activation pull request
-must verify these facts again, pin every direct dependency exactly, restrict
-Apple dependencies to exact `cfg(target_os = "macos")`, and add resolved-graph
-feature/ownership checks before changing a manifest.
+direct declarations and resolved per-target reachability are enforced by xtask.
+The high-level `security-framework` crate is deliberately not used: raw
+`SecItemAdd` and `SecItemCopyMatching` preserve the add-only contract.
+The direct dependency set is closed and exact: an unknown dependency, a
+missing required dependency, or direct `hmac` is rejected. Resolved
+HKDF-to-HMAC reachability remains allowed and separately checked.
 
-The current `hmac =0.12.1` exclusivity to `tersa-blob-spike` remains unchanged
-in PR 30. The Keychain/HKDF activation must deliberately expand the owner set
-to exactly `tersa-blob-spike` and `tersa-keychain-macos`; no other crate may
-reach HMAC. `tersa-keychain-macos` may not add direct application or domain
-edges without separately accepted ADR reasoning. `tersa-cli-macos` receives no
-general Apple-framework, SQLCipher, key export, database-path override, or
-transport capability from its reservation.
+The active `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
+`tersa-keychain-macos`; no other crate may reach HMAC. ChaCha20-Poly1305 remains
+exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
+`tersa-keychain-macos` may not add direct application or domain edges without
+separately accepted ADR reasoning. Its platform port accepts only the canonical
+domain `AccountId`; raw strings cannot enter account hashing or derivation.
+`tersa-cli-macos` receives no general Apple-framework, SQLCipher, key export,
+database-path override, or transport capability from its reservation.
 
-The future adapter must opt every macOS Keychain operation into the Data
-Protection Keychain, disable synchronization, and name the registered
-application group shared by the same-team signed app and bundled `mailctl`
-target. The same group owns their shared filesystem container. Neither target
-may fall back to the legacy Keychain, a private sandbox container, or ordinary
-Application Support when the entitlement, group, or container is unavailable.
-The official CLI is the signed executable from the notarized app distribution;
-a package-manager entry may point to it but may not substitute a separately
-rebuilt binary.
+PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
+It exposes neither raw root/derived bytes nor a database opener. PR 33 owns the
+trusted database-opening composition and must feed the privately derived key
+directly into the strict SQLCipher reader without creating a callback or key
+export API. PR 33 also owns the same-team signed runtime evidence; PR 32 fake
+concurrency tests are not that evidence.
+
+The active adapter opts every macOS Keychain operation into the Data
+Protection Keychain, omits `kSecAttrSynchronizable` from add and copy queries,
+and names the registered application group currently carried by the macOS app
+target. That group also identifies the app's filesystem container. The active
+adapter does not fall back to the legacy Keychain, the app's private sandbox
+container, or ordinary Application Support when the entitlement, group, or
+container is unavailable. PR 33 will add the separately signed bundled
+`mailctl` target, give both targets the same registered group, and supply the
+cross-target runtime evidence. Only then may the official CLI be described as
+the signed executable from the notarized app distribution; a package-manager
+entry may point to that executable but may not substitute a separately rebuilt
+binary.
+
+The signing guard treats the current direct XcodeGen declarations as an exact
+allowlist. Project-wide or per-configuration sensitive overrides, includes,
+target templates, setting groups, config files, conditional sensitive keys,
+and reuse of the protected entitlement path fail closed. The current `options`
+mapping is closed, including rejection of nested pre- and post-generation
+hooks. The `TersaMac` target type, bundle identifier, sole Rust pre-build phase,
+scheme, build rules, build-tool plugins, and additional signing controls are
+also closed exact surfaces. Exact project-root and target top-level key sets
+reject project/target attributes, dependencies, and legacy forms. The source
+and XcodeGen entitlement dictionaries each contain exactly the five reviewed
+keys with exact boolean capability values. The checked project-generation
+wrapper always uses XcodeGen `--no-env`, preserving `${TeamIdentifierPrefix}`
+for Xcode rather than environment expansion. A repository-wide tracked-file
+inventory allows the generation command only in that byte-exact wrapper. Every
+other source entitlement under `apple/` is parsed and rejected if it claims
+either protected group entitlement. The ignored generated `apple/build/` tree
+is excluded from filesystem inventory only when its root is a real directory;
+Git-index checks reject any tracked entry below it and independently enumerate
+tracked entitlement files and symlinks. Other source symlinks remain forbidden.
 
 Provisioning must use a raw add-only operation. A duplicate discards and
 zeroizes the losing candidate, then retrieves and validates the winner; it
-never calls an add-or-update generic-password helper. The shell-launched CLI
-has its own stable bundle identifier, embedded Info.plist, Hardened Runtime,
-non-inherited App Sandbox entitlement, and the same application group. PR 33
-must satisfy its dedicated signed-package and direct-shell-launch evidence
-condition without depending on or passing the later UI acceptance gate.
+never calls an add-or-update generic-password helper. All key states use a
+private redacted `SecretKey` that zeroizes on drop. The no-copy Keychain add
+constructs and consumes its Core Foundation objects inside one synchronous
+scope so the candidate pointer cannot escape. The future shell-launched
+CLI must have its own stable bundle identifier, embedded Info.plist, Hardened
+Runtime, non-inherited App Sandbox entitlement, and the same application group.
+PR 33 must satisfy its dedicated signed-package and direct-shell-launch
+evidence condition without depending on or passing the later UI acceptance
+gate.
 
 The active PR 31 store boundary keeps WAL and shared-memory sidecars persistent
 from the validated writer before authorizing a standalone read-only open. The
@@ -160,7 +194,7 @@ SQLite; deletion after preflight can be recreated internally before the reader
 fails its post-read identity check.
 
 The four reviewed changes are policy, strict read-only SQLCipher open, macOS
-Keychain/HKDF provider, then the metadata-only JSON CLI. Until all four land,
+Keychain/private-HKDF boundary, then the metadata-only JSON CLI. Until all four land,
 Phase 1 roadmap item 7 remains open. The CLI's direct store reader is an interim
 adapter composition replaceable by future `maild` IPC; it does not authorize
 `maild` in the MVP. iPhone and iPad implementation remains in Phase 2, and no

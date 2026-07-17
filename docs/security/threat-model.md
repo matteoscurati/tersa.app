@@ -14,7 +14,7 @@ production-security claim.
 |---|---|
 | OAuth authorization codes, refresh tokens, and AI provider keys | Short lifetime where applicable; device-only Keychain storage; never logs, process arguments, or repository files |
 | Gmail messages, headers, addresses, labels, drafts, and local intent | Authenticated transport; encrypted local persistence; account isolation; bounded retention |
-| Root and derived encryption keys | CSPRNG generation; Keychain wrapping; domain-separated derivation; no export or diagnostics |
+| Root and derived encryption keys | CSPRNG generation; device-only Data Protection Keychain storage; domain-separated derivation; no export or diagnostics |
 | SQLCipher databases, WAL/journals, blobs, thumbnails, and search indexes | Application encryption at rest; controlled temporary storage; integrity checks; crypto-erasure |
 | MIME, HTML, inline resources, and attachments | Bounded parsing; typed sanitized output; deny-by-default rendering; no automatic remote fetch |
 | Exports, clipboard data, and notifications | Explicit user declassification; minimum disclosure; no claim of encryption after export |
@@ -58,7 +58,7 @@ passcode, Google credentials, signing identity, or an authorized local process.
 | Threat | Required controls | Residual risk or open gate |
 |---|---|---|
 | OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, system authentication session on iOS, refresh token in device-only Keychain | Real Google exchange, Keychain persistence, revocation, and physical-device flow remain open |
-| Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, Keychain root key, Apple File Protection, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; the bundled VFS cannot prevent same-user sidecar swap-in/open/swap-back or deletion/recreation races |
+| Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, macOS Data Protection Keychain root key with device-only accessibility, fixed App Group profile layout, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; signed cross-target Keychain interoperability remains PR 33 evidence, and the bundled VFS cannot prevent same-user sidecar swap-in/open/swap-back or deletion/recreation races |
 | Malicious MIME/HTML and tracking pixels | Size/depth/part limits, attachment exclusion, typed `SafeHtml`, nonpersistent WKWebView, JavaScript/network/navigation denial, remote images blocked | Parser/WebKit zero-days and physical-device containment remain open |
 | Malicious attachment or decompression bomb | On-demand fetch, byte/ratio/time/memory limits, no macro execution, sandboxed short-lived worker when needed | Complex production parsers and sandbox evidence are not implemented |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, stable RFC Message-ID, server reconciliation after ambiguous timeout | Production sync/outbox is not implemented |

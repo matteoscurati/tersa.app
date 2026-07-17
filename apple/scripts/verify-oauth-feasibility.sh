@@ -37,13 +37,17 @@ ios_app = Path(sys.argv[3])
 
 with (apple_dir / "macos/TersaMac.entitlements").open("rb") as stream:
     entitlements = plistlib.load(stream)
-for key in (
-    "com.apple.security.app-sandbox",
-    "com.apple.security.network.client",
-    "com.apple.security.network.server",
-):
-    if entitlements.get(key) is not True:
-        raise SystemExit(f"missing required macOS entitlement: {key}")
+expected_entitlements = {
+    "com.apple.security.app-sandbox": True,
+    "com.apple.security.application-groups": [
+        "${TeamIdentifierPrefix}app.tersa.shared"
+    ],
+    "com.apple.security.network.client": True,
+    "com.apple.security.network.server": True,
+    "keychain-access-groups": ["${TeamIdentifierPrefix}app.tersa.shared"],
+}
+if entitlements != expected_entitlements:
+    raise SystemExit("the production macOS entitlements are not exact")
 
 with (mac_app / "Contents/Info.plist").open("rb") as stream:
     mac_info = plistlib.load(stream)
@@ -78,19 +82,17 @@ codesign --force --deep --sign - \
   "${evidence_dir}/Tersa.app"
 codesign --display --entitlements :- "${evidence_dir}/Tersa.app" \
   >"${evidence_dir}/signed-entitlements.plist" 2>/dev/null
-python3 - "${evidence_dir}/signed-entitlements.plist" <<'PY'
+python3 - "${apple_dir}/macos/TersaMac.entitlements" \
+  "${evidence_dir}/signed-entitlements.plist" <<'PY'
 import plistlib
 import sys
 
 with open(sys.argv[1], "rb") as stream:
-    entitlements = plistlib.load(stream)
-for key in (
-    "com.apple.security.app-sandbox",
-    "com.apple.security.network.client",
-    "com.apple.security.network.server",
-):
-    if entitlements.get(key) is not True:
-        raise SystemExit(f"signed app is missing entitlement: {key}")
+    expected = plistlib.load(stream)
+with open(sys.argv[2], "rb") as stream:
+    actual = plistlib.load(stream)
+if actual != expected:
+    raise SystemExit("the signed production app entitlements are not exact")
 PY
 
 CARGO_TARGET_DIR="${apple_dir}/build/oauth-probe-target" cargo build --locked \
@@ -116,13 +118,38 @@ info = {
 with open(sys.argv[1], "wb") as stream:
     plistlib.dump(info, stream)
 PY
+probe_signing_entitlements="${evidence_dir}/probe-signing-entitlements.plist"
+python3 - "$probe_signing_entitlements" <<'PY'
+import plistlib
+import sys
+
+entitlements = {
+    "com.apple.security.app-sandbox": True,
+    "com.apple.security.network.client": True,
+    "com.apple.security.network.server": True,
+}
+with open(sys.argv[1], "wb") as stream:
+    plistlib.dump(entitlements, stream)
+PY
 codesign --force --deep --sign - \
-  --entitlements "${apple_dir}/macos/TersaMac.entitlements" \
+  --entitlements "$probe_signing_entitlements" \
   "$probe_app"
 codesign --display --entitlements :- "$probe_app" \
   >"${evidence_dir}/probe-entitlements.plist" 2>/dev/null
-cmp "${evidence_dir}/signed-entitlements.plist" \
-  "${evidence_dir}/probe-entitlements.plist"
+python3 - "${evidence_dir}/probe-entitlements.plist" <<'PY'
+import plistlib
+import sys
+
+expected = {
+    "com.apple.security.app-sandbox": True,
+    "com.apple.security.network.client": True,
+    "com.apple.security.network.server": True,
+}
+with open(sys.argv[1], "rb") as stream:
+    actual = plistlib.load(stream)
+if actual != expected:
+    raise SystemExit("the signed OAuth probe entitlements are not exact")
+PY
 
 "${probe_app}/Contents/MacOS/oauth-entitlement-probe" \
   >"${evidence_dir}/sandbox-network-probe.txt" \

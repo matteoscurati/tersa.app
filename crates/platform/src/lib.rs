@@ -6,4 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+/// Secure local-storage capability ports.
+pub mod secure_storage;
+
 // Rust guideline compliant 1.0.
