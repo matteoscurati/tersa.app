@@ -435,9 +435,14 @@ post-close identity still matches. It must never call `std::fs::remove_file`,
 re-resolve the account path, remove an entry present in the pre-open snapshot,
 remove an entry with changed identity, or remove a profile directory. Cleanup
 failure preserves the original redacted failure and may leave restrictive
-residual store files. Those residuals block or fail closed on retry and require
-recovery by the owning product application through a later reviewed path; the
-CLI gains no repair authority.
+residual store files. A retry never reclassifies a nonempty residual as fresh:
+it re-enters the same state matrix. A main-present residual is handled only by
+the existing opener and migration path and may converge only if every existing
+key, identity, sidecar, schema, and integrity invariant passes; otherwise it
+fails closed. Any journal/WAL/shared-memory residual without the main file fails
+closed before open. No retry gains repair or fresh-cleanup authority; unresolved
+states require a later reviewed owning-product recovery path, and the CLI gains
+no repair authority.
 
 The retained parent descriptor removes parent-path re-resolution from this leaf
 cleanup. The global lock serializes cooperative bootstraps only. A same-user
@@ -463,8 +468,11 @@ combination of the three sidecars, and every main-absent orphan-sidecar
 combination; preserve the existing `absent_with_sidecar` and
 `empty_with_sidecar` journal behavior; and replace each recorded entry before
 cleanup to prove an identity mismatch is preserved rather than removed. Tests
-must also prove that pre-existing entries and profile directories survive every
-failure and that cleanup uses only the retained descriptor plus fixed names.
+must also retry every nonempty cleanup-residual subset and prove the matrix above:
+main-present subsets may converge only through all existing-opener invariants,
+while sidecar-only subsets fail before open. Pre-existing entries and profile
+directories survive every failure, and cleanup uses only the retained
+descriptor plus fixed names.
 This is a hardening of the existing pathname-based SQLite opener, not a new
 descriptor-bound SQLite API, opener, composition crate, or
 workspace-to-workspace dependency edge. The only new external-package edges are

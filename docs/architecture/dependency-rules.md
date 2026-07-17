@@ -340,9 +340,11 @@ insertion, record-to-revalidation replacement, and revalidation-to-`unlinkat`
 replacement for all four fixed entries; the first and last record
 non-prevention, while the middle proves mismatch preservation. The retained
 descriptor is released on every return after the snapshot/open/cleanup sequence.
-Residual cleanup failures
-remain fail-closed owning-application recovery work and grant no CLI repair
-authority.
+On retry, a nonempty residual re-enters the same matrix and is never
+fresh-cleanup eligible. A main-present subset may converge only through every
+existing-opener invariant; any sidecar-only subset fails before open. Tests
+retry every nonempty subset. Unresolved cleanup failures remain
+owning-application recovery work and grant no CLI repair authority.
 Activating the future bridge edge or its policy before the
 implementation pull request is forbidden. PR 33b owns the same-team signed
 runtime evidence; PR 32 fake concurrency tests, PR 33a deterministic tests, and

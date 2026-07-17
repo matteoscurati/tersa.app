@@ -213,8 +213,11 @@ SQLite opener is claimed. The stated cleanup residuals are same-user insertion
 between snapshot and recording, which can be misattributed to SQLite, and
 same-user replacement between revalidation and `unlinkat`; deterministic hooks
 cover both non-prevention gaps and intermediate mismatch preservation for all
-four entries. The descriptor is released on every return. The CLI remains
-behaviorally retrieval-only, but its
+four entries. A retry re-enters the same matrix: a main-present residual may
+converge only through all existing-opener invariants, while any sidecar-only
+residual fails before open; tests cover every nonempty subset. No retry receives
+fresh-cleanup or repair authority. The descriptor is released on every return.
+The CLI remains behaviorally retrieval-only, but its
 Keychain dependency makes provisioning APIs compile-reachable; an `xtask`
 tracked-source allowlist is defense in depth, not a compiler boundary. A future
 facade/crate boundary requires its own ADR. This governance slice activates no
