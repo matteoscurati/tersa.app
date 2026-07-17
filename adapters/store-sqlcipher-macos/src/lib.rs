@@ -56,6 +56,12 @@ mod macos {
         pub fn new(bytes: [u8; 32]) -> Self {
             Self(Zeroizing::new(bytes))
         }
+
+        /// Consumes an already protected key without materializing raw bytes.
+        #[must_use]
+        pub fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
+            Self(bytes)
+        }
     }
 
     impl fmt::Debug for DatabaseKey {

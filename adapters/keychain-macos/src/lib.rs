@@ -18,7 +18,7 @@ use tersa_platform::secure_storage::{
     AccountId, AccountProfileLocator, InstallationRootKeyProvisioner, KeyStorageError,
     ProfileStorageError, ProvisionOutcome,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Closed, redacted failure returned by the trusted read-only composition.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -57,16 +57,16 @@ const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 
 #[cfg_attr(test, derive(Eq, PartialEq))]
-struct SecretKey([u8; 32]);
+struct SecretKey(Zeroizing<[u8; 32]>);
 
 impl SecretKey {
     #[cfg(test)]
     fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self(Zeroizing::new(bytes))
     }
 
     fn zeroed() -> Self {
-        Self([0; 32])
+        Self(Zeroizing::new([0; 32]))
     }
 
     fn as_bytes(&self) -> &[u8; 32] {
@@ -83,7 +83,8 @@ impl SecretKey {
 
     #[cfg(target_os = "macos")]
     fn into_database_key(mut self) -> tersa_store_sqlcipher_macos::DatabaseKey {
-        tersa_store_sqlcipher_macos::DatabaseKey::new(std::mem::take(&mut self.0))
+        let protected = std::mem::replace(&mut self.0, Zeroizing::new([0; 32]));
+        tersa_store_sqlcipher_macos::DatabaseKey::from_zeroizing(protected)
     }
 }
 
@@ -1085,7 +1086,7 @@ mod tests {
         let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
-            tersa_store_sqlcipher_macos::DatabaseKey::new(*derived.as_bytes()),
+            derived.into_database_key(),
         )
         .unwrap();
         drop(store);
@@ -1141,7 +1142,7 @@ mod tests {
         let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
-            tersa_store_sqlcipher_macos::DatabaseKey::new(*derived.as_bytes()),
+            derived.into_database_key(),
         )
         .unwrap();
         drop(store);
