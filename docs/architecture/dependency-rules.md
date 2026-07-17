@@ -338,20 +338,32 @@ removes a profile directory.
 
 Every existing main, WAL, and SHM accepted by the writer is a same-owner regular
 file at exact `0600`, checked before SQLite access and revalidated after open.
-A canonical main without sidecars may create a new owner-only WAL/SHM pair
-through the owning writer. An existing main is first checked through the
+A canonical main without sidecars may create a new WAL/SHM pair through the
+owning writer. Newly created sidecars are identity-bound and normalized to exact
+`0600`, including under restrictive umasks; snapshot-present sidecars are never
+normalized or adopted. A logical fresh database left in WAL mode by a crash
+before migration is recoverable with or without SHM, and completes migration
+without snapshot-present cleanup authority. An existing main is first checked through the
 immutable main-file view. A complete WAL/SHM pair is validated with a
 non-checkpointing read-only/no-follow logical connection. If an abruptly
 terminated first migration retains WAL but loses SHM, the store copies the
 identity-bound encrypted main/WAL pair into O_EXCL `0600` files in a private
-`0700` `.tersa-wal-recovery-*` directory, creates SHM only in that staging
-directory, and validates key, account, schema, foreign keys, SQLCipher, and
-SQLite integrity through a read-only/no-follow database handle with
-checkpoint-on-close disabled. It revalidates the original
-pair before and after validation, identity-cleans only staging entries, and then
-the owning writer creates a new original SHM. The preflight never cleans,
-checkpoints, repairs, or adopts an original fixed entry. A process crash can
-leave encrypted owner-only staging residue; retry does not adopt or remove it.
+directory selected from exactly `.tersa-wal-recovery-v1-0` through
+`.tersa-wal-recovery-v1-7`. The exclusive directory identity is bound before an
+identity-preserving no-follow normalization to exact `0700`, then bound again to
+the opened directory descriptor. SHM is created only in staging. The copied
+main/WAL/SHM identities and directory identity are validated before the actual
+SQLite read-only/no-follow open and again, together with the opened-main moved
+check, before key or page reads. Checkpoint-on-close is disabled and verified.
+Key, account, schema, foreign-key, SQLCipher, and SQLite integrity checks then
+run on that handle, and the original pair is revalidated before and after them.
+Normal setup, copy, validation, and key failures identity-clean only the created
+stage. Identity, type, owner, mode, or directory drift fails closed and preserves
+the unknown residue. A process crash can leave at most eight encrypted
+owner-only staging directories. Retry may select an unused fixed slot but never
+adopts or removes an occupied slot; slot exhaustion creates no further name and
+fails closed. The owning writer then creates a new original exact-`0600` SHM.
+Preflight never cleans, checkpoints, repairs, or adopts an original fixed entry.
 
 The retained descriptor eliminates a parent-path cleanup race; SQLite itself
 remains pathname-based and no descriptor-bound SQLite opener is claimed. The

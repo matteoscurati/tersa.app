@@ -47,8 +47,7 @@ mod macos {
     // Bounds lock waits without introducing retries or background work.
     const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
     const MIGRATION: &str = include_str!("../migrations/0001_account_mailbox.sql");
-    static RECOVERY_STAGE_SEQUENCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    const RECOVERY_STAGE_LIMIT: usize = 8;
 
     /// Owns a redacted, zeroizing `SQLCipher` database key.
     pub struct DatabaseKey(Zeroizing<[u8; 32]>);
@@ -361,11 +360,18 @@ mod macos {
                 leaf.require_main_identity()?;
                 let fresh = configure_storage(&connection, &account, &key.0)?;
                 if fresh {
+                    materialize_fresh_wal(&connection)?;
+                }
+                if fresh || existing_preflight.is_some_and(ExistingPreflight::permits_new_sidecars)
+                {
                     // SQLite creates the WAL and SHM leaves under the process
                     // umask as soon as WAL is selected. Normalize those leaves
-                    // before migration work so every later failure can safely
-                    // clean them up and retry.
+                    // through identity-bound descriptors before migration or
+                    // final validation. Cleanup authority remains fresh-main
+                    // O_EXCL provenance only.
                     leaf.normalize_fresh_leaves(hook, &canonical_path)?;
+                }
+                if fresh {
                     hook(WriterHook::AfterFreshWalNormalization, &canonical_path)?;
                     hook(WriterHook::BeforeFreshMigration, &canonical_path)?;
                     migrate_fresh(&connection, &account)?;
@@ -582,6 +588,13 @@ mod macos {
         mode: u16,
     }
 
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct RecoveryStageLeaves {
+        main: Option<FileIdentity>,
+        wal: Option<FileIdentity>,
+        shm: Option<FileIdentity>,
+    }
+
     const OWNER_ONLY_FILE_MODE: u16 = 0o600;
 
     /// Testable boundaries around fresh-leaf claiming, migration, and cleanup.
@@ -724,13 +737,13 @@ mod macos {
             let unchanged = actual.main == self.snapshot.main
                 && actual.journal == self.snapshot.journal
                 && match preflight {
-                    ExistingPreflight::Stable => {
+                    ExistingPreflight::Stable | ExistingPreflight::FreshWal => {
                         actual.wal == self.snapshot.wal && actual.shm == self.snapshot.shm
                     }
                     ExistingPreflight::MainWithoutSidecars => {
                         actual.wal.is_some() && actual.shm.is_some()
                     }
-                    ExistingPreflight::WalWithoutShm => {
+                    ExistingPreflight::WalWithoutShm | ExistingPreflight::FreshWalWithoutShm => {
                         actual.wal == self.snapshot.wal && actual.shm.is_some()
                     }
                 };
@@ -869,6 +882,29 @@ mod macos {
         Stable,
         MainWithoutSidecars,
         WalWithoutShm,
+        FreshWal,
+        FreshWalWithoutShm,
+    }
+
+    impl ExistingPreflight {
+        const fn permits_new_sidecars(self) -> bool {
+            matches!(
+                self,
+                Self::MainWithoutSidecars | Self::WalWithoutShm | Self::FreshWalWithoutShm
+            )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecoveryHook {
+        AfterDirectoryCreate,
+        AfterDirectoryNormalize,
+        AfterMainCopy,
+        AfterWalCopy,
+        BeforeReadOnlyOpen,
+        AfterReadOnlyOpen,
+        BeforeOriginalFinalRevalidate,
+        BeforeCleanup,
     }
 
     fn canonical_database_path(path: &Path) -> Result<PathBuf, OpenFailure> {
@@ -1009,44 +1045,58 @@ mod macos {
     fn create_recovery_stage(
         leaf: &LeafGuard,
         canonical_path: &Path,
+        hook: &mut dyn FnMut(RecoveryHook, &Path) -> Result<(), OpenFailure>,
     ) -> Result<(OwnedFd, OsString, PathBuf, DirectoryIdentity), OpenFailure> {
-        for _attempt in 0..64 {
-            let sequence =
-                RECOVERY_STAGE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let name = OsString::from(format!(
-                ".tersa-wal-recovery-{}-{sequence}",
-                std::process::id()
-            ));
+        let parent_path = canonical_path.parent().ok_or(OpenFailure::Storage)?;
+        for slot in 0..RECOVERY_STAGE_LIMIT {
+            let name = OsString::from(format!(".tersa-wal-recovery-v1-{slot}"));
+            let path = parent_path.join(&name);
             match fs::mkdirat(&leaf.parent, &name, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    let directory = fs::openat(
+                    let initial = recovery_directory_identity_permissive(
                         &leaf.parent,
                         &name,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .map_err(|_error| OpenFailure::Storage)?;
-                    fs::fchmod(&directory, Mode::from_raw_mode(0o700))
+                        leaf.parent_owner,
+                    )?;
+                    let setup = (|| {
+                        hook(RecoveryHook::AfterDirectoryCreate, &path)?;
+                        fs::chmodat(
+                            &leaf.parent,
+                            &name,
+                            Mode::from_raw_mode(0o700),
+                            AtFlags::SYMLINK_NOFOLLOW,
+                        )
                         .map_err(|_error| OpenFailure::Storage)?;
-                    let stat = fs::fstat(&directory).map_err(|_error| OpenFailure::Storage)?;
-                    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-                        || stat.st_uid != leaf.parent_owner
-                        || Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700
-                    {
-                        return Err(OpenFailure::Storage);
-                    }
-                    let identity = DirectoryIdentity {
-                        device: u64::try_from(stat.st_dev)
-                            .map_err(|_error| OpenFailure::Storage)?,
-                        inode: stat.st_ino,
-                        owner: stat.st_uid,
-                        mode: Mode::from_raw_mode(stat.st_mode).as_raw_mode(),
+                        let normalized =
+                            recovery_directory_identity(&leaf.parent, &name, leaf.parent_owner)?;
+                        if !same_directory_object(initial, normalized) {
+                            return Err(OpenFailure::Storage);
+                        }
+                        hook(RecoveryHook::AfterDirectoryNormalize, &path)?;
+                        let directory = fs::openat(
+                            &leaf.parent,
+                            &name,
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        )
+                        .map_err(|_error| OpenFailure::Storage)?;
+                        let opened = directory_identity_from_stat(
+                            &fs::fstat(&directory).map_err(|_error| OpenFailure::Storage)?,
+                            leaf.parent_owner,
+                            true,
+                        )?;
+                        if opened != normalized {
+                            return Err(OpenFailure::Storage);
+                        }
+                        Ok((directory, normalized))
+                    })();
+                    return match setup {
+                        Ok((directory, identity)) => Ok((directory, name, path, identity)),
+                        Err(error) => {
+                            let _ = cleanup_created_empty_recovery_directory(leaf, &name, initial);
+                            Err(error)
+                        }
                     };
-                    let path = canonical_path
-                        .parent()
-                        .ok_or(OpenFailure::Storage)?
-                        .join(&name);
-                    return Ok((directory, name, path, identity));
                 }
                 Err(error) if error == rustix::io::Errno::EXIST => {}
                 Err(_error) => return Err(OpenFailure::Storage),
@@ -1062,7 +1112,8 @@ mod macos {
         expected: FileIdentity,
         destination_parent: &OwnedFd,
         destination_name: &OsStr,
-    ) -> Result<(), OpenFailure> {
+        created: &mut Option<FileIdentity>,
+    ) -> Result<FileIdentity, OpenFailure> {
         let source = fs::openat(
             source_parent,
             source_name,
@@ -1070,10 +1121,11 @@ mod macos {
             Mode::empty(),
         )
         .map_err(|_error| OpenFailure::Storage)?;
-        let source_identity = restrictive_regular_identity(
-            &fs::fstat(&source).map_err(|_error| OpenFailure::Storage)?,
-            source_owner,
-        )?;
+        let source_stat = fs::fstat(&source).map_err(|_error| OpenFailure::Storage)?;
+        if source_stat.st_size < 32 {
+            return Err(OpenFailure::Corrupted);
+        }
+        let source_identity = restrictive_regular_identity(&source_stat, source_owner)?;
         if source_identity != expected {
             return Err(OpenFailure::Storage);
         }
@@ -1086,17 +1138,57 @@ mod macos {
         .map_err(|_error| OpenFailure::Storage)?;
         fs::fchmod(&destination, Mode::from_raw_mode(OWNER_ONLY_FILE_MODE))
             .map_err(|_error| OpenFailure::Storage)?;
-        restrictive_regular_identity(
+        let destination_identity = restrictive_regular_identity(
             &fs::fstat(&destination).map_err(|_error| OpenFailure::Storage)?,
             source_owner,
         )?;
+        *created = Some(destination_identity);
 
         let mut source_file = std::fs::File::from(source);
         let mut destination_file = std::fs::File::from(destination);
         io::copy(&mut source_file, &mut destination_file).map_err(|_error| OpenFailure::Storage)?;
         destination_file
             .sync_all()
-            .map_err(|_error| OpenFailure::Storage)
+            .map_err(|_error| OpenFailure::Storage)?;
+        Ok(destination_identity)
+    }
+
+    fn directory_identity_from_stat(
+        stat: &fs::Stat,
+        owner: u32,
+        exact_mode: bool,
+    ) -> Result<DirectoryIdentity, OpenFailure> {
+        let mode = Mode::from_raw_mode(stat.st_mode).as_raw_mode();
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+            || stat.st_uid != owner
+            || if exact_mode {
+                mode != 0o700
+            } else {
+                mode & !0o700 != 0
+            }
+        {
+            return Err(OpenFailure::Storage);
+        }
+        Ok(DirectoryIdentity {
+            device: u64::try_from(stat.st_dev).map_err(|_error| OpenFailure::Storage)?,
+            inode: stat.st_ino,
+            owner: stat.st_uid,
+            mode,
+        })
+    }
+
+    const fn same_directory_object(left: DirectoryIdentity, right: DirectoryIdentity) -> bool {
+        left.device == right.device && left.inode == right.inode && left.owner == right.owner
+    }
+
+    fn recovery_directory_identity_permissive(
+        parent: &OwnedFd,
+        name: &OsStr,
+        owner: u32,
+    ) -> Result<DirectoryIdentity, OpenFailure> {
+        let stat = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_error| OpenFailure::Storage)?;
+        directory_identity_from_stat(&stat, owner, false)
     }
 
     fn recovery_directory_identity(
@@ -1106,18 +1198,48 @@ mod macos {
     ) -> Result<DirectoryIdentity, OpenFailure> {
         let stat = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_error| OpenFailure::Storage)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-            || stat.st_uid != owner
-            || Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700
-        {
+        directory_identity_from_stat(&stat, owner, true)
+    }
+
+    fn cleanup_created_empty_recovery_directory(
+        leaf: &LeafGuard,
+        name: &OsStr,
+        expected: DirectoryIdentity,
+    ) -> Result<(), OpenFailure> {
+        let actual = recovery_directory_identity_permissive(&leaf.parent, name, leaf.parent_owner)?;
+        if !same_directory_object(actual, expected) {
             return Err(OpenFailure::Storage);
         }
-        Ok(DirectoryIdentity {
-            device: u64::try_from(stat.st_dev).map_err(|_error| OpenFailure::Storage)?,
-            inode: stat.st_ino,
-            owner: stat.st_uid,
-            mode: Mode::from_raw_mode(stat.st_mode).as_raw_mode(),
-        })
+        fs::unlinkat(&leaf.parent, name, AtFlags::REMOVEDIR).map_err(|_error| OpenFailure::Storage)
+    }
+
+    fn recovery_stage_has_only_expected_names(
+        directory: &OwnedFd,
+        leaf: &LeafGuard,
+        expected: RecoveryStageLeaves,
+    ) -> Result<(), OpenFailure> {
+        let expected_names = [
+            expected.main.is_some().then_some(&leaf.names[0]),
+            None,
+            expected.wal.is_some().then_some(&leaf.names[2]),
+            expected.shm.is_some().then_some(&leaf.names[3]),
+        ];
+        let entries = fs::Dir::read_from(directory).map_err(|_error| OpenFailure::Storage)?;
+        for entry in entries {
+            let entry = entry.map_err(|_error| OpenFailure::Storage)?;
+            let name = entry.file_name().to_bytes();
+            if matches!(name, b"." | b"..") {
+                continue;
+            }
+            if !expected_names
+                .iter()
+                .flatten()
+                .any(|expected_name| expected_name.as_os_str().as_encoded_bytes() == name)
+            {
+                return Err(OpenFailure::Storage);
+            }
+        }
+        Ok(())
     }
 
     fn cleanup_recovery_stage(
@@ -1125,23 +1247,37 @@ mod macos {
         directory: &OwnedFd,
         name: &OsStr,
         expected_directory: DirectoryIdentity,
+        expected_leaves: RecoveryStageLeaves,
     ) -> Result<(), OpenFailure> {
-        for leaf_name in [
-            &leaf.names[3],
-            &leaf.names[2],
-            &leaf.names[1],
-            &leaf.names[0],
-        ] {
-            match leaf_entry(directory, leaf_name, leaf.parent_owner)? {
-                Some(recorded) if recorded.mode == OWNER_ONLY_FILE_MODE => {
-                    if leaf_entry(directory, leaf_name, leaf.parent_owner)? != Some(recorded) {
-                        return Err(OpenFailure::Storage);
-                    }
-                    fs::unlinkat(directory, leaf_name, AtFlags::empty())
-                        .map_err(|_error| OpenFailure::Storage)?;
+        if recovery_directory_identity(&leaf.parent, name, leaf.parent_owner)? != expected_directory
+            || directory_identity_from_stat(
+                &fs::fstat(directory).map_err(|_error| OpenFailure::Storage)?,
+                leaf.parent_owner,
+                true,
+            )? != expected_directory
+        {
+            return Err(OpenFailure::Storage);
+        }
+        recovery_stage_has_only_expected_names(directory, leaf, expected_leaves)?;
+
+        let expected = [
+            expected_leaves.main,
+            None,
+            expected_leaves.wal,
+            expected_leaves.shm,
+        ];
+        for (leaf_name, expected_identity) in leaf.names.iter().zip(expected) {
+            if leaf_entry(directory, leaf_name, leaf.parent_owner)? != expected_identity {
+                return Err(OpenFailure::Storage);
+            }
+        }
+        for (leaf_name, expected_identity) in leaf.names.iter().zip(expected).rev() {
+            if let Some(expected_identity) = expected_identity {
+                if leaf_entry(directory, leaf_name, leaf.parent_owner)? != Some(expected_identity) {
+                    return Err(OpenFailure::Storage);
                 }
-                Some(_identity) => return Err(OpenFailure::Storage),
-                None => {}
+                fs::unlinkat(directory, leaf_name, AtFlags::empty())
+                    .map_err(|_error| OpenFailure::Storage)?;
             }
         }
         if recovery_directory_identity(&leaf.parent, name, leaf.parent_owner)? != expected_directory
@@ -1151,33 +1287,78 @@ mod macos {
         fs::unlinkat(&leaf.parent, name, AtFlags::REMOVEDIR).map_err(|_error| OpenFailure::Storage)
     }
 
+    fn verify_recovery_stage(
+        leaf: &LeafGuard,
+        directory: &OwnedFd,
+        name: &OsStr,
+        expected_directory: DirectoryIdentity,
+        expected_main: FileIdentity,
+        expected_wal: FileIdentity,
+        expected_shm: FileIdentity,
+    ) -> Result<(), OpenFailure> {
+        if recovery_directory_identity(&leaf.parent, name, leaf.parent_owner)? != expected_directory
+            || directory_identity_from_stat(
+                &fs::fstat(directory).map_err(|_error| OpenFailure::Storage)?,
+                leaf.parent_owner,
+                true,
+            )? != expected_directory
+            || leaf_entry(directory, &leaf.names[0], leaf.parent_owner)? != Some(expected_main)
+            || leaf_entry(directory, &leaf.names[2], leaf.parent_owner)? != Some(expected_wal)
+            || leaf_entry(directory, &leaf.names[3], leaf.parent_owner)? != Some(expected_shm)
+        {
+            return Err(OpenFailure::Storage);
+        }
+        Ok(())
+    }
+
     fn validate_wal_without_shm_from_private_copy(
         canonical_path: &Path,
         account: &AccountId,
         key: &[u8; 32],
         leaf: &LeafGuard,
-    ) -> Result<(), OpenFailure> {
+    ) -> Result<bool, OpenFailure> {
+        validate_wal_without_shm_from_private_copy_with_hook(
+            canonical_path,
+            account,
+            key,
+            leaf,
+            &mut |_point, _path| Ok(()),
+        )
+    }
+
+    fn validate_wal_without_shm_from_private_copy_with_hook(
+        canonical_path: &Path,
+        account: &AccountId,
+        key: &[u8; 32],
+        leaf: &LeafGuard,
+        hook: &mut dyn FnMut(RecoveryHook, &Path) -> Result<(), OpenFailure>,
+    ) -> Result<bool, OpenFailure> {
         let main = leaf.snapshot.main.ok_or(OpenFailure::Storage)?;
         let wal = leaf.snapshot.wal.ok_or(OpenFailure::Storage)?;
         let (directory, stage_name, stage_path, directory_identity) =
-            create_recovery_stage(leaf, canonical_path)?;
+            create_recovery_stage(leaf, canonical_path, hook)?;
+        let mut created_leaves = RecoveryStageLeaves::default();
         let validation = (|| {
-            copy_recovery_leaf(
+            let copied_main = copy_recovery_leaf(
                 &leaf.parent,
                 &leaf.names[0],
                 leaf.parent_owner,
                 main,
                 &directory,
                 &leaf.names[0],
+                &mut created_leaves.main,
             )?;
-            copy_recovery_leaf(
+            hook(RecoveryHook::AfterMainCopy, &stage_path)?;
+            let copied_wal = copy_recovery_leaf(
                 &leaf.parent,
                 &leaf.names[2],
                 leaf.parent_owner,
                 wal,
                 &directory,
                 &leaf.names[2],
+                &mut created_leaves.wal,
             )?;
+            hook(RecoveryHook::AfterWalCopy, &stage_path)?;
             let shm = fs::openat(
                 &directory,
                 &leaf.names[3],
@@ -1187,24 +1368,71 @@ mod macos {
             .map_err(|_error| OpenFailure::Storage)?;
             fs::fchmod(&shm, Mode::from_raw_mode(OWNER_ONLY_FILE_MODE))
                 .map_err(|_error| OpenFailure::Storage)?;
-            restrictive_regular_identity(
+            let copied_shm = restrictive_regular_identity(
                 &fs::fstat(&shm).map_err(|_error| OpenFailure::Storage)?,
                 leaf.parent_owner,
             )?;
+            created_leaves.shm = Some(copied_shm);
             drop(shm);
             leaf.require_snapshot_unchanged()?;
-            // The staging copy is writable only so SQLite can rebuild its SHM
-            // index. The database handle itself remains read-only and cannot
-            // checkpoint or repair the copied main/WAL pair.
+            verify_recovery_stage(
+                leaf,
+                &directory,
+                &stage_name,
+                directory_identity,
+                copied_main,
+                copied_wal,
+                copied_shm,
+            )?;
+            hook(RecoveryHook::BeforeReadOnlyOpen, &stage_path)?;
             let connection = open_read_only_connection(&stage_path.join(&leaf.names[0]))?;
             disable_and_verify_checkpoint_on_close(&connection)?;
-            configure_read_only(&connection, account, key)?;
+            opened_file_has_moved(&connection)?;
+            verify_recovery_stage(
+                leaf,
+                &directory,
+                &stage_name,
+                directory_identity,
+                copied_main,
+                copied_wal,
+                copied_shm,
+            )?;
+            hook(RecoveryHook::AfterReadOnlyOpen, &stage_path)?;
+            verify_recovery_stage(
+                leaf,
+                &directory,
+                &stage_name,
+                directory_identity,
+                copied_main,
+                copied_wal,
+                copied_shm,
+            )?;
+            let fresh = validate_recovery_read_only(&connection, account, key)?;
+            verify_recovery_stage(
+                leaf,
+                &directory,
+                &stage_name,
+                directory_identity,
+                copied_main,
+                copied_wal,
+                copied_shm,
+            )?;
             drop(connection);
-            leaf.require_snapshot_unchanged()
+            hook(RecoveryHook::BeforeOriginalFinalRevalidate, &stage_path)?;
+            leaf.require_snapshot_unchanged()?;
+            Ok(fresh)
         })();
-        let cleanup = cleanup_recovery_stage(leaf, &directory, &stage_name, directory_identity);
+        let cleanup_hook = hook(RecoveryHook::BeforeCleanup, &stage_path);
+        let result = validation.and_then(|fresh| cleanup_hook.map(|()| fresh));
+        let cleanup = cleanup_recovery_stage(
+            leaf,
+            &directory,
+            &stage_name,
+            directory_identity,
+            created_leaves,
+        );
         cleanup?;
-        validation
+        result
     }
 
     fn preflight_read_only_files(path: &Path) -> Result<ReadOnlyFileIdentities, OpenFailure> {
@@ -1329,8 +1557,12 @@ mod macos {
             // in a private, identity-bound staging directory. The original
             // main/WAL pair remains read-only and is revalidated before and
             // after logical key, account, schema, and health checks.
-            validate_wal_without_shm_from_private_copy(path, account, key, leaf)?;
-            return Ok(ExistingPreflight::WalWithoutShm);
+            let fresh = validate_wal_without_shm_from_private_copy(path, account, key, leaf)?;
+            return Ok(if fresh {
+                ExistingPreflight::FreshWalWithoutShm
+            } else {
+                ExistingPreflight::WalWithoutShm
+            });
         }
 
         let uri = immutable_file_uri(path);
@@ -1355,11 +1587,12 @@ mod macos {
         let wal_connection = open_read_only_connection(path)?;
         disable_and_verify_checkpoint_on_close(&wal_connection)?;
         opened_file_has_moved(&wal_connection)?;
-        apply_key(&wal_connection, key).map_err(classify_key)?;
-        if validate_identity(&wal_connection, account)? {
-            return Err(OpenFailure::Corrupted);
-        }
-        Ok(ExistingPreflight::Stable)
+        let fresh = validate_recovery_read_only(&wal_connection, account, key)?;
+        Ok(if fresh {
+            ExistingPreflight::FreshWal
+        } else {
+            ExistingPreflight::Stable
+        })
     }
 
     fn immutable_file_uri(path: &Path) -> OsString {
@@ -1600,11 +1833,28 @@ mod macos {
         transaction.commit().map_err(classify_open)
     }
 
+    fn materialize_fresh_wal(connection: &Connection) -> Result<(), OpenFailure> {
+        connection
+            .execute_batch("BEGIN IMMEDIATE; PRAGMA user_version = 0; COMMIT;")
+            .map_err(classify_open)
+    }
+
     fn configure_read_only(
         connection: &Connection,
         account: &AccountId,
         key: &[u8; 32],
     ) -> Result<(), OpenFailure> {
+        if validate_recovery_read_only(connection, account, key)? {
+            return Err(OpenFailure::Corrupted);
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_read_only(
+        connection: &Connection,
+        account: &AccountId,
+        key: &[u8; 32],
+    ) -> Result<bool, OpenFailure> {
         apply_key(connection, key).map_err(classify_key)?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
@@ -1625,10 +1875,9 @@ mod macos {
 
         connection.execute_batch("BEGIN;").map_err(classify_open)?;
         let validation = (|| {
-            if validate_identity(connection, account)? {
-                return Err(OpenFailure::Corrupted);
-            }
-            validate_health(connection)
+            let fresh = validate_identity(connection, account)?;
+            validate_health(connection)?;
+            Ok(fresh)
         })();
         if validation.is_ok() {
             connection.execute_batch("COMMIT;").map_err(classify_open)?;
@@ -2005,6 +2254,86 @@ mod macos {
             (database, store)
         }
 
+        fn crash_store_at(database: &TestDatabase, point: &str) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::wal_resident_first_migration_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_CRASH_DATABASE", database.path())
+                .env("TERSA_STORE_CRASH_POINT", point)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(73));
+        }
+
+        fn recovery_stage_paths(database: &TestDatabase) -> Vec<PathBuf> {
+            (0..RECOVERY_STAGE_LIMIT)
+                .map(|slot| {
+                    database
+                        .directory
+                        .join(format!(".tersa-wal-recovery-v1-{slot}"))
+                })
+                .collect()
+        }
+
+        fn assert_no_recovery_stages(database: &TestDatabase) {
+            assert!(
+                recovery_stage_paths(database)
+                    .into_iter()
+                    .all(|path| !path.exists())
+            );
+        }
+
+        fn open_existing_under_umask(database: &TestDatabase, mask: &str) {
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; shift; exec \"$@\"")
+                .arg("tersa-existing-umask")
+                .arg(mask)
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::restrictive_umask_existing_store_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_EXISTING_DATABASE", database.path())
+                .stdin(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "existing store helper failed for umask {mask}"
+            );
+        }
+
+        fn validate_missing_shm_under_umask(database: &TestDatabase, mask: &str) {
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; shift; exec \"$@\"")
+                .arg("tersa-recovery-umask")
+                .arg(mask)
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::restrictive_umask_existing_store_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_EXISTING_DATABASE", database.path())
+                .env("TERSA_STORE_RECOVERY_ONLY", "1")
+                .stdin(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "recovery helper failed for umask {mask}");
+        }
+
         fn raw_connection(database: &TestDatabase) -> Connection {
             let path = canonical_database_path(database.path()).unwrap();
             assert!(prepare_database_leaf(&path).unwrap().is_fresh());
@@ -2326,6 +2655,41 @@ mod macos {
             );
         }
 
+        fn crashed_missing_shm(label: &str) -> TestDatabase {
+            let database = TestDatabase::new(label);
+            crash_store_at(&database, "after-migration");
+            fs::remove_file(shm_path(&database)).unwrap();
+            database
+        }
+
+        fn canonical_pair_state(
+            database: &TestDatabase,
+        ) -> (Vec<u8>, Vec<u8>, FileIdentity, FileIdentity) {
+            (
+                fs::read(database.path()).unwrap(),
+                fs::read(wal_path(database)).unwrap(),
+                file_identity(database.path()).unwrap(),
+                file_identity(&wal_path(database)).unwrap(),
+            )
+        }
+
+        fn validate_missing_shm_with_hook(
+            database: &TestDatabase,
+            key_byte: u8,
+            hook: &mut dyn FnMut(RecoveryHook, &Path) -> Result<(), OpenFailure>,
+        ) -> Result<bool, OpenFailure> {
+            let canonical_path = canonical_database_path(database.path()).unwrap();
+            let leaf = LeafGuard::open(&canonical_path).unwrap();
+            let database_key = key(key_byte);
+            validate_wal_without_shm_from_private_copy_with_hook(
+                &canonical_path,
+                &account(),
+                &database_key.0,
+                &leaf,
+                hook,
+            )
+        }
+
         #[test]
         fn existing_canonical_main_without_sidecars_rebuilds_owner_only_wal_state() {
             let (source, store) = open("canonical-main-source");
@@ -2386,20 +2750,7 @@ mod macos {
         #[test]
         fn wal_resident_first_migration_reopens_after_abrupt_exit() {
             let database = TestDatabase::new("wal-resident-first-migration");
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "macos::tests::wal_resident_first_migration_crash_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("TERSA_STORE_CRASH_DATABASE", database.path())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert_eq!(status.code(), Some(73));
+            crash_store_at(&database, "after-migration");
             assert!(database.path().is_file());
             assert!(wal_path(&database).is_file());
             assert!(shm_path(&database).is_file());
@@ -2441,6 +2792,293 @@ mod macos {
             assert_eq!(fs::read(database.path()).unwrap(), main_before);
             assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
             assert!(shm_path(&database).is_file());
+        }
+
+        #[test]
+        fn fresh_wal_crash_before_migration_converges_with_or_without_shm() {
+            for point in ["after-wal-normalization", "before-migration"] {
+                for missing_shm in [false, true] {
+                    let database = TestDatabase::new(&format!(
+                        "fresh-wal-{point}-{}",
+                        if missing_shm {
+                            "missing-shm"
+                        } else {
+                            "complete"
+                        }
+                    ));
+                    crash_store_at(&database, point);
+                    if missing_shm {
+                        fs::remove_file(shm_path(&database)).unwrap();
+                    }
+                    let canonical_path = canonical_database_path(database.path()).unwrap();
+                    let leaf = LeafGuard::open(&canonical_path).unwrap();
+                    let expected = if missing_shm {
+                        ExistingPreflight::FreshWalWithoutShm
+                    } else {
+                        ExistingPreflight::FreshWal
+                    };
+                    assert_eq!(
+                        preflight_existing(&canonical_path, &account(), &key(7).0, &leaf),
+                        Ok(expected)
+                    );
+                    let mut cleanup_observed = false;
+                    let store = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                        account(),
+                        database.path(),
+                        key(7),
+                        &mut |observed, _path| {
+                            if matches!(
+                                observed,
+                                WriterHook::CleanupBeforeRecord(_)
+                                    | WriterHook::CleanupAfterRecord(_)
+                                    | WriterHook::CleanupAfterRevalidate(_)
+                            ) {
+                                cleanup_observed = true;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert!(!cleanup_observed);
+                    assert_eq!(
+                        schema_state(&store),
+                        (APPLICATION_ID, VERSION, canonical_schema())
+                    );
+                    assert_no_recovery_stages(&database);
+                }
+            }
+        }
+
+        #[test]
+        fn missing_shm_recovery_normalizes_private_stage_under_restrictive_umasks() {
+            for mask in ["0777", "0577", "0377"] {
+                let database = TestDatabase::new(&format!("recovery-umask-{mask}"));
+                crash_store_at(&database, "after-migration");
+                fs::remove_file(shm_path(&database)).unwrap();
+                let main_before = fs::read(database.path()).unwrap();
+                let wal_before = fs::read(wal_path(&database)).unwrap();
+                let main_identity = file_identity(database.path()).unwrap();
+                let wal_identity = file_identity(&wal_path(&database)).unwrap();
+
+                validate_missing_shm_under_umask(&database, mask);
+
+                assert_eq!(fs::read(database.path()).unwrap(), main_before);
+                assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
+                assert_eq!(file_identity(database.path()).unwrap(), main_identity);
+                assert_eq!(file_identity(&wal_path(&database)).unwrap(), wal_identity);
+                assert_no_recovery_stages(&database);
+            }
+        }
+
+        #[test]
+        fn canonical_main_without_sidecars_normalizes_new_pair_under_restrictive_umasks() {
+            let (source, store) = open("canonical-main-umask-source");
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA wal_checkpoint(FULL);")
+                .unwrap();
+            drop(store);
+
+            for mask in ["0777", "0577", "0377"] {
+                let database = TestDatabase::new(&format!("canonical-main-umask-{mask}"));
+                fs::copy(source.path(), database.path()).unwrap();
+                fs::set_permissions(database.path(), fs::Permissions::from_mode(0o600)).unwrap();
+                open_existing_under_umask(&database, mask);
+                for path in [database.path(), &wal_path(&database), &shm_path(&database)] {
+                    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+                }
+                assert_no_recovery_stages(&database);
+            }
+        }
+
+        #[test]
+        fn missing_shm_recovery_normal_errors_clean_the_bounded_stage() {
+            let wrong_key = crashed_missing_shm("recovery-wrong-key");
+            let wrong_key_before = canonical_pair_state(&wrong_key);
+            assert_eq!(
+                validate_missing_shm_with_hook(&wrong_key, 8, &mut |_point, _path| Ok(())),
+                Err(OpenFailure::Corrupted)
+            );
+            assert_eq!(canonical_pair_state(&wrong_key), wrong_key_before);
+            assert_no_recovery_stages(&wrong_key);
+
+            let corrupt_wal = crashed_missing_shm("recovery-corrupt-wal");
+            fs::write(wal_path(&corrupt_wal), b"corrupt-encrypted-wal").unwrap();
+            let corrupt_wal_before = canonical_pair_state(&corrupt_wal);
+            assert!(
+                validate_missing_shm_with_hook(&corrupt_wal, 7, &mut |_point, _path| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(canonical_pair_state(&corrupt_wal), corrupt_wal_before);
+            assert_no_recovery_stages(&corrupt_wal);
+
+            for failure_point in [
+                RecoveryHook::AfterDirectoryCreate,
+                RecoveryHook::AfterDirectoryNormalize,
+                RecoveryHook::AfterMainCopy,
+                RecoveryHook::AfterWalCopy,
+                RecoveryHook::BeforeReadOnlyOpen,
+                RecoveryHook::AfterReadOnlyOpen,
+                RecoveryHook::BeforeOriginalFinalRevalidate,
+                RecoveryHook::BeforeCleanup,
+            ] {
+                let database = crashed_missing_shm(&format!("recovery-boundary-{failure_point:?}"));
+                let before = canonical_pair_state(&database);
+                let result = validate_missing_shm_with_hook(&database, 7, &mut |point, _path| {
+                    if point == failure_point {
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                });
+                assert_eq!(result, Err(OpenFailure::Storage));
+                assert_eq!(canonical_pair_state(&database), before);
+                assert_no_recovery_stages(&database);
+            }
+        }
+
+        #[test]
+        fn missing_shm_recovery_original_drift_fails_closed_and_cleans_its_stage() {
+            let database = crashed_missing_shm("recovery-original-drift");
+            let replacement = database.directory.join("replacement-wal");
+            write_restrictive(&replacement, b"replacement-wal");
+            let original = database.directory.join("original-wal");
+            let mut drifted = false;
+            let result = validate_missing_shm_with_hook(&database, 7, &mut |point, _path| {
+                if point == RecoveryHook::AfterWalCopy {
+                    fs::rename(wal_path(&database), &original).unwrap();
+                    fs::rename(&replacement, wal_path(&database)).unwrap();
+                    drifted = true;
+                }
+                Ok(())
+            });
+            assert!(drifted);
+            assert_eq!(result, Err(OpenFailure::Storage));
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), b"replacement-wal");
+            assert!(original.is_file());
+            assert_no_recovery_stages(&database);
+        }
+
+        #[test]
+        fn missing_shm_recovery_preserves_tampered_stage_residue_fail_closed() {
+            let mode_database = crashed_missing_shm("recovery-stage-mode-tamper");
+            let mut mode_stage = None;
+            let mode_result =
+                validate_missing_shm_with_hook(&mode_database, 7, &mut |point, stage| {
+                    if point == RecoveryHook::AfterReadOnlyOpen {
+                        fs::set_permissions(
+                            stage.join("mail.sqlite3-wal"),
+                            fs::Permissions::from_mode(0o640),
+                        )
+                        .unwrap();
+                        mode_stage = Some(stage.to_path_buf());
+                    }
+                    Ok(())
+                });
+            assert_eq!(mode_result, Err(OpenFailure::Storage));
+            let mode_stage = mode_stage.unwrap();
+            assert_eq!(
+                fs::metadata(mode_stage.join("mail.sqlite3-wal"))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+
+            let directory_database = crashed_missing_shm("recovery-stage-directory-tamper");
+            let mut moved_stage = None;
+            let directory_result =
+                validate_missing_shm_with_hook(&directory_database, 7, &mut |point, stage| {
+                    if point == RecoveryHook::AfterWalCopy {
+                        let moved = directory_database.directory.join("moved-recovery-stage");
+                        fs::rename(stage, &moved).unwrap();
+                        fs::create_dir(stage).unwrap();
+                        fs::set_permissions(stage, fs::Permissions::from_mode(0o700)).unwrap();
+                        moved_stage = Some((stage.to_path_buf(), moved));
+                    }
+                    Ok(())
+                });
+            assert_eq!(directory_result, Err(OpenFailure::Storage));
+            let (replacement_stage, moved_stage) = moved_stage.unwrap();
+            assert!(replacement_stage.is_dir());
+            assert!(moved_stage.is_dir());
+        }
+
+        #[test]
+        fn missing_shm_recovery_preserves_exact_mode_replacements_and_unknown_files() {
+            let replacement_database = crashed_missing_shm("recovery-stage-inode-tamper");
+            let captured_main = replacement_database.directory.join("captured-stage-main");
+            let mut replacement_stage = None;
+            let replacement_result =
+                validate_missing_shm_with_hook(&replacement_database, 7, &mut |point, stage| {
+                    if point == RecoveryHook::BeforeCleanup {
+                        fs::rename(stage.join("mail.sqlite3"), &captured_main).unwrap();
+                        write_restrictive(&stage.join("mail.sqlite3"), b"exact-mode-replacement");
+                        replacement_stage = Some(stage.to_path_buf());
+                    }
+                    Ok(())
+                });
+            assert_eq!(replacement_result, Err(OpenFailure::Storage));
+            let replacement_stage = replacement_stage.unwrap();
+            assert!(captured_main.is_file());
+            assert_eq!(
+                fs::metadata(replacement_stage.join("mail.sqlite3"))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+
+            let journal_database = crashed_missing_shm("recovery-stage-journal-tamper");
+            let mut journal_stage = None;
+            let journal_result =
+                validate_missing_shm_with_hook(&journal_database, 7, &mut |point, stage| {
+                    if point == RecoveryHook::BeforeCleanup {
+                        write_restrictive(
+                            &stage.join("mail.sqlite3-journal"),
+                            b"unexpected-journal",
+                        );
+                        journal_stage = Some(stage.to_path_buf());
+                    }
+                    Ok(())
+                });
+            assert_eq!(journal_result, Err(OpenFailure::Storage));
+            let journal_stage = journal_stage.unwrap();
+            assert!(journal_stage.join("mail.sqlite3").is_file());
+            assert!(journal_stage.join("mail.sqlite3-wal").is_file());
+            assert!(journal_stage.join("mail.sqlite3-shm").is_file());
+            assert!(journal_stage.join("mail.sqlite3-journal").is_file());
+        }
+
+        #[test]
+        fn missing_shm_recovery_stage_attempts_are_strictly_bounded() {
+            let database = crashed_missing_shm("recovery-stage-exhaustion");
+            let stages = recovery_stage_paths(&database);
+            for stage in &stages {
+                fs::create_dir(stage).unwrap();
+                fs::set_permissions(stage, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let before = canonical_pair_state(&database);
+            assert_eq!(
+                validate_missing_shm_with_hook(&database, 7, &mut |_point, _path| Ok(())),
+                Err(OpenFailure::Storage)
+            );
+            assert_eq!(canonical_pair_state(&database), before);
+            assert!(stages.iter().all(|stage| stage.is_dir()));
+            assert_eq!(
+                fs::read_dir(&database.directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".tersa-wal-recovery-v1-")
+                    })
+                    .count(),
+                RECOVERY_STAGE_LIMIT
+            );
         }
 
         #[test]
@@ -2909,13 +3547,25 @@ mod macos {
             let Some(database) = std::env::var_os("TERSA_STORE_CRASH_DATABASE") else {
                 return;
             };
+            let Some(crash_point) = std::env::var_os("TERSA_STORE_CRASH_POINT") else {
+                return;
+            };
             let database = PathBuf::from(database);
+            let crash_point = crash_point.to_string_lossy();
             let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
                 account(),
                 &database,
                 key(7),
                 &mut |point, _path| {
-                    if point == WriterHook::AfterFreshMigration {
+                    let should_crash = matches!(
+                        (crash_point.as_ref(), point),
+                        (
+                            "after-wal-normalization",
+                            WriterHook::AfterFreshWalNormalization
+                        ) | ("before-migration", WriterHook::BeforeFreshMigration)
+                            | ("after-migration", WriterHook::AfterFreshMigration)
+                    );
+                    if should_crash {
                         assert!(database.is_file());
                         assert!(sidecar_path(&database, "-wal").is_file());
                         assert!(sidecar_path(&database, "-shm").is_file());
@@ -2925,6 +3575,59 @@ mod macos {
                 },
             );
             panic!("crash boundary was not reached: {result:?}");
+        }
+
+        #[test]
+        #[ignore = "subprocess helper for restrictive-umask existing-store recovery"]
+        fn restrictive_umask_existing_store_child() {
+            let Some(database) = std::env::var_os("TERSA_STORE_EXISTING_DATABASE") else {
+                return;
+            };
+            let database = PathBuf::from(database);
+            if std::env::var_os("TERSA_STORE_RECOVERY_ONLY").is_some() {
+                let canonical_path = canonical_database_path(&database).unwrap();
+                let leaf = LeafGuard::open(&canonical_path).unwrap();
+                assert!(
+                    !validate_wal_without_shm_from_private_copy(
+                        &canonical_path,
+                        &account(),
+                        &key(7).0,
+                        &leaf,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    (0..RECOVERY_STAGE_LIMIT)
+                        .map(|slot| database
+                            .parent()
+                            .unwrap()
+                            .join(format!(".tersa-wal-recovery-v1-{slot}")))
+                        .all(|path| !path.exists())
+                );
+                return;
+            }
+            let store = SqlCipherMailboxStore::open(account(), &database, key(7)).unwrap();
+            assert_eq!(
+                schema_state(&store),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+            for path in [
+                database.clone(),
+                sidecar_path(&database, "-wal"),
+                sidecar_path(&database, "-shm"),
+            ] {
+                assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+            }
+            assert!(
+                (0..RECOVERY_STAGE_LIMIT)
+                    .map(|slot| {
+                        database
+                            .parent()
+                            .unwrap()
+                            .join(format!(".tersa-wal-recovery-v1-{slot}"))
+                    })
+                    .all(|path| !path.exists())
+            );
         }
 
         #[test]

@@ -223,15 +223,21 @@ pathname-based; no descriptor-bound SQLite opener is claimed. An immutable
 main-file preflight falls back to a non-checkpointing read-only logical
 validation when a fresh main has a complete WAL/SHM pair. If SHM is missing,
 the store validates identity-bound encrypted main/WAL copies in O_EXCL `0600`
-staging files beneath a private `0700` account directory, with
-a read-only/no-follow database handle, checkpoint-on-close disabled, and no
-mutation of the originals. It removes only
-identity-revalidated staging entries before the owning writer rebuilds an exact
-`0600` SHM. A crash can leave encrypted owner-only staging residue that retry
-does not adopt or delete. Existing main/WAL/SHM modes are checked at exact
-`0600` before access and revalidated after open; a canonical main without
-sidecars may re-establish its owner-only pair. This allows abrupt
-first-migration recovery without original cleanup or repair authority. The
+staging files beneath one exclusively created directory selected from exactly
+eight fixed `.tersa-wal-recovery-v1-*` slots. The directory is identity-bound,
+normalized to exact `0700`, and opened no-follow even under umasks `0777`,
+`0577`, or `0377`. Directory and copied-file identities are bound before the
+actual read-only/no-follow SQLite handle and revalidated with the opened-main
+moved check before key or page reads; checkpoint-on-close is disabled. Normal
+setup, copy, key, and validation failures clean only the proven stage. Tampered
+or mismatched staging residue is preserved fail closed. A crash can leave at
+most eight encrypted owner-only stages; retry never adopts an occupied slot,
+and exhaustion creates no unbounded name. The owning writer then rebuilds an
+exact `0600` SHM; the staging preflight has no mutation, cleanup, or repair
+authority over the original main/WAL pair. Existing main/WAL/SHM modes are checked at exact `0600` before
+access and revalidated after open. A canonical main without sidecars normalizes
+only its newly created pair, and a logical fresh WAL state left immediately
+before migration converges with or without SHM. The
 stated cleanup residuals are same-user sidecar insertion after
 the proven main claim, which can be misattributed to SQLite, and same-user
 replacement between revalidation and `unlinkat`; deterministic hooks cover both

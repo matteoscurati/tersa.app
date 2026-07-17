@@ -434,26 +434,48 @@ opener and preserves the journal when that opener rejects it.
 An existing main, WAL, or SHM must be a same-owner regular file at exact mode
 `0600`; the writer checks those modes before SQLite access and revalidates the
 pre-open identities and modes after open. An existing canonical main without
-sidecars may re-establish its owner-only WAL/SHM pair through the owning writer.
+sidecars may re-establish its WAL/SHM pair through the owning writer. The writer
+normalizes only those newly created sidecars through identity-bound descriptors
+to exact `0600`, including under process umasks `0777`, `0577`, and `0377`; it
+never normalizes or adopts a sidecar that was present in the snapshot. A fresh
+logical database left in WAL mode by a crash immediately before migration is a
+recoverable existing state, with or without SHM. Its owning writer completes
+migration without receiving snapshot-present cleanup authority.
 
 An existing main is first validated without mutation through the immutable
 main-file view. If the snapshot contains the complete WAL/SHM pair, a second
 read-only/no-follow connection with checkpoint-on-close disabled validates the
-logical WAL-resident database. If a committed first migration has a WAL but its
-SHM was lost, SQLite cannot open either immutable or ordinary read-only state.
-The store instead creates one private `0700` `.tersa-wal-recovery-*` directory
-beneath the retained account descriptor, copies the still-encrypted main and WAL
-from identity-bound no-follow descriptors into exclusive `0600` staging files,
-creates only a staging SHM, and runs the same key, account, canonical-schema,
-foreign-key, SQLCipher, and SQLite integrity checks through a read-only/no-follow
-database handle with checkpoint-on-close disabled. It revalidates the original main/WAL identities before and after that
-check, removes only identity-revalidated staging entries, then lets the owning
-writer reopen the unchanged original pair and create a new owner-only SHM. No
-original fixed entry is cleaned, checkpointed, adopted, or repaired by the
-preflight. Abrupt termination during staging can leave only encrypted owner-only
-staging residue; a later reviewed maintenance path may remove it, but retry does
-not adopt or delete it. This WAL-aware preflight never grants fresh-cleanup
-authority to a snapshot-present main.
+logical WAL-resident database. If WAL exists but SHM was lost, SQLite cannot
+open either immutable or ordinary read-only state. The store selects the first
+available name from exactly eight fixed staging slots,
+`.tersa-wal-recovery-v1-0` through `.tersa-wal-recovery-v1-7`, beneath the
+retained account descriptor. It creates the selected directory exclusively,
+binds its identity, normalizes that same object to exact `0700` with
+descriptor-relative no-follow `chmodat`, and only then opens it no-follow. This
+converges even when the creation umask initially produces mode `0000`, `0200`,
+or `0400`.
+
+The store copies the still-encrypted main and WAL from identity-bound no-follow
+descriptors into exclusive, descriptor-normalized `0600` staging files and
+creates only a `0600` staging SHM. Before database key or page reads, it binds
+the parent-resolved directory identity to the opened directory descriptor,
+binds all three copied identities, opens the staging main with actual SQLite
+read-only/no-follow flags, disables and verifies checkpoint-on-close, verifies
+that the opened main has not moved, and revalidates the directory and copied
+identities. The same key, account, canonical-schema, foreign-key, SQLCipher, and
+SQLite integrity checks then run on that read-only handle. The original main/WAL
+identities are revalidated before and after validation.
+
+Normal setup, copy, wrong-key, corrupt-WAL, schema, or integrity failures remove
+only the provably created, identity-revalidated stage. An observed identity,
+type, owner, or mode mismatch fails closed and preserves the unknown or tampered
+residue. A process crash may leave at most the eight encrypted, owner-only
+staging directories. Retry may use another empty fixed slot but never adopts or
+deletes a pre-existing slot; exhaustion fails closed without creating an
+unbounded ninth name. After successful cleanup, the owning writer reopens the
+unchanged original pair and creates a new exact-`0600` SHM. No original fixed
+entry is cleaned, checkpointed, adopted, or repaired by preflight, and this
+WAL-aware path never grants fresh-cleanup authority to a snapshot-present main.
 
 On a fresh-leaf failure after the store has successfully claimed the main file
 with `O_EXCL`, but before migration is accepted, the store first closes all
@@ -503,7 +525,8 @@ main and its WAL/SHM. The retained parent descriptor is released on every return
 after the snapshot, open, and any authorized cleanup sequence.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
-or migration boundary; cover the all-absent fresh state, every main-present
+or migration boundary, including WAL-resident crashes before migration with and
+without SHM; cover the all-absent fresh state, every main-present
 combination of the three sidecars, and every main-absent orphan-sidecar
 combination; preserve the existing `absent_with_sidecar` and
 `empty_with_sidecar` journal behavior; and replace each recorded entry before
@@ -512,7 +535,11 @@ must also retry every nonempty cleanup-residual subset and prove the matrix abov
 main-present subsets may converge only through all existing-opener invariants,
 while sidecar-only subsets fail before open. Pre-existing entries and profile
 directories survive every failure, and cleanup uses only the retained
-descriptor plus fixed names.
+descriptor plus fixed names. Recovery-stage tests must cover restrictive umasks,
+wrong keys, corrupt WAL, setup and copy boundaries, copied-leaf mode drift,
+original identity drift, directory replacement, and exhaustion of all eight
+fixed slots. Normal failures leave no staging residue; observed tampering is
+preserved and remains fail closed.
 This is a hardening of the existing pathname-based SQLite opener, not a new
 descriptor-bound SQLite API, opener, composition crate, or
 workspace-to-workspace dependency edge. The only new external-package edges are
