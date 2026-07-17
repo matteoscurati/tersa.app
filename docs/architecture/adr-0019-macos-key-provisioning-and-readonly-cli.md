@@ -196,6 +196,40 @@ returned container because macOS may return an expected-form URL even for an
 invalid group. It never falls back to a normal Application Support path or
 either target's private sandbox container.
 
+PR 33a.5 makes the product application the logical profile owner and assigns
+the directory-establishment operation exclusively to the trusted composition
+inside `tersa-keychain-macos`. Starting from an opened and validated existing
+App Group container, that composition may walk or create only the literal
+`profiles`, `default`, and `accounts` components and the lowercase digest
+derived from the canonical `AccountId`. Every step is descriptor-relative and
+no-follow. A newly created directory must have verified owner-only `0700`
+permissions. An existing component is accepted only when it is the expected
+same-user directory with no group or other permission bits. A symlink,
+non-directory, wrong owner, permissive mode, changed identity, or any other
+unexpected existing object fails closed; path canonicalization, replacement,
+and fallback are forbidden.
+
+Concurrent creators converge without replacement: an already-existing result
+from a create attempt is accepted only after the same no-follow identity,
+ownership, type, and permission validation. The composition records the
+identity of each directory created by its invocation. On failure it attempts
+cleanup in reverse order, removing only an empty directory whose identity still
+matches beneath the validated parent. It never recursively removes content or
+removes a pre-existing directory. Cleanup failure preserves the original
+redacted failure and may leave only validated owner-only directories; it cannot
+continue into database opening. Deterministic tests must inject failure after
+each creation boundary, verify reverse cleanup and safe residuals, cover
+symlink/non-directory/permission/identity rejection, and prove concurrent
+convergence.
+
+After the fixed account directory is validated, the trusted composition passes
+only the fixed `mail.sqlite3` leaf path and private derived key into the existing
+validated `SqlCipherMailboxStore::open` path. That store remains the sole owner
+of database-leaf creation, claiming, schema migration, validation, and its own
+failure cleanup. The directory composition must not create, delete, replace, or
+repair `mail.sqlite3`, its WAL, or its shared-memory sidecar and must not return
+the opened store or another storage capability across the bridge boundary.
+
 The architecture check accepts the PR 32 signing configuration only at the
 exact `TersaMac` target paths. It rejects project or per-configuration
 overrides, includes, target templates, setting groups, configuration files,
@@ -248,20 +282,29 @@ It must reuse the single existing add-only Keychain provisioning channel in
 `tersa-keychain-macos`; a second provisioning mechanism or key import path is
 forbidden. The private derived account-database key is consumed directly by the
 existing validated read-write SQLCipher opening path and is never returned to
-the application, CLI, or another adapter. The product application is the sole
-profile owner and migrator. The CLI remains retrieval-only and non-owning and
-must never provision, establish, claim, migrate, or repair a profile.
+the application, CLI, or another adapter. The `TersaMac` product application is
+the sole logical profile owner and the only production authority allowed to
+request profile establishment or migration. `tersa-keychain-macos` is its sole
+trusted composition executor, while the existing SQLCipher writer remains the
+only database-leaf creation and migration implementation. The CLI remains
+retrieval-only and non-owning and must never provision, establish, claim,
+migrate, or repair a profile.
 
 The only new workspace dependency edge authorized for PR 33a.5 is a
 macOS-target-gated edge from the existing `tersa-apple-bridge` composition root
 to `tersa-keychain-macos`. The existing `TersaMac` product-application target is
-the sole production invoker. The bridge must validate an opaque account
-identifier into the canonical domain `AccountId` before invoking the trusted
-composition and may expose no key, database path, profile, group, derivation,
-configuration, or test override. It may not depend directly on the SQLCipher
-store or add another platform, application, domain, or executable edge. The
-implementation PR must activate this exact edge in the dependency policy; no
-other manifest edge is implied by this amendment.
+the sole production invoker. PR 33a.5 may add exactly one macOS-gated C ABI
+invocation to the existing bridge and the corresponding call from the existing
+`TersaMac` application source. The call accepts only opaque account-identifier
+bytes and returns only a closed success or redacted failure status. The bridge
+must validate those bytes into the canonical domain `AccountId` before invoking
+the trusted composition. It receives narrow one-shot bootstrap command
+authority, not a reusable storage capability: no raw key, store object, database
+handle, database path, profile, group, derivation input, configuration, or test
+override crosses the bridge boundary or is returned to it. The bridge may not
+depend directly on the SQLCipher store or add another platform, application,
+domain, or executable edge. The implementation PR must activate this exact edge
+in the dependency policy; no other manifest edge is implied by this amendment.
 
 Only the canonical domain `AccountId` may select an account. Production uses
 only the fixed `default` profile and the fixed paths, Keychain attributes, and

@@ -99,9 +99,11 @@ the accepted [macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing
    credentialless, source-only product-application bootstrap that reuses the
    existing Keychain provisioner and validated read-write SQLCipher path; then
    the real Developer ID signed and notarized bundled distribution. The
-   product application remains the sole owner and migrator, the CLI remains
-   retrieval-only and non-owning, and this item stays open until the final
-   credential-dependent evidence passes.
+   product application remains the sole logical owner and migration authority,
+   the trusted Keychain composition is its exclusive executor, the SQLCipher
+   writer owns database-leaf migration, and the CLI remains retrieval-only and
+   non-owning. This item stays open until the final credential-dependent
+   evidence passes.
 8. Build a macOS UI baseline and signed/notarized vertical slice only after its
    separately pinned macOS UI and release gates pass.
 
@@ -128,9 +130,12 @@ and direct validated read-write SQLCipher composition are mandatory; no
 production override or second provisioning channel is permitted. The only new
 dependency edge is the macOS-gated existing `tersa-apple-bridge` composition
 root to `tersa-keychain-macos`; the existing `TersaMac` target is the sole
-production invoker, and the bridge receives no key or storage authority. Each
-slice requires independent review with zero unresolved actionable findings on
-its exact head.
+production invoker. The bridge receives only narrow one-shot authority to
+request fixed-profile bootstrap for a validated `AccountId` and receive a
+closed status. It receives no raw key, caller-selected path, profile or
+configuration override, database handle, store object, or returned storage
+capability. Each slice requires independent review with zero unresolved
+actionable findings on its exact head.
 
 ## Phase 2 — iPhone and iPad implementation
 

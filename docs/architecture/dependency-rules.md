@@ -24,6 +24,14 @@ and feasibility adapters:
 | `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only macOS CLI source adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
+This table is the active workspace graph. The governance-only PR 33a.5
+amendment authorizes, but does not activate, one future
+`cfg(target_os = "macos")` edge from `tersa-apple-bridge` to
+`tersa-keychain-macos`. The implementation pull request must add that exact
+manifest edge and its exact `xtask` policy entry together. Until then, the
+active bridge dependencies remain only `tersa-application` and
+`tersa-presentation`; this document changes no manifest or passing gate.
+
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
 `tersa-dioxus-spike` are the only workspace crates allowed to depend on their
@@ -132,8 +140,28 @@ PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
 It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
 trusted database-opening composition and must feed the privately derived key
 directly into the strict SQLCipher reader without creating a callback or key
-export API. PR 33b owns the same-team signed runtime evidence; PR 32 fake
-concurrency tests and PR 33a deterministic tests are not that evidence.
+export API.
+
+PR 33a.5 is a future authorized, inactive macOS-only edge from the existing
+`tersa-apple-bridge` composition root to `tersa-keychain-macos`. The existing
+`TersaMac` target is its sole production invoker through exactly one new
+macOS-gated C ABI bootstrap call. That call accepts only an opaque account
+identifier and returns a closed status. The bridge first validates the canonical
+`AccountId`, then has only one-shot command authority to request fixed-profile
+bootstrap. It receives no raw key, caller-selected path, profile or
+configuration override, database handle, store object, or returned storage
+capability and gains no direct edge to `tersa-store-sqlcipher-macos`.
+
+The trusted `tersa-keychain-macos` composition is the sole filesystem-directory
+establisher on behalf of the product application. It may create only the fixed
+owner-only profile components through descriptor-relative no-follow operations,
+with fail-closed validation, concurrent convergence, and deterministic safe
+cleanup defined by ADR 0019. The existing validated SQLCipher write opener
+remains the sole owner and migrator of the database leaf. Activating the future
+bridge edge or its policy before the implementation pull request is forbidden.
+PR 33b owns the same-team signed runtime evidence; PR 32 fake concurrency tests,
+PR 33a deterministic tests, and PR 33a.5 credentialless tests are not that
+evidence.
 
 The active adapter opts every macOS Keychain operation into the Data
 Protection Keychain, omits `kSecAttrSynchronizable` from add and copy queries,
@@ -203,12 +231,15 @@ fails its post-read identity check.
 
 The reviewed delivery changes are policy, strict read-only SQLCipher open,
 macOS Keychain/private-HKDF boundary, deterministic metadata-only JSON CLI
-source, then real signed CLI distribution evidence. PR 33a activates source and
-dependency policy but does not create the official CLI. Phase 1 roadmap item 7
-remains open until PR 33b passes. The CLI's trusted direct-store composition is
-an interim adapter boundary replaceable by future `maild` IPC; it does not authorize
-`maild` in the MVP. iPhone and iPad implementation remains in Phase 2, and no
-reservation or macOS evidence changes a mobile gate.
+source, credentialless product-application bootstrap source, then real signed
+CLI distribution evidence. PR 33a activates CLI source and dependency policy
+but does not create the official CLI. PR 33a.5 must activate only the authorized
+macOS-gated bridge edge and fixed bootstrap composition; this governance
+amendment activates neither. Phase 1 roadmap item 7 remains open until PR 33b
+passes. The CLI's trusted direct-store composition is an interim adapter
+boundary replaceable by future `maild` IPC; it does not authorize `maild` in the
+MVP. iPhone and iPad implementation remains in Phase 2, and no reservation or
+macOS evidence changes a mobile gate.
 
 Run the boundary check with:
 
