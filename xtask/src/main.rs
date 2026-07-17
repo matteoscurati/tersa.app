@@ -298,7 +298,11 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         Path::new("apple"),
         &mut entitlement_paths,
     )?;
+    let tracked_entitlements = tracked_apple_signing_inventory(Path::new("."))?;
+    violations.extend(tracked_entitlements.violations);
+    entitlement_paths.extend(tracked_entitlements.entitlement_paths);
     entitlement_paths.sort();
+    entitlement_paths.dedup();
     for path in entitlement_paths {
         if path == Path::new("apple/macos/TersaMac.entitlements") {
             continue;
@@ -341,6 +345,7 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &development,
         &evidence,
     ));
+    violations.extend(tracked_project_generation_violations(Path::new("."))?);
     Ok(())
 }
 
@@ -349,11 +354,32 @@ fn collect_entitlement_paths(
     directory: &Path,
     output: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
+    if directory == source_root {
+        let metadata = fs::symlink_metadata(source_root)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::other(format!(
+                "Apple signing inventory root `{}` must not be a symbolic link",
+                source_root.display()
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::other(format!(
+                "Apple signing inventory root `{}` must be a directory",
+                source_root.display()
+            )));
+        }
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
         if path == source_root.join("build") {
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(io::Error::other(format!(
+                    "excluded Apple build root `{}` must be a real directory",
+                    path.display()
+                )));
+            }
             continue;
         }
         if file_type.is_dir() {
@@ -372,7 +398,61 @@ fn collect_entitlement_paths(
     Ok(())
 }
 
-const PROJECT_GENERATION_WRAPPER: &str = r#"#!/bin/sh
+#[derive(Debug, Default, Eq, PartialEq)]
+struct TrackedAppleSigningInventory {
+    entitlement_paths: Vec<PathBuf>,
+    violations: Vec<String>,
+}
+
+fn tracked_apple_signing_inventory(
+    repository_root: &Path,
+) -> io::Result<TrackedAppleSigningInventory> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["ls-files", "--stage", "-z", "--", "apple"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "git ls-files failed while inventorying Apple signing inputs",
+        ));
+    }
+    let entries = String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut inventory = TrackedAppleSigningInventory::default();
+    for entry in entries.split('\0').filter(|entry| !entry.is_empty()) {
+        let Some((metadata, path)) = entry.split_once('\t') else {
+            return Err(io::Error::other("malformed git index entry"));
+        };
+        let Some(mode) = metadata.split_whitespace().next() else {
+            return Err(io::Error::other("git index entry is missing its mode"));
+        };
+        if path.starts_with("apple/build/") || path == "apple/build" {
+            inventory.violations.push(format!(
+                "tracked generated Apple build entry `{path}` is forbidden"
+            ));
+        }
+        if !path.ends_with(".entitlements") {
+            continue;
+        }
+        match mode {
+            "100644" | "100755" => inventory.entitlement_paths.push(PathBuf::from(path)),
+            "120000" => inventory.violations.push(format!(
+                "tracked entitlement `{path}` must not be a symbolic link"
+            )),
+            _ => inventory.violations.push(format!(
+                "tracked entitlement `{path}` has unsupported git mode `{mode}`"
+            )),
+        }
+    }
+    Ok(inventory)
+}
+
+const XCODEGEN_GENERATE_NEEDLE: &str = concat!("xcodegen", " generate");
+
+fn project_generation_wrapper() -> String {
+    concat!(
+        r#"#!/bin/sh
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -392,8 +472,11 @@ command -v xcodegen >/dev/null 2>&1 || {
   exit 2
 }
 
-exec xcodegen generate --no-env --spec apple/project.yml --project apple
-"#;
+exec xcodegen"#,
+        " generate --no-env --spec apple/project.yml --project apple\n"
+    )
+    .to_owned()
+}
 
 fn project_generation_surface_violations(
     wrapper: &str,
@@ -402,7 +485,7 @@ fn project_generation_surface_violations(
     evidence: &str,
 ) -> Vec<String> {
     let mut violations = Vec::new();
-    if wrapper != PROJECT_GENERATION_WRAPPER {
+    if wrapper != project_generation_wrapper() {
         violations.push(
             "apple/scripts/generate-project.sh must remain the exact reviewed --no-env wrapper"
                 .to_owned(),
@@ -417,7 +500,7 @@ fn project_generation_surface_violations(
             1,
         ),
     ] {
-        if document.contains("xcodegen generate") {
+        if document.contains(XCODEGEN_GENERATE_NEEDLE) {
             violations.push(format!(
                 "{path} must not bypass apple/scripts/generate-project.sh"
             ));
@@ -433,6 +516,51 @@ fn project_generation_surface_violations(
         }
     }
     violations
+}
+
+fn tracked_project_generation_violations(repository_root: &Path) -> io::Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["ls-files", "-z"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "git ls-files failed while inventorying project-generation commands",
+        ));
+    }
+    let paths = String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let expected_wrapper = project_generation_wrapper();
+    let mut violations = Vec::new();
+    for path in paths.split('\0').filter(|path| !path.is_empty()) {
+        let filesystem_path = repository_root.join(path);
+        let metadata = fs::symlink_metadata(&filesystem_path)?;
+        let contents = if metadata.file_type().is_symlink() {
+            fs::read_link(&filesystem_path)?
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
+        } else if metadata.is_file() {
+            fs::read(&filesystem_path)?
+        } else {
+            continue;
+        };
+        if !contents
+            .windows(XCODEGEN_GENERATE_NEEDLE.len())
+            .any(|window| window == XCODEGEN_GENERATE_NEEDLE.as_bytes())
+        {
+            continue;
+        }
+        if path != "apple/scripts/generate-project.sh"
+            || contents.as_slice() != expected_wrapper.as_bytes()
+        {
+            violations.push(format!(
+                "tracked file `{path}` contains a forbidden direct XcodeGen generation command"
+            ));
+        }
+    }
+    Ok(violations)
 }
 
 fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
@@ -588,22 +716,7 @@ impl Visitor<'_> for StrictYamlKeyVisitor {
 }
 
 fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    for key in [
-        "com.apple.security.application-groups",
-        "keychain-access-groups",
-    ] {
-        match parse_plist_string_array(entitlements, key) {
-            Ok(values) if values == [SIGNING_GROUP] => {}
-            Ok(_) => violations.push(format!(
-                "apple/macos/TersaMac.entitlements `{key}` must contain exactly the registered macOS group"
-            )),
-            Err(error) => violations.push(format!(
-                "apple/macos/TersaMac.entitlements has invalid `{key}` structure: {error}"
-            )),
-        }
-    }
-
+    let mut violations = source_tersa_mac_entitlement_violations(entitlements);
     let root = match parse_project_root(project) {
         Ok(root) => root,
         Err(error) => {
@@ -658,6 +771,16 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
             ));
         }
     }
+    match yaml_path(&application.body, &["entitlements", "properties"]) {
+        Some(properties) => violations.extend(exact_tersa_mac_entitlement_violations(
+            properties,
+            "the TersaMac XcodeGen entitlement properties",
+        )),
+        None => violations.push(
+            "the TersaMac XcodeGen entitlement properties must contain the exact five-key dictionary"
+                .to_owned(),
+        ),
+    }
     if !matches!(
         yaml_path(
             &application.body,
@@ -681,6 +804,81 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
             "the TersaMac target CODE_SIGN_ENTITLEMENTS setting must exactly match macos/TersaMac.entitlements"
                 .to_owned(),
         );
+    }
+    violations
+}
+
+fn source_tersa_mac_entitlement_violations(entitlements: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    match plist::from_bytes::<StrictYamlValue>(entitlements.as_bytes()) {
+        Ok(entitlements) => violations.extend(exact_tersa_mac_entitlement_violations(
+            &entitlements,
+            "apple/macos/TersaMac.entitlements",
+        )),
+        Err(error) => violations.push(format!(
+            "apple/macos/TersaMac.entitlements plist parse failed: {error}"
+        )),
+    }
+    for key in [
+        "com.apple.security.application-groups",
+        "keychain-access-groups",
+    ] {
+        match parse_plist_string_array(entitlements, key) {
+            Ok(values) if values == [SIGNING_GROUP] => {}
+            Ok(_) => violations.push(format!(
+                "apple/macos/TersaMac.entitlements `{key}` must contain exactly the registered macOS group"
+            )),
+            Err(error) => violations.push(format!(
+                "apple/macos/TersaMac.entitlements has invalid `{key}` structure: {error}"
+            )),
+        }
+    }
+
+    violations
+}
+
+fn exact_tersa_mac_entitlement_violations(
+    entitlements: &StrictYamlValue,
+    context: &str,
+) -> Vec<String> {
+    let Ok(entitlements) = yaml_mapping(entitlements, context) else {
+        return vec![format!("{context} must be a dictionary")];
+    };
+    let expected_keys = BTreeSet::from([
+        "com.apple.security.app-sandbox",
+        "com.apple.security.application-groups",
+        "com.apple.security.network.client",
+        "com.apple.security.network.server",
+        "keychain-access-groups",
+    ]);
+    let actual_keys = entitlements
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    if actual_keys != expected_keys {
+        violations.push(format!(
+            "{context} must contain exactly the five reviewed entitlement keys"
+        ));
+    }
+    for key in [
+        "com.apple.security.app-sandbox",
+        "com.apple.security.network.client",
+        "com.apple.security.network.server",
+    ] {
+        if !matches!(entitlements.get(key), Some(StrictYamlValue::Bool(true))) {
+            violations.push(format!("{context} `{key}` must be boolean true"));
+        }
+    }
+    for key in [
+        "com.apple.security.application-groups",
+        "keychain-access-groups",
+    ] {
+        if !yaml_exact_string_array(entitlements.get(key), SIGNING_GROUP) {
+            violations.push(format!(
+                "{context} `{key}` must contain exactly the registered macOS group"
+            ));
+        }
     }
     violations
 }
@@ -743,6 +941,7 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
     let Ok(target) = yaml_mapping(target, "TersaMac target") else {
         return vec!["the TersaMac target must be a direct mapping".to_owned()];
     };
+    validate_tersa_mac_top_level_keys(target, &mut violations);
     if !matches!(
         target.get("type"),
         Some(StrictYamlValue::String(value)) if value == "application"
@@ -827,6 +1026,29 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
     violations
 }
 
+fn validate_tersa_mac_top_level_keys(
+    target: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    let expected_keys = BTreeSet::from([
+        "entitlements",
+        "info",
+        "platform",
+        "preBuildScripts",
+        "scheme",
+        "settings",
+        "sources",
+        "type",
+    ]);
+    let actual_keys = target.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        violations.push(
+            "the TersaMac target must contain only the exact reviewed top-level XcodeGen keys"
+                .to_owned(),
+        );
+    }
+}
+
 fn effective_signing_configuration_violations(
     root: &StrictYamlValue,
     targets: &[ProjectTarget],
@@ -835,29 +1057,7 @@ fn effective_signing_configuration_violations(
     let Ok(root_mapping) = yaml_mapping(root, "project root") else {
         return vec!["apple/project.yml root must be a mapping".to_owned()];
     };
-    validate_project_options(root_mapping.get("options"), &mut violations);
-    for key in [
-        "include",
-        "includes",
-        "targetTemplates",
-        "settingGroups",
-        "configFiles",
-        "configs",
-        "preGenCommand",
-        "postGenCommand",
-        "schemes",
-    ] {
-        if root_mapping.contains_key(key) {
-            violations.push(format!(
-                "apple/project.yml unsupported signing indirection `{key}` is forbidden"
-            ));
-        }
-    }
-    inspect_settings_indirection(
-        root_mapping.get("settings"),
-        "project-wide settings",
-        &mut violations,
-    );
+    validate_project_root_surface(root_mapping, &mut violations);
 
     for target in targets {
         let Ok(body) = yaml_mapping(&target.body, &format!("target `{}`", target.name)) else {
@@ -926,6 +1126,46 @@ fn effective_signing_configuration_violations(
     violations
 }
 
+fn validate_project_root_surface(
+    root_mapping: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    let expected_root_keys = BTreeSet::from(["name", "options", "settings", "targets"]);
+    let actual_root_keys = root_mapping
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_root_keys != expected_root_keys {
+        violations.push(
+            "apple/project.yml must contain only the exact reviewed project-root XcodeGen keys"
+                .to_owned(),
+        );
+    }
+    validate_project_options(root_mapping.get("options"), violations);
+    for key in [
+        "include",
+        "includes",
+        "targetTemplates",
+        "settingGroups",
+        "configFiles",
+        "configs",
+        "preGenCommand",
+        "postGenCommand",
+        "schemes",
+    ] {
+        if root_mapping.contains_key(key) {
+            violations.push(format!(
+                "apple/project.yml unsupported signing indirection `{key}` is forbidden"
+            ));
+        }
+    }
+    inspect_settings_indirection(
+        root_mapping.get("settings"),
+        "project-wide settings",
+        violations,
+    );
+}
+
 fn allowed_target_entitlement_path(target: &str, path: &str) -> bool {
     matches!(
         (target, path),
@@ -990,6 +1230,10 @@ fn is_sensitive_signing_key(key: &str) -> bool {
     key.contains("CODE_SIGN")
         || key.contains("DEVELOPMENT_TEAM")
         || key.contains("PROVISIONING_PROFILE")
+        || key == "DevelopmentTeam"
+        || key.starts_with("DevelopmentTeam[")
+        || key == "ProvisioningStyle"
+        || key.starts_with("ProvisioningStyle[")
         || key == "TeamIdentifierPrefix"
         || key.starts_with("TeamIdentifierPrefix[")
         || key == "AppIdentifierPrefix"
@@ -2513,26 +2757,31 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cargo_metadata::PackageId;
 
     use super::{
-        PROJECT_GENERATION_WRAPPER, RESERVED_FUTURE_POLICY, ResolvedDependencyIdentity,
-        blob_dependency_graph_violations, blob_manifest_dependency_violations,
-        check_diagnostic_runtime_reachability, collect_entitlement_paths, dependency_policy,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
-        keychain_direct_dependency_set_violations, non_owner_entitlement_violations,
-        parse_identity, parse_plist_string_array, parse_project_targets,
-        project_generation_surface_violations, reserved_future_policy_violations,
-        resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
-        signing_configuration_violations, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, target_metadata_options,
+        RESERVED_FUTURE_POLICY, ResolvedDependencyIdentity, blob_dependency_graph_violations,
+        blob_manifest_dependency_violations, check_diagnostic_runtime_reachability,
+        collect_entitlement_paths, dependency_policy, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
+        reserved_future_policy_violations, resolved_workspace_dependency_names,
+        rusqlite_resolved_feature_violations, signing_configuration_violations,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        target_metadata_options, tracked_apple_signing_inventory,
+        tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.network.client</key><true/>
+<key>com.apple.security.network.server</key><true/>
 <key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 <key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#;
@@ -2545,13 +2794,19 @@ options:
     macOS: "15.0"
     iOS: "18.0"
   xcodeVersion: "26.0"
+settings: {}
 targets:
   TersaMac:
     type: application
     platform: macOS
+    sources: []
+    info: {}
     entitlements:
       path: macos/TersaMac.entitlements
       properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.application-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
         keychain-access-groups:
@@ -2572,6 +2827,39 @@ targets:
   OtherIOS:
     platform: iOS
 "#;
+
+    static TEMPORARY_REPOSITORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_repository(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tersa-{label}-{}-{}",
+            std::process::id(),
+            TEMPORARY_REPOSITORY_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("temporary repository must be created");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init must execute");
+        assert!(status.success(), "git init must succeed");
+        root
+    }
+
+    fn git_add(repository: &Path, force: bool, paths: &[&str]) {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repository).arg("add");
+        if force {
+            command.arg("--force");
+        }
+        let status = command
+            .args(["--"])
+            .args(paths)
+            .status()
+            .expect("git add must execute");
+        assert!(status.success(), "git add must succeed");
+    }
 
     #[test]
     fn parses_a_well_formed_identity() {
@@ -2716,24 +3004,34 @@ targets:
     fn signing_parser_uses_declared_platform_with_interleaved_targets() {
         let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.security.network.server</key><true/>
   <key>com.apple.security.application-groups</key>
   <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
   <key>keychain-access-groups</key>
   <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#;
-        let project = r#"options:
+        let project = r#"name: Tersa
+options:
   bundleIdPrefix: app.tersa
   deploymentTarget: { macOS: "15.0", iOS: "18.0" }
   xcodeVersion: "26.0"
+settings: {}
 targets:
   FirstIOS:
     platform: iOS
   TersaMac:
     type: application
     platform: macOS
+    sources: []
+    info: {}
     entitlements:
       path: macos/TersaMac.entitlements
       properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.application-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
         keychain-access-groups:
@@ -2813,13 +3111,19 @@ options:
   bundleIdPrefix: app.tersa
   deploymentTarget: { macOS: "15.0", iOS: "18.0" }
   xcodeVersion: "26.0"
+settings: {}
 targets:
   TersaMac:
     type: application
     platform: macOS
+    sources: []
+    info: {}
     entitlements:
       path: macos/TersaMac.entitlements
       properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.application-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
         keychain-access-groups: ["${TeamIdentifierPrefix}app.tersa.shared"]
     settings:
@@ -2838,6 +3142,9 @@ targets:
         assert!(
             signing_configuration_violations(
                 r#"<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.network.client</key><true/>
+<key>com.apple.security.network.server</key><true/>
 <key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 <key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#,
@@ -2896,13 +3203,19 @@ options:
   bundleIdPrefix: app.tersa
   deploymentTarget: { macOS: "15.0", iOS: "18.0" }
   xcodeVersion: "26.0"
+settings: {}
 targets:
   TersaMac:
     type: application
     platform: macOS
+    sources: []
+    info: {}
     entitlements:
       path: macos/TersaMac.entitlements
       properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.application-groups: []
         keychain-access-groups:
           - wrong.group
@@ -2920,6 +3233,9 @@ targets:
       testTargets: []
 "#;
         let entitlements = r#"<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.network.client</key><true/>
+<key>com.apple.security.network.server</key><true/>
 <key>com.apple.security.application-groups</key><array></array>
 <key>keychain-access-groups</key><array><string>wrong.group</string></array>
 </dict></plist>"#;
@@ -2947,8 +3263,9 @@ targets:
             signing_configuration_violations(VALID_ENTITLEMENTS, VALID_SIGNING_PROJECT).is_empty()
         );
 
-        let project_wide = format!(
-            "{VALID_SIGNING_PROJECT}\nsettings:\n  base:\n    TERSA_MACOS_APP_GROUP: forbidden\n"
+        let project_wide = VALID_SIGNING_PROJECT.replace(
+            "settings: {}",
+            "settings:\n  base:\n    TERSA_MACOS_APP_GROUP: forbidden",
         );
         let per_config = VALID_SIGNING_PROJECT.replace(
             "    settings:\n      base:",
@@ -3069,6 +3386,132 @@ targets:
                     .iter()
                     .any(|violation| violation.contains("options must contain only")),
                 "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_and_tersa_mac_top_level_keys_are_closed_allowlists() {
+        let cases = [
+            (
+                "missing project name",
+                VALID_SIGNING_PROJECT.replacen("name: Tersa\n", "", 1),
+                "project-root XcodeGen keys",
+            ),
+            (
+                "project attributes",
+                VALID_SIGNING_PROJECT.replace(
+                    "settings: {}",
+                    "attributes:\n  DevelopmentTeam: ATTACKER\nsettings: {}",
+                ),
+                "project-root XcodeGen keys",
+            ),
+            (
+                "missing reviewed target key",
+                VALID_SIGNING_PROJECT.replace("    sources: []\n", ""),
+                "TersaMac target must contain only",
+            ),
+            (
+                "nested legacy target",
+                VALID_SIGNING_PROJECT.replace(
+                    "    type: application",
+                    "    type: application\n    legacy:\n      toolPath: /tmp/unreviewed",
+                ),
+                "TersaMac target must contain only",
+            ),
+            (
+                "nested dependency",
+                VALID_SIGNING_PROJECT.replace(
+                    "    type: application",
+                    "    type: application\n    dependencies:\n      - target: Unreviewed",
+                ),
+                "TersaMac target must contain only",
+            ),
+            (
+                "nested target attributes",
+                VALID_SIGNING_PROJECT.replace(
+                    "    type: application",
+                    "    type: application\n    attributes:\n      DevelopmentTeam: ATTACKER\n      ProvisioningStyle: Manual",
+                ),
+                "TersaMac target must contain only",
+            ),
+        ];
+        for (label, project, expected) in cases {
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+
+        let defensive_attributes = VALID_SIGNING_PROJECT.replace(
+            "  OtherMac:\n    platform: macOS",
+            "  OtherMac:\n    platform: macOS\n    attributes:\n      DevelopmentTeam: ATTACKER\n      ProvisioningStyle: Manual",
+        );
+        let violations =
+            signing_configuration_violations(VALID_ENTITLEMENTS, &defensive_attributes);
+        for key in ["DevelopmentTeam", "ProvisioningStyle"] {
+            assert!(
+                violations.iter().any(|violation| violation.contains(key)),
+                "{key} must be recognized defensively; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tersa_mac_entitlement_dictionaries_are_exact_five_key_typed_allowlists() {
+        let source_cases = [
+            VALID_ENTITLEMENTS.replace(
+                "</dict>",
+                "<key>com.apple.security.get-task-allow</key><true/></dict>",
+            ),
+            VALID_ENTITLEMENTS.replace(
+                "<key>com.apple.security.app-sandbox</key><true/>",
+                "<key>com.apple.security.app-sandbox</key><false/>",
+            ),
+            VALID_ENTITLEMENTS.replace(
+                "<key>com.apple.security.network.client</key><true/>",
+                "<key>com.apple.security.network.client</key><string>true</string>",
+            ),
+            VALID_ENTITLEMENTS.replace("<key>com.apple.security.network.server</key><true/>", ""),
+        ];
+        for source in source_cases {
+            let violations = signing_configuration_violations(&source, VALID_SIGNING_PROJECT);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains("apple/macos/TersaMac.entitlements")),
+                "source entitlement mutation must fail closed; got {violations:?}"
+            );
+        }
+
+        let property_cases = [
+            VALID_SIGNING_PROJECT.replace(
+                "        com.apple.security.app-sandbox: true",
+                "        com.apple.security.app-sandbox: true\n        com.apple.security.get-task-allow: true",
+            ),
+            VALID_SIGNING_PROJECT.replace(
+                "        com.apple.security.app-sandbox: true",
+                "        com.apple.security.app-sandbox: false",
+            ),
+            VALID_SIGNING_PROJECT.replace(
+                "        com.apple.security.network.client: true",
+                "        com.apple.security.network.client: \"true\"",
+            ),
+            VALID_SIGNING_PROJECT.replace(
+                "        com.apple.security.network.server: true\n",
+                "",
+            ),
+        ];
+        for project in property_cases {
+            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            assert!(
+                violations.iter().any(|violation| violation.contains(
+                    "TersaMac XcodeGen entitlement properties"
+                )),
+                "XcodeGen entitlement mutation must fail closed; got {violations:?}"
             );
         }
     }
@@ -3230,35 +3673,150 @@ targets:
 
     #[test]
     fn project_generation_must_use_the_exact_no_env_wrapper() {
+        let wrapper = project_generation_wrapper();
         let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
         let consumer = "sh apple/scripts/generate-project.sh\n";
         assert!(
-            project_generation_surface_violations(
-                PROJECT_GENERATION_WRAPPER,
-                &ci,
-                consumer,
-                consumer,
-            )
-            .is_empty()
+            project_generation_surface_violations(&wrapper, &ci, consumer, consumer).is_empty()
         );
 
-        let missing_no_env = PROJECT_GENERATION_WRAPPER.replace(" --no-env", "");
+        let missing_no_env = wrapper.replace(" --no-env", "");
         assert!(
             project_generation_surface_violations(&missing_no_env, &ci, consumer, consumer)
                 .iter()
                 .any(|violation| violation.contains("exact reviewed --no-env wrapper"))
         );
-        let direct = "xcodegen generate --spec apple/project.yml --project apple\n";
-        assert!(
-            project_generation_surface_violations(
-                PROJECT_GENERATION_WRAPPER,
-                &(ci + direct),
-                consumer,
-                consumer,
-            )
-            .iter()
-            .any(|violation| violation.contains("must not bypass"))
+        let direct = concat!(
+            "xcodegen",
+            " generate --spec apple/project.yml --project apple\n"
         );
+        assert!(
+            project_generation_surface_violations(&wrapper, &(ci + direct), consumer, consumer,)
+                .iter()
+                .any(|violation| violation.contains("must not bypass"))
+        );
+    }
+
+    #[test]
+    fn every_tracked_project_generation_command_is_inventory_checked() {
+        let repository = temporary_repository("xcodegen-inventory");
+        fs::create_dir_all(repository.join("apple/scripts"))
+            .expect("script directory must be created");
+        fs::create_dir_all(repository.join("docs")).expect("docs directory must be created");
+        fs::write(
+            repository.join("apple/scripts/generate-project.sh"),
+            project_generation_wrapper(),
+        )
+        .expect("wrapper must be written");
+        fs::write(
+            repository.join("docs/development.md"),
+            concat!("xcodegen", " generate --spec unreviewed.yml\n"),
+        )
+        .expect("direct command fixture must be written");
+        git_add(
+            &repository,
+            false,
+            &["apple/scripts/generate-project.sh", "docs/development.md"],
+        );
+
+        let violations = tracked_project_generation_violations(&repository)
+            .expect("tracked command inventory must succeed");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("docs/development.md")),
+            "tracked direct command must fail closed; got {violations:?}"
+        );
+
+        fs::write(
+            repository.join("docs/development.md"),
+            "sh apple/scripts/generate-project.sh\n",
+        )
+        .expect("consumer must be rewritten");
+        assert!(
+            tracked_project_generation_violations(&repository)
+                .expect("tracked command inventory must succeed")
+                .is_empty()
+        );
+
+        fs::write(
+            repository.join("apple/scripts/generate-project.sh"),
+            format!("{}# unreviewed change\n", project_generation_wrapper()),
+        )
+        .expect("wrapper mutation must be written");
+        let violations = tracked_project_generation_violations(&repository)
+            .expect("tracked command inventory must succeed");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("apple/scripts/generate-project.sh")),
+            "non-exact wrapper must fail closed; got {violations:?}"
+        );
+        fs::remove_dir_all(repository).expect("temporary repository must be removed");
+    }
+
+    #[test]
+    fn tracked_apple_inventory_rejects_force_added_build_entries_and_entitlement_symlinks() {
+        let repository = temporary_repository("tracked-apple-inventory");
+        fs::create_dir_all(repository.join("apple/build/DerivedData"))
+            .expect("ignored build directory must be created");
+        fs::create_dir_all(repository.join("apple/source"))
+            .expect("source directory must be created");
+        fs::write(repository.join(".gitignore"), "apple/build/\n")
+            .expect("ignore file must be written");
+        fs::write(
+            repository.join("apple/build/DerivedData/Forced.txt"),
+            "tracked generated content",
+        )
+        .expect("force-added fixture must be written");
+        fs::write(
+            repository.join("apple/source/Regular.entitlements"),
+            "<plist version=\"1.0\"><dict/></plist>",
+        )
+        .expect("regular entitlement must be written");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            Path::new("Regular.entitlements"),
+            repository.join("apple/source/Linked.entitlements"),
+        )
+        .expect("entitlement symlink must be created");
+        git_add(
+            &repository,
+            false,
+            &[
+                ".gitignore",
+                "apple/source/Regular.entitlements",
+                "apple/source/Linked.entitlements",
+            ],
+        );
+        git_add(&repository, true, &["apple/build/DerivedData/Forced.txt"]);
+
+        let inventory = tracked_apple_signing_inventory(&repository)
+            .expect("tracked Apple inventory must succeed");
+        assert_eq!(
+            inventory.entitlement_paths,
+            vec![std::path::PathBuf::from(
+                "apple/source/Regular.entitlements"
+            )]
+        );
+        assert!(
+            inventory
+                .violations
+                .iter()
+                .any(|violation| violation.contains("apple/build/DerivedData/Forced.txt")),
+            "force-added ignored content must fail closed; got {:?}",
+            inventory.violations
+        );
+        #[cfg(unix)]
+        assert!(
+            inventory
+                .violations
+                .iter()
+                .any(|violation| violation.contains("Linked.entitlements")),
+            "tracked entitlement symlink must fail closed; got {:?}",
+            inventory.violations
+        );
+        fs::remove_dir_all(repository).expect("temporary repository must be removed");
     }
 
     #[test]
@@ -3301,6 +3859,31 @@ targets:
             let error = collect_entitlement_paths(&root, &root, &mut Vec::new())
                 .expect_err("source symlinks must fail closed");
             assert!(error.to_string().contains("must not be a symbolic link"));
+
+            let real_root = root.with_extension("real");
+            fs::create_dir_all(&real_root).expect("real inventory root must be created");
+            let linked_root = root.with_extension("linked");
+            std::os::unix::fs::symlink(&real_root, &linked_root)
+                .expect("inventory root symlink must be created");
+            let error = collect_entitlement_paths(&linked_root, &linked_root, &mut Vec::new())
+                .expect_err("inventory root symlink must fail closed");
+            assert!(error.to_string().contains("root"));
+            fs::remove_file(linked_root).expect("inventory root symlink must be removed");
+            fs::remove_dir_all(real_root).expect("real inventory root must be removed");
+
+            let build_link_root = root.with_extension("build-link");
+            let generated_target = root.with_extension("generated-target");
+            fs::create_dir_all(&build_link_root)
+                .expect("build-link inventory root must be created");
+            fs::create_dir_all(&generated_target).expect("generated target must be created");
+            std::os::unix::fs::symlink(&generated_target, build_link_root.join("build"))
+                .expect("excluded build-root symlink must be created");
+            let error =
+                collect_entitlement_paths(&build_link_root, &build_link_root, &mut Vec::new())
+                    .expect_err("excluded build-root symlink must fail closed");
+            assert!(error.to_string().contains("excluded Apple build root"));
+            fs::remove_dir_all(build_link_root).expect("build-link inventory root must be removed");
+            fs::remove_dir_all(generated_target).expect("generated target must be removed");
         }
         fs::remove_dir_all(&root).expect("inventory fixture must be removed");
     }

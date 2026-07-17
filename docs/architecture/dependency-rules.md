@@ -147,12 +147,18 @@ and reuse of the protected entitlement path fail closed. The current `options`
 mapping is closed, including rejection of nested pre- and post-generation
 hooks. The `TersaMac` target type, bundle identifier, sole Rust pre-build phase,
 scheme, build rules, build-tool plugins, and additional signing controls are
-also closed exact surfaces. The checked project-generation wrapper always uses
-XcodeGen `--no-env`, preserving `${TeamIdentifierPrefix}` for Xcode rather than
-environment expansion. Every other source entitlement under `apple/` is parsed
-and rejected if it claims either protected group entitlement. The ignored
-generated `apple/build/` tree is excluded from inventory, while source symlinks
-remain forbidden.
+also closed exact surfaces. Exact project-root and target top-level key sets
+reject project/target attributes, dependencies, and legacy forms. The source
+and XcodeGen entitlement dictionaries each contain exactly the five reviewed
+keys with exact boolean capability values. The checked project-generation
+wrapper always uses XcodeGen `--no-env`, preserving `${TeamIdentifierPrefix}`
+for Xcode rather than environment expansion. A repository-wide tracked-file
+inventory allows the generation command only in that byte-exact wrapper. Every
+other source entitlement under `apple/` is parsed and rejected if it claims
+either protected group entitlement. The ignored generated `apple/build/` tree
+is excluded from filesystem inventory only when its root is a real directory;
+Git-index checks reject any tracked entry below it and independently enumerate
+tracked entitlement files and symlinks. Other source symlinks remain forbidden.
 
 Provisioning must use a raw add-only operation. A duplicate discards and
 zeroizes the losing candidate, then retrieves and validates the winner; it

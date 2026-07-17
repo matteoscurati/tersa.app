@@ -176,15 +176,24 @@ and `postGenCommand` hooks. `TersaMac` is fixed to an application target, one
 exact Rust build phase, no post-build or compile phases, no build rules or
 build-tool plugins, and a scheme without executable actions. Signing controls,
 conditional variants, identifier expansion roots, and the bundle identifier
-are exact allowlists.
+are exact allowlists. The project root and `TersaMac` target also have closed
+top-level key sets, so project attributes, target attributes, dependencies,
+and legacy target forms cannot add an alternate signing or execution surface.
+Both the source entitlement and XcodeGen entitlement properties contain exactly
+the same five reviewed keys; their three capability flags are boolean `true`.
 
 All repository project generation uses the checked
 `apple/scripts/generate-project.sh` wrapper with XcodeGen `--no-env`. This keeps
 `${TeamIdentifierPrefix}` literal in the generated project until Xcode resolves
 it. The entitlement source inventory excludes only the ignored generated
-`apple/build/` tree, including local DerivedData copies and symlinks. Every
-other entitlement file under `apple/` is parsed and rejected if it claims
-either protected group entitlement, and any source-tree symlink fails closed.
+`apple/build/` tree, including local DerivedData copies and internal symlinks;
+the excluded root itself must be a real directory. A separate Git-index
+inventory rejects every tracked entry below `apple/build/` and every tracked
+entitlement symlink, then independently enumerates all tracked entitlement
+files. Every other entitlement file under `apple/` is parsed and rejected if it
+claims either protected group entitlement, and any source-tree symlink fails
+closed. A repository-wide tracked-file inventory permits the XcodeGen generation
+command only in the byte-exact wrapper.
 These surfaces require a reviewed policy change rather than attempted partial
 XcodeGen resolution.
 

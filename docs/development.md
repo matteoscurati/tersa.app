@@ -237,6 +237,8 @@ diagnostic artifacts:
 The checked wrapper is the only supported XcodeGen entry point. It passes
 `--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
 literal until Xcode resolves them; CI and evidence scripts use the same path.
+The architecture gate inventories every tracked file and rejects a direct
+XcodeGen generation command anywhere outside the byte-exact wrapper.
 
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
