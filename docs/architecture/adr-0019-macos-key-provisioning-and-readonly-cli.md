@@ -157,16 +157,31 @@ Data Protection Keychain API on macOS. The Foundation surface resolves and
 validates the application-group container through the inward platform port.
 
 PR 33a.5 authorizes `rustix =1.1.4` as the sole new external direct dependency
-of `tersa-keychain-macos`. It must be declared only under the exact
-`cfg(target_os = "macos")`, with default features disabled and the direct feature
-set exactly `fs` and `std`. It supplies the safe descriptor-relative filesystem
-and advisory-lock operations required by the fixed bootstrap. No direct `libc`
-dependency, handwritten syscall binding, or new unsafe POSIX FFI is authorized.
+of `tersa-keychain-macos`. It must use the canonical atomic macOS target
+structure `cfg(target_os = "macos")`, with default features disabled and the
+direct feature set exactly `fs` and `std`. It supplies the safe
+descriptor-relative filesystem and advisory-lock operations required by the
+fixed bootstrap. No direct `libc` dependency, handwritten syscall binding, or
+new unsafe POSIX FFI is authorized.
 The implementation pull request must update the Keychain adapter's closed
 direct-dependency set and enforce the exact rustix version, target,
 default-feature state, and feature set in `xtask`, with positive and negative
 policy tests. This governance amendment changes no manifest, active dependency
 graph, or gate.
+
+The protected rustix direct-owner set is exactly the existing portable
+`tersa-blob-spike` diagnostic and the future macOS-gated
+`tersa-keychain-macos` declaration. `tersa-cli-macos` and
+`tersa-apple-bridge` may reach the Keychain adapter's rustix only transitively
+on `aarch64-apple-darwin`, through their exact protected workspace edges to
+`tersa-keychain-macos`. They may not declare rustix directly or reach that
+protected edge through another workspace parent or target. Resolved-path tests
+must accept the blob owner, the Keychain owner, and the exact CLI/bridge macOS
+chains and reject direct CLI/bridge declarations, another workspace owner,
+alternate workspace paths, iOS, and every non-macOS target. This policy is
+scoped to exact workspace declarations and paths into the protected Keychain
+chain; unrelated third-party packages may retain their own transitive rustix
+reachability and must not trigger a false global ban.
 
 The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
@@ -388,12 +403,35 @@ in the dependency policy; no other manifest edge is implied by this amendment.
 Name-only allowance in `dependency_policy` is insufficient. The implementation
 must also add `tersa-apple-bridge -> tersa-keychain-macos` to the exact
 `protected_edge` match enforced by
-`future_macos_store_dependency_violation`, so only the literal
-`cfg(target_os = "macos")` is accepted. Policy tests must prove that exact macOS
-form passes and that an untargeted edge, an iOS edge, a macOS-and-iOS edge, and
-every other cfg spelling or expression fail. This governance pull request does
-not add the edge or change `xtask`; PR 33a.5 must activate the manifest and both
-policy layers atomically.
+`future_macos_store_dependency_violation`, so only the canonical atomic target
+structure `cfg(target_os = "macos")` is accepted. `cargo_metadata` canonicalizes
+equivalent whitespace and quote spelling, so source-text spelling is not a
+policy boundary. Tests must prove that the canonical atomic macOS target passes
+and that an untargeted edge, iOS, combined platforms, nested `all`/`any`/`not`,
+feature-conditioned targets, and other semantically different or broadened
+target expressions fail. This governance pull request does not add the edge or
+change `xtask`; PR 33a.5 must activate the manifest and both policy layers
+atomically.
+
+PR 33a.5 must also add narrow resolved-graph exceptions for
+`tersa-apple-bridge` on `aarch64-apple-darwin` only. HMAC reachability is
+allowed solely through the immediate workspace chain
+`tersa-apple-bridge -> tersa-keychain-macos -> hkdf -> hmac`; SQLCipher
+reachability is allowed solely from `tersa-apple-bridge` through
+`tersa-keychain-macos`, `tersa-store-sqlcipher-macos`, `rusqlite`, and
+`libsqlite3-sys` in that order. The bridge must not be added to the general
+`HMAC_OWNERS` or `SQLCIPHER_OWNERS` sets and receives no direct HMAC, HKDF,
+rusqlite, libsqlite3-sys, SQLCipher-store, or other crypto dependency.
+
+The current enforcement points are `check_blob_dependency_graph` and
+`blob_dependency_graph_violations` for HKDF/HMAC, and
+`check_sqlcipher_dependency_graph` and
+`sqlcipher_dependency_graph_violations` for SQLCipher. The implementation may
+refactor those helpers only if exact semantic path tests remain. Positive tests
+must prove both approved bridge paths on `aarch64-apple-darwin`; negative tests
+must reject direct declarations, alternate workspace intermediaries, additional
+workspace path parents, any extra crypto or SQLCipher path, iOS, and every
+non-macOS target. Existing owner rules remain unchanged for all other members.
 
 Only the canonical domain `AccountId` may select an account. Production uses
 only the fixed `default` profile and the fixed paths, Keychain attributes, and

@@ -30,11 +30,13 @@ amendment authorizes, but does not activate, one future
 `tersa-keychain-macos`. The implementation pull request must add that exact
 manifest edge, its name allowance in `dependency_policy`, and its exact tuple in
 the `protected_edge` branch of `future_macos_store_dependency_violation`
-together. Positive and negative tests must accept only the literal macOS cfg and
-reject untargeted, iOS, macOS-and-iOS, and every other cfg form. Until then, the
-active bridge dependencies remain only `tersa-application` and
-`tersa-presentation`; this document changes no manifest, `xtask` policy, or
-passing gate.
+together. Tests must accept only the canonical atomic macOS target structure
+and reject untargeted, iOS, combined-platform, nested `all`/`any`/`not`,
+feature-conditioned, or otherwise broadened target structures. Equivalent
+whitespace and quote spelling canonicalized by `cargo_metadata` is not a policy
+distinction. Until then, the active bridge dependencies remain only
+`tersa-application` and `tersa-presentation`; this document changes no manifest,
+`xtask` policy, or passing gate.
 
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
@@ -125,14 +127,25 @@ missing required dependency, or direct `hmac` is rejected. Resolved
 HKDF-to-HMAC reachability remains allowed and separately checked.
 
 PR 33a.5 authorizes one future external addition to that closed direct set:
-`rustix =1.1.4`, only under the exact `cfg(target_os = "macos")`, with default
-features disabled and features exactly `fs` and `std`. It is used only for safe
-descriptor-relative filesystem and advisory-lock operations. No direct `libc`,
-handwritten syscall binding, or new unsafe POSIX FFI is authorized. The
+`rustix =1.1.4`, under the canonical atomic macOS target structure
+`cfg(target_os = "macos")`, with default features disabled and features exactly
+`fs` and `std`. It is used only for safe descriptor-relative filesystem and
+advisory-lock operations. No direct `libc`, handwritten syscall binding, or new
+unsafe POSIX FFI is authorized. The
 implementation must activate the manifest declaration and exact version,
 target, default-feature, feature-set, direct-owner, and resolved-target checks
 in `xtask` together, with pass and fail fixtures. This governance amendment
 leaves the current manifest and closed active set unchanged.
+
+Direct rustix owners are exactly `tersa-blob-spike`, which remains the existing
+portable diagnostic owner, and the future exact macOS-gated
+`tersa-keychain-macos` declaration. The CLI and bridge may reach the protected
+Keychain rustix transitively only through their exact macOS workspace edges to
+`tersa-keychain-macos`; direct declarations, alternate workspace parents or
+paths, iOS, and other targets fail. Resolved-path tests must cover every allowed
+and rejected form. This check is scoped to direct workspace declarations and
+paths into the protected Keychain chain. It must not reject unrelated rustix
+versions or reachability introduced solely by third-party dependency graphs.
 
 The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
 `tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
@@ -165,6 +178,24 @@ identifier and returns a closed status. The bridge first validates the canonical
 bootstrap. It receives no raw key, caller-selected path, profile or
 configuration override, database handle, store object, or returned storage
 capability and gains no direct edge to `tersa-store-sqlcipher-macos`.
+
+The bridge gains only two narrow resolved-graph exceptions on
+`aarch64-apple-darwin`: HMAC through the exact chain
+`tersa-apple-bridge -> tersa-keychain-macos -> hkdf -> hmac`, and SQLCipher
+through the exact workspace chain from bridge to Keychain adapter to
+`tersa-store-sqlcipher-macos`, followed by `rusqlite -> libsqlite3-sys`. The
+bridge is not added to `HMAC_OWNERS` or `SQLCIPHER_OWNERS`, and no direct crypto,
+store, rusqlite, or libsqlite3-sys declaration is authorized.
+
+`blob_dependency_graph_violations` and its
+`check_blob_dependency_graph` caller, plus
+`sqlcipher_dependency_graph_violations` and its
+`check_sqlcipher_dependency_graph` caller, are the current resolved-graph
+enforcement points. They may be refactored only with semantic tests proving the
+exact allowed chains and rejecting direct declarations, alternate workspace
+intermediaries, extra workspace path parents, additional protected paths, iOS,
+and every non-macOS target. Existing owner-list behavior remains unchanged for
+all other workspace members.
 
 All cooperative product-application bootstraps must first serialize on the
 fixed App Group lock file `.tersa-profile-bootstrap-v1.lock`. The trusted

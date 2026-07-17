@@ -145,13 +145,25 @@ exact head.
 PR 33a.5 must add the exact macOS-only `rustix =1.1.4` `fs`/`std` dependency to
 the Keychain adapter and enforce both the closed dependency set and the exact
 protected bridge edge in `xtask`; name-only allowance is insufficient. Every
-cooperative product bootstrap serializes from Keychain provisioning through
-final status on the fixed `.tersa-profile-bootstrap-v1.lock` App Group file;
-the CLI never bootstraps. This lock and the identity checks cover cooperative
-races only. A same-user replacement between revalidation and pathname unlink
-remains an explicit local-malware residual and requires a deterministic
-non-prevention fixture. This governance slice activates no manifest, policy,
-runtime edge, or gate.
+direct rustix owner remains limited to the existing blob diagnostic and this
+future Keychain declaration. CLI and bridge reach the protected Keychain
+rustix only through their exact macOS workspace edges; unrelated third-party
+rustix reachability is outside that path-scoped rule.
+
+The bridge's resolved HMAC and SQLCipher reachability is allowed on
+`aarch64-apple-darwin` only through bridge-to-Keychain-to-HKDF/HMAC and
+bridge-to-Keychain-to-store/rusqlite/libsqlite3-sys respectively. The bridge is
+not a general crypto or SQLCipher owner, and direct or alternate workspace paths
+fail. Target checks enforce the canonical atomic macOS structure while ignoring
+equivalent whitespace or quote spelling normalized by `cargo_metadata`.
+
+Every cooperative product bootstrap serializes from Keychain provisioning
+through final status on the fixed `.tersa-profile-bootstrap-v1.lock` App Group
+file; the CLI never bootstraps. This lock and the identity checks cover
+cooperative races only. A same-user replacement between revalidation and
+pathname unlink remains an explicit local-malware residual and requires a
+deterministic non-prevention fixture. This governance slice activates no
+manifest, policy, runtime edge, or gate.
 
 ## Phase 2 — iPhone and iPad implementation
 
