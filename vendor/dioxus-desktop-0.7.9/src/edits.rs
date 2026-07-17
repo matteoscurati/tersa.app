@@ -1112,6 +1112,7 @@ mod transport_tests {
     #[test]
     fn slow_drip_upgrade_cannot_extend_the_handshake_deadline() {
         let timeout = Duration::from_millis(100);
+        let completion_timeout = timeout * 3;
         let (location, listener) = start_server(0);
         let address = listener
             .local_addr()
@@ -1122,6 +1123,7 @@ mod transport_tests {
         let slot = slots
             .try_acquire()
             .expect("test handshake slot must be available");
+        let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let handler = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("test server must accept");
             EditWebsocket::handle_connection_for_location(
@@ -1132,6 +1134,9 @@ mod transport_tests {
                 slot,
                 location,
             );
+            completion_sender
+                .send(())
+                .expect("test must observe handshake worker completion");
         });
 
         let request = format!(
@@ -1139,18 +1144,28 @@ mod transport_tests {
             encode_key_string(&location.client_key)
         );
         let mut peer = TcpStream::connect(address).expect("test peer must connect");
-        let started = Instant::now();
-        for byte in request.bytes() {
-            if peer.write_all(&[byte]).is_err() {
-                break;
+        let peer_controller = peer
+            .try_clone()
+            .expect("test peer controller must clone the socket");
+        let writer = thread::spawn(move || {
+            for byte in request.bytes() {
+                if peer.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
             }
-            thread::sleep(Duration::from_millis(15));
-        }
+        });
+
+        let completion = completion_receiver.recv_timeout(completion_timeout);
+        let _ = peer_controller.shutdown(Shutdown::Both);
+        writer
+            .join()
+            .expect("slow-drip peer writer must not panic");
         handler
             .join()
             .expect("slow-drip handshake worker must not panic");
         assert!(
-            started.elapsed() < timeout * 3,
+            completion.is_ok(),
             "slow-drip input must not extend the absolute handshake deadline"
         );
         assert!(
