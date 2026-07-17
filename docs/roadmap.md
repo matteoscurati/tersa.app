@@ -193,17 +193,32 @@ credentiallessly builds/analyzes the existing target. It adds no Xcode test
 target or policy exception. Runtime dispatch/overflow evidence remains PR 33b;
 PR 33a.5 Rust tests cover C ABI main-thread rejection and locking.
 
-The store snapshots main/WAL/shared-memory before opening. All absent is a fresh
-leaf eligible for bounded failed-open cleanup; a present main with any sidecar
-combination uses the existing opener/migration path and is never cleanup
-eligible; an absent main with either sidecar fails before open without cleanup.
-Fresh-cleanup identities are recorded only after failed handles close,
-immediately before revalidation and pathname unlink. The cooperative lock cannot
-prevent malicious replacement in that gap. The CLI remains behaviorally
-retrieval-only, but its Keychain dependency makes provisioning APIs
-compile-reachable; an `xtask` tracked-source allowlist is defense in depth, not
-a compiler boundary. A future facade/crate boundary requires its own ADR. This
-governance slice activates no manifest, policy, runtime edge, or gate.
+Before SQLite open, the store retains a validated account-directory descriptor
+and snapshots exactly `mail.sqlite3`, `mail.sqlite3-journal`,
+`mail.sqlite3-wal`, and `mail.sqlite3-shm` through that descriptor. All four
+absent is a fresh leaf eligible for bounded failed-open cleanup. A present main
+with any combination of the three sidecars uses the existing opener/migration
+path, which may still reject it, and is never cleanup eligible. An absent main
+with any sidecar fails before open without cleanup.
+This augments the existing `database_sidecar_exists` three-suffix invariant;
+fixtures preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
+and cover every relevant combination.
+
+After a failed fresh open closes SQLite handles, the store may clean any of the
+four fixed entries that was absent pre-open and newly present after close under
+the cooperative-writer assumption. It uses rustix `statat` and `unlinkat`
+beneath the retained descriptor and never re-resolves a parent pathname or calls
+`std::fs::remove_file`. SQLite remains pathname-based; no descriptor-bound
+SQLite opener is claimed. The stated cleanup residuals are same-user insertion
+between snapshot and recording, which can be misattributed to SQLite, and
+same-user replacement between revalidation and `unlinkat`; deterministic hooks
+cover both non-prevention gaps and intermediate mismatch preservation for all
+four entries. The descriptor is released on every return. The CLI remains
+behaviorally retrieval-only, but its
+Keychain dependency makes provisioning APIs compile-reachable; an `xtask`
+tracked-source allowlist is defense in depth, not a compiler boundary. A future
+facade/crate boundary requires its own ADR. This governance slice activates no
+manifest, policy, runtime edge, or gate.
 
 ## Phase 2 — iPhone and iPad implementation
 

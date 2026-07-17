@@ -141,7 +141,7 @@ exact direct macOS declarations to both `tersa-keychain-macos` and
 continues to request `fs` and `std`; the Keychain member directly augments only
 `process` for `geteuid`, while the store inherits only `fs` and `std` and must
 not request `process`. Rustix owns the safe descriptor-relative filesystem,
-locking, `statat`, and unlink operations; no direct `libc`, handwritten syscall
+locking, `statat`, and `unlinkat` operations; no direct `libc`, handwritten syscall
 binding, or unsafe POSIX FFI is authorized.
 
 Direct owners are exactly `tersa-blob-spike`, `tersa-keychain-macos`, and
@@ -304,25 +304,45 @@ migrator of the database leaf. PR 33a.5 must harden that same API's fresh-leaf
 failure cleanup, but creates no descriptor-bound opener or new
 workspace-to-workspace edge; its exact store-to-rustix external-package edge is
 the only addition needed for this cleanup.
-Under the lock, the store uses its direct rustix dependency to take a no-follow
-snapshot of main/WAL/shared-memory. If all are absent, it invokes the existing
-opener and permits bounded fresh-failure cleanup. A present main file with any
-sidecar combination is an existing leaf: it uses the existing opener/migration
-path and never permits fresh cleanup. An absent main file with either sidecar
-present fails before open and performs no cleanup. Only after a failed fresh
-open closes every handle does the store record each newly present fixed entry's
-identity, revalidate immediately before pathname unlink, and remove a matching
-restrictive same-user regular file. The store performs both `statat` and unlink
-through that direct rustix dependency. Identity is not captured at SQLite
-creation time. It never removes pre-existing or mismatched entries, and profile
-directory cleanup stops before the store is invoked. Residual cleanup failures
+Under the lock and before SQLite open, the store opens and retains a validated
+account-directory descriptor solely for descriptor-relative snapshot, `statat`,
+and cleanup. Through its direct rustix dependency it snapshots exactly the main,
+rollback-journal, WAL, and shared-memory names: `mail.sqlite3`,
+`mail.sqlite3-journal`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. All four
+absent is a fresh leaf that enters the existing opener and permits bounded
+fresh-failure cleanup. A present main file with any combination of the three
+sidecars is an existing leaf: it enters the existing opener/migration path,
+which may still reject it, and never permits fresh cleanup. An absent main with
+any journal, WAL, or shared-memory name present fails before open and performs
+no cleanup.
+
+This classification augments and must not weaken the existing
+`database_sidecar_exists` three-suffix invariant. Fixtures preserve the current
+`absent_with_sidecar` and `empty_with_sidecar` rollback-journal behavior and
+cover the all-absent state, every main-present sidecar combination, and every
+main-absent orphan-sidecar combination. Only after a failed fresh open closes
+all SQLite handles may the store consider any of the four fixed entries that
+was absent pre-open and is newly present after close. Under the cooperative-writer
+assumption it records and revalidates each candidate's identity through
+descriptor-relative no-follow `statat`, then uses rustix `unlinkat` beneath the
+same retained parent descriptor. It never uses `std::fs::remove_file`,
+re-resolves the parent path, removes a pre-existing or mismatched entry, or
+removes a profile directory.
+
+The retained descriptor eliminates a parent-path cleanup race; SQLite itself
+remains pathname-based and no descriptor-bound SQLite opener is claimed. The
+stated store-cleanup residuals are limited to mutable final names: a same-user
+insertion after the absent snapshot but before post-close recording can be
+misattributed to SQLite, and a same-user replacement after revalidation but
+before `unlinkat` cannot be atomically excluded. macOS supplies neither creation
+provenance nor unlink-if-inode. Deterministic hooks cover snapshot-to-record
+insertion, record-to-revalidation replacement, and revalidation-to-`unlinkat`
+replacement for all four fixed entries; the first and last record
+non-prevention, while the middle proves mismatch preservation. The retained
+descriptor is released on every return after the snapshot/open/cleanup sequence.
+Residual cleanup failures
 remain fail-closed owning-application recovery work and grant no CLI repair
-authority. Identity checks and the advisory lock cover ordinary and cooperative
-races, not a same-user malicious replacement between revalidation and pathname
-unlink. Because macOS has no unlink-if-inode operation and the lock is
-cooperative, that gap remains an explicit unlocked-device residual. A
-deterministic fixture must hook post-close recording, revalidation, and unlink
-and record this non-prevention rather than asserting the replacement is safe.
+authority.
 Activating the future bridge edge or its policy before the
 implementation pull request is forbidden. PR 33b owns the same-team signed
 runtime evidence; PR 32 fake concurrency tests, PR 33a deterministic tests, and

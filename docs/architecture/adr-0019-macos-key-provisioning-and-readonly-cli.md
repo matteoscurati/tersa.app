@@ -92,8 +92,9 @@ allowed only when `profiles` is absent or the entire existing tree is an empty
 fixed skeleton: `profiles` contains no entry other than an optional `default`;
 `default` contains no entry other than an optional `accounts`; and `accounts`
 contains no entries. The global lock file at the App Group root is not profile
-state. Any account-digest directory, database, WAL, shared-memory file, or other
-child under `profiles` is conservatively existing profile state. A fixed
+state. Any account-digest directory, database, rollback journal, WAL,
+shared-memory file, or other child under `profiles` is conservatively existing
+profile state. A fixed
 component that exists as a symlink, non-directory, or otherwise unexpected
 object also counts as existing profile state. An inspection error fails closed
 without mutation.
@@ -208,7 +209,7 @@ declaration remains exact-pinned with `fs` and `std`; the Keychain member adds
 directly only `process`, solely for `geteuid`-based same-user validation. The
 store member inherits only workspace `fs` and `std` and must not directly
 request `process`. Rustix supplies safe descriptor-relative filesystem,
-advisory-lock, `statat`, and unlink operations. No direct `libc` dependency,
+advisory-lock, `statat`, and `unlinkat` operations. No direct `libc` dependency,
 handwritten syscall binding, or new unsafe POSIX FFI is authorized.
 
 The exact direct-owner set is the existing portable `tersa-blob-spike`
@@ -346,7 +347,8 @@ belongs to PR 33b. Rust deterministic tests in PR 33a.5 cover the C ABI's
 umasks, a crash after lock-file creation but before `fchmod`, concurrent
 normalization, rejection of any execute/group/other permission bit, crash
 release of the advisory lock, and adversarial two-thread and two-process
-interleavings around directory creation and main/WAL/shared-memory cleanup. The
+interleavings around directory creation and
+main/rollback-journal/WAL/shared-memory cleanup. The
 interleaving tests must prove cooperative serialization through final status
 rather than deletion or replacement of another bootstrap's state.
 
@@ -399,58 +401,77 @@ the immediate checks remains an explicit unlocked-device/local-malware residual.
 The store remains the sole owner of database-leaf creation, claiming, schema
 migration, validation, and leaf cleanup. PR 33a.5 must harden the same existing
 `SqlCipherMailboxStore::open` API and path for a freshly created leaf. While the
-bootstrap lock is held and immediately before the store call, the store adapter
-uses its own direct rustix dependency to record a descriptor-relative no-follow
-absence/presence snapshot for exactly `mail.sqlite3`, `mail.sqlite3-wal`, and
-`mail.sqlite3-shm`. The snapshot classifies cleanup authorization; it does not
-reject an existing main database merely because a sidecar is absent.
+bootstrap lock is held and immediately before SQLite open, the store opens and
+retains a validated account-directory descriptor solely for descriptor-relative
+snapshot, `statat`, and cleanup. Through its direct rustix dependency it records
+a no-follow absence/presence snapshot for exactly `mail.sqlite3`,
+`mail.sqlite3-journal`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. The snapshot
+classifies cleanup authorization; it does not reject an existing main database
+merely because any sidecar is absent.
 
-| Main | WAL / SHM | Required behavior |
+| Main | Rollback journal / WAL / SHM | Required behavior |
 |---|---|---|
-| Absent | Both absent | Fresh leaf: invoke the existing opener and permit bounded fresh-failure cleanup. |
-| Present | Either sidecar combination, including neither | Existing leaf: invoke the existing opener and migration path; never permit fresh-failure cleanup. |
-| Absent | Either sidecar present | Fail closed before store open; perform no cleanup. |
+| Absent | All three absent | Fresh leaf: invoke the existing opener and permit bounded fresh-failure cleanup. |
+| Present | Any combination, including all absent | Existing leaf: invoke the existing opener and migration path; never permit fresh-failure cleanup. The opener may still reject it. |
+| Absent | Any one or more present | Fail closed before store open; perform no cleanup. |
 
-On any failure before successful claim and migration, the store first closes
-all handles. Only when the snapshot classified a fresh leaf does the store use
-its direct rustix dependency for descriptor-relative no-follow `statat` and
-pathname unlink of the fixed names. If an entry is newly present, the store
-records its identity, type, owner, and permissions at that post-close point and
-revalidates them immediately before unlink. The identity is not known or
-recorded at SQLite creation time. Cleanup may unlink only a same-user
-restrictive regular file whose post-close identity still matches. It must never
-remove an entry present in the pre-store snapshot, an entry with a changed
-identity, or a profile directory. Cleanup failure preserves the original
-redacted failure and may leave restrictive residual store files. Those
-residuals block or fail closed on retry and require recovery by the owning
-product application through a later reviewed path; the CLI gains no repair
-authority.
+This four-entry pre-open classification augments and must not weaken the
+existing `database_sidecar_exists` invariant over the three suffixes
+`-journal`, `-wal`, and `-shm`. In particular, the existing
+`absent_with_sidecar` and `empty_with_sidecar` rollback-journal fixtures retain
+their behavior: an orphan journal with no main file is preserved and fails
+before open, while an empty present main plus journal enters the existing-leaf
+opener and preserves the journal when that opener rejects it.
 
-The identity checks and global lock prevent ordinary observable changes and
-serialize cooperative bootstraps only. They do not prevent a same-user malicious
-process from ignoring the advisory lock and replacing an entry after the final
-identity revalidation but before the pathname unlink. macOS provides no
-unlink-if-inode primitive for transferring that check atomically into removal.
-This revalidation/unlink gap is an explicit unlocked-device/local-malware
-residual for directory cleanup and main/WAL/shared-memory cleanup; no prevention
-claim is made. A deterministic hook fixture must perform the replacement in
-that exact gap, record the non-prevention outcome, and preserve it as an explicit
-residual test analogous to the existing SQLite sidecar swap fixtures. Additional
-hooks must exercise replacement between post-close identity recording and
-revalidation, and between revalidation and unlink, for the main file and both
-sidecars.
+On any fresh-leaf failure before successful claim and migration, the store
+first closes all SQLite handles while retaining the validated parent descriptor.
+For each fixed name that was absent in the pre-open snapshot and is newly
+present after close, the store may treat it as a cleanup candidate under the
+cooperative-writer assumption. It uses descriptor-relative no-follow `statat`,
+records identity, type, owner, and permissions after close, and revalidates
+immediately before descriptor-relative `unlinkat` beneath that same retained
+parent. Cleanup may remove only a same-user restrictive regular file whose
+post-close identity still matches. It must never call `std::fs::remove_file`,
+re-resolve the account path, remove an entry present in the pre-open snapshot,
+remove an entry with changed identity, or remove a profile directory. Cleanup
+failure preserves the original redacted failure and may leave restrictive
+residual store files. Those residuals block or fail closed on retry and require
+recovery by the owning product application through a later reviewed path; the
+CLI gains no repair authority.
+
+The retained parent descriptor removes parent-path re-resolution from this leaf
+cleanup. The global lock serializes cooperative bootstraps only. A same-user
+malicious process that ignores it can insert a fixed-name entry after the absent
+snapshot but before post-close recording; the store cannot prove whether SQLite
+or that process created the candidate. It can also replace the mutable fixed
+final name after final identity revalidation and before `unlinkat`. macOS
+provides neither creation provenance for the first gap nor an unlink-if-inode
+primitive for the second. These two mutable-final-name gaps are the stated
+store-cleanup residuals; no parent-path cleanup race is claimed. Deterministic
+hooks must exercise insertion between snapshot and post-close recording,
+replacement between recording and revalidation, and replacement in the exact
+revalidation-to-`unlinkat` gap for the main file, rollback journal, WAL, and
+shared-memory file. The insertion and final replacement hooks record
+non-prevention rather than claiming safety; the middle hook proves that an
+observable identity mismatch is preserved. The retained parent descriptor is
+released on every return after the snapshot, open, and any authorized cleanup
+sequence.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
-or migration boundary, cover all main/WAL/shared-memory snapshot combinations,
-and replace each recorded entry before cleanup to prove an identity mismatch is
-preserved rather than removed. Tests must also prove that pre-existing entries
-and profile directories survive every failure. This is a hardening of the
-existing store opener, not a new descriptor-bound API, opener, composition
-crate, or workspace-to-workspace dependency edge. The only new external-package
-edges are the exact rustix declarations authorized above. The directory
-composition must not itself create, delete, replace, or repair `mail.sqlite3` or
-either sidecar and must not return the opened store or another storage capability
-across the bridge boundary.
+or migration boundary; cover the all-absent fresh state, every main-present
+combination of the three sidecars, and every main-absent orphan-sidecar
+combination; preserve the existing `absent_with_sidecar` and
+`empty_with_sidecar` journal behavior; and replace each recorded entry before
+cleanup to prove an identity mismatch is preserved rather than removed. Tests
+must also prove that pre-existing entries and profile directories survive every
+failure and that cleanup uses only the retained descriptor plus fixed names.
+This is a hardening of the existing pathname-based SQLite opener, not a new
+descriptor-bound SQLite API, opener, composition crate, or
+workspace-to-workspace dependency edge. The only new external-package edges are
+the exact rustix declarations authorized above. The directory composition must
+not itself create, delete, replace, or repair any of the four fixed entries and
+must not return the opened store or another storage capability across the bridge
+boundary.
 
 The architecture check accepts the PR 32 signing configuration only at the
 exact `TersaMac` target paths. It rejects project or per-configuration
