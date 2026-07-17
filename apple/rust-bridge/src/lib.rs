@@ -55,11 +55,15 @@ pub use oauth::{
 };
 
 #[cfg(test)]
-#[expect(
-    unsafe_code,
-    reason = "the public C ABI is unsafe to call and these tests exercise its checked boundary"
+#[cfg_attr(
+    target_os = "macos",
+    expect(
+        unsafe_code,
+        reason = "the public C ABI is unsafe to call and these tests exercise its checked boundary"
+    )
 )]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
 
     #[cfg(target_os = "macos")]
