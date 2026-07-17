@@ -448,8 +448,6 @@ fn tracked_apple_signing_inventory(
     Ok(inventory)
 }
 
-const XCODEGEN_GENERATE_NEEDLE: &str = concat!("xcodegen", " generate");
-
 fn project_generation_wrapper() -> String {
     concat!(
         r#"#!/bin/sh
@@ -500,7 +498,7 @@ fn project_generation_surface_violations(
             1,
         ),
     ] {
-        if document.contains(XCODEGEN_GENERATE_NEEDLE) {
+        if contains_xcodegen_generation_invocation(document) {
             violations.push(format!(
                 "{path} must not bypass apple/scripts/generate-project.sh"
             ));
@@ -540,27 +538,197 @@ fn tracked_project_generation_violations(repository_root: &Path) -> io::Result<V
             fs::read_link(&filesystem_path)?
                 .to_string_lossy()
                 .into_owned()
-                .into_bytes()
         } else if metadata.is_file() {
-            fs::read(&filesystem_path)?
+            String::from_utf8_lossy(&fs::read(&filesystem_path)?).into_owned()
         } else {
             continue;
         };
-        if !contents
-            .windows(XCODEGEN_GENERATE_NEEDLE.len())
-            .any(|window| window == XCODEGEN_GENERATE_NEEDLE.as_bytes())
-        {
+        if !contains_xcodegen_generation_invocation(&contents) {
             continue;
         }
-        if path != "apple/scripts/generate-project.sh"
-            || contents.as_slice() != expected_wrapper.as_bytes()
-        {
+        if path != "apple/scripts/generate-project.sh" || contents != expected_wrapper {
             violations.push(format!(
-                "tracked file `{path}` contains a forbidden direct XcodeGen generation command"
+                "tracked file `{path}` contains a forbidden executable XcodeGen generation invocation"
             ));
         }
     }
     Ok(violations)
+}
+
+fn contains_xcodegen_generation_invocation(document: &str) -> bool {
+    let logical_lines = document.replace("\\\r\n", " ").replace("\\\n", " ");
+    logical_lines
+        .lines()
+        .any(shell_line_generates_xcode_project)
+}
+
+fn shell_line_generates_xcode_project(line: &str) -> bool {
+    let tokens = shell_tokens(line);
+    let mut segment = Vec::new();
+    for token in tokens {
+        if matches!(token.as_str(), ";" | "&&" | "||" | "|") {
+            if shell_segment_generates_xcode_project(&segment) {
+                return true;
+            }
+            segment.clear();
+        } else {
+            segment.push(token);
+        }
+    }
+    shell_segment_generates_xcode_project(&segment)
+}
+
+fn shell_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else if character == '\\' && delimiter == '"' {
+                if let Some(escaped) = characters.next() {
+                    token.push(escaped);
+                }
+            } else {
+                token.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    token.push(escaped);
+                }
+            }
+            '#' if token.is_empty() => break,
+            character if character.is_whitespace() => push_shell_token(&mut tokens, &mut token),
+            ';' | '|' | '&' => {
+                push_shell_token(&mut tokens, &mut token);
+                let mut operator = character.to_string();
+                if characters.peek() == Some(&character) {
+                    operator.push(character);
+                    characters.next();
+                }
+                tokens.push(operator);
+            }
+            _ => token.push(character),
+        }
+    }
+    push_shell_token(&mut tokens, &mut token);
+    tokens
+}
+
+fn push_shell_token(tokens: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
+    }
+}
+
+fn shell_segment_generates_xcode_project(tokens: &[String]) -> bool {
+    let mut index = 0;
+    if tokens.first().is_some_and(|token| token == "-")
+        && tokens.get(1).is_some_and(|token| token == "run:")
+    {
+        index = 2;
+    } else if tokens.first().is_some_and(|token| token == "run:") {
+        index = 1;
+    }
+    while tokens.get(index).is_some_and(|token| {
+        matches!(
+            token.as_str(),
+            "if" | "then" | "elif" | "while" | "until" | "do" | "!"
+        )
+    }) {
+        index += 1;
+    }
+    while tokens
+        .get(index)
+        .is_some_and(|token| shell_assignment(token))
+    {
+        index += 1;
+    }
+    shell_wrapped_command_generates(tokens, index)
+}
+
+fn shell_wrapped_command_generates(tokens: &[String], mut index: usize) -> bool {
+    loop {
+        let Some(command) = tokens.get(index).map(|token| shell_command_name(token)) else {
+            return false;
+        };
+        match command {
+            "env" | "sudo" => {
+                index += 1;
+                while tokens
+                    .get(index)
+                    .is_some_and(|token| token.starts_with('-') || shell_assignment(token))
+                {
+                    index += 1;
+                }
+            }
+            "exec" => {
+                index += 1;
+                while tokens
+                    .get(index)
+                    .is_some_and(|token| token.starts_with('-'))
+                {
+                    index += 1;
+                }
+            }
+            "command" => {
+                index += 1;
+                if tokens
+                    .get(index)
+                    .is_some_and(|token| matches!(token.as_str(), "-v" | "-V"))
+                {
+                    return false;
+                }
+                while tokens
+                    .get(index)
+                    .is_some_and(|token| token.starts_with('-'))
+                {
+                    index += 1;
+                }
+            }
+            "sh" | "bash" | "zsh" => {
+                return tokens
+                    .iter()
+                    .skip(index + 1)
+                    .position(|token| token == "-c")
+                    .and_then(|offset| tokens.get(index + offset + 2))
+                    .is_some_and(|script| contains_xcodegen_generation_invocation(script));
+            }
+            "xcodegen" => return xcodegen_arguments_generate(&tokens[index + 1..]),
+            _ => return false,
+        }
+    }
+}
+
+fn shell_command_name(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
+fn shell_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(|character: char| character.is_ascii_digit())
+        && name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn xcodegen_arguments_generate(arguments: &[String]) -> bool {
+    let Some(first) = arguments.first().map(String::as_str) else {
+        return true;
+    };
+    if matches!(first, "--version" | "version" | "--help" | "-h" | "help") {
+        return false;
+    }
+    first == "generate" || first.starts_with('-')
 }
 
 fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
@@ -3695,6 +3863,17 @@ targets:
                 .iter()
                 .any(|violation| violation.contains("must not bypass"))
         );
+        let root_form = "xcodegen --spec apple/project.yml --project apple\n";
+        assert!(
+            project_generation_surface_violations(
+                &wrapper,
+                &format!("{consumer}{consumer}{consumer}{root_form}"),
+                consumer,
+                consumer,
+            )
+            .iter()
+            .any(|violation| violation.contains("must not bypass"))
+        );
     }
 
     #[test]
@@ -3708,35 +3887,75 @@ targets:
             project_generation_wrapper(),
         )
         .expect("wrapper must be written");
-        fs::write(
-            repository.join("docs/development.md"),
-            concat!("xcodegen", " generate --spec unreviewed.yml\n"),
-        )
-        .expect("direct command fixture must be written");
+        fs::write(repository.join("docs/development.md"), "initial fixture\n")
+            .expect("tracked fixture must be written");
         git_add(
             &repository,
             false,
             &["apple/scripts/generate-project.sh", "docs/development.md"],
         );
 
-        let violations = tracked_project_generation_violations(&repository)
-            .expect("tracked command inventory must succeed");
-        assert!(
-            violations
-                .iter()
-                .any(|violation| violation.contains("docs/development.md")),
-            "tracked direct command must fail closed; got {violations:?}"
-        );
+        for (label, invocation) in [
+            (
+                "explicit generate subcommand",
+                concat!("xcodegen", " generate --spec unreviewed.yml\n"),
+            ),
+            ("root long spec option", "xcodegen --spec unreviewed.yml\n"),
+            (
+                "root attached long spec option",
+                "xcodegen --spec=unreviewed.yml\n",
+            ),
+            ("root short spec option", "xcodegen -s unreviewed.yml\n"),
+            ("bare invocation", "xcodegen\n"),
+            (
+                "path-qualified executable",
+                "/opt/local/bin/xcodegen --spec unreviewed.yml\n",
+            ),
+            (
+                "quoted variable-qualified executable",
+                "\"$RUNNER_TEMP/xcodegen/bin/xcodegen\" -s unreviewed.yml\n",
+            ),
+            (
+                "ordinary whitespace variation",
+                "  xcodegen\t  --spec\t unreviewed.yml  \n",
+            ),
+            (
+                "backslash-newline continuation",
+                "xcodegen \\\n  --spec unreviewed.yml\n",
+            ),
+        ] {
+            fs::write(repository.join("docs/development.md"), invocation)
+                .expect("direct command fixture must be written");
+            let violations = tracked_project_generation_violations(&repository)
+                .expect("tracked command inventory must succeed");
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains("docs/development.md")),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
 
         fs::write(
             repository.join("docs/development.md"),
-            "sh apple/scripts/generate-project.sh\n",
+            concat!(
+                "sh apple/scripts/generate-project.sh\n",
+                "command -v xcodegen >/dev/null\n",
+                "\"$RUNNER_TEMP/xcodegen/bin/xcodegen\" --version | grep Version\n",
+                "curl https://example.invalid/xcodegen/releases/xcodegen.zip\n",
+                "XCODEGEN_PATH=/opt/local/bin/xcodegen\n",
+                "echo xcodegen\n",
+                "xcodegen is mentioned here as prose, not executed successfully.\n",
+                "The /opt/local/bin/xcodegen path is documentation.\n",
+                "XcodeGen 2.45.4 is the pinned project generator.\n",
+            ),
         )
-        .expect("consumer must be rewritten");
+        .expect("legitimate occurrences must be written");
         assert!(
             tracked_project_generation_violations(&repository)
                 .expect("tracked command inventory must succeed")
-                .is_empty()
+                .is_empty(),
+            "version, install, prose, argument, and path occurrences must remain allowed"
         );
 
         fs::write(
