@@ -1788,9 +1788,11 @@ fn swift_bootstrap_source_inventory(
         let submit_count = swift_member_call_count(&code, "submit");
         let submit_reference_count = swift_member_reference_count(&code, "submit");
         let canonical_submit_count = swift_call_count(&code, "bootstrapWorker.submit");
+        let has_unqualified_submit = swift_has_unqualified_call_in_executable_body(&code, "submit");
         submissions += submit_count;
         if submit_count != submit_reference_count
             || submit_count != canonical_submit_count
+            || has_unqualified_submit
             || (submit_count > 0 && path != app_delegate_path)
         {
             violations.push(format!(
@@ -1970,8 +1972,9 @@ fn swift_bootstrap_launch_entry_violations(
         }
         let code = strip_swift_non_code(document);
         for (name, body) in swift_function_declarations(&code) {
-            let enters_bootstrap =
-                swift_member_call_count(body, "submit") != 0 || reachable_entries.contains(&name);
+            let enters_bootstrap = swift_member_call_count(body, "submit") != 0
+                || swift_unqualified_call_count(body, "submit") != 0
+                || reachable_entries.contains(&name);
             let is_reviewed_owner = path == Path::new("apple/macos/AppDelegate.swift")
                 && owner_entries.contains(&name)
                 && swift_call_count(body, "bootstrapWorker.submit") == 1;
@@ -1985,6 +1988,7 @@ fn swift_bootstrap_launch_entry_violations(
         for (property, bodies) in swift_named_property_bodies(&code) {
             if bodies.iter().any(|body| {
                 swift_member_call_count(body, "submit") != 0
+                    || swift_unqualified_call_count(body, "submit") != 0
                     || reachable_entries
                         .iter()
                         .any(|entry| contains_identifier(body, entry))
@@ -2151,6 +2155,85 @@ fn swift_member_reference_at(document: &str, index: usize, method: &str) -> bool
         .rev()
         .find(|byte| !is_rust_ascii_whitespace(*byte))
         == Some(b'.')
+}
+
+fn swift_has_unqualified_call_in_executable_body(document: &str, name: &str) -> bool {
+    swift_function_declarations(document)
+        .into_iter()
+        .any(|(_function, body)| swift_unqualified_call_count(body, name) != 0)
+        || swift_named_property_bodies(document)
+            .into_values()
+            .flatten()
+            .any(|body| swift_unqualified_call_count(body, name) != 0)
+}
+
+fn swift_unqualified_call_count(document: &str, name: &str) -> usize {
+    document
+        .match_indices(name)
+        .filter(|(index, _matched)| {
+            if !is_identifier_at(document, *index, name) {
+                return false;
+            }
+            let escaped = document[..*index].ends_with('`')
+                && document[*index + name.len()..].starts_with('`');
+            let token_start = index.saturating_sub(usize::from(escaped));
+            let token_end = *index + name.len() + usize::from(escaped);
+            let opening = skip_ascii_whitespace(document, token_end);
+            if document.as_bytes().get(opening) != Some(&b'(') {
+                return false;
+            }
+            if document[..token_start]
+                .bytes()
+                .rev()
+                .find(|byte| !is_rust_ascii_whitespace(*byte))
+                == Some(b'.')
+            {
+                return false;
+            }
+            if matches!(
+                swift_preceding_identifier(document, token_start),
+                Some("case" | "func" | "macro")
+            ) {
+                return false;
+            }
+            !swift_selector_reference_at(document, token_start)
+        })
+        .count()
+}
+
+fn swift_preceding_identifier(document: &str, index: usize) -> Option<&str> {
+    let prefix = document.get(..index)?;
+    let end = prefix
+        .bytes()
+        .rposition(|byte| !is_rust_ascii_whitespace(byte))?
+        + 1;
+    let start = prefix[..end]
+        .bytes()
+        .rposition(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+        .map_or(0, |delimiter| delimiter + 1);
+    (start != end).then_some(&prefix[start..end])
+}
+
+fn swift_selector_reference_at(document: &str, index: usize) -> bool {
+    let prefix = &document[..index];
+    let mut closed_depth = 0_usize;
+    let Some(opening) = prefix
+        .bytes()
+        .enumerate()
+        .rev()
+        .find_map(|(position, byte)| {
+            match byte {
+                b')' => closed_depth += 1,
+                b'(' if closed_depth != 0 => closed_depth -= 1,
+                b'(' => return Some(position),
+                _ => {}
+            }
+            None
+        })
+    else {
+        return false;
+    };
+    prefix[..opening].trim_end().ends_with("#selector")
 }
 
 fn swift_owner_flow_forwards_completion(document: &str) -> bool {
@@ -6458,6 +6541,65 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             (PathBuf::from("apple/macos/TersaRustBridge.h"), "int32_t tersa_macos_bootstrap_default_account(const uint8_t *account_id, size_t account_id_len);\nstatic inline void helper(void) { tersa_macos_bootstrap_default_account(0, 0); }".to_owned()),
         ];
         assert!(!swift_bootstrap_inventory_violations(&header_with_helper).is_empty());
+    }
+
+    #[test]
+    fn swift_inventory_rejects_unqualified_worker_submissions() {
+        let delegate = r"
+private let bootstrapWorker = BootstrapWorker()
+func applicationDidFinishLaunching(_ notification: Notification) { _ = version() }
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        let inert_worker = r#"class BootstrapWorker {
+    func submit(accountIdentifier: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) {}
+    func retainReferences() {
+        func submit(_ value: Int) {}
+        let callback = submit
+        let selector = #selector(submit(accountIdentifier:completion:))
+        let diagnostic = "submit(accountIdentifier: Data(), completion: receive)"
+        // submit(accountIdentifier: Data(), completion: receive)
+    }
+}
+tersa_macos_bootstrap_default_account(pointer, count)"#;
+        let inert_sources = vec![
+            (
+                PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                inert_worker.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.to_owned(),
+            ),
+        ];
+        assert!(
+            swift_bootstrap_inventory_violations(&inert_sources).is_empty(),
+            "declarations, function references, selectors, comments, strings, and the reviewed qualified call are inert"
+        );
+
+        for unreviewed_body in [
+            "func alternateOwner() { submit(accountIdentifier: Data(), completion: receive) }",
+            "func alternateOwner() { submit\n    (accountIdentifier: Data(), completion: receive) }",
+            "func alternateOwner() { submit /* hidden spacing */ \u{000b} (accountIdentifier: Data(), completion: receive) }",
+            "func alternateOwner() { `submit`(accountIdentifier: Data(), completion: receive) }",
+            "var alternateOwner: Void { submit(accountIdentifier: Data(), completion: receive) }",
+            "let alternateOwner = { submit(accountIdentifier: Data(), completion: receive) }",
+            "func alternateOwner() { let selector = #selector(submit(accountIdentifier:completion:)); submit(accountIdentifier: Data(), completion: receive) }",
+        ] {
+            let worker = format!(
+                "class BootstrapWorker {{\n    func submit(accountIdentifier: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) {{}}\n    {unreviewed_body}\n}}\ntersa_macos_bootstrap_default_account(pointer, count)"
+            );
+            let sources = vec![
+                (PathBuf::from("apple/macos/BootstrapWorker.swift"), worker),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+            ];
+            assert!(
+                !swift_bootstrap_inventory_violations(&sources).is_empty(),
+                "unqualified BootstrapWorker submission must fail closed: {unreviewed_body}"
+            );
+        }
     }
 
     #[test]

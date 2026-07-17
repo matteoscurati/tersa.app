@@ -529,6 +529,7 @@ fn bootstrap_default_account_with_dependencies(
     ) else {
         return ProductBootstrapStatus::Unavailable;
     };
+    drop(root);
     let digest = hex_digest(account);
     let Ok(mut directories) = establish_account_directory(&lock, &container, &digest) else {
         return ProductBootstrapStatus::Unavailable;
