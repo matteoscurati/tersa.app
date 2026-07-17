@@ -446,8 +446,10 @@ fn validate_bootstrap_account_bytes(
 #[cfg(target_os = "macos")]
 fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
-    let Some(process_guard) = acquire_process_lock(deadline) else {
-        return ProductBootstrapStatus::BusyOrUnavailable;
+    let process_guard = match acquire_process_lock(deadline) {
+        Ok(guard) => guard,
+        Err(ProcessLockFailure::TimedOut) => return ProductBootstrapStatus::BusyOrUnavailable,
+        Err(ProcessLockFailure::Poisoned) => return ProductBootstrapStatus::Unavailable,
     };
     let _process_guard = process_guard;
     let Ok(locator) = ProductionContainerLocator::new() else {
@@ -501,8 +503,10 @@ fn bootstrap_default_account_with_dependencies(
     let root = match backend.copy() {
         Ok(Some(root)) => root,
         Ok(None) => {
-            if !is_empty_profile_skeleton(lock.container_fd()) {
-                return ProductBootstrapStatus::RootMissingWithExistingProfile;
+            match is_empty_profile_skeleton(lock.container_fd()) {
+                Ok(true) => {}
+                Ok(false) => return ProductBootstrapStatus::RootMissingWithExistingProfile,
+                Err(_error) => return ProductBootstrapStatus::Unavailable,
             }
             if provision_installation_root_key(backend).is_err() {
                 return ProductBootstrapStatus::Unavailable;
@@ -552,7 +556,16 @@ fn process_lock() -> &'static Mutex<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn acquire_process_lock(deadline: Instant) -> Option<std::sync::MutexGuard<'static, ()>> {
+#[derive(Debug, Eq, PartialEq)]
+enum ProcessLockFailure {
+    TimedOut,
+    Poisoned,
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_process_lock(
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'static, ()>, ProcessLockFailure> {
     acquire_mutex_until(process_lock(), deadline)
 }
 
@@ -560,17 +573,19 @@ fn acquire_process_lock(deadline: Instant) -> Option<std::sync::MutexGuard<'stat
 fn acquire_mutex_until(
     mutex: &Mutex<()>,
     deadline: Instant,
-) -> Option<std::sync::MutexGuard<'_, ()>> {
+) -> Result<std::sync::MutexGuard<'_, ()>, ProcessLockFailure> {
     loop {
         match mutex.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(_error)) => return None,
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_error)) => {
+                return Err(ProcessLockFailure::Poisoned);
+            }
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(
                     BOOTSTRAP_BACKOFF.min(deadline.saturating_duration_since(Instant::now())),
                 );
             }
-            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(ProcessLockFailure::TimedOut),
         }
     }
 }
@@ -655,7 +670,6 @@ fn acquire_global_lock_with_hook(
                 Mode::empty(),
             )?;
             validate_lock(&fs::fstat(&lock)?, Some(&expected), false)?;
-            validate_lock(&fs::fstat(&lock)?, Some(&expected), true)?;
             lock
         }
         Err(error) => return Err(error),
@@ -720,64 +734,67 @@ fn require_deadline(deadline: Instant) -> rustix::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn is_empty_profile_skeleton(container: std::os::fd::BorrowedFd<'_>) -> bool {
+fn is_empty_profile_skeleton(container: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<bool> {
+    is_empty_profile_skeleton_with_probe(container, &mut || Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+fn is_empty_profile_skeleton_with_probe(
+    container: std::os::fd::BorrowedFd<'_>,
+    probe: &mut dyn FnMut() -> rustix::io::Result<()>,
+) -> rustix::io::Result<bool> {
     use std::os::fd::AsFd;
+    probe()?;
     let profiles = match open_optional_directory(container, "profiles") {
         Ok(Some(profiles)) => profiles,
-        Ok(None) => return true,
-        Err(_error) => return false,
+        Ok(None) => return Ok(true),
+        Err(error) => return Err(error),
     };
-    if !directory_has_only(profiles.as_fd(), Some("default")) {
-        return false;
+    if !directory_has_only(profiles.as_fd(), Some("default"))? {
+        return Ok(false);
     }
     let default = match open_optional_directory(profiles.as_fd(), "default") {
         Ok(Some(default)) => default,
-        Ok(None) => return true,
-        Err(_error) => return false,
+        Ok(None) => return Ok(true),
+        Err(error) => return Err(error),
     };
-    if !directory_has_only(default.as_fd(), Some("accounts")) {
-        return false;
+    if !directory_has_only(default.as_fd(), Some("accounts"))? {
+        return Ok(false);
     }
     match open_optional_directory(default.as_fd(), "accounts") {
         Ok(Some(accounts)) => accounts_have_only_empty_directories(accounts.as_fd()),
-        Ok(None) => true,
-        Err(_) => false,
+        Ok(None) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn accounts_have_only_empty_directories(accounts: std::os::fd::BorrowedFd<'_>) -> bool {
+fn accounts_have_only_empty_directories(
+    accounts: std::os::fd::BorrowedFd<'_>,
+) -> rustix::io::Result<bool> {
     use rustix::fs::{self, Mode, OFlags};
     use std::os::fd::AsFd;
 
-    let Ok(entries) = fs::Dir::read_from(accounts) else {
-        return false;
-    };
+    let entries = fs::Dir::read_from(accounts)?;
     for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
+        let entry = entry?;
         let name = entry.file_name();
         if matches!(name.to_bytes(), b"." | b"..") {
             continue;
         }
-        let Ok(directory) = fs::openat(
+        let directory = fs::openat(
             accounts,
             name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
-        ) else {
-            return false;
-        };
-        let Ok(stat) = fs::fstat(&directory) else {
-            return false;
-        };
-        if validate_directory(&stat, None).is_err() || !directory_has_only(directory.as_fd(), None)
+        )?;
+        let stat = fs::fstat(&directory)?;
+        if validate_directory(&stat, None).is_err() || !directory_has_only(directory.as_fd(), None)?
         {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -802,23 +819,22 @@ fn open_optional_directory(
 }
 
 #[cfg(target_os = "macos")]
-fn directory_has_only(directory: std::os::fd::BorrowedFd<'_>, allowed: Option<&str>) -> bool {
-    let Ok(entries) = rustix::fs::Dir::read_from(directory) else {
-        return false;
-    };
+fn directory_has_only(
+    directory: std::os::fd::BorrowedFd<'_>,
+    allowed: Option<&str>,
+) -> rustix::io::Result<bool> {
+    let entries = rustix::fs::Dir::read_from(directory)?;
     for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
+        let entry = entry?;
         let name = entry.file_name().to_bytes();
         if matches!(name, b"." | b"..") {
             continue;
         }
         if allowed.is_none_or(|allowed| name != allowed.as_bytes()) {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -974,7 +990,7 @@ fn validate_directory(
     use rustix::fs::{FileType, Mode};
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
         || stat.st_uid != rustix::process::geteuid().as_raw()
-        || Mode::from_raw_mode(stat.st_mode).as_raw_mode() & 0o077 != 0
+        || Mode::from_raw_mode(stat.st_mode).as_raw_mode() & 0o7077 != 0
         || expected.is_some_and(|old| !same_identity(old, stat))
     {
         return Err(rustix::io::Errno::PERM);
@@ -1693,6 +1709,66 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct SharedFileBackend {
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SharedFileBackend {
+        fn new(container: &Path) -> Self {
+            Self {
+                path: container.join("test-installation-root"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RootKeyRetriever for SharedFileBackend {
+        fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
+            match std::fs::read(&self.path) {
+                Ok(bytes) => {
+                    let key: [u8; 32] = bytes
+                        .try_into()
+                        .map_err(|_bytes| KeyStorageError::Invalid)?;
+                    Ok(Some(SecretKey::new(key)))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_error) => Err(KeyStorageError::OperationFailed),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RootKeyBackend for SharedFileBackend {
+        fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
+            Ok(SecretKey::new([7; 32]))
+        }
+
+        fn add(&self, candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&self.path)
+            {
+                Ok(mut file) => {
+                    file.write_all(candidate.as_bytes())
+                        .and_then(|()| file.sync_all())
+                        .map_err(|_error| KeyStorageError::OperationFailed)?;
+                    Ok(AddResult::Added)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(AddResult::Duplicate)
+                }
+                Err(_error) => Err(KeyStorageError::OperationFailed),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     struct ProvisionFailureBackend;
 
     #[cfg(target_os = "macos")]
@@ -1931,18 +2007,18 @@ mod tests {
 
         let fixture = BootstrapFixture::new("preflight");
         let root = fixture.open();
-        assert!(is_empty_profile_skeleton(root.as_fd()));
+        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
         fixture.create_directory("profiles");
-        assert!(is_empty_profile_skeleton(root.as_fd()));
+        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
         fixture.create_directory("profiles/default");
-        assert!(is_empty_profile_skeleton(root.as_fd()));
+        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
         fixture.create_directory("profiles/default/accounts");
-        assert!(is_empty_profile_skeleton(root.as_fd()));
+        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
 
         fixture.create_directory("profiles/default/accounts/existing-account");
         // An interrupted first bootstrap may leave an empty account directory;
         // it is safe to recover only while it contains no database state.
-        assert!(is_empty_profile_skeleton(root.as_fd()));
+        assert!(is_empty_profile_skeleton(root.as_fd()).unwrap());
         std::fs::write(
             fixture
                 .path
@@ -1950,7 +2026,7 @@ mod tests {
             b"state",
         )
         .unwrap();
-        assert!(!is_empty_profile_skeleton(root.as_fd()));
+        assert!(!is_empty_profile_skeleton(root.as_fd()).unwrap());
         std::fs::remove_file(
             fixture
                 .path
@@ -1958,7 +2034,34 @@ mod tests {
         )
         .unwrap();
         std::fs::write(fixture.path.join("profiles/unexpected"), b"state").unwrap();
-        assert!(!is_empty_profile_skeleton(root.as_fd()));
+        assert!(!is_empty_profile_skeleton(root.as_fd()).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_preflight_probe_error_is_not_existing_profile_state() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = BootstrapFixture::new("preflight-probe-error");
+        let root = fixture.open();
+        assert_eq!(
+            is_empty_profile_skeleton_with_probe(root.as_fd(), &mut || {
+                Err(rustix::io::Errno::IO)
+            }),
+            Err(rustix::io::Errno::IO)
+        );
+
+        fixture.create_directory("profiles");
+        std::fs::set_permissions(
+            fixture.path.join("profiles"),
+            std::fs::Permissions::from_mode(0o2700),
+        )
+        .unwrap();
+        assert_eq!(
+            is_empty_profile_skeleton(root.as_fd()),
+            Err(rustix::io::Errno::PERM)
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2057,6 +2160,68 @@ mod tests {
             ),
             ProductBootstrapStatus::Ready
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn complete_injected_bootstrap_serializes_processes_and_preserves_second_state() {
+        let fixture = BootstrapFixture::new("cross-process-bootstrap");
+        let first_entered = fixture.path.join("first-entered");
+        let first_release = fixture.path.join("first-release");
+        let second_entered = fixture.path.join("second-entered");
+        let executable = std::env::current_exe().unwrap();
+        let mut first = Command::new(&executable)
+            .args([
+                "--exact",
+                "tests::injected_bootstrap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_CHILD_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_CHILD_ENTERED", &first_entered)
+            .env("TERSA_BOOTSTRAP_CHILD_RELEASE", &first_release)
+            .env("TERSA_BOOTSTRAP_CHILD_FAIL", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut first, &first_entered);
+        let mut second = Command::new(&executable)
+            .args([
+                "--exact",
+                "tests::injected_bootstrap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_CHILD_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_CHILD_ENTERED", &second_entered)
+            .env("TERSA_BOOTSTRAP_CHILD_RELEASE", &first_release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            !second_entered.exists(),
+            "second entered a post-lock stage early"
+        );
+        std::fs::write(&first_release, b"release").unwrap();
+        assert!(first.wait().unwrap().success());
+        wait_for_child_checkpoint(&mut second, &second_entered);
+        assert!(second.wait().unwrap().success());
+        assert!(second_entered.exists());
+        assert_eq!(
+            std::fs::read(fixture.path.join("test-installation-root")).unwrap(),
+            [7; 32]
+        );
+        let database = fixture
+            .path
+            .join("profiles/default/accounts")
+            .join(hex_digest(&account_id()))
+            .join("mail.sqlite3");
+        assert!(std::fs::metadata(database).unwrap().len() >= 512);
     }
 
     #[cfg(target_os = "macos")]
@@ -2209,6 +2374,50 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "subprocess helper for complete injected bootstrap serialization"]
+    fn injected_bootstrap_child() {
+        let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_CHILD_CONTAINER") else {
+            return;
+        };
+        let Some(entered) = std::env::var_os("TERSA_BOOTSTRAP_CHILD_ENTERED") else {
+            return;
+        };
+        let Some(release) = std::env::var_os("TERSA_BOOTSTRAP_CHILD_RELEASE") else {
+            return;
+        };
+        let fail = std::env::var_os("TERSA_BOOTSTRAP_CHILD_FAIL").is_some();
+        let container = PathBuf::from(container);
+        let backend = SharedFileBackend::new(&container);
+        let status = bootstrap_default_account_with_dependencies(
+            &account_id(),
+            &backend,
+            &FakeLocator(Ok(container)),
+            Instant::now() + Duration::from_secs(5),
+            |account, path, key| {
+                let store =
+                    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(account, path, key)
+                        .map_err(|_error| ())?;
+                std::fs::write(&entered, b"entered").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !Path::new(&release).exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                drop(store);
+                if fail { Err(()) } else { Ok(()) }
+            },
+        );
+        assert_eq!(
+            status,
+            if fail {
+                ProductBootstrapStatus::Unavailable
+            } else {
+                ProductBootstrapStatus::Ready
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "subprocess helper for a crash before lock mode normalization"]
     fn global_lock_creation_crash_child() {
         let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_CONTAINER") else {
@@ -2273,9 +2482,22 @@ mod tests {
 
         let mutex = Mutex::new(());
         let guard = mutex.lock().unwrap();
-        assert!(acquire_mutex_until(&mutex, Instant::now() + Duration::from_millis(20)).is_none());
+        assert!(matches!(
+            acquire_mutex_until(&mutex, Instant::now() + Duration::from_millis(20)),
+            Err(ProcessLockFailure::TimedOut)
+        ));
         drop(guard);
-        assert!(acquire_mutex_until(&mutex, Instant::now() + Duration::from_secs(1)).is_some());
+        assert!(acquire_mutex_until(&mutex, Instant::now() + Duration::from_secs(1)).is_ok());
+
+        let poisoned = Mutex::new(());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison process mutex fixture");
+        }));
+        assert!(matches!(
+            acquire_mutex_until(&poisoned, Instant::now() + Duration::from_secs(1)),
+            Err(ProcessLockFailure::Poisoned)
+        ));
     }
 
     #[cfg(target_os = "macos")]

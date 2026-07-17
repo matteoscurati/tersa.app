@@ -190,8 +190,10 @@ PR 33a.5 pins the worker's concurrency-one and one-pending source contract with
 `apple/macos/BootstrapWorker.swift`, its sole call site in
 `apple/macos/AppDelegate.swift`, and `xtask` fixtures, then only
 credentiallessly builds the existing target. It adds no Xcode test
-target or policy exception. Runtime dispatch/overflow evidence remains PR 33b;
-PR 33a.5 Rust tests cover C ABI main-thread rejection and locking.
+target or policy exception. Runtime dispatch/overflow evidence remains PR 33b.
+PR 33a.5 Rust tests prove invalid C ABI null/zero/oversized input mapping and
+background-thread boundary mapping without Keychain access; they do not execute
+a valid main-thread bootstrap call. They also cover locking.
 
 Before SQLite open, the store retains a validated account-directory descriptor
 and snapshots exactly `mail.sqlite3`, `mail.sqlite3-journal`,

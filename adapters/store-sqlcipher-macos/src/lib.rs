@@ -305,13 +305,18 @@ mod macos {
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
             if leaf.snapshot.main.is_some() {
-                let preflight = preflight_existing(&canonical_path, &account, &key.0);
-                if let Err(kind) = preflight {
-                    key.0.zeroize();
-                    return Err(match kind {
-                        OpenFailure::Corrupted => MailboxStoreError::Corrupted,
-                        OpenFailure::Storage => MailboxStoreError::Storage,
-                    });
+                match preflight_existing(&canonical_path, &account, &key.0) {
+                    Ok(true) => {
+                        if let Err(kind) = leaf.adopt_recoverable_fresh_main() {
+                            key.0.zeroize();
+                            return Err(mailbox_open_error(kind));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(kind) => {
+                        key.0.zeroize();
+                        return Err(mailbox_open_error(kind));
+                    }
                 }
             }
             if let Err(kind) = hook(WriterHook::AfterSnapshot, &canonical_path) {
@@ -348,20 +353,24 @@ mod macos {
                 hook(WriterHook::AfterOpen, &canonical_path)?;
                 opened_file_has_moved(&connection)?;
                 leaf.require_main_identity()?;
-                if leaf.snapshot.is_fresh() {
-                    hook(WriterHook::BeforeFreshMigration, &canonical_path)?;
-                }
-                configure_and_migrate(&connection, &account, &key.0)?;
-                if leaf.snapshot.is_fresh() {
+                let fresh = configure_storage(&connection, &account, &key.0)?;
+                if fresh {
                     // SQLite creates the WAL and SHM leaves under the process
-                    // umask.  Normalize only leaves absent at our no-follow
-                    // snapshot, then require every live database leaf to be
-                    // owner-only before accepting the new store.
+                    // umask as soon as WAL is selected. Normalize those leaves
+                    // before migration work so every later failure can safely
+                    // clean them up and retry.
+                    leaf.normalize_fresh_leaves(hook, &canonical_path)?;
+                    hook(WriterHook::AfterFreshWalNormalization, &canonical_path)?;
+                    hook(WriterHook::BeforeFreshMigration, &canonical_path)?;
+                    migrate_fresh(&connection, &account)?;
+                    // Migration can create another coordination leaf; repeat
+                    // the identity-bound normalization before accepting it.
                     leaf.normalize_fresh_leaves(hook, &canonical_path)?;
                     leaf.mark_fresh_migration_succeeded();
                     hook(WriterHook::AfterFreshMigration, &canonical_path)?;
                 }
-                Ok(())
+                set_and_verify_persistent_wal(&connection)?;
+                validate_health(&connection)
             })();
             key.0.zeroize();
             if let Err(kind) = outcome {
@@ -569,6 +578,7 @@ mod macos {
         AfterFreshClaim,
         AfterOpen,
         BeforeFreshMigration,
+        AfterFreshWalNormalization,
         AfterFreshMigration,
         CleanupBeforeRecord(usize),
         CleanupAfterRecord(usize),
@@ -624,6 +634,14 @@ mod macos {
             }
             let parent_owner = parent_stat.st_uid;
             let snapshot = snapshot_leaf_entries(&parent, parent_owner, &names)?;
+            // A pre-existing main leaf has no creation provenance from this
+            // opener. It is never normalized or adopted with broader access.
+            if snapshot
+                .main
+                .is_some_and(|main| main.mode != OWNER_ONLY_FILE_MODE)
+            {
+                return Err(OpenFailure::Storage);
+            }
             if snapshot.main.is_none()
                 && (snapshot.journal.is_some() || snapshot.wal.is_some() || snapshot.shm.is_some())
             {
@@ -657,6 +675,17 @@ mod macos {
             )?;
             drop(descriptor);
             self.fresh_main = Some(identity);
+            Ok(())
+        }
+
+        fn adopt_recoverable_fresh_main(&mut self) -> Result<(), OpenFailure> {
+            let expected = self.snapshot.main.ok_or(OpenFailure::Storage)?;
+            let actual = leaf_entry(&self.parent, &self.names[0], self.parent_owner)?
+                .ok_or(OpenFailure::Storage)?;
+            if actual != expected || actual.mode != OWNER_ONLY_FILE_MODE {
+                return Err(OpenFailure::Storage);
+            }
+            self.fresh_main = Some(actual);
             Ok(())
         }
 
@@ -749,7 +778,13 @@ mod macos {
             hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
             canonical_path: &Path,
         ) {
-            if !self.snapshot.is_fresh() || self.fresh_migration_succeeded {
+            let adopted_fresh_main = self.snapshot.main.is_some()
+                && self.fresh_main == self.snapshot.main
+                && self.snapshot.journal.is_none()
+                && self.snapshot.wal.is_none()
+                && self.snapshot.shm.is_none();
+            if (!self.snapshot.is_fresh() && !adopted_fresh_main) || self.fresh_migration_succeeded
+            {
                 return;
             }
             for (index, (name, before)) in self
@@ -763,7 +798,10 @@ mod macos {
                 ])
                 .enumerate()
             {
-                if before.is_none() {
+                if index == 0 && self.fresh_main.is_none() {
+                    continue;
+                }
+                if before.is_none() || index == 0 {
                     let _ = remove_unchanged_restrictive_leaf(
                         &self.parent,
                         name,
@@ -999,7 +1037,7 @@ mod macos {
         path: &Path,
         account: &AccountId,
         key: &[u8; 32],
-    ) -> Result<(), OpenFailure> {
+    ) -> Result<bool, OpenFailure> {
         let uri = immutable_file_uri(path);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -1012,7 +1050,7 @@ mod macos {
         if fresh && database_sidecar_exists(path)? {
             return Err(OpenFailure::Corrupted);
         }
-        Ok(())
+        Ok(fresh)
     }
 
     fn immutable_file_uri(path: &Path) -> OsString {
@@ -1218,11 +1256,11 @@ mod macos {
         Corrupted,
         Storage,
     }
-    fn configure_and_migrate(
+    fn configure_storage(
         connection: &Connection,
         account: &AccountId,
         key: &[u8; 32],
-    ) -> Result<(), OpenFailure> {
+    ) -> Result<bool, OpenFailure> {
         apply_key(connection, key).map_err(classify_key)?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
@@ -1235,32 +1273,30 @@ mod macos {
             )
             .map_err(classify_open)?;
         let fresh = validate_identity(connection, account)?;
-        if fresh {
-            configure_owned_storage(connection)?;
-            let transaction = connection
-                .unchecked_transaction()
-                .map_err(|_error| OpenFailure::Storage)?;
-            transaction
-                .execute_batch(MIGRATION)
-                .map_err(classify_open)?;
-            transaction
-                .execute(
-                    "INSERT INTO account_binding (singleton, account_id) VALUES (1, ?1)",
-                    params![account.as_str()],
-                )
-                .map_err(classify_open)?;
-            transaction
-                .pragma_update(None, "application_id", APPLICATION_ID)
-                .map_err(classify_open)?;
-            transaction
-                .pragma_update(None, "user_version", VERSION)
-                .map_err(classify_open)?;
-            transaction.commit().map_err(classify_open)?;
-        } else {
-            configure_owned_storage(connection)?;
-        }
-        set_and_verify_persistent_wal(connection)?;
-        validate_health(connection)
+        configure_owned_storage(connection)?;
+        Ok(fresh)
+    }
+
+    fn migrate_fresh(connection: &Connection, account: &AccountId) -> Result<(), OpenFailure> {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|_error| OpenFailure::Storage)?;
+        transaction
+            .execute_batch(MIGRATION)
+            .map_err(classify_open)?;
+        transaction
+            .execute(
+                "INSERT INTO account_binding (singleton, account_id) VALUES (1, ?1)",
+                params![account.as_str()],
+            )
+            .map_err(classify_open)?;
+        transaction
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .map_err(classify_open)?;
+        transaction
+            .pragma_update(None, "user_version", VERSION)
+            .map_err(classify_open)?;
+        transaction.commit().map_err(classify_open)
     }
 
     fn configure_read_only(
@@ -1797,6 +1833,11 @@ mod macos {
 
             let existing_empty = TestDatabase::new("existing empty ?#%");
             fs::File::create(existing_empty.path()).unwrap();
+            fs::set_permissions(
+                existing_empty.path(),
+                fs::Permissions::from_mode(u32::from(OWNER_ONLY_FILE_MODE)),
+            )
+            .unwrap();
             let existing_store =
                 SqlCipherMailboxStore::open(account(), existing_empty.path(), key(7)).unwrap();
             assert_eq!(
@@ -1811,8 +1852,25 @@ mod macos {
                 (APPLICATION_ID, VERSION, canonical_schema())
             );
 
+            let unsafe_empty = TestDatabase::new("unsafe-existing-empty");
+            fs::File::create(unsafe_empty.path()).unwrap();
+            fs::set_permissions(unsafe_empty.path(), fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                SqlCipherMailboxStore::open(account(), unsafe_empty.path(), key(7)),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert_eq!(
+                fs::metadata(unsafe_empty.path()).unwrap().mode() & 0o777,
+                0o644
+            );
+
             let empty_with_sidecar = TestDatabase::new("empty-with-sidecar");
             fs::File::create(empty_with_sidecar.path()).unwrap();
+            fs::set_permissions(
+                empty_with_sidecar.path(),
+                fs::Permissions::from_mode(u32::from(OWNER_ONLY_FILE_MODE)),
+            )
+            .unwrap();
             let mut journal_name = empty_with_sidecar.path().as_os_str().to_os_string();
             journal_name.push("-journal");
             let existing_journal_path = PathBuf::from(journal_name);
@@ -1840,7 +1898,7 @@ mod macos {
         fn writer_leaf_snapshot_accepts_existing_combinations_and_rejects_orphans() {
             for sidecars in 0_u8..8 {
                 let existing = TestDatabase::new(&format!("existing-sidecars-{sidecars}"));
-                fs::write(existing.path(), b"existing-main").unwrap();
+                write_restrictive(existing.path(), b"existing-main");
                 for (index, suffix) in ["-journal", "-wal", "-shm"].into_iter().enumerate() {
                     if sidecars & (1 << index) != 0 {
                         fs::write(sidecar_path(existing.path(), suffix), b"existing-sidecar")
@@ -1890,6 +1948,7 @@ mod macos {
             for point in [
                 WriterHook::BeforeFreshClaim,
                 WriterHook::AfterFreshClaim,
+                WriterHook::AfterFreshWalNormalization,
                 WriterHook::BeforeFreshMigration,
                 WriterHook::AfterFreshMigration,
             ] {
@@ -1916,6 +1975,56 @@ mod macos {
                 }
                 assert!(database.directory.exists());
             }
+        }
+
+        #[test]
+        fn recoverable_empty_main_failure_cleans_then_retries() {
+            let database = TestDatabase::new("recoverable-empty-main");
+            write_restrictive(database.path(), b"");
+            let mut fired = false;
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                database.path(),
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::AfterFreshWalNormalization {
+                        fired = true;
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(fired);
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert!(database.files().is_empty());
+
+            let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                schema_state(&store),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+        }
+
+        #[test]
+        fn fresh_claim_eexist_preserves_the_racing_main_leaf() {
+            let database = TestDatabase::new("fresh-claim-eexist");
+            let mut inserted = false;
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                database.path(),
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::BeforeFreshClaim {
+                        write_restrictive(database.path(), b"racing-owner");
+                        inserted = true;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(inserted);
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert_eq!(fs::read(database.path()).unwrap(), b"racing-owner");
+            assert_eq!(fs::metadata(database.path()).unwrap().mode() & 0o777, 0o600);
         }
 
         #[test]
@@ -1971,7 +2080,10 @@ mod macos {
 
         #[test]
         fn cleanup_hooks_record_the_three_mutable_final_name_residuals() {
-            for index in 0..4 {
+            // Main-leaf cleanup is deliberately excluded: after a failed
+            // O_EXCL claim it has no creation provenance. The dedicated
+            // regression covers that boundary; these cases cover sidecars.
+            for index in 1..4 {
                 let inserted = TestDatabase::new(&format!("cleanup-insert-{index}"));
                 let inserted_path = fixed_leaf_path(&inserted, index);
                 let mut injected = false;
@@ -1990,8 +2102,7 @@ mod macos {
                 );
                 assert!(injected);
                 assert!(matches!(result, Err(MailboxStoreError::Storage)));
-                // Accepted residual: insertion provenance is unknowable, so the
-                // restrictive inserted file can be removed by cleanup.
+                // Sidecars absent at snapshot remain cleanup candidates.
                 assert!(!inserted_path.exists());
 
                 let replaced = TestDatabase::new(&format!("cleanup-middle-replace-{index}"));
@@ -2357,7 +2468,7 @@ mod macos {
                 &database,
                 key(7),
                 &mut |point, _path| {
-                    if point == WriterHook::BeforeFreshMigration {
+                    if point == WriterHook::AfterFreshWalNormalization {
                         injected = true;
                         return Err(OpenFailure::Storage);
                     }

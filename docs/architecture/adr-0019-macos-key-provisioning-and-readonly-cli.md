@@ -201,6 +201,11 @@ bootstrap calls before Keychain or filesystem access. The implementation must
 update the exact Foundation feature policy and its positive and negative
 fixtures; no other Foundation type or feature is authorized.
 
+The Rust FFI harness proves public ABI rejection for null, zero-length, and
+oversized inputs plus background-thread boundary status mapping without touching
+Keychain. It does not reliably execute a valid main-thread bootstrap call; that
+runtime dispatch claim remains PR 33b evidence.
+
 PR 33a.5 authorizes `rustix =1.1.4` as the sole new external package, with exact
 direct macOS declarations in both `tersa-keychain-macos` and
 `tersa-store-sqlcipher-macos`. Both use the canonical atomic target structure

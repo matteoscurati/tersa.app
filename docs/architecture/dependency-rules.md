@@ -266,8 +266,10 @@ in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin thos
 bounds and paths, and only a credentialless build of the existing
 `TersaMac` target. It adds no test target, scheme test action, or
 signing/entitlement exception and passes no runtime gate. PR 33b owns runtime
-dispatch and overflow evidence. PR 33a.5 Rust tests cover the C ABI main-thread
-rejection and locking behavior, including timeout, `EINTR`, a crash between
+dispatch and overflow evidence. PR 33a.5 Rust tests cover invalid C ABI
+null/zero/oversized input mapping and background-thread boundary mapping without
+touching Keychain; they do not execute a valid main-thread bootstrap call.
+They also cover locking behavior, including timeout, `EINTR`, a crash between
 lock creation and `fchmod`, concurrent normalization, rejection of excess
 permission bits, crash release, and adversarial two-thread/two-process
 serialization.

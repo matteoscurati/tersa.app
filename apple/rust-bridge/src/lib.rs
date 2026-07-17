@@ -54,4 +54,47 @@ pub use oauth::{
     tersa_oauth_macos_begin, tersa_oauth_macos_entitlement_probe, tersa_oauth_macos_poll,
 };
 
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    reason = "the public C ABI is unsafe to call and these tests exercise its checked boundary"
+)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_ffi_rejects_invalid_boundary_inputs_without_capability_access() {
+        let invalid = tersa_keychain_macos::ProductBootstrapStatus::InvalidAccountIdentifier as i32;
+        let one = [b'a'];
+        // SAFETY: the non-null pointer is valid, and zero length is rejected before dereference.
+        let zero = unsafe { tersa_macos_bootstrap_default_account(one.as_ptr(), 0) };
+        assert_eq!(zero, invalid);
+        // SAFETY: null inputs are rejected before any pointer dereference.
+        let null = unsafe { tersa_macos_bootstrap_default_account(std::ptr::null(), 1) };
+        assert_eq!(null, invalid);
+        let bytes = [b'a'; 257];
+        // SAFETY: `bytes` has the stated readable length; the ABI rejects its size.
+        let oversized =
+            unsafe { tersa_macos_bootstrap_default_account(bytes.as_ptr(), bytes.len()) };
+        assert_eq!(oversized, invalid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_ffi_background_thread_preserves_boundary_status_mapping() {
+        let status = std::thread::spawn(|| {
+            let invalid = b"invalid account";
+            // SAFETY: `invalid` has the stated readable length and is copied by the ABI.
+            unsafe { tersa_macos_bootstrap_default_account(invalid.as_ptr(), invalid.len()) }
+        })
+        .join()
+        .expect("background boundary call must not panic");
+        assert_eq!(
+            status,
+            tersa_keychain_macos::ProductBootstrapStatus::InvalidAccountIdentifier as i32
+        );
+    }
+}
+
 // Rust guideline compliant 1.0.
