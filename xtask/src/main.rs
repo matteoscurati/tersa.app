@@ -557,17 +557,24 @@ fn tracked_project_generation_violations(repository_root: &Path) -> io::Result<V
 
 fn contains_xcodegen_generation_invocation(document: &str) -> bool {
     let logical_lines = document.replace("\\\r\n", " ").replace("\\\n", " ");
+    let mut bindings = StaticXcodegenBindings::default();
     logical_lines
         .lines()
-        .any(shell_line_generates_xcode_project)
+        .any(|line| shell_line_generates_xcode_project(line, &mut bindings))
 }
 
-fn shell_line_generates_xcode_project(line: &str) -> bool {
+#[derive(Default)]
+struct StaticXcodegenBindings {
+    aliases: BTreeSet<String>,
+    variables: BTreeSet<String>,
+}
+
+fn shell_line_generates_xcode_project(line: &str, bindings: &mut StaticXcodegenBindings) -> bool {
     let tokens = shell_tokens(line);
     let mut segment = Vec::new();
     for token in tokens {
         if matches!(token.as_str(), ";" | "&&" | "||" | "|") {
-            if shell_segment_generates_xcode_project(&segment) {
+            if shell_segment_generates_xcode_project(&segment, bindings) {
                 return true;
             }
             segment.clear();
@@ -575,7 +582,7 @@ fn shell_line_generates_xcode_project(line: &str) -> bool {
             segment.push(token);
         }
     }
-    shell_segment_generates_xcode_project(&segment)
+    shell_segment_generates_xcode_project(&segment, bindings)
 }
 
 fn shell_tokens(line: &str) -> Vec<String> {
@@ -627,14 +634,28 @@ fn push_shell_token(tokens: &mut Vec<String>, token: &mut String) {
     }
 }
 
-fn shell_segment_generates_xcode_project(tokens: &[String]) -> bool {
+fn shell_segment_generates_xcode_project(
+    tokens: &[String],
+    bindings: &mut StaticXcodegenBindings,
+) -> bool {
+    record_static_xcodegen_bindings(tokens, bindings);
     let mut index = 0;
+    let mut yaml_run_scalar = false;
     if tokens.first().is_some_and(|token| token == "-")
         && tokens.get(1).is_some_and(|token| token == "run:")
     {
         index = 2;
+        yaml_run_scalar = true;
     } else if tokens.first().is_some_and(|token| token == "run:") {
         index = 1;
+        yaml_run_scalar = true;
+    }
+    if yaml_run_scalar
+        && tokens.len() == index + 1
+        && tokens[index].chars().any(char::is_whitespace)
+        && contains_xcodegen_generation_invocation(&tokens[index])
+    {
+        return true;
     }
     while tokens.get(index).is_some_and(|token| {
         matches!(
@@ -650,10 +671,14 @@ fn shell_segment_generates_xcode_project(tokens: &[String]) -> bool {
     {
         index += 1;
     }
-    shell_wrapped_command_generates(tokens, index)
+    shell_wrapped_command_generates(tokens, index, bindings)
 }
 
-fn shell_wrapped_command_generates(tokens: &[String], mut index: usize) -> bool {
+fn shell_wrapped_command_generates(
+    tokens: &[String],
+    mut index: usize,
+    bindings: &StaticXcodegenBindings,
+) -> bool {
     loop {
         let Some(command) = tokens.get(index).map(|token| shell_command_name(token)) else {
             return false;
@@ -696,14 +721,74 @@ fn shell_wrapped_command_generates(tokens: &[String], mut index: usize) -> bool 
                 return tokens
                     .iter()
                     .skip(index + 1)
-                    .position(|token| token == "-c")
+                    .position(|token| shell_command_string_flag(token))
                     .and_then(|offset| tokens.get(index + offset + 2))
                     .is_some_and(|script| contains_xcodegen_generation_invocation(script));
             }
             "xcodegen" => return xcodegen_arguments_generate(&tokens[index + 1..]),
+            _ if static_binding_is_xcodegen(&tokens[index], bindings) => {
+                return xcodegen_arguments_generate(&tokens[index + 1..]);
+            }
             _ => return false,
         }
     }
+}
+
+fn record_static_xcodegen_bindings(tokens: &[String], bindings: &mut StaticXcodegenBindings) {
+    let alias_declaration = tokens
+        .first()
+        .is_some_and(|token| shell_command_name(token) == "alias");
+    let candidates = if alias_declaration {
+        &tokens[1..]
+    } else {
+        tokens
+    };
+    for token in candidates {
+        let Some((name, value)) = token.split_once('=') else {
+            if !alias_declaration {
+                break;
+            }
+            continue;
+        };
+        if !shell_identifier(name) {
+            continue;
+        }
+        let is_xcodegen = static_value_is_xcodegen(value, bindings);
+        let target = if alias_declaration {
+            &mut bindings.aliases
+        } else {
+            &mut bindings.variables
+        };
+        if is_xcodegen {
+            target.insert(name.to_owned());
+        } else {
+            target.remove(name);
+        }
+    }
+}
+
+fn static_value_is_xcodegen(value: &str, bindings: &StaticXcodegenBindings) -> bool {
+    let command = value.split_whitespace().next().unwrap_or(value);
+    shell_command_name(command) == "xcodegen" || static_binding_is_xcodegen(command, bindings)
+}
+
+fn static_binding_is_xcodegen(token: &str, bindings: &StaticXcodegenBindings) -> bool {
+    if bindings.aliases.contains(token) {
+        return true;
+    }
+    shell_variable_reference(token).is_some_and(|name| bindings.variables.contains(name))
+}
+
+fn shell_variable_reference(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("${")
+        .and_then(|name| name.strip_suffix('}'))
+        .or_else(|| token.strip_prefix('$'))
+        .filter(|name| shell_identifier(name))
+}
+
+fn shell_command_string_flag(token: &str) -> bool {
+    token.starts_with('-') && !token.starts_with("--") && token[1..].chars().any(|flag| flag == 'c')
 }
 
 fn shell_command_name(token: &str) -> &str {
@@ -714,6 +799,10 @@ fn shell_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
     };
+    shell_identifier(name)
+}
+
+fn shell_identifier(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(|character: char| character.is_ascii_digit())
         && name
@@ -3876,6 +3965,33 @@ targets:
         );
     }
 
+    const STATIC_PROJECT_GENERATION_BYPASS_FIXTURES: &[(&str, &str)] = &[
+        (
+            "combined bash login-command flags",
+            "bash -lc 'xcodegen --spec unreviewed.yml'\n",
+        ),
+        (
+            "combined sh error-command flags",
+            "sh -ec 'xcodegen -s unreviewed.yml'\n",
+        ),
+        (
+            "static alias indirection",
+            "alias xcg=xcodegen; xcg --spec unreviewed.yml\n",
+        ),
+        (
+            "static variable indirection",
+            "XCODEGEN=xcodegen; \"$XCODEGEN\" --spec unreviewed.yml\n",
+        ),
+        (
+            "double-quoted GitHub Actions scalar",
+            "- run: \"xcodegen generate --spec unreviewed.yml\"\n",
+        ),
+        (
+            "single-quoted GitHub Actions scalar",
+            "- run: 'xcodegen generate --spec unreviewed.yml'\n",
+        ),
+    ];
+
     #[test]
     fn every_tracked_project_generation_command_is_inventory_checked() {
         let repository = temporary_repository("xcodegen-inventory");
@@ -3923,7 +4039,10 @@ targets:
                 "backslash-newline continuation",
                 "xcodegen \\\n  --spec unreviewed.yml\n",
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(STATIC_PROJECT_GENERATION_BYPASS_FIXTURES.iter().copied())
+        {
             fs::write(repository.join("docs/development.md"), invocation)
                 .expect("direct command fixture must be written");
             let violations = tracked_project_generation_violations(&repository)
@@ -3942,6 +4061,10 @@ targets:
                 "sh apple/scripts/generate-project.sh\n",
                 "command -v xcodegen >/dev/null\n",
                 "\"$RUNNER_TEMP/xcodegen/bin/xcodegen\" --version | grep Version\n",
+                "xcodegen --help\n",
+                "/opt/local/bin/xcodegen help\n",
+                "- run: \"echo xcodegen\"\n",
+                "\"xcodegen is quoted prose, not a command\"\n",
                 "curl https://example.invalid/xcodegen/releases/xcodegen.zip\n",
                 "XCODEGEN_PATH=/opt/local/bin/xcodegen\n",
                 "echo xcodegen\n",
