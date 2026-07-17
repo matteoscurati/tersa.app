@@ -850,7 +850,16 @@ fn rust_exported_c_abi_violations(package_documents: &[(PathBuf, String)]) -> Ve
         let comments_masked = strip_rust_comments(document);
         let production_document = strip_rust_test_modules(&comments_masked);
         let code = strip_rust_non_code(&production_document);
-        for signature_range in rust_no_mangle_signature_ranges(&code) {
+        let signature_ranges = rust_no_mangle_signature_ranges(&code);
+        let parsed_no_mangle_attributes = signature_ranges.len();
+        let no_mangle_occurrences = identifier_occurrence_count(&code, "no_mangle");
+        if no_mangle_occurrences != parsed_no_mangle_attributes {
+            violations.push(format!(
+                "{} contains a production no_mangle occurrence outside an exact reviewed direct attribute",
+                path.display()
+            ));
+        }
+        for signature_range in signature_ranges {
             no_mangle_attributes += 1;
             let Some((signature_start, signature_end)) = signature_range else {
                 violations.push(format!(
@@ -2133,8 +2142,11 @@ fn swift_member_call_count(document: &str, method: &str) -> usize {
         .match_indices(method)
         .filter(|(index, _)| {
             swift_member_reference_at(document, *index, method)
-                && document[skip_ascii_whitespace(document, *index + method.len())..]
-                    .starts_with('(')
+                && swift_identifier_token_bounds(document, *index, method).is_some_and(
+                    |(_token_start, token_end)| {
+                        document[skip_ascii_whitespace(document, token_end)..].starts_with('(')
+                    },
+                )
         })
         .count()
 }
@@ -2147,14 +2159,31 @@ fn swift_member_reference_count(document: &str, method: &str) -> usize {
 }
 
 fn swift_member_reference_at(document: &str, index: usize, method: &str) -> bool {
-    if !is_identifier_at(document, index, method) {
+    let Some((token_start, _token_end)) = swift_identifier_token_bounds(document, index, method)
+    else {
         return false;
-    }
-    document[..index]
+    };
+    document[..token_start]
         .bytes()
         .rev()
         .find(|byte| !is_rust_ascii_whitespace(*byte))
         == Some(b'.')
+}
+
+fn swift_identifier_token_bounds(
+    document: &str,
+    index: usize,
+    identifier: &str,
+) -> Option<(usize, usize)> {
+    if !is_identifier_at(document, index, identifier) {
+        return None;
+    }
+    let escaped =
+        document[..index].ends_with('`') && document[index + identifier.len()..].starts_with('`');
+    Some((
+        index.saturating_sub(usize::from(escaped)),
+        index + identifier.len() + usize::from(escaped),
+    ))
 }
 
 fn swift_has_unqualified_call_in_executable_body(document: &str, name: &str) -> bool {
@@ -2174,10 +2203,11 @@ fn swift_unqualified_call_count(document: &str, name: &str) -> usize {
             if !is_identifier_at(document, *index, name) {
                 return false;
             }
-            let escaped = document[..*index].ends_with('`')
-                && document[*index + name.len()..].starts_with('`');
-            let token_start = index.saturating_sub(usize::from(escaped));
-            let token_end = *index + name.len() + usize::from(escaped);
+            let Some((token_start, token_end)) =
+                swift_identifier_token_bounds(document, *index, name)
+            else {
+                return false;
+            };
             let opening = skip_ascii_whitespace(document, token_end);
             if document.as_bytes().get(opening) != Some(&b'(') {
                 return false;
@@ -2192,7 +2222,7 @@ fn swift_unqualified_call_count(document: &str, name: &str) -> usize {
             }
             if matches!(
                 swift_preceding_identifier(document, token_start),
-                Some("case" | "func" | "macro")
+                Some("func" | "macro")
             ) {
                 return false;
             }
@@ -2278,6 +2308,17 @@ fn swift_call_argument_is_identifier(
 
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
     let code = strip_swift_non_code(document);
+    if code.match_indices("@_").any(|(index, _)| {
+        code[index + 1..]
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte == b'_')
+    }) {
+        return vec![format!(
+            "{} must not use underscored Swift attributes in inventoried macOS sources",
+            path.display()
+        )];
+    }
     for forbidden in [
         "CFBundleGetFunctionPointerForName",
         "NSAddressOfSymbol",
@@ -6204,6 +6245,49 @@ mod compatibility {{
     }
 
     #[test]
+    fn apple_bridge_export_inventory_rejects_cfg_attr_no_mangle_without_text_false_positives() {
+        let (lib, oauth) = reviewed_apple_bridge_export_sources();
+        for mutation in [
+            format!(
+                "{lib}\n#[cfg_attr(unix, unsafe(no_mangle))]\npub extern \"C\" fn cfg_gated_export() -> i32 {{ 0 }}"
+            ),
+            format!(
+                "{lib}\n#[cfg_attr(unix, unsafe(no_mangle), inline)]\npub extern \"C\" fn cfg_gated_export() -> i32 {{ 0 }}"
+            ),
+        ] {
+            let contaminated = vec![
+                (PathBuf::from("apple/rust-bridge/src/lib.rs"), mutation),
+                (
+                    PathBuf::from("apple/rust-bridge/src/oauth.rs"),
+                    oauth.to_owned(),
+                ),
+            ];
+            assert!(
+                !rust_exported_c_abi_violations(&contaminated).is_empty(),
+                "production cfg_attr no_mangle exports must not evade the direct-attribute inventory"
+            );
+        }
+        let inert = format!(
+            r##"{lib}
+// #[cfg_attr(unix, unsafe(no_mangle))]
+const NOTE: &str = "#[cfg_attr(unix, unsafe(no_mangle))]";
+#[cfg(test)] mod tests {{ #[cfg_attr(unix, unsafe(no_mangle))] pub extern "C" fn test_only_export() -> i32 {{ 0 }} }}
+"##
+        );
+        let sources = vec![
+            (PathBuf::from("apple/rust-bridge/src/lib.rs"), inert),
+            (
+                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
+                oauth.to_owned(),
+            ),
+        ];
+        assert!(
+            rust_exported_c_abi_violations(&sources).is_empty(),
+            "comments, strings, and Rust test modules must remain inert to the production no_mangle inventory"
+        );
+    }
+
+    #[test]
     fn bridge_source_graph_is_closed_against_build_and_external_sources() {
         let manifest_path = PathBuf::from("apple/rust-bridge/Cargo.toml");
         let lib_path = PathBuf::from("apple/rust-bridge/src/lib.rs");
@@ -6581,6 +6665,8 @@ tersa_macos_bootstrap_default_account(pointer, count)"#;
             "func alternateOwner() { submit\n    (accountIdentifier: Data(), completion: receive) }",
             "func alternateOwner() { submit /* hidden spacing */ \u{000b} (accountIdentifier: Data(), completion: receive) }",
             "func alternateOwner() { `submit`(accountIdentifier: Data(), completion: receive) }",
+            "func alternateOwner() { if case submit(accountIdentifier: Data(), completion: receive) = callback {} }",
+            "func alternateOwner() { switch callback { case submit(accountIdentifier: Data(), completion: receive): break default: break } }",
             "var alternateOwner: Void { submit(accountIdentifier: Data(), completion: receive) }",
             "let alternateOwner = { submit(accountIdentifier: Data(), completion: receive) }",
             "func alternateOwner() { let selector = #selector(submit(accountIdentifier:completion:)); submit(accountIdentifier: Data(), completion: receive) }",
@@ -6600,6 +6686,21 @@ tersa_macos_bootstrap_default_account(pointer, count)"#;
                 "unqualified BootstrapWorker submission must fail closed: {unreviewed_body}"
             );
         }
+
+        let escaped_member = vec![
+            (
+                PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                inert_worker.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.replace("bootstrapWorker.submit", "bootstrapWorker.`submit`"),
+            ),
+        ];
+        assert!(
+            !swift_bootstrap_inventory_violations(&escaped_member).is_empty(),
+            "escaped Swift member syntax must not evade the bootstrap submission inventory"
+        );
     }
 
     #[test]
@@ -6721,6 +6822,53 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
                 "Swift string bypass must fail closed: {bypass}"
             );
         }
+    }
+
+    #[test]
+    fn swift_inventory_rejects_underscored_attributes_without_text_false_positives() {
+        let worker = r"class BootstrapWorker {}
+tersa_macos_bootstrap_default_account(pointer, count)";
+        let delegate = r"
+private let bootstrapWorker = BootstrapWorker()
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        for attribute in [
+            "@_extern(c, \"SecItemDelete\")\nfunc hiddenKeychainCall() {}",
+            "@_extern(c, \"tersa_macos_bootstrap_default_account\")\nfunc hiddenBootstrapCall() {}",
+            "@_expose(Cxx)\nfunc exposedBootstrapCall() {}",
+            "@_dynamicReplacement(for: establishedOwner)\nfunc replacement() {}",
+        ] {
+            let sources = vec![
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    format!("{worker}\n{attribute}"),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+            ];
+            assert!(
+                !swift_bootstrap_inventory_violations(&sources).is_empty(),
+                "underscored Swift attributes must fail closed: {attribute}"
+            );
+        }
+        let inert = format!(
+            r#"{worker}
+// @_extern(c, "SecItemDelete")
+let note = "@_dynamicReplacement(for: establishedOwner) SecItemDelete""#
+        );
+        let sources = vec![
+            (PathBuf::from("apple/macos/BootstrapWorker.swift"), inert),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.to_owned(),
+            ),
+        ];
+        assert!(
+            swift_bootstrap_inventory_violations(&sources).is_empty(),
+            "underscored attributes and protected symbols in Swift comments and strings must remain inert"
+        );
     }
 
     #[test]

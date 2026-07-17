@@ -92,7 +92,7 @@ const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_LOCK: &str = ".tersa-profile-bootstrap-v1.lock";
 #[cfg(target_os = "macos")]
-const DIRECTORY_CREATION_JOURNAL_MAGIC: &str = "tersa-profile-directory-v1";
+const DIRECTORY_CREATION_JOURNAL_MAGIC: &str = "tersa-profile-directory-v2";
 #[cfg(target_os = "macos")]
 const DIRECTORY_CREATION_JOURNAL_LIMIT: usize = 192;
 #[cfg(target_os = "macos")]
@@ -649,9 +649,13 @@ fn acquire_global_lock_with_hook(
         Mode::from_raw_mode(0o600),
     ) {
         Ok(lock) => {
-            hook(GlobalLockHook::AfterCreate)?;
             fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
             validate_lock(&fs::fstat(&lock)?, None, true)?;
+            // A newly linked journal must survive a crash before it can
+            // authorize any directory creation or recovery.
+            fs::fsync(&lock)?;
+            fs::fsync(&directory)?;
+            hook(GlobalLockHook::AfterCreate)?;
             lock
         }
         Err(error) if error == rustix::io::Errno::EXIST => {
@@ -828,11 +832,19 @@ struct DirectorySnapshot {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingDirectoryCreation {
     parent_device: i64,
     parent_inode: u64,
     component: String,
+    phase: DirectoryCreationPhase,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DirectoryCreationPhase {
+    Intent,
+    Created { child_device: i64, child_inode: u64 },
 }
 
 #[cfg(target_os = "macos")]
@@ -842,6 +854,19 @@ impl PendingDirectoryCreation {
             parent_device: i64::from(parent.st_dev),
             parent_inode: parent.st_ino,
             component: component.to_owned(),
+            phase: DirectoryCreationPhase::Intent,
+        }
+    }
+
+    fn created(&self, child: &rustix::fs::Stat) -> Self {
+        Self {
+            parent_device: self.parent_device,
+            parent_inode: self.parent_inode,
+            component: self.component.clone(),
+            phase: DirectoryCreationPhase::Created {
+                child_device: i64::from(child.st_dev),
+                child_inode: child.st_ino,
+            },
         }
     }
 
@@ -852,10 +877,19 @@ impl PendingDirectoryCreation {
     }
 
     fn encode(&self) -> String {
-        format!(
-            "{DIRECTORY_CREATION_JOURNAL_MAGIC}\n{}\n{}\n{}\n",
-            self.parent_device, self.parent_inode, self.component
-        )
+        match self.phase {
+            DirectoryCreationPhase::Intent => format!(
+                "{DIRECTORY_CREATION_JOURNAL_MAGIC}\nintent\n{}\n{}\n{}\n",
+                self.parent_device, self.parent_inode, self.component
+            ),
+            DirectoryCreationPhase::Created {
+                child_device,
+                child_inode,
+            } => format!(
+                "{DIRECTORY_CREATION_JOURNAL_MAGIC}\ncreated\n{}\n{}\n{}\n{}\n{}\n",
+                self.parent_device, self.parent_inode, self.component, child_device, child_inode
+            ),
+        }
     }
 
     fn decode(bytes: &[u8]) -> rustix::io::Result<Self> {
@@ -867,6 +901,7 @@ impl PendingDirectoryCreation {
         if fields.next() != Some(DIRECTORY_CREATION_JOURNAL_MAGIC) {
             return Err(rustix::io::Errno::INVAL);
         }
+        let phase = fields.next().ok_or(rustix::io::Errno::INVAL)?;
         let parent_device = fields
             .next()
             .ok_or(rustix::io::Errno::INVAL)?
@@ -883,14 +918,37 @@ impl PendingDirectoryCreation {
             || !component
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            || fields.next().is_some()
         {
             return Err(rustix::io::Errno::INVAL);
         }
+        let phase = match phase {
+            "intent" if fields.next().is_none() => DirectoryCreationPhase::Intent,
+            "created" => {
+                let child_device = fields
+                    .next()
+                    .ok_or(rustix::io::Errno::INVAL)?
+                    .parse()
+                    .map_err(|_error| rustix::io::Errno::INVAL)?;
+                let child_inode = fields
+                    .next()
+                    .ok_or(rustix::io::Errno::INVAL)?
+                    .parse()
+                    .map_err(|_error| rustix::io::Errno::INVAL)?;
+                if fields.next().is_some() {
+                    return Err(rustix::io::Errno::INVAL);
+                }
+                DirectoryCreationPhase::Created {
+                    child_device,
+                    child_inode,
+                }
+            }
+            _ => return Err(rustix::io::Errno::INVAL),
+        };
         Ok(Self {
             parent_device,
             parent_inode,
             component: component.to_owned(),
+            phase,
         })
     }
 }
@@ -941,11 +999,66 @@ fn write_directory_creation_journal(
 }
 
 #[cfg(target_os = "macos")]
+fn advance_directory_creation_journal(
+    journal: std::os::fd::BorrowedFd<'_>,
+    pending: &PendingDirectoryCreation,
+) -> rustix::io::Result<()> {
+    let current = read_directory_creation_journal(journal)?.ok_or(rustix::io::Errno::INVAL)?;
+    if current.parent_device != pending.parent_device
+        || current.parent_inode != pending.parent_inode
+        || current.component != pending.component
+        || !matches!(current.phase, DirectoryCreationPhase::Intent)
+        || !matches!(pending.phase, DirectoryCreationPhase::Created { .. })
+    {
+        return Err(rustix::io::Errno::PERM);
+    }
+    let bytes = pending.encode();
+    if bytes.len() > DIRECTORY_CREATION_JOURNAL_LIMIT || bytes.len() <= current.encode().len() {
+        return Err(rustix::io::Errno::FBIG);
+    }
+    // Created records are longer than intent records. Overwrite in place so a
+    // crash can leave only the old intent, a malformed nonempty record, or the
+    // complete created phase; it can never manufacture an empty/no-journal
+    // state while the new child already exists.
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = rustix::io::pwrite(journal, &bytes.as_bytes()[written..], written as u64)?;
+        if count == 0 {
+            return Err(rustix::io::Errno::IO);
+        }
+        written += count;
+    }
+    rustix::fs::fsync(journal)
+}
+
+#[cfg(target_os = "macos")]
 fn clear_directory_creation_journal(
     journal: std::os::fd::BorrowedFd<'_>,
 ) -> rustix::io::Result<()> {
     rustix::fs::ftruncate(journal, 0)?;
     rustix::fs::fsync(journal)
+}
+
+#[cfg(target_os = "macos")]
+fn authorize_existing_directory(
+    pending: Option<&PendingDirectoryCreation>,
+    existing: &rustix::fs::Stat,
+) -> rustix::io::Result<bool> {
+    match pending.map(|pending| &pending.phase) {
+        Some(DirectoryCreationPhase::Intent) => {
+            // Intent proves only that a creation was planned. It never
+            // authorizes a child that appeared before a durable identity.
+            Err(rustix::io::Errno::PERM)
+        }
+        Some(DirectoryCreationPhase::Created {
+            child_device,
+            child_inode,
+        }) if *child_device == i64::from(existing.st_dev) && *child_inode == existing.st_ino => {
+            Ok(true)
+        }
+        Some(DirectoryCreationPhase::Created { .. }) => Err(rustix::io::Errno::PERM),
+        None => Ok(false),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1095,7 +1208,7 @@ fn establish_account_component(
     validate_directory(&parent_stat, None)?;
     let pending = read_directory_creation_journal(lock.journal_fd())?;
     *retain_created_lineage = pending.is_some();
-    let mut pending_matches = pending
+    let pending_matches = pending
         .as_ref()
         .is_some_and(|pending| pending.matches(&parent_stat, component));
     let existing = match fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW) {
@@ -1103,30 +1216,31 @@ fn establish_account_component(
         Err(error) if error == rustix::io::Errno::NOENT => None,
         Err(error) => return Err(error),
     };
-    let (created, before) = if let Some(existing) = existing {
-        (false, existing)
+    if pending.is_some() && !pending_matches {
+        return Err(rustix::io::Errno::PERM);
+    }
+    let (created, before, authorization) = if let Some(existing) = existing {
+        let authorization = authorize_existing_directory(pending.as_ref(), &existing)?;
+        (false, existing, authorization)
     } else {
         if pending.is_some() && !pending_matches {
             return Err(rustix::io::Errno::PERM);
         }
-        if pending.is_none() {
+        let intent = if let Some(pending) = pending.as_ref() {
+            match &pending.phase {
+                DirectoryCreationPhase::Intent => pending.clone(),
+                DirectoryCreationPhase::Created { .. } => return Err(rustix::io::Errno::PERM),
+            }
+        } else {
             let intent = PendingDirectoryCreation::new(&parent_stat, component);
             *retain_created_lineage = true;
             (hooks.0)(boundary)?;
             write_directory_creation_journal(lock.journal_fd(), &intent)?;
-            pending_matches = true;
-        }
+            intent
+        };
         let mkdir_result = (hooks.1)(boundary)
             .and_then(|()| fs::mkdirat(parent, component, Mode::from_raw_mode(0o700)));
         if let Err(error) = mkdir_result {
-            if error == rustix::io::Errno::EXIST {
-                // EEXIST proves this invocation did not create the object.
-                // Revoke the intent durably so no later retry can use it to
-                // normalize the raced identity.
-                clear_directory_creation_journal(lock.journal_fd())?;
-                *retain_created_lineage = false;
-                return Err(error);
-            }
             // The failing mkdir did not prove that the name is absent. Only a
             // descriptor-relative no-follow absence check can revoke its
             // intent. Otherwise the journaled parent and all of its newly
@@ -1140,16 +1254,17 @@ fn establish_account_component(
             }
             return Err(error);
         }
+        let child = fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW)?;
+        validate_directory(&child, None)?;
+        let created = intent.created(&child);
+        advance_directory_creation_journal(lock.journal_fd(), &created)?;
         (hooks.2)(boundary)?;
-        (
-            true,
-            fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW)?,
-        )
+        (true, child, true)
     };
     validate_directory(&before, None)?;
     let mode = Mode::from_raw_mode(before.st_mode).as_raw_mode();
     let recoverable = !created && mode != 0o700;
-    if recoverable && !pending_matches {
+    if recoverable && !authorization {
         return Err(rustix::io::Errno::PERM);
     }
     let created_identity = if created || recoverable {
@@ -1163,6 +1278,8 @@ fn establish_account_component(
             Mode::from_raw_mode(0o700),
             AtFlags::SYMLINK_NOFOLLOW,
         )?;
+        Some(before)
+    } else if authorization {
         Some(before)
     } else {
         None
@@ -1181,11 +1298,16 @@ fn establish_account_component(
     if (created || recoverable) && Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
         return Err(rustix::io::Errno::PERM);
     }
-    if pending_matches {
+    if authorization || created {
+        // The created phase binds recovery to this exact child. Make the
+        // child metadata and its containing entry durable before revoking the
+        // only authorization for recovery.
+        rustix::fs::fsync(&child)?;
+        rustix::fs::fsync(parent)?;
         clear_directory_creation_journal(lock.journal_fd())?;
         *retain_created_lineage = false;
     }
-    Ok((child, stat, created || recoverable))
+    Ok((child, stat, created || recoverable || authorization))
 }
 
 #[cfg(target_os = "macos")]
@@ -2518,7 +2640,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let fixture = BootstrapFixture::new("lock-create-crash");
-        let checkpoint = fixture.path.join("created-before-fchmod");
+        let checkpoint = fixture.path.join("created-after-durable-sync");
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg("umask 0777; exec \"$@\"")
@@ -2539,7 +2661,7 @@ mod tests {
             .unwrap();
         wait_for_child_checkpoint(&mut child, &checkpoint);
         let lock_path = fixture.path.join(BOOTSTRAP_LOCK);
-        assert_eq!(std::fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o000);
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
         drop(acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap());
@@ -2976,7 +3098,180 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn mkdir_eexist_revokes_intent_and_retry_rejects_raced_object() {
+    fn intent_only_journal_retries_an_absent_child_but_preserves_a_later_foreign_child() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let retry = BootstrapFixture::new("intent-only-retry");
+        let retry_lock =
+            acquire_global_lock(&retry.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let retry_parent = retry.open();
+        let retry_intent = PendingDirectoryCreation::new(
+            &rustix::fs::fstat(retry_parent.as_fd()).unwrap(),
+            "profiles",
+        );
+        write_directory_creation_journal(retry_lock.journal_fd(), &retry_intent).unwrap();
+        let established = establish_account_directory(&retry_lock, &retry.path, digest).unwrap();
+        established.revalidate().unwrap();
+        assert_eq!(
+            std::fs::metadata(retry.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let foreign = BootstrapFixture::new("intent-only-foreign-child");
+        let foreign_lock =
+            acquire_global_lock(&foreign.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let foreign_parent = foreign.open();
+        let foreign_intent = PendingDirectoryCreation::new(
+            &rustix::fs::fstat(foreign_parent.as_fd()).unwrap(),
+            "profiles",
+        );
+        write_directory_creation_journal(foreign_lock.journal_fd(), &foreign_intent).unwrap();
+        let profiles = foreign.path.join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(establish_account_directory(&foreign_lock, &foreign.path, digest).is_err());
+        assert_eq!(std::fs::metadata(&profiles).unwrap().mode() & 0o777, 0o000);
+        assert!(
+            std::fs::metadata(foreign.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len()
+                > 0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn created_identity_phase_retries_only_the_created_child_and_clears_after_sync() {
+        use std::os::unix::fs::MetadataExt;
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let fixture = BootstrapFixture::new("created-identity-retry");
+        let lock =
+            acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let failure = establish_account_directory_with_hooks(
+            &lock,
+            &fixture.path,
+            digest,
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+            |boundary| {
+                if boundary == 0 {
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+        );
+        assert!(matches!(failure, Err(error) if error == rustix::io::Errno::IO));
+        let pending = read_directory_creation_journal(lock.journal_fd())
+            .unwrap()
+            .unwrap();
+        let profiles = fixture.path.join("profiles");
+        let profile_stat = std::fs::metadata(&profiles).unwrap();
+        assert!(matches!(
+            pending.phase,
+            DirectoryCreationPhase::Created {
+                child_device,
+                child_inode
+            } if u64::try_from(child_device).is_ok_and(|device| device == profile_stat.dev())
+                && child_inode == profile_stat.ino()
+        ));
+        let established = establish_account_directory(&lock, &fixture.path, digest).unwrap();
+        established.revalidate().unwrap();
+        assert_eq!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn created_identity_phase_rejects_replacement_and_partial_transition() {
+        use std::os::fd::AsFd;
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let replaced = BootstrapFixture::new("created-identity-replacement");
+        let replaced_lock =
+            acquire_global_lock(&replaced.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let replaced_parent = replaced.open();
+        let intent = PendingDirectoryCreation::new(
+            &rustix::fs::fstat(replaced_parent.as_fd()).unwrap(),
+            "profiles",
+        );
+        write_directory_creation_journal(replaced_lock.journal_fd(), &intent).unwrap();
+        let profiles = replaced.path.join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        let created_stat = rustix::fs::statat(
+            replaced_parent.as_fd(),
+            "profiles",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        advance_directory_creation_journal(
+            replaced_lock.journal_fd(),
+            &intent.created(&created_stat),
+        )
+        .unwrap();
+        let displaced = replaced.path.join("displaced-profiles");
+        std::fs::rename(&profiles, &displaced).unwrap();
+        std::fs::create_dir(&profiles).unwrap();
+        assert!(establish_account_directory(&replaced_lock, &replaced.path, digest).is_err());
+        assert!(profiles.is_dir());
+        assert!(displaced.is_dir());
+        assert!(
+            std::fs::metadata(replaced.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        let partial = BootstrapFixture::new("partial-created-transition");
+        let partial_lock =
+            acquire_global_lock(&partial.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let partial_parent = partial.open();
+        let intent = PendingDirectoryCreation::new(
+            &rustix::fs::fstat(partial_parent.as_fd()).unwrap(),
+            "profiles",
+        );
+        write_directory_creation_journal(partial_lock.journal_fd(), &intent).unwrap();
+        let profiles = partial.path.join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        let created_stat = rustix::fs::statat(
+            partial_parent.as_fd(),
+            "profiles",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let created = intent.created(&created_stat).encode();
+        let interrupted = created.len() / 2;
+        rustix::io::pwrite(
+            partial_lock.journal_fd(),
+            &created.as_bytes()[..interrupted],
+            0,
+        )
+        .unwrap();
+        rustix::fs::fsync(partial_lock.journal_fd()).unwrap();
+        assert!(read_directory_creation_journal(partial_lock.journal_fd()).is_err());
+        assert!(establish_account_directory(&partial_lock, &partial.path, digest).is_err());
+        assert!(profiles.is_dir());
+        assert!(
+            std::fs::metadata(partial.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len()
+                > 0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mkdir_eexist_preserves_intent_and_retry_rejects_raced_object() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
@@ -2994,7 +3289,7 @@ mod tests {
                     std::fs::create_dir(&raced_accounts).unwrap();
                     std::fs::set_permissions(
                         &raced_accounts,
-                        std::fs::Permissions::from_mode(0o000),
+                        std::fs::Permissions::from_mode(0o700),
                     )
                     .unwrap();
                     Err(rustix::io::Errno::EXIST)
@@ -3008,19 +3303,19 @@ mod tests {
         assert!(failure.is_err());
         assert_eq!(
             std::fs::metadata(&raced_accounts).unwrap().mode() & 0o777,
-            0o000
+            0o700
         );
         assert!(raced.path.join("profiles/default").exists());
-        assert_eq!(
+        assert!(
             std::fs::metadata(raced.path.join(BOOTSTRAP_LOCK))
                 .unwrap()
-                .len(),
-            0
+                .len()
+                > 0
         );
         assert!(establish_account_directory(&raced_lock, &raced.path, digest).is_err());
         assert_eq!(
             std::fs::metadata(&raced_accounts).unwrap().mode() & 0o777,
-            0o000
+            0o700
         );
     }
 
