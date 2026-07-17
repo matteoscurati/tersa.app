@@ -274,7 +274,8 @@ touching Keychain; they do not execute a valid main-thread bootstrap call.
 They also cover locking behavior, including timeout, `EINTR`, a crash between
 lock creation and `fchmod`, concurrent normalization, rejection of excess
 permission bits, crash release, and adversarial two-thread/two-process
-serialization.
+serialization. A post-open mode-race fixture proves that the existing lock's
+descriptor-bound final validation still requires exact `0600`.
 
 Before provisioning an absent root, the locked composition accepts only an
 absent profile tree or the exact empty `profiles/default/accounts` skeleton.
@@ -317,27 +318,40 @@ which may still reject it, and never permits fresh cleanup. An absent main with
 any journal, WAL, or shared-memory name present fails before open and performs
 no cleanup.
 
-This classification augments and must not weaken the existing
-`database_sidecar_exists` three-suffix invariant. Fixtures preserve the current
+This classification is enforced over all three sidecar suffixes. Fixtures
+preserve the current
 `absent_with_sidecar` and `empty_with_sidecar` rollback-journal behavior and
 cover the all-absent state, every main-present sidecar combination, and every
 main-absent orphan-sidecar combination. Only after a failed fresh open closes
 all SQLite handles, and only with a proven exclusive main-file claim, may the
 store consider any fixed entry that was absent pre-open and is newly present
 after close. Without that proof no main or sidecar cleanup runs, so a racing
-main plus WAL/SHM is preserved. Under the cooperative-writer assumption the
+main plus WAL/SHM is preserved. The recorded `O_EXCL` main identity is
+revalidated inside the unlink helper immediately before every candidate unlink;
+a main replacement or deletion preserves every remaining candidate. Under the
+cooperative-writer assumption the
 authorized path records and revalidates each candidate's identity through
 descriptor-relative no-follow `statat`, then uses rustix `unlinkat` beneath the
 same retained parent descriptor. It never uses `std::fs::remove_file`,
 re-resolves the parent path, removes a pre-existing or mismatched entry, or
 removes a profile directory.
 
-An existing main is first checked through the immutable main-file view. If that
-view is fresh and the snapshot includes the complete WAL/SHM pair, a
-non-checkpointing read-only/no-follow connection validates the logical
-WAL-resident state, after which the full snapshot is revalidated. This allows
-an abruptly terminated first migration to reopen without granting cleanup
-authority to the snapshot-present main.
+Every existing main, WAL, and SHM accepted by the writer is a same-owner regular
+file at exact `0600`, checked before SQLite access and revalidated after open.
+A canonical main without sidecars may create a new owner-only WAL/SHM pair
+through the owning writer. An existing main is first checked through the
+immutable main-file view. A complete WAL/SHM pair is validated with a
+non-checkpointing read-only/no-follow logical connection. If an abruptly
+terminated first migration retains WAL but loses SHM, the store copies the
+identity-bound encrypted main/WAL pair into O_EXCL `0600` files in a private
+`0700` `.tersa-wal-recovery-*` directory, creates SHM only in that staging
+directory, and validates key, account, schema, foreign keys, SQLCipher, and
+SQLite integrity through a read-only/no-follow database handle with
+checkpoint-on-close disabled. It revalidates the original
+pair before and after validation, identity-cleans only staging entries, and then
+the owning writer creates a new original SHM. The preflight never cleans,
+checkpoints, repairs, or adopts an original fixed entry. A process crash can
+leave encrypted owner-only staging residue; retry does not adopt or remove it.
 
 The retained descriptor eliminates a parent-path cleanup race; SQLite itself
 remains pathname-based and no descriptor-bound SQLite opener is claimed. The

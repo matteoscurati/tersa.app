@@ -613,6 +613,7 @@ fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Resul
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GlobalLockHook {
     AfterCreate,
+    AfterExistingOpen,
 }
 
 #[cfg(target_os = "macos")]
@@ -669,7 +670,8 @@ fn acquire_global_lock_with_hook(
                 OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )?;
-            validate_lock(&fs::fstat(&lock)?, Some(&expected), false)?;
+            hook(GlobalLockHook::AfterExistingOpen)?;
+            validate_lock(&fs::fstat(&lock)?, Some(&expected), true)?;
             lock
         }
         Err(error) => return Err(error),
@@ -2062,6 +2064,39 @@ mod tests {
             acquire_global_lock(&invalid.path, Instant::now() + Duration::from_secs(1)).is_err()
         );
         assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn existing_global_lock_mode_race_fails_after_descriptor_binding() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = BootstrapFixture::new("lock-mode-race");
+        let path = fixture.path.join(BOOTSTRAP_LOCK);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let mut raced = false;
+
+        let result = acquire_global_lock_with_hook(
+            &fixture.path,
+            Instant::now() + Duration::from_secs(1),
+            &mut |point| {
+                if point == GlobalLockHook::AfterExistingOpen {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                    raced = true;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(raced);
+        assert!(matches!(result, Err(error) if error == rustix::io::Errno::PERM));
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode() & 0o777, 0o400);
     }
 
     #[cfg(target_os = "macos")]

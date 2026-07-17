@@ -176,7 +176,9 @@ creation requests `O_EXCL` mode `0600` and normalizes its returned descriptor.
 For an existing same-user regular lock, no-follow `statat`, bounded no-follow
 `chmodat` recovery of `0000`, `0200`, or `0400`, then no-follow open and exact
 identity/mode revalidation precede locking. Execute/group/other bits or any type,
-owner, or identity drift fail without repair. This converges after restrictive
+owner, identity, or final-mode drift fail without repair. A deterministic
+post-open mode-race fixture proves exact `0600` remains mandatory. This
+converges after restrictive
 umasks or a crash before `fchmod`, including an otherwise unopenable `0000`
 file, and all work remains inside the deadline. Mutable-name normalization gaps
 remain an explicit same-user local-malware residual.
@@ -205,8 +207,8 @@ absent is a fresh leaf eligible for bounded failed-open cleanup. A present main
 with any combination of the three sidecars uses the existing opener/migration
 path, which may still reject it, and is never cleanup eligible. An absent main
 with any sidecar fails before open without cleanup.
-This augments the existing `database_sidecar_exists` three-suffix invariant;
-fixtures preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
+This classification is enforced over all three sidecar suffixes; fixtures
+preserve `absent_with_sidecar` and `empty_with_sidecar` journal behavior
 and cover every relevant combination.
 
 After a failed fresh open closes SQLite handles, the store may clean fixed
@@ -214,11 +216,23 @@ entries that were absent pre-open only when it first proved main-file authorship
 with `O_EXCL`. Without that proof no main or sidecar cleanup runs, preserving a
 racing main plus WAL/SHM. The authorized path uses rustix `statat` and `unlinkat`
 beneath the retained descriptor and never re-resolves a parent pathname or calls
-`std::fs::remove_file`. SQLite remains pathname-based; no descriptor-bound
-SQLite opener is claimed. An immutable main-file preflight falls back to a
-non-checkpointing read-only logical validation when a fresh main has a complete
-WAL/SHM pair, allowing abrupt first-migration recovery without cleanup
-authority. The stated cleanup residuals are same-user sidecar insertion after
+`std::fs::remove_file`. Candidate cleanup also revalidates the recorded
+`O_EXCL` main identity inside the unlink helper immediately before every unlink;
+a main replacement preserves all remaining candidates. SQLite remains
+pathname-based; no descriptor-bound SQLite opener is claimed. An immutable
+main-file preflight falls back to a non-checkpointing read-only logical
+validation when a fresh main has a complete WAL/SHM pair. If SHM is missing,
+the store validates identity-bound encrypted main/WAL copies in O_EXCL `0600`
+staging files beneath a private `0700` account directory, with
+a read-only/no-follow database handle, checkpoint-on-close disabled, and no
+mutation of the originals. It removes only
+identity-revalidated staging entries before the owning writer rebuilds an exact
+`0600` SHM. A crash can leave encrypted owner-only staging residue that retry
+does not adopt or delete. Existing main/WAL/SHM modes are checked at exact
+`0600` before access and revalidated after open; a canonical main without
+sidecars may re-establish its owner-only pair. This allows abrupt
+first-migration recovery without original cleanup or repair authority. The
+stated cleanup residuals are same-user sidecar insertion after
 the proven main claim, which can be misattributed to SQLite, and same-user
 replacement between revalidation and `unlinkat`; deterministic hooks cover both
 non-prevention gaps and intermediate mismatch preservation. A retry re-enters

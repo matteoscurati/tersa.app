@@ -314,7 +314,8 @@ can replace that entry between `statat`, `chmodat`, open, and final `fstat`; the
 identity check detects an observable replacement but cannot prevent chmod from
 affecting the replacement. This is an explicit unlocked-device/local-malware
 residual. Deterministic hooks exercise both gaps and record the non-prevention
-case without claiming atomicity.
+case without claiming atomicity. A separate post-open mode-race hook proves that
+the descriptor-bound final `fstat` still requires exact `0600` and fails closed.
 
 The synchronous bootstrap C ABI runs only on the dedicated bounded `TersaMac`
 bootstrap worker, never on the AppKit/main thread. The worker has concurrency
@@ -352,7 +353,8 @@ runtime or device-signed gate. Runtime worker dispatch and overflow evidence
 belongs to PR 33b. Rust deterministic tests in PR 33a.5 cover the C ABI's
 `NSThread`-based main-thread rejection, timeout, injected `EINTR`, restrictive
 umasks, a crash after lock-file creation but before `fchmod`, concurrent
-normalization, rejection of any execute/group/other permission bit, crash
+normalization, rejection of any execute/group/other permission bit, an
+existing-lock mode race after descriptor binding, crash
 release of the advisory lock, and adversarial two-thread and two-process
 interleavings around directory creation and
 main/rollback-journal/WAL/shared-memory cleanup. The
@@ -422,21 +424,36 @@ merely because any sidecar is absent.
 | Present | Any combination, including all absent | Existing leaf: invoke the existing opener and migration path; never permit fresh-failure cleanup. The opener may still reject it. |
 | Absent | Any one or more present | Fail closed before store open; perform no cleanup. |
 
-This four-entry pre-open classification augments and must not weaken the
-existing `database_sidecar_exists` invariant over the three suffixes
+This four-entry pre-open classification is enforced over the three suffixes
 `-journal`, `-wal`, and `-shm`. In particular, the existing
 `absent_with_sidecar` and `empty_with_sidecar` rollback-journal fixtures retain
 their behavior: an orphan journal with no main file is preserved and fails
 before open, while an empty present main plus journal enters the existing-leaf
 opener and preserves the journal when that opener rejects it.
 
+An existing main, WAL, or SHM must be a same-owner regular file at exact mode
+`0600`; the writer checks those modes before SQLite access and revalidates the
+pre-open identities and modes after open. An existing canonical main without
+sidecars may re-establish its owner-only WAL/SHM pair through the owning writer.
+
 An existing main is first validated without mutation through the immutable
-main-file view. If that view is fresh and the snapshot contains the complete
-WAL/SHM pair, a second read-only/no-follow connection with
-checkpoint-on-close disabled validates the logical WAL-resident database. This
-recovers a committed first migration left in WAL by an abrupt process exit.
-The store then revalidates the complete pre-open leaf snapshot. This WAL-aware
-preflight grants no cleanup authority and never adopts a snapshot-present main.
+main-file view. If the snapshot contains the complete WAL/SHM pair, a second
+read-only/no-follow connection with checkpoint-on-close disabled validates the
+logical WAL-resident database. If a committed first migration has a WAL but its
+SHM was lost, SQLite cannot open either immutable or ordinary read-only state.
+The store instead creates one private `0700` `.tersa-wal-recovery-*` directory
+beneath the retained account descriptor, copies the still-encrypted main and WAL
+from identity-bound no-follow descriptors into exclusive `0600` staging files,
+creates only a staging SHM, and runs the same key, account, canonical-schema,
+foreign-key, SQLCipher, and SQLite integrity checks through a read-only/no-follow
+database handle with checkpoint-on-close disabled. It revalidates the original main/WAL identities before and after that
+check, removes only identity-revalidated staging entries, then lets the owning
+writer reopen the unchanged original pair and create a new owner-only SHM. No
+original fixed entry is cleaned, checkpointed, adopted, or repaired by the
+preflight. Abrupt termination during staging can leave only encrypted owner-only
+staging residue; a later reviewed maintenance path may remove it, but retry does
+not adopt or delete it. This WAL-aware preflight never grants fresh-cleanup
+authority to a snapshot-present main.
 
 On a fresh-leaf failure after the store has successfully claimed the main file
 with `O_EXCL`, but before migration is accepted, the store first closes all
@@ -447,7 +464,10 @@ cooperative-writer assumption. Without the proven exclusive main-file claim,
 no main or sidecar cleanup runs; a racing main with WAL/SHM is preserved. The
 authorized cleanup uses descriptor-relative no-follow `statat`, records
 identity, type, owner, and permissions after close, and revalidates immediately
-before descriptor-relative `unlinkat` beneath that same retained parent.
+before descriptor-relative `unlinkat` beneath that same retained parent. Before
+each candidate unlink, including after deterministic race hooks, the fixed main
+name must still resolve to the recorded `O_EXCL`-created main identity; a main
+replacement or deletion preserves every remaining candidate.
 Cleanup may remove only a same-user restrictive regular file whose post-close
 identity still matches. It must never call `std::fs::remove_file`, re-resolve
 the account path, remove an entry present in the pre-open snapshot, remove an
