@@ -1007,6 +1007,8 @@ fn establish_account_directory(
         digest,
         |_boundary| Ok(()),
         |_boundary| Ok(()),
+        |_boundary| Ok(()),
+        |_boundary| Ok(()),
     )
 }
 
@@ -1015,7 +1017,9 @@ fn establish_account_directory_with_hooks(
     lock: &BootstrapLock,
     container_path: &Path,
     digest: &str,
-    mut after_mkdir: impl FnMut(usize) -> rustix::io::Result<()>,
+    before_journal_write: impl FnMut(usize) -> rustix::io::Result<()>,
+    before_mkdir: impl FnMut(usize) -> rustix::io::Result<()>,
+    after_mkdir: impl FnMut(usize) -> rustix::io::Result<()>,
     mut after_boundary: impl FnMut(usize) -> rustix::io::Result<()>,
 ) -> rustix::io::Result<EstablishedDirectories> {
     use rustix::fs::{self, Mode, OFlags};
@@ -1031,6 +1035,8 @@ fn establish_account_directory_with_hooks(
         path: container_path.to_path_buf(),
         snapshots: Vec::new(),
     };
+    let mut component_hooks = (before_journal_write, before_mkdir, after_mkdir);
+    let mut retain_created_lineage = false;
     let result = (|| {
         for (boundary, component) in ["profiles", "default", "accounts", digest]
             .into_iter()
@@ -1041,10 +1047,11 @@ fn establish_account_directory_with_hooks(
                 parent.as_fd(),
                 boundary,
                 component,
-                &mut after_mkdir,
+                &mut component_hooks,
+                &mut retain_created_lineage,
             )?;
             established.snapshots.push(DirectorySnapshot {
-                parent: rustix::io::dup(parent.as_fd())?,
+                parent: rustix::io::fcntl_dupfd_cloexec(parent.as_fd(), 0)?,
                 name: component.to_owned(),
                 expected: stat,
                 created,
@@ -1056,7 +1063,13 @@ fn establish_account_directory_with_hooks(
         Ok(())
     })();
     if let Err(error) = result {
-        established.cleanup_before_store_open();
+        // A live journal names a parent by identity. Removing that parent (or
+        // any ancestor that makes it reachable) would make crash recovery
+        // irrecoverable. The residual is deliberately retained unless the
+        // component was proven absent and the journal clear was durable.
+        if !retain_created_lineage {
+            established.cleanup_before_store_open();
+        }
         return Err(error);
     }
     Ok(established)
@@ -1068,13 +1081,19 @@ fn establish_account_component(
     parent: std::os::fd::BorrowedFd<'_>,
     boundary: usize,
     component: &str,
-    after_mkdir: &mut impl FnMut(usize) -> rustix::io::Result<()>,
+    hooks: &mut (
+        impl FnMut(usize) -> rustix::io::Result<()>,
+        impl FnMut(usize) -> rustix::io::Result<()>,
+        impl FnMut(usize) -> rustix::io::Result<()>,
+    ),
+    retain_created_lineage: &mut bool,
 ) -> rustix::io::Result<(rustix::fd::OwnedFd, rustix::fs::Stat, bool)> {
     use rustix::fs::{self, AtFlags, Mode, OFlags};
 
     let parent_stat = fs::fstat(parent)?;
     validate_directory(&parent_stat, None)?;
     let pending = read_directory_creation_journal(lock.journal_fd())?;
+    *retain_created_lineage = pending.is_some();
     let mut pending_matches = pending
         .as_ref()
         .is_some_and(|pending| pending.matches(&parent_stat, component));
@@ -1091,19 +1110,36 @@ fn establish_account_component(
         }
         if pending.is_none() {
             let intent = PendingDirectoryCreation::new(&parent_stat, component);
+            *retain_created_lineage = true;
+            (hooks.0)(boundary)?;
             write_directory_creation_journal(lock.journal_fd(), &intent)?;
             pending_matches = true;
         }
-        if let Err(error) = fs::mkdirat(parent, component, Mode::from_raw_mode(0o700)) {
-            // An object that appeared after the no-follow absence check was
-            // not created by this invocation. Revoke the intent so a later
-            // retry cannot use it to normalize that unproven object.
+        let mkdir_result = (hooks.1)(boundary)
+            .and_then(|()| fs::mkdirat(parent, component, Mode::from_raw_mode(0o700)));
+        if let Err(error) = mkdir_result {
             if error == rustix::io::Errno::EXIST {
+                // EEXIST proves this invocation did not create the object.
+                // Revoke the intent durably so no later retry can use it to
+                // normalize the raced identity.
                 clear_directory_creation_journal(lock.journal_fd())?;
+                *retain_created_lineage = false;
+                return Err(error);
+            }
+            // The failing mkdir did not prove that the name is absent. Only a
+            // descriptor-relative no-follow absence check can revoke its
+            // intent. Otherwise the journaled parent and all of its newly
+            // created ancestors must survive for a fail-closed retry.
+            match fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(probe_error) if probe_error == rustix::io::Errno::NOENT => {
+                    clear_directory_creation_journal(lock.journal_fd())?;
+                    *retain_created_lineage = false;
+                }
+                Ok(_) | Err(_) => {}
             }
             return Err(error);
         }
-        after_mkdir(boundary)?;
+        (hooks.2)(boundary)?;
         (
             true,
             fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW)?,
@@ -1146,6 +1182,7 @@ fn establish_account_component(
     }
     if pending_matches {
         clear_directory_creation_journal(lock.journal_fd())?;
+        *retain_created_lineage = false;
     }
     Ok((child, stat, created || recoverable))
 }
@@ -2752,6 +2789,8 @@ mod tests {
             &lock,
             &container,
             digest,
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
             |boundary| {
                 assert_eq!(boundary, 0);
                 std::fs::write(&checkpoint, b"created").unwrap();
@@ -2814,6 +2853,8 @@ mod tests {
                 &fixture.path,
                 digest,
                 |_boundary| Ok(()),
+                |_boundary| Ok(()),
+                |_boundary| Ok(()),
                 |boundary| {
                     if boundary == failure_boundary {
                         Err(rustix::io::Errno::IO)
@@ -2831,6 +2872,14 @@ mod tests {
             acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
         let mut established = establish_account_directory(&lock, &fixture.path, digest).unwrap();
         established.revalidate().unwrap();
+        for snapshot in &established.snapshots {
+            assert!(
+                rustix::io::fcntl_getfd(&snapshot.parent)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC),
+                "retained cleanup descriptors must never survive exec"
+            );
+        }
         let account = established.path().to_path_buf();
         let moved = account.with_extension("moved");
         std::fs::rename(&account, &moved).unwrap();
@@ -2840,6 +2889,218 @@ mod tests {
         established.cleanup_before_store_open();
         assert!(account.exists());
         assert!(moved.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deeper_mkdir_failure_clears_journal_and_retry_converges() {
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let retry = BootstrapFixture::new("deeper-mkdir-retry");
+        let retry_lock =
+            acquire_global_lock(&retry.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let failure = establish_account_directory_with_hooks(
+            &retry_lock,
+            &retry.path,
+            digest,
+            |_boundary| Ok(()),
+            |boundary| {
+                if boundary == 2 {
+                    assert!(
+                        std::fs::metadata(retry.path.join(BOOTSTRAP_LOCK))
+                            .unwrap()
+                            .len()
+                            > 0
+                    );
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+        );
+        assert!(matches!(failure, Err(error) if error == rustix::io::Errno::IO));
+        assert_eq!(
+            std::fs::metadata(retry.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!retry.path.join("profiles").exists());
+        let established = establish_account_directory(&retry_lock, &retry.path, digest).unwrap();
+        established.revalidate().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn partial_journal_write_retains_created_lineage() {
+        use std::io::Write;
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let fixture = BootstrapFixture::new("partial-directory-journal");
+        let lock =
+            acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let journal_path = fixture.path.join(BOOTSTRAP_LOCK);
+        let failure = establish_account_directory_with_hooks(
+            &lock,
+            &fixture.path,
+            digest,
+            |boundary| {
+                if boundary == 2 {
+                    let mut journal = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&journal_path)
+                        .unwrap();
+                    journal.write_all(b"partial-directory-intent").unwrap();
+                    journal.sync_all().unwrap();
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+        );
+        assert!(matches!(failure, Err(error) if error == rustix::io::Errno::IO));
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            b"partial-directory-intent"
+        );
+        assert!(fixture.path.join("profiles/default").is_dir());
+        assert!(!fixture.path.join("profiles/default/accounts").exists());
+        assert!(establish_account_directory(&lock, &fixture.path, digest).is_err());
+        assert!(fixture.path.join("profiles/default").is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mkdir_eexist_revokes_intent_and_retry_rejects_raced_object() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let raced = BootstrapFixture::new("deeper-mkdir-race");
+        let raced_lock =
+            acquire_global_lock(&raced.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let raced_accounts = raced.path.join("profiles/default/accounts");
+        let failure = establish_account_directory_with_hooks(
+            &raced_lock,
+            &raced.path,
+            digest,
+            |_boundary| Ok(()),
+            |boundary| {
+                if boundary == 2 {
+                    std::fs::create_dir(&raced_accounts).unwrap();
+                    std::fs::set_permissions(
+                        &raced_accounts,
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                    Err(rustix::io::Errno::EXIST)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+        );
+        assert!(failure.is_err());
+        assert_eq!(
+            std::fs::metadata(&raced_accounts).unwrap().mode() & 0o777,
+            0o000
+        );
+        assert!(raced.path.join("profiles/default").exists());
+        assert_eq!(
+            std::fs::metadata(raced.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(establish_account_directory(&raced_lock, &raced.path, digest).is_err());
+        assert_eq!(
+            std::fs::metadata(&raced_accounts).unwrap().mode() & 0o777,
+            0o000
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uncertain_mkdir_failure_retains_journaled_lineage() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let uncertain = BootstrapFixture::new("deeper-mkdir-uncertain-object");
+        let uncertain_lock =
+            acquire_global_lock(&uncertain.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let uncertain_accounts = uncertain.path.join("profiles/default/accounts");
+        let failure = establish_account_directory_with_hooks(
+            &uncertain_lock,
+            &uncertain.path,
+            digest,
+            |_boundary| Ok(()),
+            |boundary| {
+                if boundary == 2 {
+                    std::fs::create_dir(&uncertain_accounts).unwrap();
+                    std::fs::set_permissions(
+                        &uncertain_accounts,
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+        );
+        assert!(failure.is_err());
+        assert_eq!(
+            std::fs::metadata(&uncertain_accounts).unwrap().mode() & 0o777,
+            0o000
+        );
+        assert!(uncertain.path.join("profiles/default").exists());
+        assert!(
+            std::fs::metadata(uncertain.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len()
+                > 0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replaced_parent_is_not_normalized_or_deleted_after_mkdir_failure() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let replaced = BootstrapFixture::new("deeper-mkdir-parent-replacement");
+        let replaced_lock =
+            acquire_global_lock(&replaced.path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let original = replaced.path.join("profiles/default");
+        let displaced = replaced.path.join("profiles/displaced");
+        let failure = establish_account_directory_with_hooks(
+            &replaced_lock,
+            &replaced.path,
+            digest,
+            |_boundary| Ok(()),
+            |boundary| {
+                if boundary == 2 {
+                    std::fs::rename(&original, &displaced).unwrap();
+                    std::fs::create_dir(&original).unwrap();
+                    std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o711))
+                        .unwrap();
+                    Err(rustix::io::Errno::IO)
+                } else {
+                    Ok(())
+                }
+            },
+            |_boundary| Ok(()),
+            |_boundary| Ok(()),
+        );
+        assert!(failure.is_err());
+        assert_eq!(std::fs::metadata(&original).unwrap().mode() & 0o777, 0o711);
+        assert!(displaced.exists());
     }
 
     #[test]

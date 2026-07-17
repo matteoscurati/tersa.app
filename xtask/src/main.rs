@@ -1236,15 +1236,20 @@ fn rust_qualified_item_uses<'a>(document: &'a str, module: &str) -> Vec<RustQual
 
 /// Masks test-only Rust modules before enforcing production source boundaries.
 fn strip_rust_test_modules(document: &str) -> String {
+    // Discover attributes and module braces from code-only bytes, then apply
+    // the resulting ranges to the original document. This preserves literals
+    // for later alias inspection without allowing literal text to invent a
+    // cfg(test) module that masks following production code.
+    let syntax = strip_rust_non_code(document);
     let mut output = document.to_owned();
     let mut search_from = 0;
-    while let Some(relative) = document[search_from..].find("#[cfg") {
+    while let Some(relative) = syntax[search_from..].find("#[cfg") {
         let attribute_start = search_from + relative;
-        let Some(attribute_end) = document[attribute_start..].find(']') else {
+        let Some(attribute_end) = syntax[attribute_start..].find(']') else {
             break;
         };
         let attribute_end = attribute_start + attribute_end + 1;
-        let compact_attribute = document[attribute_start..attribute_end]
+        let compact_attribute = syntax[attribute_start..attribute_end]
             .bytes()
             .filter(|byte| !is_rust_ascii_whitespace(*byte))
             .collect::<Vec<_>>();
@@ -1252,11 +1257,11 @@ fn strip_rust_test_modules(document: &str) -> String {
             search_from = attribute_end;
             continue;
         }
-        let Some(opening) = rust_directly_attributed_module(document, attribute_end) else {
+        let Some(opening) = rust_directly_attributed_module(&syntax, attribute_end) else {
             search_from = attribute_end;
             continue;
         };
-        let Some(module) = balanced_brace_body(document, opening) else {
+        let Some(module) = balanced_brace_body(&syntax, opening) else {
             search_from = attribute_end;
             continue;
         };
@@ -5770,6 +5775,13 @@ mod later {}
         let unicode_masked = strip_rust_test_modules(unicode);
         assert_eq!(unicode_masked.len(), unicode.len());
         assert!(unicode_masked.contains("fn production() { protected(); }"));
+
+        let literal_pseudo_module = r##"
+const EXAMPLE: &str = "#[cfg(test)] mod scratch {";
+fn production() { protected(); }
+"##;
+        let literal_masked = strip_rust_test_modules(literal_pseudo_module);
+        assert!(literal_masked.contains("fn production() { protected(); }"));
     }
 
     #[test]
@@ -5814,6 +5826,11 @@ unsafe extern "C" {
     fn hidden_alias(query: *const core::ffi::c_void) -> i32;
 }
 "#,
+            r##"
+const EXAMPLE: &str = "#[cfg(test)] mod scratch {";
+#[link_name = "SecItemDelete"]
+unsafe extern "C" { fn hidden_string_alias(); }
+"##,
         ] {
             let mut contaminated = clean.clone();
             contaminated.push((
@@ -5970,8 +5987,7 @@ fn boundary() {
         assert!(rust_authority_source_surface_violations(path, inert).is_empty());
     }
 
-    #[test]
-    fn apple_bridge_export_inventory_pins_every_reviewed_signature() {
+    fn reviewed_apple_bridge_export_sources() -> (&'static str, &'static str) {
         let lib = r#"
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_apple_bridge_version() -> u32 {}
@@ -6015,6 +6031,12 @@ pub extern "C" fn tersa_oauth_macos_poll(session_id: u64) -> i32 {}
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
 "#;
+        (lib, oauth)
+    }
+
+    #[test]
+    fn apple_bridge_export_inventory_pins_every_reviewed_signature() {
+        let (lib, oauth) = reviewed_apple_bridge_export_sources();
         let reviewed = vec![
             (
                 PathBuf::from("apple/rust-bridge/src/lib.rs"),
@@ -6072,6 +6094,29 @@ mod compatibility {{
         assert!(
             !rust_exported_c_abi_violations(&comment_mask_bypass).is_empty(),
             "a comment containing a pseudo cfg(test) module must not hide a production export"
+        );
+
+        let literal_mask_bypass = vec![
+            (
+                PathBuf::from("apple/rust-bridge/src/lib.rs"),
+                lib.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
+                format!(
+                    r##"{oauth}
+mod compatibility {{
+    const EXAMPLE: &str = "#[cfg(test)] mod scratch {{";
+    #[unsafe(no_mangle)]
+    pub extern "C" fn tersa_oauth_literal_dump(session_id: u64) -> i32 {{ 0 }}
+}}
+"##
+                ),
+            ),
+        ];
+        assert!(
+            !rust_exported_c_abi_violations(&literal_mask_bypass).is_empty(),
+            "a literal containing a pseudo cfg(test) module must not hide a production export"
         );
     }
 

@@ -894,7 +894,7 @@ mod macos {
                     return;
                 }
                 let expected = (index == 0).then_some(fresh_main);
-                let _ = remove_unchanged_restrictive_leaf(
+                if remove_unchanged_restrictive_leaf(
                     &self.parent,
                     &self.names[index],
                     self.parent_owner,
@@ -902,7 +902,11 @@ mod macos {
                     (&self.names[0], fresh_main),
                     hook,
                     canonical_path,
-                );
+                )
+                .is_err()
+                {
+                    return;
+                }
             }
         }
     }
@@ -1027,12 +1031,16 @@ mod macos {
         // A hook error only stops this best-effort cleanup; the caller retains
         // its original redacted failure class.
         hook(WriterHook::CleanupBeforeRecord(index), canonical_path)?;
-        let recorded = leaf_entry(parent, name, parent_owner)?.ok_or(OpenFailure::Storage)?;
+        let Some(recorded) = leaf_entry(parent, name, parent_owner)? else {
+            return Ok(());
+        };
         if expected.is_some_and(|identity| identity != recorded) {
             return Err(OpenFailure::Storage);
         }
         hook(WriterHook::CleanupAfterRecord(index), canonical_path)?;
-        let revalidated = leaf_entry(parent, name, parent_owner)?.ok_or(OpenFailure::Storage)?;
+        let Some(revalidated) = leaf_entry(parent, name, parent_owner)? else {
+            return Ok(());
+        };
         if recorded != revalidated {
             return Err(OpenFailure::Storage);
         }
@@ -1043,7 +1051,11 @@ mod macos {
         if leaf_entry(parent, cleanup_authority.0, parent_owner)? != Some(cleanup_authority.1) {
             return Err(OpenFailure::Storage);
         }
-        fs::unlinkat(parent, name, AtFlags::empty()).map_err(|_error| OpenFailure::Storage)
+        match fs::unlinkat(parent, name, AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(_error) => Err(OpenFailure::Storage),
+        }
     }
 
     #[cfg(test)]
@@ -3286,6 +3298,51 @@ mod macos {
         }
 
         #[test]
+        fn restrictive_umask_sidecar_refusal_preserves_main_for_retries() {
+            let database = TestDatabase::new("cleanup-refused-umask");
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; shift; exec \"$@\"")
+                .arg("tersa-cleanup-refused-umask")
+                .arg("0777")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::restrictive_umask_sidecar_refusal_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_STORE_CLEANUP_REFUSED_DATABASE", database.path())
+                .stdin(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "restrictive-umask cleanup helper failed");
+        }
+
+        #[test]
+        fn absent_journal_is_benign_during_fresh_cleanup() {
+            let database = TestDatabase::new("cleanup-absent-journal");
+            let mut injected = false;
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                database.path(),
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::AfterFreshClaim {
+                        write_restrictive(&wal_path(&database), b"candidate-wal");
+                        write_restrictive(&shm_path(&database), b"candidate-shm");
+                        injected = true;
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(injected);
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert!(database.files().is_empty());
+        }
+
+        #[test]
         fn fresh_leaf_normalization_is_bound_to_the_opened_descriptor() {
             use std::os::unix::fs::MetadataExt;
 
@@ -3362,8 +3419,17 @@ mod macos {
                 assert!(replacement_done);
                 assert!(matches!(result, Err(MailboxStoreError::Storage)));
                 // The middle revalidation observes the identity change and
-                // preserves the replacement for all four fixed names.
+                // stops before deleting the cleanup-authority main.
                 assert_eq!(fs::read(&replaced_path).unwrap(), b"replacement-preserved");
+                let main_before_retry = file_identity(replaced.path()).unwrap();
+                let files_before_retry = replaced.files();
+                assert_corrupted(SqlCipherMailboxStore::open(
+                    account(),
+                    replaced.path(),
+                    key(7),
+                ));
+                assert_eq!(file_identity(replaced.path()).unwrap(), main_before_retry);
+                assert_eq!(replaced.files(), files_before_retry);
 
                 let final_gap = TestDatabase::new(&format!("cleanup-final-gap-{index}"));
                 let final_path = fixed_leaf_path(&final_gap, index);
@@ -3391,6 +3457,53 @@ mod macos {
                 // Accepted residual: unlinkat cannot bind deletion to the
                 // revalidated inode, so this final-gap replacement is removed.
                 assert!(!final_path.exists());
+            }
+        }
+
+        #[test]
+        fn cleanup_refuses_an_unowned_symlink_and_preserves_main_for_retries() {
+            let database = TestDatabase::new("cleanup-unowned-symlink");
+            let foreign = database.directory.join("foreign-sidecar-target");
+            let candidate = shm_path(&database);
+            let mut injected = false;
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                database.path(),
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::AfterFreshClaim {
+                        write_restrictive(&foreign, b"foreign-sidecar");
+                        std::os::unix::fs::symlink(&foreign, &candidate).unwrap();
+                        injected = true;
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(injected);
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            let main_before_retry = file_identity(database.path()).unwrap();
+            assert!(
+                fs::symlink_metadata(&candidate)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(&foreign).unwrap(), b"foreign-sidecar");
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    SqlCipherMailboxStore::open(account(), database.path(), key(7)),
+                    Err(MailboxStoreError::Storage)
+                ));
+                assert_eq!(file_identity(database.path()).unwrap(), main_before_retry);
+                assert!(
+                    fs::symlink_metadata(&candidate)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(&foreign).unwrap(), b"foreign-sidecar");
             }
         }
 
@@ -3851,6 +3964,52 @@ mod macos {
                 assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
             }
             drop(store);
+        }
+
+        #[test]
+        #[ignore = "subprocess helper for refused sidecar cleanup under a restrictive umask"]
+        fn restrictive_umask_sidecar_refusal_child() {
+            use std::os::unix::fs::MetadataExt;
+
+            let Some(database) = std::env::var_os("TERSA_STORE_CLEANUP_REFUSED_DATABASE") else {
+                return;
+            };
+            let database = PathBuf::from(database);
+            let refused_sidecar = sidecar_path(&database, "-shm");
+            let mut injected = false;
+            let first = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                &database,
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::AfterFreshClaim {
+                        fs::write(&refused_sidecar, b"refused-sidecar").unwrap();
+                        injected = true;
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(injected);
+            assert!(matches!(first, Err(MailboxStoreError::Storage)));
+            assert_eq!(fs::metadata(&database).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&refused_sidecar).unwrap().mode() & 0o777,
+                0o000
+            );
+            let main_before_retry = file_identity(&database).unwrap();
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    SqlCipherMailboxStore::open(account(), &database, key(7)),
+                    Err(MailboxStoreError::Storage)
+                ));
+                assert_eq!(file_identity(&database).unwrap(), main_before_retry);
+                assert_eq!(
+                    fs::metadata(&refused_sidecar).unwrap().mode() & 0o777,
+                    0o000
+                );
+            }
         }
 
         #[test]
