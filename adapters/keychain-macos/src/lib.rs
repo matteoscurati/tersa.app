@@ -1161,6 +1161,7 @@ fn establish_account_directory_with_hooks(
                 parent.as_fd(),
                 boundary,
                 component,
+                digest,
                 &mut component_hooks,
                 &mut retain_created_lineage,
             )?;
@@ -1195,6 +1196,7 @@ fn establish_account_component(
     parent: std::os::fd::BorrowedFd<'_>,
     boundary: usize,
     component: &str,
+    digest: &str,
     hooks: &mut (
         impl FnMut(usize) -> rustix::io::Result<()>,
         impl FnMut(usize) -> rustix::io::Result<()>,
@@ -1216,11 +1218,14 @@ fn establish_account_component(
         Err(error) if error == rustix::io::Errno::NOENT => None,
         Err(error) => return Err(error),
     };
-    if pending.is_some() && !pending_matches {
-        return Err(rustix::io::Errno::PERM);
-    }
     let (created, before, authorization) = if let Some(existing) = existing {
-        let authorization = authorize_existing_directory(pending.as_ref(), &existing)?;
+        let authorization = existing_directory_authorization(
+            pending.as_ref(),
+            pending_matches,
+            boundary,
+            digest,
+            &existing,
+        )?;
         (false, existing, authorization)
     } else {
         if pending.is_some() && !pending_matches {
@@ -1308,6 +1313,46 @@ fn establish_account_component(
         *retain_created_lineage = false;
     }
     Ok((child, stat, created || recoverable || authorization))
+}
+
+#[cfg(target_os = "macos")]
+fn existing_directory_authorization(
+    pending: Option<&PendingDirectoryCreation>,
+    pending_matches: bool,
+    boundary: usize,
+    digest: &str,
+    existing: &rustix::fs::Stat,
+) -> rustix::io::Result<bool> {
+    // A pending record may be carried across an existing fixed-lineage
+    // ancestor, but it cannot authorize that ancestor. Validate it before
+    // continuing so recovery never turns the journal into a general
+    // traversal capability.
+    validate_directory(existing, None)?;
+    if pending_matches {
+        return authorize_existing_directory(pending, existing);
+    }
+    if pending.is_some_and(|pending| {
+        !pending_targets_later_fixed_component(boundary, &pending.component, digest)
+    }) {
+        return Err(rustix::io::Errno::PERM);
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn pending_targets_later_fixed_component(
+    boundary: usize,
+    pending_component: &str,
+    digest: &str,
+) -> bool {
+    let target_boundary = match pending_component {
+        "profiles" => Some(0),
+        "default" => Some(1),
+        "accounts" => Some(2),
+        component if component == digest => Some(3),
+        _ => None,
+    };
+    target_boundary.is_some_and(|target_boundary| target_boundary > boundary)
 }
 
 #[cfg(target_os = "macos")]
@@ -2717,59 +2762,16 @@ mod tests {
     fn crash_after_directory_mkdir_recovers_only_the_journaled_identity() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let fixture = BootstrapFixture::new("directory-create-crash");
-        std::fs::write(fixture.path.join("test-installation-root"), [7_u8; 32]).unwrap();
-        let checkpoint = fixture.path.join("created-before-directory-normalization");
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("umask 0777; exec \"$@\"")
-            .arg("tersa-directory-crash")
-            .arg(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::directory_creation_crash_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("TERSA_BOOTSTRAP_DIRECTORY_CONTAINER", &fixture.path)
-            .env("TERSA_BOOTSTRAP_DIRECTORY_READY", &checkpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        wait_for_child_checkpoint(&mut child, &checkpoint);
-        let profiles = fixture.path.join("profiles");
-        assert_eq!(std::fs::metadata(&profiles).unwrap().mode() & 0o777, 0o000);
-        child.kill().unwrap();
-        assert!(!child.wait().unwrap().success());
-
         let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
-        let status = bootstrap_default_account_with_dependencies(
-            &account_id(),
-            &SharedFileBackend::new(&fixture.path),
-            &FakeLocator(Ok(fixture.path.clone())),
-            Instant::now() + Duration::from_secs(1),
-            |_account, database, _key| {
-                assert_eq!(
-                    database,
-                    fixture
-                        .path
-                        .join("profiles/default/accounts")
-                        .join(digest)
-                        .join("mail.sqlite3")
-                );
-                Ok(())
-            },
-        );
-        assert_eq!(status, ProductBootstrapStatus::Ready);
-        assert_eq!(std::fs::metadata(&profiles).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(
-            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
-                .unwrap()
-                .len(),
-            0
-        );
+        let components = [
+            "profiles".to_owned(),
+            "default".to_owned(),
+            "accounts".to_owned(),
+            digest.to_owned(),
+        ];
+        for boundary in 0..=3 {
+            crash_and_recover_directory_boundary(boundary, digest, &components);
+        }
 
         let arbitrary = BootstrapFixture::new("arbitrary-zero-mode-directory");
         std::fs::create_dir(arbitrary.path.join("profiles")).unwrap();
@@ -2787,6 +2789,90 @@ mod tests {
                 .mode()
                 & 0o777,
             0o000
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn crash_and_recover_directory_boundary(
+        boundary: usize,
+        digest: &str,
+        components: &[String; 4],
+    ) {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = BootstrapFixture::new(&format!("directory-create-crash-{boundary}"));
+        std::fs::write(fixture.path.join("test-installation-root"), [7_u8; 32]).unwrap();
+        let checkpoint = fixture
+            .path
+            .join(format!("created-before-directory-normalization-{boundary}"));
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0777; exec \"$@\"")
+            .arg("tersa-directory-crash")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::directory_creation_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_DIRECTORY_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_DIRECTORY_READY", &checkpoint)
+            .env("TERSA_BOOTSTRAP_DIRECTORY_BOUNDARY", boundary.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut child, &checkpoint);
+        let crashed_component = components[..=boundary]
+            .iter()
+            .fold(fixture.path.clone(), |path, component| path.join(component));
+        assert_eq!(
+            std::fs::metadata(&crashed_component).unwrap().mode() & 0o777,
+            0o000,
+            "boundary {boundary} did not reach its requested mkdir checkpoint"
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let status = bootstrap_default_account_with_dependencies(
+            &account_id(),
+            &SharedFileBackend::new(&fixture.path),
+            &FakeLocator(Ok(fixture.path.clone())),
+            Instant::now() + Duration::from_secs(1),
+            |_account, database, _key| {
+                assert_eq!(
+                    database,
+                    fixture
+                        .path
+                        .join("profiles/default/accounts")
+                        .join(digest)
+                        .join("mail.sqlite3")
+                );
+                Ok(())
+            },
+        );
+        assert_eq!(
+            status,
+            ProductBootstrapStatus::Ready,
+            "boundary {boundary} did not recover"
+        );
+        for component_boundary in 0..=3 {
+            let directory = components[..=component_boundary]
+                .iter()
+                .fold(fixture.path.clone(), |path, component| path.join(component));
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().mode() & 0o777,
+                0o700,
+                "boundary {boundary} left fixed lineage component {component_boundary} unnormalized"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                .unwrap()
+                .len(),
+            0
         );
     }
 
@@ -2904,6 +2990,11 @@ mod tests {
         let Some(checkpoint) = std::env::var_os("TERSA_BOOTSTRAP_DIRECTORY_READY") else {
             return;
         };
+        let boundary = std::env::var("TERSA_BOOTSTRAP_DIRECTORY_BOUNDARY")
+            .ok()
+            .and_then(|boundary| boundary.parse::<usize>().ok())
+            .filter(|boundary| *boundary <= 3)
+            .expect("subprocess crash boundary must be 0 through 3");
         let container = PathBuf::from(container);
         let lock =
             acquire_global_lock(&container, Instant::now() + Duration::from_secs(5)).unwrap();
@@ -2914,9 +3005,11 @@ mod tests {
             digest,
             |_boundary| Ok(()),
             |_boundary| Ok(()),
-            |boundary| {
-                assert_eq!(boundary, 0);
-                std::fs::write(&checkpoint, b"created").unwrap();
+            |observed_boundary| {
+                if observed_boundary != boundary {
+                    return Ok(());
+                }
+                std::fs::write(&checkpoint, boundary.to_string()).unwrap();
                 loop {
                     thread::park();
                 }
@@ -3141,6 +3234,49 @@ mod tests {
                 .len()
                 > 0
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_journal_rejects_non_lineage_and_wrong_target_after_existing_ancestor() {
+        use std::os::fd::AsFd;
+
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        for (name, mutate) in [
+            (
+                "non-lineage",
+                Box::new(|pending: &mut PendingDirectoryCreation| {
+                    pending.component = "foreign".to_owned();
+                }) as Box<dyn Fn(&mut PendingDirectoryCreation)>,
+            ),
+            (
+                "wrong-target",
+                Box::new(|pending: &mut PendingDirectoryCreation| {
+                    pending.parent_inode = pending.parent_inode.saturating_add(1);
+                }),
+            ),
+        ] {
+            let fixture = BootstrapFixture::new(&format!("pending-journal-{name}"));
+            fixture.create_directory("profiles");
+            let lock = acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let parent = fixture.open();
+            let mut pending = PendingDirectoryCreation::new(
+                &rustix::fs::fstat(parent.as_fd()).unwrap(),
+                "profiles",
+            );
+            mutate(&mut pending);
+            write_directory_creation_journal(lock.journal_fd(), &pending).unwrap();
+
+            assert!(establish_account_directory(&lock, &fixture.path, digest).is_err());
+            assert!(fixture.path.join("profiles").is_dir());
+            assert!(
+                std::fs::metadata(fixture.path.join(BOOTSTRAP_LOCK))
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
