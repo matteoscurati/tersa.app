@@ -353,6 +353,11 @@ mod macos {
                 }
                 configure_and_migrate(&connection, &account, &key.0)?;
                 if leaf.snapshot.is_fresh() {
+                    // SQLite creates the WAL and SHM leaves under the process
+                    // umask.  Normalize only leaves absent at our no-follow
+                    // snapshot, then require every live database leaf to be
+                    // owner-only before accepting the new store.
+                    leaf.normalize_fresh_leaves(hook, &canonical_path)?;
                     leaf.mark_fresh_migration_succeeded();
                     hook(WriterHook::AfterFreshMigration, &canonical_path)?;
                 }
@@ -568,6 +573,7 @@ mod macos {
         CleanupBeforeRecord(usize),
         CleanupAfterRecord(usize),
         CleanupAfterRevalidate(usize),
+        NormalizeAfterOpen(usize),
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,6 +647,10 @@ mod macos {
                 Mode::from(OWNER_ONLY_FILE_MODE),
             )
             .map_err(|_error| OpenFailure::Storage)?;
+            // O_CREAT's mode is filtered by umask.  This descriptor is still
+            // exclusively ours, so normalize before exact-mode validation.
+            fs::fchmod(&descriptor, Mode::from(OWNER_ONLY_FILE_MODE))
+                .map_err(|_error| OpenFailure::Storage)?;
             let identity = restrictive_regular_identity(
                 &fs::fstat(&descriptor).map_err(|_error| OpenFailure::Storage)?,
                 self.parent_owner,
@@ -664,6 +674,74 @@ mod macos {
 
         fn mark_fresh_migration_succeeded(&mut self) {
             self.fresh_migration_succeeded = true;
+        }
+
+        fn normalize_fresh_leaves(
+            &mut self,
+            hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
+            canonical_path: &Path,
+        ) -> Result<(), OpenFailure> {
+            let before = [
+                self.snapshot.main,
+                self.snapshot.journal,
+                self.snapshot.wal,
+                self.snapshot.shm,
+            ];
+            for (index, (name, prior)) in self.names.iter().zip(before).enumerate() {
+                let Some(identity) = leaf_entry(&self.parent, name, self.parent_owner)? else {
+                    continue;
+                };
+                if prior.is_none() {
+                    if identity.mode != OWNER_ONLY_FILE_MODE {
+                        // SQLite may create a sidecar as 0000 under a highly
+                        // restrictive umask. Normalize through the retained
+                        // parent before opening, then bind the descriptor to
+                        // this pre-chmod identity and normalize it again.
+                        fs::chmodat(
+                            &self.parent,
+                            name,
+                            Mode::from(OWNER_ONLY_FILE_MODE),
+                            AtFlags::SYMLINK_NOFOLLOW,
+                        )
+                        .map_err(|_error| OpenFailure::Storage)?;
+                    }
+                    let descriptor = fs::openat(
+                        &self.parent,
+                        name,
+                        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|_error| OpenFailure::Storage)?;
+                    let opened = regular_identity(
+                        &fs::fstat(&descriptor).map_err(|_error| OpenFailure::Storage)?,
+                        self.parent_owner,
+                    )?;
+                    if opened.device != identity.device || opened.inode != identity.inode {
+                        return Err(OpenFailure::Storage);
+                    }
+                    hook(WriterHook::NormalizeAfterOpen(index), canonical_path)?;
+                    fs::fchmod(&descriptor, Mode::from(OWNER_ONLY_FILE_MODE))
+                        .map_err(|_error| OpenFailure::Storage)?;
+                    let normalized_descriptor = restrictive_regular_identity(
+                        &fs::fstat(&descriptor).map_err(|_error| OpenFailure::Storage)?,
+                        self.parent_owner,
+                    )?;
+                    if normalized_descriptor.device != identity.device
+                        || normalized_descriptor.inode != identity.inode
+                    {
+                        return Err(OpenFailure::Storage);
+                    }
+                }
+                let normalized = leaf_entry(&self.parent, name, self.parent_owner)?
+                    .ok_or(OpenFailure::Storage)?;
+                if normalized.device != identity.device
+                    || normalized.inode != identity.inode
+                    || normalized.mode != OWNER_ONLY_FILE_MODE
+                {
+                    return Err(OpenFailure::Storage);
+                }
+            }
+            self.require_main_identity()
         }
 
         fn cleanup_fresh_candidates(
@@ -1841,6 +1919,57 @@ mod macos {
         }
 
         #[test]
+        fn restrictive_umasks_cleanup_then_retry_with_owner_only_leaves() {
+            let executable = std::env::current_exe().unwrap();
+            for (label, mask) in [("zero", "0777"), ("write", "0577"), ("read", "0377")] {
+                let database = TestDatabase::new(&format!("umask-{label}"));
+                let status = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg("umask \"$1\"; shift; exec \"$@\"")
+                    .arg("tersa-umask")
+                    .arg(mask)
+                    .arg(&executable)
+                    .args([
+                        "--exact",
+                        "macos::tests::restrictive_umask_store_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TERSA_STORE_UMASK_DATABASE", database.path())
+                    .stdin(Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "store helper failed for umask {mask}");
+            }
+        }
+
+        #[test]
+        fn fresh_leaf_normalization_is_bound_to_the_opened_descriptor() {
+            use std::os::unix::fs::MetadataExt;
+
+            let database = TestDatabase::new("normalize-replacement");
+            let backup = database.directory.join("opened-main");
+            let mut replaced = false;
+            let result = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                database.path(),
+                key(7),
+                &mut |point, canonical_path| {
+                    if point == WriterHook::NormalizeAfterOpen(0) {
+                        fs::rename(canonical_path, &backup).unwrap();
+                        write_restrictive(canonical_path, b"same-user-replacement");
+                        replaced = true;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(replaced);
+            assert!(matches!(result, Err(MailboxStoreError::Storage)));
+            assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o600);
+            assert!(!database.path().exists());
+        }
+
+        #[test]
         fn cleanup_hooks_record_the_three_mutable_final_name_residuals() {
             for index in 0..4 {
                 let inserted = TestDatabase::new(&format!("cleanup-insert-{index}"));
@@ -2211,6 +2340,50 @@ mod macos {
             loop {
                 thread::park();
             }
+        }
+
+        #[test]
+        #[ignore = "subprocess helper for process-global umask coverage"]
+        fn restrictive_umask_store_child() {
+            use std::os::unix::fs::MetadataExt;
+
+            let Some(database) = std::env::var_os("TERSA_STORE_UMASK_DATABASE") else {
+                return;
+            };
+            let database = PathBuf::from(database);
+            let mut injected = false;
+            let first = SqlCipherMailboxStore::open_inner_with_writer_hook(
+                account(),
+                &database,
+                key(7),
+                &mut |point, _path| {
+                    if point == WriterHook::BeforeFreshMigration {
+                        injected = true;
+                        return Err(OpenFailure::Storage);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(injected);
+            assert!(matches!(first, Err(MailboxStoreError::Storage)));
+            assert!(
+                fs::read_dir(database.parent().unwrap())
+                    .unwrap()
+                    .all(|entry| !entry.unwrap().path().is_file())
+            );
+
+            let store = SqlCipherMailboxStore::open(account(), &database, key(7)).unwrap();
+            let wal = sidecar_path(&database, "-wal");
+            let shm = sidecar_path(&database, "-shm");
+            for path in [&database, &wal, &shm] {
+                assert!(
+                    path.exists(),
+                    "expected live SQLite leaf {}",
+                    path.display()
+                );
+                assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+            }
+            drop(store);
         }
 
         #[test]

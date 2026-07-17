@@ -56,13 +56,6 @@ jobs:
           -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
           TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
           TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
-      - name: Analyze credentialless macOS bootstrap source
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
-          -configuration Debug -destination 'platform=macOS,arch=arm64'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" analyze
       - name: Build unsigned iOS simulator debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS

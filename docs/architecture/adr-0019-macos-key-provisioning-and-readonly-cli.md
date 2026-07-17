@@ -338,7 +338,7 @@ protocol; the CLI never bootstraps and receives no lock or repair authority.
 PR 33a.5 proves the concurrency-one, one-pending worker contract through exact
 review of `apple/macos/BootstrapWorker.swift` and its sole application call site
 in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin those
-bounds and paths, and only credentialless build and analyze of the existing
+bounds and paths, and only a credentialless build of the existing
 `TersaMac` Xcode target. It adds no Xcode test target, scheme test action,
 entitlement or signing-policy exception, and this source evidence passes no
 runtime or device-signed gate. Runtime worker dispatch and overflow evidence

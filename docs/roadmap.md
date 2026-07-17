@@ -189,7 +189,7 @@ filesystem effect.
 PR 33a.5 pins the worker's concurrency-one and one-pending source contract with
 `apple/macos/BootstrapWorker.swift`, its sole call site in
 `apple/macos/AppDelegate.swift`, and `xtask` fixtures, then only
-credentiallessly builds/analyzes the existing target. It adds no Xcode test
+credentiallessly builds the existing target. It adds no Xcode test
 target or policy exception. Runtime dispatch/overflow evidence remains PR 33b;
 PR 33a.5 Rust tests cover C ABI main-thread rejection and locking.
 

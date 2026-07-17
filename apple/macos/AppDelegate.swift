@@ -15,8 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Receives opaque bytes only from the future owning product flow.
-    func establishOwnedAccountProfile(accountIdentifier: Data) {
-        bootstrapWorker.submit(accountIdentifier: accountIdentifier) { _ in }
+    func establishOwnedAccountProfile(
+        accountIdentifier: Data,
+        completion: @escaping @MainActor (ProductBootstrapStatus) -> Void
+    ) {
+        bootstrapWorker.submit(accountIdentifier: accountIdentifier, completion: completion)
     }
 
     func startOAuthAuthorization() -> Bool {

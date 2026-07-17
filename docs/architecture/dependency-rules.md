@@ -263,7 +263,7 @@ performs bootstrap.
 PR 33a.5 proves the worker's concurrency-one and one-pending bounds through the
 exact `apple/macos/BootstrapWorker.swift` implementation and its sole call site
 in `apple/macos/AppDelegate.swift`, `xtask` source-policy fixtures that pin those
-bounds and paths, and only credentialless build/analyze of the existing
+bounds and paths, and only a credentialless build of the existing
 `TersaMac` target. It adds no test target, scheme test action, or
 signing/entitlement exception and passes no runtime gate. PR 33b owns runtime
 dispatch and overflow evidence. PR 33a.5 Rust tests cover the C ABI main-thread

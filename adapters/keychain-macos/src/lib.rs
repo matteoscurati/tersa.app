@@ -453,14 +453,50 @@ fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
     let Ok(locator) = ProductionContainerLocator::new() else {
         return ProductBootstrapStatus::Unavailable;
     };
+    let Ok(backend) = ProductionBackend::new() else {
+        return ProductBootstrapStatus::Unavailable;
+    };
+    bootstrap_default_account_with_dependencies(
+        account,
+        &backend,
+        &locator,
+        deadline,
+        |account, path, key| {
+            tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(account, path, key)
+                .map(|_store| ())
+                .map_err(|_error| ())
+        },
+    )
+}
+
+/// Executes the fixed bootstrap state machine through injected trusted capabilities.
+///
+/// This internal seam is deliberately capability-based: tests can exercise every
+/// status without exporting a root key or adding a configurable production path.
+#[cfg(target_os = "macos")]
+fn bootstrap_default_account_with_dependencies(
+    account: &AccountId,
+    backend: &impl RootKeyBackend,
+    locator: &impl ContainerLocator,
+    deadline: Instant,
+    open_store: impl FnOnce(
+        AccountId,
+        PathBuf,
+        tersa_store_sqlcipher_macos::DatabaseKey,
+    ) -> Result<(), ()>,
+) -> ProductBootstrapStatus {
     let Ok(container) = locator.container() else {
         return ProductBootstrapStatus::Unavailable;
     };
-    let Ok(lock) = acquire_global_lock(&container, deadline) else {
-        return ProductBootstrapStatus::BusyOrUnavailable;
-    };
-    let Ok(backend) = ProductionBackend::new() else {
-        return ProductBootstrapStatus::Unavailable;
+    let lock = match acquire_global_lock(&container, deadline) {
+        Ok(lock) => lock,
+        // Only a bounded wait for another holder is a busy condition.  A
+        // malformed lock entry, an unsafe container, or any other I/O failure
+        // is an invariant failure and must not be presented as contention.
+        Err(error) if error == rustix::io::Errno::TIMEDOUT => {
+            return ProductBootstrapStatus::BusyOrUnavailable;
+        }
+        Err(_error) => return ProductBootstrapStatus::Unavailable,
     };
     let root = match backend.copy() {
         Ok(Some(root)) => root,
@@ -468,7 +504,7 @@ fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
             if !is_empty_profile_skeleton(lock.container_fd()) {
                 return ProductBootstrapStatus::RootMissingWithExistingProfile;
             }
-            if provision_installation_root_key(&backend).is_err() {
+            if provision_installation_root_key(backend).is_err() {
                 return ProductBootstrapStatus::Unavailable;
             }
             match backend.copy() {
@@ -494,7 +530,7 @@ fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
         directories.cleanup_before_store_open();
         return ProductBootstrapStatus::Unavailable;
     }
-    let result = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+    let result = open_store(
         account.clone(),
         directories.path().join("mail.sqlite3"),
         key.into_database_key(),
@@ -504,8 +540,8 @@ fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
         return ProductBootstrapStatus::Unavailable;
     }
     match result {
-        Ok(_store) => ProductBootstrapStatus::Ready,
-        Err(_error) => ProductBootstrapStatus::Unavailable,
+        Ok(()) => ProductBootstrapStatus::Ready,
+        Err(()) => ProductBootstrapStatus::Unavailable,
     }
 }
 
@@ -555,6 +591,21 @@ impl BootstrapLock {
 
 #[cfg(target_os = "macos")]
 fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Result<BootstrapLock> {
+    acquire_global_lock_with_hook(container, deadline, &mut |_point| Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalLockHook {
+    AfterCreate,
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_global_lock_with_hook(
+    container: &Path,
+    deadline: Instant,
+    hook: &mut dyn FnMut(GlobalLockHook) -> rustix::io::Result<()>,
+) -> rustix::io::Result<BootstrapLock> {
     use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags};
     use std::os::fd::AsFd;
 
@@ -573,6 +624,7 @@ fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Resul
         Mode::from_raw_mode(0o600),
     ) {
         Ok(lock) => {
+            hook(GlobalLockHook::AfterCreate)?;
             fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
             validate_lock(&fs::fstat(&lock)?, None, true)?;
             lock
@@ -583,8 +635,11 @@ fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Resul
                 fs::statat(directory.as_fd(), BOOTSTRAP_LOCK, AtFlags::SYMLINK_NOFOLLOW)?;
             validate_lock(&expected, None, false)?;
             let mode = Mode::from_raw_mode(expected.st_mode).as_raw_mode();
+            // A 0000/0200/0400 legacy lock cannot be opened even by its owner on
+            // Darwin.  `chmodat(..., NOFOLLOW)` is the only recovery path;
+            // bind it to the preceding and following identity checks so a
+            // replacement is rejected before flocking.
             if mode != 0o600 {
-                require_deadline(deadline)?;
                 fs::chmodat(
                     directory.as_fd(),
                     BOOTSTRAP_LOCK,
@@ -599,6 +654,7 @@ fn acquire_global_lock(container: &Path, deadline: Instant) -> rustix::io::Resul
                 OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )?;
+            validate_lock(&fs::fstat(&lock)?, Some(&expected), false)?;
             validate_lock(&fs::fstat(&lock)?, Some(&expected), true)?;
             lock
         }
@@ -683,10 +739,45 @@ fn is_empty_profile_skeleton(container: std::os::fd::BorrowedFd<'_>) -> bool {
         return false;
     }
     match open_optional_directory(default.as_fd(), "accounts") {
-        Ok(Some(accounts)) => directory_has_only(accounts.as_fd(), None),
+        Ok(Some(accounts)) => accounts_have_only_empty_directories(accounts.as_fd()),
         Ok(None) => true,
         Err(_) => false,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn accounts_have_only_empty_directories(accounts: std::os::fd::BorrowedFd<'_>) -> bool {
+    use rustix::fs::{self, Mode, OFlags};
+    use std::os::fd::AsFd;
+
+    let Ok(entries) = fs::Dir::read_from(accounts) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let Ok(directory) = fs::openat(
+            accounts,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let Ok(stat) = fs::fstat(&directory) else {
+            return false;
+        };
+        if validate_directory(&stat, None).is_err() || !directory_has_only(directory.as_fd(), None)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -802,7 +893,7 @@ fn establish_account_directory_with_hook(
     digest: &str,
     mut after_boundary: impl FnMut(usize) -> rustix::io::Result<()>,
 ) -> rustix::io::Result<EstablishedDirectories> {
-    use rustix::fs::{self, Mode, OFlags};
+    use rustix::fs::{self, AtFlags, Mode, OFlags};
     use std::os::fd::AsFd;
     let mut parent = fs::openat(
         container,
@@ -825,6 +916,23 @@ fn establish_account_directory_with_hook(
                 Err(error) if error == rustix::io::Errno::EXIST => false,
                 Err(error) => return Err(error),
             };
+            let created_identity = if created {
+                let expected = fs::statat(parent.as_fd(), component, AtFlags::SYMLINK_NOFOLLOW)?;
+                validate_directory(&expected, None)?;
+                // `mkdirat` applies the process umask. A mode such as 0000
+                // cannot be opened on Darwin, so normalize by name while the
+                // retained parent descriptor and the before/after identity
+                // checks bind the operation to the directory we created.
+                fs::chmodat(
+                    parent.as_fd(),
+                    component,
+                    Mode::from_raw_mode(0o700),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+                Some(expected)
+            } else {
+                None
+            };
             let child = fs::openat(
                 parent.as_fd(),
                 component,
@@ -835,7 +943,7 @@ fn establish_account_directory_with_hook(
                 fs::fchmod(&child, Mode::from_raw_mode(0o700))?;
             }
             let stat = fs::fstat(&child)?;
-            validate_directory(&stat, None)?;
+            validate_directory(&stat, created_identity.as_ref())?;
             if created && Mode::from_raw_mode(stat.st_mode).as_raw_mode() != 0o700 {
                 return Err(rustix::io::Errno::PERM);
             }
@@ -1424,9 +1532,13 @@ mod macos_container {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
+    #[cfg(target_os = "macos")]
+    use std::thread;
 
     #[cfg(target_os = "macos")]
     static PROFILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1580,6 +1692,27 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    struct ProvisionFailureBackend;
+
+    #[cfg(target_os = "macos")]
+    impl RootKeyRetriever for ProvisionFailureBackend {
+        fn copy(&self) -> Result<Option<SecretKey>, KeyStorageError> {
+            Ok(None)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RootKeyBackend for ProvisionFailureBackend {
+        fn random_key(&self) -> Result<SecretKey, KeyStorageError> {
+            Err(KeyStorageError::OperationFailed)
+        }
+
+        fn add(&self, _candidate: &SecretKey) -> Result<AddResult, KeyStorageError> {
+            Err(KeyStorageError::OperationFailed)
+        }
+    }
+
     #[derive(Clone)]
     struct ConcurrentFake {
         item: Arc<Mutex<Option<[u8; 32]>>>,
@@ -1641,6 +1774,158 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn bootstrap_orchestration_provisions_and_orders_store_open() {
+        let account = account_id();
+        let ready = BootstrapFixture::new("orchestration-ready");
+        let existing = Fake::default();
+        *existing.item.lock().unwrap() = Some([7; 32]);
+        let opened_path = Arc::new(Mutex::new(None));
+        let opened_path_for_call = Arc::clone(&opened_path);
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &existing,
+                &FakeLocator(Ok(ready.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                move |_account, path, _key| {
+                    assert!(path.parent().unwrap().is_dir());
+                    *opened_path_for_call.lock().unwrap() = Some(path);
+                    Ok(())
+                },
+            ),
+            ProductBootstrapStatus::Ready
+        );
+        assert_eq!(*existing.calls.lock().unwrap(), vec!["copy"]);
+        assert_eq!(
+            opened_path
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "mail.sqlite3"
+        );
+
+        let provisioned = BootstrapFixture::new("orchestration-provisioned");
+        let backend = Fake::default();
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &backend,
+                &FakeLocator(Ok(provisioned.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| Ok(()),
+            ),
+            ProductBootstrapStatus::Ready
+        );
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            vec!["copy", "copy", "random", "add", "zeroized", "copy", "copy"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_orchestration_fails_closed_at_each_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let account = account_id();
+        let occupied = BootstrapFixture::new("orchestration-occupied");
+        for directory in [
+            "profiles",
+            "profiles/default",
+            "profiles/default/accounts",
+            "profiles/default/accounts/existing",
+        ] {
+            occupied.create_directory(directory);
+        }
+        let database = occupied
+            .path
+            .join("profiles/default/accounts/existing/mail.sqlite3");
+        std::fs::write(&database, b"encrypted-state").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &Fake::default(),
+                &FakeLocator(Ok(occupied.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open without the root key"),
+            ),
+            ProductBootstrapStatus::RootMissingWithExistingProfile
+        );
+
+        let failed_provision = BootstrapFixture::new("orchestration-provision-failure");
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &ProvisionFailureBackend,
+                &FakeLocator(Ok(failed_provision.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open after provision failure"),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+
+        let store_failure = BootstrapFixture::new("orchestration-store-failure");
+        let backend = Fake::default();
+        *backend.item.lock().unwrap() = Some([7; 32]);
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &backend,
+                &FakeLocator(Ok(store_failure.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| Err(()),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+
+        let malformed = BootstrapFixture::new("orchestration-malformed");
+        std::fs::write(malformed.path.join("profiles"), b"not-a-directory").unwrap();
+        let backend = Fake::default();
+        *backend.item.lock().unwrap() = Some([7; 32]);
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &backend,
+                &FakeLocator(Ok(malformed.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open for malformed layout"),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+
+        let unsafe_lock = BootstrapFixture::new("orchestration-unsafe-lock");
+        let lock_path = unsafe_lock.path.join(BOOTSTRAP_LOCK);
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &Fake::default(),
+                &FakeLocator(Ok(unsafe_lock.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open with an unsafe lock"),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account,
+                &Fake::default(),
+                &FakeLocator(Err(ProfileStorageError::Unavailable)),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| panic!("store must not open without a container"),
+            ),
+            ProductBootstrapStatus::Unavailable
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn profile_preflight_accepts_only_absent_or_empty_fixed_skeletons() {
         use std::os::fd::AsFd;
 
@@ -1655,11 +1940,21 @@ mod tests {
         assert!(is_empty_profile_skeleton(root.as_fd()));
 
         fixture.create_directory("profiles/default/accounts/existing-account");
-        assert!(!is_empty_profile_skeleton(root.as_fd()));
-        std::fs::remove_dir(
+        // An interrupted first bootstrap may leave an empty account directory;
+        // it is safe to recover only while it contains no database state.
+        assert!(is_empty_profile_skeleton(root.as_fd()));
+        std::fs::write(
             fixture
                 .path
-                .join("profiles/default/accounts/existing-account"),
+                .join("profiles/default/accounts/existing-account/mail.sqlite3-wal"),
+            b"state",
+        )
+        .unwrap();
+        assert!(!is_empty_profile_skeleton(root.as_fd()));
+        std::fs::remove_file(
+            fixture
+                .path
+                .join("profiles/default/accounts/existing-account/mail.sqlite3-wal"),
         )
         .unwrap();
         std::fs::write(fixture.path.join("profiles/unexpected"), b"state").unwrap();
@@ -1693,6 +1988,272 @@ mod tests {
             acquire_global_lock(&invalid.path, Instant::now() + Duration::from_secs(1)).is_err()
         );
         assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_child_checkpoint(child: &mut std::process::Child, checkpoint: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !checkpoint.exists() && Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "helper exited before checkpoint"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(checkpoint.exists(), "helper did not reach checkpoint");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn global_lock_serializes_processes_and_releases_after_kill() {
+        let fixture = BootstrapFixture::new("cross-process-lock");
+        let checkpoint = fixture.path.join("child-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::global_lock_holder_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_LOCK_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_LOCK_READY", &checkpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut child, &checkpoint);
+
+        assert!(matches!(
+            acquire_global_lock(
+                &fixture.path,
+                Instant::now() + Duration::from_millis(40)
+            ),
+            Err(error) if error == rustix::io::Errno::TIMEDOUT
+        ));
+        let backend = Fake::default();
+        *backend.item.lock().unwrap() = Some([7; 32]);
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account_id(),
+                &backend,
+                &FakeLocator(Ok(fixture.path.clone())),
+                Instant::now() + Duration::from_millis(40),
+                |_account, _path, _key| Ok(()),
+            ),
+            ProductBootstrapStatus::BusyOrUnavailable
+        );
+
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        drop(acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap());
+        assert_eq!(
+            bootstrap_default_account_with_dependencies(
+                &account_id(),
+                &backend,
+                &FakeLocator(Ok(fixture.path.clone())),
+                Instant::now() + Duration::from_secs(1),
+                |_account, _path, _key| Ok(()),
+            ),
+            ProductBootstrapStatus::Ready
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_legacy_lock_normalization_serializes_two_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = BootstrapFixture::new("concurrent-lock-normalization");
+        let lock_path = fixture.path.join(BOOTSTRAP_LOCK);
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checkpoints = [
+            fixture.path.join("first-ready"),
+            fixture.path.join("second-ready"),
+        ];
+        let mut children = checkpoints.each_ref().map(|checkpoint| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::global_lock_holder_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_BOOTSTRAP_LOCK_CONTAINER", &fixture.path)
+                .env("TERSA_BOOTSTRAP_LOCK_READY", checkpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            if let Some(index) = checkpoints.iter().position(|path| path.exists()) {
+                break index;
+            }
+            assert!(Instant::now() < deadline, "neither lock contender acquired");
+            for child in &mut children {
+                assert!(child.try_wait().unwrap().is_none());
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let second = 1 - first;
+        children[first].kill().unwrap();
+        assert!(!children[first].wait().unwrap().success());
+        wait_for_child_checkpoint(&mut children[second], &checkpoints[second]);
+        children[second].kill().unwrap();
+        assert!(!children[second].wait().unwrap().success());
+        drop(acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn crash_after_lock_creation_recovers_a_zero_mode_residual() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = BootstrapFixture::new("lock-create-crash");
+        let checkpoint = fixture.path.join("created-before-fchmod");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0777; exec \"$@\"")
+            .arg("tersa-lock-crash")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::global_lock_creation_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TERSA_BOOTSTRAP_LOCK_CONTAINER", &fixture.path)
+            .env("TERSA_BOOTSTRAP_LOCK_READY", &checkpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_child_checkpoint(&mut child, &checkpoint);
+        let lock_path = fixture.path.join(BOOTSTRAP_LOCK);
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o000);
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        drop(acquire_global_lock(&fixture.path, Instant::now() + Duration::from_secs(1)).unwrap());
+        assert_eq!(std::fs::metadata(lock_path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restrictive_umasks_normalize_every_created_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let executable = std::env::current_exe().unwrap();
+        for (label, mask) in [("zero", "0777"), ("write", "0577"), ("read", "0377")] {
+            let fixture = BootstrapFixture::new(&format!("umask-{label}"));
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; shift; exec \"$@\"")
+                .arg("tersa-umask")
+                .arg(mask)
+                .arg(&executable)
+                .args([
+                    "--exact",
+                    "tests::restrictive_umask_directory_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TERSA_BOOTSTRAP_UMASK_CONTAINER", &fixture.path)
+                .stdin(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "directory helper failed for umask {mask}");
+            let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+            for relative in [
+                "profiles",
+                "profiles/default",
+                "profiles/default/accounts",
+                &format!("profiles/default/accounts/{digest}"),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(fixture.path.join(relative))
+                        .unwrap()
+                        .mode()
+                        & 0o777,
+                    0o700,
+                    "wrong mode for {relative} under umask {mask}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "subprocess helper for the real global bootstrap lock"]
+    fn global_lock_holder_child() {
+        let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_CONTAINER") else {
+            return;
+        };
+        let Some(checkpoint) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_READY") else {
+            return;
+        };
+        let _lock = acquire_global_lock(
+            Path::new(&container),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        std::fs::write(checkpoint, b"ready").unwrap();
+        loop {
+            thread::park();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "subprocess helper for a crash before lock mode normalization"]
+    fn global_lock_creation_crash_child() {
+        let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_CONTAINER") else {
+            return;
+        };
+        let Some(checkpoint) = std::env::var_os("TERSA_BOOTSTRAP_LOCK_READY") else {
+            return;
+        };
+        let _result = acquire_global_lock_with_hook(
+            Path::new(&container),
+            Instant::now() + Duration::from_secs(5),
+            &mut |point| {
+                assert_eq!(point, GlobalLockHook::AfterCreate);
+                std::fs::write(&checkpoint, b"created").unwrap();
+                loop {
+                    thread::park();
+                }
+            },
+        );
+        panic!("crash helper must be killed at the checkpoint");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "subprocess helper for process-global umask coverage"]
+    fn restrictive_umask_directory_child() {
+        use std::os::fd::AsFd;
+
+        let Some(container) = std::env::var_os("TERSA_BOOTSTRAP_UMASK_CONTAINER") else {
+            return;
+        };
+        let container = PathBuf::from(container);
+        let root = rustix::fs::openat(
+            rustix::fs::CWD,
+            &container,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let digest = "1a0b66a4c753580e7b1710d6e6057933d031fc6d5ebfd4ff3994f4b02641fc47";
+        let established = establish_account_directory(root.as_fd(), &container, digest).unwrap();
+        established.revalidate().unwrap();
     }
 
     #[cfg(target_os = "macos")]

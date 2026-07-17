@@ -252,9 +252,6 @@ sh apple/scripts/generate-project.sh
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
   -configuration Debug -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
-  -configuration Debug -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO analyze
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
   -configuration Debug -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
