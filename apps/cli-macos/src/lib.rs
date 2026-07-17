@@ -105,7 +105,7 @@ impl MailboxReaderFactory for ProductionMailboxReaderFactory {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _unused = account;
+            let _ = account;
             Err(OpenFailure::Operation)
         }
     }
