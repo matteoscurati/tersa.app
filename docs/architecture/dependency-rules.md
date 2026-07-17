@@ -126,12 +126,22 @@ The direct dependency set is closed and exact: an unknown dependency, a
 missing required dependency, or direct `hmac` is rejected. Resolved
 HKDF-to-HMAC reachability remains allowed and separately checked.
 
+PR 33a.5 keeps the workspace `objc2-foundation` declaration unchanged and adds
+only `NSThread` through the Keychain member's workspace inheritance. The
+Keychain member's effective requested set is exactly `std`, `NSFileManager`,
+`NSString`, `NSThread`, and `NSURL`. The Rust C ABI boundary uses `NSThread`
+solely for an `isMainThread` rejection before bootstrap state is touched. Exact
+member-declaration and effective-feature policy tests must reject every other
+Foundation feature.
+
 PR 33a.5 authorizes one future external addition to that closed direct set:
 `rustix =1.1.4`, under the canonical atomic macOS target structure
-`cfg(target_os = "macos")`, with default features disabled and features exactly
-`fs` and `std`. It is used only for safe descriptor-relative filesystem and
-advisory-lock operations. No direct `libc`, handwritten syscall binding, or new
-unsafe POSIX FFI is authorized. The
+`cfg(target_os = "macos")`, with default features disabled and effective
+requested features exactly `fs`, `process`, and `std`. The workspace declaration
+continues to supply `fs` and `std`; only the Keychain member augments it with
+`process`, solely for `geteuid` same-user validation. It is otherwise used only
+for safe descriptor-relative filesystem and advisory-lock operations. No direct
+`libc`, handwritten syscall binding, or new unsafe POSIX FFI is authorized. The
 implementation must activate the manifest declaration and exact version,
 target, default-feature, feature-set, direct-owner, and resolved-target checks
 in `xtask` together, with pass and fail fixtures. This governance amendment
@@ -146,6 +156,10 @@ paths, iOS, and other targets fail. Resolved-path tests must cover every allowed
 and rejected form. This check is scoped to direct workspace declarations and
 paths into the protected Keychain chain. It must not reject unrelated rustix
 versions or reachability introduced solely by third-party dependency graphs.
+The blob member keeps its current declaration and inherited `fs`/`std` request
+unchanged. Tests must reject a direct blob `process` feature while allowing
+Cargo's resolved macOS feature unification to include `process` because of the
+Keychain member; manifest-request and resolved-graph assertions are distinct.
 
 The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
 `tersa-keychain-macos`; the macOS-only CLI may reach it only through the active
@@ -162,6 +176,19 @@ platform port accepts only the canonical domain `AccountId`; raw strings cannot
 enter account hashing or derivation. `tersa-cli-macos` receives no direct
 platform, SQLCipher, general Apple-framework, key export, database-path
 override, or transport capability.
+
+The CLI's reviewed production source invokes only
+`open_default_read_only_mailbox` and inspects `ReadOnlyMailboxOpenError`, so its
+behavior remains retrieval-only. Crate visibility is not a security sandbox:
+the public provisioner is compile-reachable through the Keychain dependency.
+PR 33a.5 must add a narrow Git-index tracked-source inventory for
+`apps/cli-macos` that allows only those retrieval-item references and rejects
+provisioning/bootstrap references, imports, reexports, wildcards, crate aliases,
+and item aliases. New public bootstrap symbols must enter the rejected inventory
+in the same pull request. Fixtures cover fully qualified, `use`, `pub use`, `as`,
+wildcard, and crate-alias forms. This textual guard is defense in depth, not
+semantic or compiler-level non-reachability; a true boundary requires a future
+facade/crate ADR.
 
 PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
 It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
@@ -200,13 +227,30 @@ all other workspace members.
 All cooperative product-application bootstraps must first serialize on the
 fixed App Group lock file `.tersa-profile-bootstrap-v1.lock`. The trusted
 Keychain adapter opens or converges on it descriptor-relatively with no-follow,
-`O_CLOEXEC`, same-user regular-file, and exact `0600` validation, never deletes
-it, and takes an exclusive blocking advisory lock after its process-local mutex.
-Both guards span Keychain provisioning/retrieval, directory establishment,
-store opening and migration, identity checks, cleanup, and final status. The CLI
-never performs bootstrap. Two-thread and two-process interleaving tests must
-prove cooperative serialization around directory and main/WAL/shared-memory
-cleanup.
+`O_CLOEXEC`, same-user regular-file, and exact `0600` validation and never
+deletes it. A new file is `fchmod`ed to `0600` and exactly `fstat`ed before use;
+an existing mode drift fails closed without repair. The synchronous C ABI runs
+only on the bounded dedicated worker, never the main thread. A fixed 30-second
+monotonic deadline covers nonblocking process-mutex and exclusive advisory-lock
+acquisition; `EINTR` and would-block retry only within the remaining budget.
+Other errors and timeout return the fixed busy/unavailable status and release
+attempt-local resources. Both guards span Keychain retrieval, absent-root
+profile preflight, any authorized provisioning, directory establishment, store
+opening and migration, identity checks, cleanup, and final status. The CLI never
+performs bootstrap. Tests cover dispatch/main-thread rejection, timeout, `EINTR`,
+restrictive umasks, mode drift, crash release, and adversarial
+two-thread/two-process serialization.
+
+Before provisioning an absent root, the locked composition accepts only an
+absent profile tree or the exact empty `profiles/default/accounts` skeleton.
+Any account child, database state, unexpected child, or symlink returns the
+distinct closed `root_missing_with_existing_profile` status without a Keychain
+write, profile-tree mutation, or store mutation. Creation of the validated
+permanent global lock file may precede this determination. Only a validated
+Keychain item-not-found result may enter this preflight; every other retrieval
+error fails closed before inspection. Migration Assistant, restore, and
+re-signing are recorded causes requiring a later reviewed owning-product
+recovery path. The CLI retains its key-access-failed retrieval-only behavior.
 
 The trusted `tersa-keychain-macos` composition is the sole filesystem-directory
 establisher on behalf of the product application. It may create only the fixed
@@ -223,17 +267,21 @@ residual.
 The existing validated SQLCipher write opener remains the sole owner and
 migrator of the database leaf. PR 33a.5 must harden that same API's fresh-leaf
 failure cleanup, but creates no descriptor-bound opener or new dependency edge.
-After closing handles, cleanup may remove only main/WAL/shared-memory entries
-created by that invocation whose identities and restrictive file properties
-still match. It never removes pre-existing or mismatched entries, and profile
-directory cleanup stops before the store is invoked. Residual cleanup failures
+Under the lock, a pre-store no-follow snapshot must show main/WAL/shared-memory
+all absent. After closing handles on failure, the store records identity only
+then for each newly present fixed entry, revalidates immediately before pathname
+unlink, and removes only a matching restrictive same-user regular file. Identity
+is not captured at SQLite creation time. It never removes pre-existing or
+mismatched entries, and profile directory cleanup stops before the store is
+invoked. Residual cleanup failures
 remain fail-closed owning-application recovery work and grant no CLI repair
 authority. Identity checks and the advisory lock cover ordinary and cooperative
 races, not a same-user malicious replacement between revalidation and pathname
 unlink. Because macOS has no unlink-if-inode operation and the lock is
 cooperative, that gap remains an explicit unlocked-device residual. A
-deterministic fixture must record this non-prevention rather than asserting the
-replacement is safe. Activating the future bridge edge or its policy before the
+deterministic fixture must hook post-close recording, revalidation, and unlink
+and record this non-prevention rather than asserting the replacement is safe.
+Activating the future bridge edge or its policy before the
 implementation pull request is forbidden. PR 33b owns the same-team signed
 runtime evidence; PR 32 fake concurrency tests, PR 33a deterministic tests, and
 PR 33a.5 credentialless tests are not that evidence.

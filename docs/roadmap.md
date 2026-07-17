@@ -142,13 +142,15 @@ which alone owns identity-checked cleanup of fresh leaf files. Each slice
 requires independent review with zero unresolved actionable findings on its
 exact head.
 
-PR 33a.5 must add the exact macOS-only `rustix =1.1.4` `fs`/`std` dependency to
-the Keychain adapter and enforce both the closed dependency set and the exact
-protected bridge edge in `xtask`; name-only allowance is insufficient. Every
-direct rustix owner remains limited to the existing blob diagnostic and this
-future Keychain declaration. CLI and bridge reach the protected Keychain
-rustix only through their exact macOS workspace edges; unrelated third-party
-rustix reachability is outside that path-scoped rule.
+PR 33a.5 must add exact macOS-only `rustix =1.1.4` to the Keychain adapter with
+effective requested features `fs`, `process`, and `std`; `process` is solely for
+`geteuid`. The blob keeps its existing inherited `fs`/`std` member declaration,
+even if Cargo unifies `process` in the resolved macOS graph. Both the closed
+dependency set and exact protected bridge edge require `xtask` enforcement;
+name-only allowance is insufficient. Direct rustix owners remain limited to the
+blob diagnostic and future Keychain declaration. CLI and bridge reach the
+protected Keychain rustix only through exact macOS workspace edges; unrelated
+third-party reachability remains outside that path-scoped rule.
 
 The bridge's resolved HMAC and SQLCipher reachability is allowed on
 `aarch64-apple-darwin` only through bridge-to-Keychain-to-HKDF/HMAC and
@@ -159,10 +161,24 @@ equivalent whitespace or quote spelling normalized by `cargo_metadata`.
 
 Every cooperative product bootstrap serializes from Keychain provisioning
 through final status on the fixed `.tersa-profile-bootstrap-v1.lock` App Group
-file; the CLI never bootstraps. This lock and the identity checks cover
-cooperative races only. A same-user replacement between revalidation and
-pathname unlink remains an explicit local-malware residual and requires a
-deterministic non-prevention fixture. This governance slice activates no
+file. The synchronous C ABI runs on a bounded dedicated worker, never the main
+thread; the Rust boundary uses the narrowly authorized Foundation `NSThread`
+feature to reject a direct main-thread call. Process-mutex and nonblocking
+advisory-lock acquisition share a fixed 30-second monotonic deadline. New lock
+files are `fchmod`ed and `fstat`ed to exact `0600`; existing drift fails closed.
+After validated Keychain item-not-found and before provisioning, only an absent
+tree or empty fixed profile skeleton is accepted; any existing state returns
+`root_missing_with_existing_profile` without Keychain, profile-tree, or store
+mutation. The permanent validated lock file is the sole possible preceding
+filesystem effect.
+
+Fresh-store cleanup snapshots main/WAL/shared-memory absence before opening and
+records identities only after failed handles close, immediately before
+revalidation and pathname unlink. The cooperative lock cannot prevent malicious
+replacement in that gap. The CLI remains behaviorally retrieval-only, but its
+Keychain dependency makes provisioning APIs compile-reachable; an `xtask`
+tracked-source allowlist is defense in depth, not a compiler boundary. A future
+facade/crate boundary requires its own ADR. This governance slice activates no
 manifest, policy, runtime edge, or gate.
 
 ## Phase 2 — iPhone and iPad implementation

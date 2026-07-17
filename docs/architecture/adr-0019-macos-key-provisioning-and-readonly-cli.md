@@ -84,6 +84,41 @@ never replaced implicitly. The PR 33a CLI has retrieval-only access: an
 absent item is an error and cannot cause key generation, import, repair,
 rotation, or a second Keychain write.
 
+For the PR 33a.5 product bootstrap, an absent root does not by itself authorize
+provisioning. While holding the global bootstrap lock and before generating any
+key, the trusted composition inspects the fixed profile tree
+descriptor-relatively with no-follow semantics. New-state provisioning is
+allowed only when `profiles` is absent or the entire existing tree is an empty
+fixed skeleton: `profiles` contains no entry other than an optional `default`;
+`default` contains no entry other than an optional `accounts`; and `accounts`
+contains no entries. The global lock file at the App Group root is not profile
+state. Any account-digest directory, database, WAL, shared-memory file, or other
+child under `profiles` is conservatively existing profile state. A fixed
+component that exists as a symlink, non-directory, or otherwise unexpected
+object also counts as existing profile state. An inspection error fails closed
+without mutation.
+
+Only a validated Keychain item-not-found result enters this profile preflight.
+An entitlement, attribute, access-group, decoding, or other retrieval failure
+fails closed before the profile tree is inspected and cannot authorize
+provisioning.
+
+If the root is absent and existing profile state is present, the composition
+must not generate or store a key, mutate the profile tree, or open, migrate,
+repair, or otherwise mutate the store. The already validated permanent global
+lock file may have been created before this determination; it is the only
+permitted filesystem effect. The composition returns the distinct closed
+redacted product-bootstrap status `root_missing_with_existing_profile`, not
+corruption.
+There is no automatic delete, replacement, import, or recovery. Migration
+Assistant, backup restore, and re-signing into a different Keychain access group
+are recorded causes; recovery belongs to a later separately reviewed path owned
+by the product application. The CLI continues to report its fixed key-access
+failure and remains retrieval-only; it cannot recover this state. Deterministic
+tests must cover absent-root empty/new state, absent-root existing fixed or
+unexpected profile state, and concurrent calls where the first valid bootstrap
+provisions and the serialized follower retrieves the winner.
+
 Provisioning uses an add-only `SecItemAdd` operation, never an add-or-update
 password helper. On `errSecDuplicateItem`, the generated losing key is
 zeroized, the process retrieves and validates the single winning item, and no
@@ -156,13 +191,26 @@ setter is forbidden because its duplicate-item path can update existing data.
 Data Protection Keychain API on macOS. The Foundation surface resolves and
 validates the application-group container through the inward platform port.
 
+PR 33a.5 keeps the workspace `objc2-foundation` declaration on its current four
+features and adds only `NSThread` through the Keychain member's workspace
+inheritance. Its effective requested feature set is therefore exactly `std`,
+`NSFileManager`, `NSString`, `NSThread`, and `NSURL`. The synchronous Rust C ABI
+boundary uses `NSThread::isMainThread` solely to reject direct main-thread
+bootstrap calls before Keychain or filesystem access. The implementation must
+update the exact Foundation feature policy and its positive and negative
+fixtures; no other Foundation type or feature is authorized.
+
 PR 33a.5 authorizes `rustix =1.1.4` as the sole new external direct dependency
 of `tersa-keychain-macos`. It must use the canonical atomic macOS target
 structure `cfg(target_os = "macos")`, with default features disabled and the
-direct feature set exactly `fs` and `std`. It supplies the safe
+effective requested feature set exactly `fs`, `process`, and `std`. The
+workspace declaration remains exact-pinned with `fs` and `std`, and the
+Keychain member adds only `process` through workspace dependency inheritance.
+It supplies the safe
 descriptor-relative filesystem and advisory-lock operations required by the
 fixed bootstrap. No direct `libc` dependency, handwritten syscall binding, or
-new unsafe POSIX FFI is authorized.
+new unsafe POSIX FFI is authorized. `process` is used solely for `geteuid`-based
+same-user validation.
 The implementation pull request must update the Keychain adapter's closed
 direct-dependency set and enforce the exact rustix version, target,
 default-feature state, and feature set in `xtask`, with positive and negative
@@ -182,6 +230,14 @@ alternate workspace paths, iOS, and every non-macOS target. This policy is
 scoped to exact workspace declarations and paths into the protected Keychain
 chain; unrelated third-party packages may retain their own transitive rustix
 reachability and must not trigger a false global ban.
+
+The existing blob diagnostic keeps its current member declaration unchanged and
+requests only the inherited `fs` and `std` features. Policy tests must prove it
+does not acquire a direct `process` feature declaration. Cargo may unify
+`process` into a resolved macOS rustix package shared with the Keychain member;
+that graph-level unification must not be misreported as the blob selecting the
+feature. Direct-declaration tests and resolved-feature tests therefore remain
+separate.
 
 The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
@@ -225,25 +281,48 @@ either target's private sandbox container.
 
 Every product-application bootstrap uses one non-configurable global lock file
 at `<shared-group-container>/.tersa-profile-bootstrap-v1.lock`. After opening
-and validating the existing App Group container, `tersa-keychain-macos` first
-acquires its process-local bootstrap mutex, then opens the lock file
+and validating the existing App Group container and acquiring the process-local
+mutex under the deadline below, `tersa-keychain-macos` opens the file
 descriptor-relatively with no-follow and `O_CLOEXEC` semantics. Initial creation
-uses create-new mode and `0600`; an already-existing result converges only by
-opening without creation and validating the same-user regular-file type and
-exact `0600` permissions. Symlinks, unexpected objects or attributes, open or
-lock errors, and process-local mutex poisoning fail closed. The lock file is
-never deleted, renamed, repaired, or made configurable.
+uses create-new mode with `0600`, then applies `fchmod(0600)` to the new
+descriptor and requires `fstat` to report a same-user regular file with exact
+`0600` before locking. This normalization prevents a restrictive process umask
+from bricking a newly created lock. An existing file converges only by opening
+without creation and validating the same attributes; existing mode drift fails
+closed and is never chmod-repaired. Symlinks, unexpected objects or attributes,
+and open errors fail closed. The lock file is never deleted, renamed, repaired,
+or made configurable.
 
-The composition then takes an exclusive blocking advisory lock and holds both
-guards through Keychain root provisioning or retrieval, fixed-directory work,
-the store claim and migration, all pre- and post-open identity checks, every
-authorized failure-cleanup attempt, and construction of the final closed status.
-Every cooperative `TersaMac` bootstrap must enter through this lock protocol;
-the CLI never bootstraps and receives no lock or repair authority. Deterministic
-two-thread and two-process tests must force adversarial interleavings around
-directory creation and main/WAL/shared-memory cleanup and prove that cooperative
-bootstraps serialize through final status rather than deleting or replacing one
-another's state.
+The synchronous bootstrap C ABI runs only on the dedicated bounded `TersaMac`
+bootstrap worker, never on the AppKit/main thread. The worker has concurrency
+one and at most one pending operation; overflow returns the fixed redacted
+`bootstrap_busy_or_unavailable` status. A direct main-thread C ABI call returns
+the fixed redacted `bootstrap_invalid_execution_context` status before touching
+Keychain or filesystem state. Completion may be delivered to the main thread
+only after the worker call returns.
+
+A fixed non-configurable 30-second monotonic deadline begins before the first
+process-local mutex attempt and covers mutex, lock-file open/validation, and
+advisory-lock acquisition. Mutex acquisition and the exclusive advisory lock use
+nonblocking attempts with a fixed 10-millisecond backoff capped by the remaining
+deadline. `EINTR` retries within the same remaining budget; would-block retries
+after the backoff; poisoning, any other error, or deadline expiry returns
+`bootstrap_busy_or_unavailable` without entering bootstrap state and releases
+every guard or descriptor acquired by that attempt. After both guards are
+acquired, they remain held through Keychain root retrieval, the absent-root
+profile preflight, any authorized root provisioning, fixed-directory work,
+store claim and migration, all pre- and post-open identity checks, every
+authorized failure-cleanup attempt, and construction of the final closed
+status.
+
+Every cooperative `TersaMac` bootstrap must enter through this worker and lock
+protocol; the CLI never bootstraps and receives no lock or repair authority.
+Deterministic tests must cover main-thread rejection and worker dispatch,
+bounded-queue overflow, timeout, injected `EINTR`, restrictive umasks, existing
+mode drift, crash release of the advisory lock, and adversarial two-thread and
+two-process interleavings around directory creation and main/WAL/shared-memory
+cleanup. The interleaving tests must prove cooperative serialization through
+final status rather than deletion or replacement of another bootstrap's state.
 
 PR 33a.5 makes the product application the logical profile owner and assigns
 the directory-establishment operation exclusively to the trusted composition
@@ -293,16 +372,25 @@ the immediate checks remains an explicit unlocked-device/local-malware residual.
 
 The store remains the sole owner of database-leaf creation, claiming, schema
 migration, validation, and leaf cleanup. PR 33a.5 must harden the same existing
-`SqlCipherMailboxStore::open` API and path for a freshly created leaf. On any
-failure before successful claim and migration, the store first closes its
-handles, then may remove only the main, WAL, or shared-memory entry created by
-that invocation whose recorded identity still matches and whose regular-file
-type, owner, and restrictive permissions revalidate. It must never remove a
-pre-existing entry or an entry with a changed identity, and it must not remove
-profile directories. Cleanup failure preserves the original redacted failure
-and may leave restrictive residual store files. Those residuals block or fail
-closed on retry and require recovery by the owning product application through
-a later reviewed path; the CLI gains no repair authority.
+`SqlCipherMailboxStore::open` API and path for a freshly created leaf. While the
+bootstrap lock is held and immediately before the store call, it records a
+descriptor-relative no-follow absence/presence snapshot for exactly
+`mail.sqlite3`, `mail.sqlite3-wal`, and `mail.sqlite3-shm`. Fresh-leaf cleanup is
+authorized only when all three were absent; an orphan sidecar or other
+inconsistent pre-store state fails closed without cleanup.
+
+On any failure before successful claim and migration, the store first closes
+all handles. It then uses descriptor-relative no-follow `statat` on each fixed
+name that was absent in the pre-store snapshot. If an entry is newly present,
+the store records its identity, type, owner, and permissions at that post-close
+point and revalidates them immediately before pathname unlink. The identity is
+not known or recorded at SQLite creation time. Cleanup may unlink only a
+same-user restrictive regular file whose post-close identity still matches. It
+must never remove an entry present in the pre-store snapshot, an entry with a
+changed identity, or a profile directory. Cleanup failure preserves the original
+redacted failure and may leave restrictive residual store files. Those residuals
+block or fail closed on retry and require recovery by the owning product
+application through a later reviewed path; the CLI gains no repair authority.
 
 The identity checks and global lock prevent ordinary observable changes and
 serialize cooperative bootstraps only. They do not prevent a same-user malicious
@@ -313,7 +401,10 @@ This revalidation/unlink gap is an explicit unlocked-device/local-malware
 residual for directory cleanup and main/WAL/shared-memory cleanup; no prevention
 claim is made. A deterministic hook fixture must perform the replacement in
 that exact gap, record the non-prevention outcome, and preserve it as an explicit
-residual test analogous to the existing SQLite sidecar swap fixtures.
+residual test analogous to the existing SQLite sidecar swap fixtures. Additional
+hooks must exercise replacement between post-close identity recording and
+revalidation, and between revalidation and unlink, for the main file and both
+sidecars.
 
 Deterministic tests must inject failures before and after each fresh-leaf claim
 or migration boundary, cover main/WAL/shared-memory creation, and replace each
@@ -560,6 +651,25 @@ argument parsing, the fixed JSON serializer, terminal-safe escaping, process
 I/O, and stable exit mapping; serde is not added to the application boundary.
 Replacing the direct adapters with `maild` IPC must preserve commands, limits,
 ordering, JSON, exit codes, and declassification semantics.
+
+The production CLI composition is reviewed and source-policy-checked to invoke
+only `open_default_read_only_mailbox` and inspect
+`ReadOnlyMailboxOpenError`. Its behavior and authority remain retrieval-only.
+This is not a Rust visibility sandbox: because the CLI depends on
+`tersa-keychain-macos`, the public provisioner is compile-reachable in the crate
+graph today. No semantic or compiler-level non-reachability claim is made.
+
+As defense in depth, PR 33a.5 must add a narrow Git-index tracked-source
+inventory for `apps/cli-macos`. Every Keychain-adapter item reference is closed
+to the two retrieval items above. The inventory rejects direct references,
+imports, reexports, wildcard imports, crate aliases, and item aliases involving
+any provisioning or bootstrap API, and the same implementation pull request
+must register every new public bootstrap symbol in the rejected inventory.
+Positive and negative fixtures must cover fully qualified calls, `use`,
+`pub use`, `as`, wildcard, and crate-alias forms. This textual tracked-source
+guard is defense in depth, not proof against all Rust syntax or generated code.
+If true compile-time non-reachability becomes required, a separately reviewed
+facade/crate boundary and ADR must replace this composition.
 
 ## Non-claims
 
