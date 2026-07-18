@@ -107,6 +107,19 @@ the accepted [macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing
 8. Build a macOS UI baseline and signed/notarized vertical slice only after its
    separately pinned macOS UI and release gates pass.
 
+Per the 2026-07-18 amendment to the
+[macOS-first phasing ADR](architecture/adr-0013-macos-first-phasing.md), the
+credential-dependent signed and notarized distribution (item 7's final
+slice, PR 33b) and the distribution-signed evidence for item 8 are deferred
+to last, while item 8's source and development work and the
+production-UI-toolkit ADR proceed first. This reorders delivery only: it
+passes, reopens, or closes no gate, `ui_baseline_approved` stays false, and
+item 7 stays open until PR 33b. Item 8's "only after" gate wording applies
+to signed gate-closure claims and release artifacts, not to the start of
+source or development work. Ad-hoc or development evidence produced before
+the credential block never satisfies `P1-MACOS-001`, `P1-MACOS-002`, or
+`P1-MACOS-003`.
+
 The target slice connects one account, synchronizes a bounded recent mailbox,
 shows an encrypted cached inbox and thread, supports the planned bounded
 mailbox state flow, reopens offline, and exposes the same core through the
