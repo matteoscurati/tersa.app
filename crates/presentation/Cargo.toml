@@ -9,5 +9,9 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+tersa-application = { path = "../application", version = "=0.0.0" }
+tersa-domain = { path = "../domain", version = "=0.0.0" }
+
 [lints]
 workspace = true

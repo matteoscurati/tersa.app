@@ -47,7 +47,7 @@ pub struct MailboxMetadataMessage {
 }
 
 impl MailboxMetadataMessage {
-    fn from_envelope(envelope: &MessageEnvelope) -> Self {
+    pub(crate) fn from_envelope(envelope: &MessageEnvelope) -> Self {
         Self {
             message_id: envelope.message_id().clone(),
             thread_id: envelope.thread_id().clone(),

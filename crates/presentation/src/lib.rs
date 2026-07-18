@@ -6,6 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+/// UI-neutral mailbox view models projected from metadata documents.
+pub mod mailbox;
+
 /// Returns the protocol version expected by platform presentation adapters.
 ///
 /// This small stable surface lets platform bootstraps prove that they link the
