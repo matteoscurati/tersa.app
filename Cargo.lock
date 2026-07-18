@@ -7598,6 +7598,10 @@ dependencies = [
 [[package]]
 name = "tersa-presentation"
 version = "0.0.0"
+dependencies = [
+ "tersa-application",
+ "tersa-domain",
+]
 
 [[package]]
 name = "tersa-search-spike"
