@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-16
+- Amended: 2026-07-18
 
 ## Context
 
@@ -44,6 +45,68 @@ acceptance), and `P1-MACOS-003` (macOS Phase 1 acceptance guard).
 distribution-signed evidence. These are Phase 1-only claims: they do not
 satisfy `M1-UI-001`, approve a mobile toolkit, change any M0/mobile/M1 status,
 or change `ui_baseline_approved`. This ADR records no pass.
+
+## Amendment 2026-07-18: Phase 1 delivery reordering
+
+The binding pull-request sequence above is amended for delivery order only:
+the credential-dependent signed and notarized distribution is deferred to
+last, and credential-independent source work proceeds first. This amendment
+passes, reopens, closes, or edits no gate and weakens no requirement.
+
+The rationale is that a real Developer ID Application identity, the
+registered application group, and notarization authority are preconditions
+not yet available to the release operator (see
+[ADR-0019](adr-0019-macos-key-provisioning-and-readonly-cli.md), "PR 33b does
+not begin until ..."). This is a deferral of preconditions, not a failed
+gate, and it is explicitly not the demonstrated-inability condition in the
+"Fail-closed stop conditions" section below: that clause addresses proven
+inability of signing or notarization to satisfy the macOS acceptance
+protocol and would stop macOS UI work, whereas absent credentials only defer
+the signed distribution.
+
+The revised execution order is:
+
+1. Select and validate the production macOS UI toolkit via a separately
+   reviewed ADR (reserved ADR-0020). This amendment approves no toolkit;
+   ADR-0006 A9 ("Neither Slint nor Dioxus is production-approved") still
+   stands.
+2. Implement the macOS UI vertical-slice source (item 9 above, roadmap
+   item 8) against the existing Rust core, under ad-hoc/development
+   signing, producing accessibility and App Sandbox development evidence
+   only.
+3. Implement the real OAuth and Gmail authorization source path behind the
+   existing ports. This depends on Google credentials and Google
+   verification, which the deferral of Apple credentials does not affect;
+   `M0-OAUTH-001` stays open and no runtime or authorization gate is
+   claimed.
+4. Build the cache and performance measurement harness and take unsigned
+   pre-measurements only; `M0-CACHE-001` stays open and the budgets remain
+   constraints, not passes.
+5. Last, once ADR-0019's PR 33b start conditions are satisfied -- a real
+   Developer ID Application identity, the registered application group,
+   notarization authority, and the ADR-0019 reviewed product-application
+   provisioning path that provisions the fixed root and establishes the
+   account profile -- the Apple-credential distribution block, comprising
+   PR 33b (roadmap item 7, item 8 above, closure) and the
+   distribution-signed `P1-MACOS-001`, `P1-MACOS-002`, and `P1-MACOS-003`
+   evidence.
+
+The load-bearing split is explicit: Steps 2 through 4 source and development
+work may start before the credential block, but it produces only
+ad-hoc/development evidence that can never count toward `P1-MACOS-001`,
+`P1-MACOS-002`, or `P1-MACOS-003`, or toward any distribution-signed closure,
+which remain Developer-ID/notarization-only per the macOS Phase 1 acceptance
+protocol. Roadmap item 7 remains open until PR 33b, and ADR-0019's PR 33b
+preconditions are unchanged.
+
+The phrase "only after its own gates pass" in item 9 above (roadmap item 8)
+governs gate-closure claims and signed release artifacts, not the start of
+source and development work.
+
+This amendment passes, reopens, closes, or edits no gate;
+`ui_baseline_approved` stays false; no UI toolkit is approved; no signing,
+App Sandbox, App Group, Keychain, or notarization requirement is weakened;
+and Phase 1 evidence never closes a Phase 2 gate.
 
 ## Non-claims
 
