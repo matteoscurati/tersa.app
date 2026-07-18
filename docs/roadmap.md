@@ -112,7 +112,8 @@ Per the 2026-07-18 amendment to the
 credential-dependent signed and notarized distribution (item 7's final
 slice, PR 33b) and the distribution-signed evidence for item 8 are deferred
 to last, while item 8's source and development work and the
-production-UI-toolkit ADR proceed first. This reorders delivery only: it
+[production-UI-toolkit ADR](architecture/adr-0020-macos-production-ui-toolkit.md)
+proceed first. This reorders delivery only: it
 passes, reopens, or closes no gate, `ui_baseline_approved` stays false, and
 item 7 stays open until PR 33b. Item 8's "only after" gate wording applies
 to signed gate-closure claims and release artifacts, not to the start of
