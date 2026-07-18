@@ -119,7 +119,8 @@ item 7 stays open until PR 33b. Item 8's "only after" gate wording applies
 to signed gate-closure claims and release artifacts, not to the start of
 source or development work. Ad-hoc or development evidence produced before
 the credential block never satisfies `P1-MACOS-001`, `P1-MACOS-002`, or
-`P1-MACOS-003`.
+`P1-MACOS-003`. The macOS UI vertical slice is planned and decomposed in the
+[macOS UI vertical-slice ADR](architecture/adr-0021-macos-ui-vertical-slice.md).
 
 The target slice connects one account, synchronizes a bounded recent mailbox,
 shows an encrypted cached inbox and thread, supports the planned bounded
