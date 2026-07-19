@@ -24,6 +24,8 @@ core-foundation = { workspace = true, default-features = false }
 objc2-foundation = { workspace = true, features = ["NSThread"] }
 rustix = { workspace = true, default-features = false, features = ["process"] }
 security-framework-sys = { workspace = true }
+tersa-application = { path = "../../crates/application", version = "=0.0.0" }
+tersa-presentation = { path = "../../crates/presentation", version = "=0.0.0" }
 tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0.0.0" }
 
 [lints]

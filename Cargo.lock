@@ -7575,7 +7575,9 @@ dependencies = [
  "rustix 1.1.4",
  "security-framework-sys",
  "sha2",
+ "tersa-application",
  "tersa-platform",
+ "tersa-presentation",
  "tersa-store-sqlcipher-macos",
  "zeroize",
 ]

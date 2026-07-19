@@ -491,6 +491,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         .map(|(path, _document)| path.clone())
         .collect::<BTreeSet<_>>();
     let canonical_bridge = PathBuf::from("apple/rust-bridge/src/lib.rs");
+    let canonical_mailbox_bridge = PathBuf::from("apple/rust-bridge/src/mailbox.rs");
     violations.extend(bridge_package_source_surface_violations(
         &bridge_package_sources,
         &bridge_paths,
@@ -501,17 +502,24 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
             violations.extend(rust_authority_source_surface_violations(&path, &document));
         }
     }
-    if !bridge_paths.contains(&canonical_bridge) {
-        violations.push(
-            "the Apple bridge canonical source `apple/rust-bridge/src/lib.rs` must be tracked"
-                .to_owned(),
-        );
-    } else if let Some((_path, document)) = bridge_sources
-        .iter()
-        .find(|(path, _document)| path == &canonical_bridge)
-    {
-        violations.extend(bridge_bootstrap_source_violations(document));
+    let mut boundary_document = String::new();
+    for canonical_source in [&canonical_bridge, &canonical_mailbox_bridge] {
+        if !bridge_paths.contains(canonical_source) {
+            violations.push(format!(
+                "the Apple bridge canonical source `{}` must be tracked",
+                canonical_source.display()
+            ));
+            continue;
+        }
+        if let Some((_path, document)) = bridge_sources
+            .iter()
+            .find(|(path, _document)| path == canonical_source)
+        {
+            boundary_document.push_str(document);
+            boundary_document.push('\n');
+        }
     }
+    violations.extend(bridge_bootstrap_source_violations(&boundary_document));
 
     let worker_path = repository_root.join("apple/macos/BootstrapWorker.swift");
     let app_delegate_path = repository_root.join("apple/macos/AppDelegate.swift");
@@ -589,17 +597,21 @@ fn tracked_source_documents(
 
 fn cli_keychain_source_violations(path: &str, document: &str) -> Vec<String> {
     const ALLOWED: [&str; 2] = ["ReadOnlyMailboxOpenError", "open_default_read_only_mailbox"];
-    const FORBIDDEN_BOOTSTRAP: [&str; 4] = [
+    const FORBIDDEN_COMPOSITION: [&str; 8] = [
         "DataProtectionRootKeyProvisioner",
         "InstallationRootKeyProvisioner",
+        "MailboxReadStatus",
         "ProductBootstrapStatus",
         "bootstrap_default_account_bytes",
+        "read_default_inbox",
+        "read_default_thread",
+        "search_default_mailbox",
     ];
     let mut violations = Vec::new();
     let code = strip_rust_non_code(document);
     let policy_code = strip_rust_test_modules(&code);
     for reference in rust_qualified_item_uses(&policy_code, "tersa_keychain_macos") {
-        if !ALLOWED.contains(&reference.item)
+        if !ALLOWED.contains(&reference.item.as_str())
             || (reference.item == "open_default_read_only_mailbox" && !reference.is_call)
         {
             violations.push(format!(
@@ -613,10 +625,10 @@ fn cli_keychain_source_violations(path: &str, document: &str) -> Vec<String> {
             "{path} must use only fully qualified, non-aliased Keychain retrieval items"
         ));
     }
-    for symbol in FORBIDDEN_BOOTSTRAP {
+    for symbol in FORBIDDEN_COMPOSITION {
         if contains_identifier(&policy_code, symbol) {
             violations.push(format!(
-                "{path} contains forbidden bootstrap symbol `{symbol}`"
+                "{path} contains forbidden Keychain composition symbol `{symbol}`"
             ));
         }
     }
@@ -800,6 +812,7 @@ fn bridge_package_source_surface_violations(
     let reviewed_rust_sources = BTreeSet::from([
         PathBuf::from("apple/rust-bridge/examples/oauth_entitlement_probe.rs"),
         PathBuf::from("apple/rust-bridge/src/lib.rs"),
+        PathBuf::from("apple/rust-bridge/src/mailbox.rs"),
         PathBuf::from("apple/rust-bridge/src/oauth.rs"),
     ]);
     let tracked_rust_sources = package_documents
@@ -811,7 +824,7 @@ fn bridge_package_source_surface_violations(
         .collect::<BTreeSet<_>>();
     if tracked_rust_sources != reviewed_rust_sources {
         violations.push(
-            "the Apple bridge tracked Rust source inventory must match the reviewed library, OAuth module, and entitlement probe"
+            "the Apple bridge tracked Rust source inventory must match the reviewed library, mailbox read module, OAuth module, and entitlement probe"
                 .to_owned(),
         );
     }
@@ -825,11 +838,13 @@ fn bridge_package_source_surface_violations(
             continue;
         }
         violations.extend(rust_external_source_expansion_violations(path, document));
-        if path != Path::new("apple/rust-bridge/src/lib.rs") {
+        if path != Path::new("apple/rust-bridge/src/lib.rs")
+            && path != Path::new("apple/rust-bridge/src/mailbox.rs")
+        {
             let code = strip_rust_test_modules(&strip_rust_non_code(document));
             if contains_identifier(&code, "tersa_keychain_macos") {
                 violations.push(format!(
-                    "{} must not reference the Keychain bootstrap adapter outside the canonical bridge source",
+                    "{} must not reference the Keychain bootstrap adapter outside the canonical bridge sources",
                     path.display()
                 ));
             }
@@ -887,7 +902,7 @@ fn rust_exported_c_abi_violations(package_documents: &[(PathBuf, String)]) -> Ve
     }
     if no_mangle_attributes != expected.len() || actual.len() != expected.len() {
         violations.push(
-            "the Apple bridge production exported C ABI set must match the eight reviewed symbols, including the unexposed entitlement probe"
+            "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe"
                 .to_owned(),
         );
     }
@@ -913,6 +928,18 @@ fn expected_apple_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
         (
             "tersa_macos_bootstrap_default_account",
             "pubunsafeextern\"C\"fntersa_macos_bootstrap_default_account(account_id:*constu8,account_id_len:usize,)->i32",
+        ),
+        (
+            "tersa_macos_mailbox_read_inbox",
+            "pubunsafeextern\"C\"fntersa_macos_mailbox_read_inbox(account_id:*constu8,account_id_len:usize,limit:u16,output:*mutu8,output_capacity:usize,output_len:*mutusize,)->i32",
+        ),
+        (
+            "tersa_macos_mailbox_read_thread",
+            "pubunsafeextern\"C\"fntersa_macos_mailbox_read_thread(account_id:*constu8,account_id_len:usize,thread_id:*constu8,thread_id_len:usize,limit:u16,output:*mutu8,output_capacity:usize,output_len:*mutusize,)->i32",
+        ),
+        (
+            "tersa_macos_mailbox_search",
+            "pubunsafeextern\"C\"fntersa_macos_mailbox_search(account_id:*constu8,account_id_len:usize,query:*constu8,query_len:usize,limit:u16,output:*mutu8,output_capacity:usize,output_len:*mutusize,)->i32",
         ),
         (
             "tersa_oauth_cancel",
@@ -1121,16 +1148,131 @@ fn rust_has_macro_invocation(document: &str, name: &str) -> bool {
     })
 }
 
+/// The closed per-function Keychain reference policy for one bridge C ABI
+/// boundary function.
+struct BridgeBoundaryPolicy {
+    /// The single reviewed Keychain status item the function may reference,
+    /// with its exact reviewed reference count.
+    status: &'static str,
+    status_references: usize,
+    /// The reviewed Keychain status variants the function must reference
+    /// individually, in the qualified form the source uses.
+    status_variants: &'static [&'static str],
+    /// The single validating Keychain entry the function must call exactly once.
+    entry: &'static str,
+    /// The single reviewed encoder call the function must make exactly once,
+    /// or empty when the function returns validated bytes without encoding.
+    encoder: &'static str,
+    /// The single reviewed bounded-output call the function must make exactly
+    /// once, or empty when the function writes no caller output.
+    bounded_write: &'static str,
+    /// Required bounded-copy and boundary-check source fragments. Each
+    /// `slice::from_raw_parts` site is pinned to its own `.to_vec()` copy so
+    /// one bounded copy cannot satisfy another site's requirement.
+    required: &'static [&'static str],
+}
+
+const BRIDGE_BOUNDARY_POLICIES: [(&str, BridgeBoundaryPolicy); 4] = [
+    (
+        "tersa_macos_bootstrap_default_account",
+        BridgeBoundaryPolicy {
+            status: "ProductBootstrapStatus",
+            status_references: 1,
+            status_variants: &[],
+            entry: "bootstrap_default_account_bytes",
+            encoder: "",
+            bounded_write: "",
+            required: &[
+                "account_id.is_null()",
+                "account_id_len == 0",
+                "account_id_len > 256",
+                "slice::from_raw_parts(account_id, account_id_len) }.to_vec()",
+            ],
+        },
+    ),
+    (
+        "tersa_macos_mailbox_read_inbox",
+        BridgeBoundaryPolicy {
+            status: "mailbox_read::MailboxReadStatus",
+            status_references: 3,
+            status_variants: &[
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall",
+            ],
+            entry: "mailbox_read::read_default_inbox",
+            encoder: "encode_inbox(&model)",
+            bounded_write: "write_bounded_output(&encoded, output, output_capacity, output_len)",
+            required: &[
+                "account_id.is_null()",
+                "account_id_len == 0",
+                "account_id_len > 256",
+                "slice::from_raw_parts(account_id, account_id_len) }.to_vec()",
+                "output.is_null()",
+                "output_len.is_null()",
+            ],
+        },
+    ),
+    (
+        "tersa_macos_mailbox_read_thread",
+        BridgeBoundaryPolicy {
+            status: "mailbox_read::MailboxReadStatus",
+            status_references: 3,
+            status_variants: &[
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall",
+            ],
+            entry: "mailbox_read::read_default_thread",
+            encoder: "encode_thread(&model)",
+            bounded_write: "write_bounded_output(&encoded, output, output_capacity, output_len)",
+            required: &[
+                "account_id.is_null()",
+                "account_id_len == 0",
+                "account_id_len > 256",
+                "slice::from_raw_parts(account_id, account_id_len) }.to_vec()",
+                "thread_id.is_null()",
+                "thread_id_len == 0",
+                "thread_id_len > 256",
+                "slice::from_raw_parts(thread_id, thread_id_len) }.to_vec()",
+                "output.is_null()",
+                "output_len.is_null()",
+            ],
+        },
+    ),
+    (
+        "tersa_macos_mailbox_search",
+        BridgeBoundaryPolicy {
+            status: "mailbox_read::MailboxReadStatus",
+            status_references: 3,
+            status_variants: &[
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall",
+            ],
+            entry: "mailbox_read::search_default_mailbox",
+            encoder: "encode_search(&model)",
+            bounded_write: "write_bounded_output(&encoded, output, output_capacity, output_len)",
+            required: &[
+                "account_id.is_null()",
+                "account_id_len == 0",
+                "account_id_len > 256",
+                "slice::from_raw_parts(account_id, account_id_len) }.to_vec()",
+                "query.is_null()",
+                "query_len == 0",
+                "query_len > 256",
+                "slice::from_raw_parts(query, query_len) }.to_vec()",
+                "output.is_null()",
+                "output_len.is_null()",
+            ],
+        },
+    ),
+];
+
 fn bridge_bootstrap_source_violations(document: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let code = strip_rust_non_code(document);
     let policy_code = strip_rust_test_modules(&code);
-    let Some(function) = rust_function_body(&policy_code, "tersa_macos_bootstrap_default_account")
-    else {
-        return vec![
-            "the Apple bridge must define the canonical macOS bootstrap C ABI function".to_owned(),
-        ];
-    };
     for forbidden in ["tersa_domain"] {
         if contains_identifier(&policy_code, forbidden) {
             violations.push(format!(
@@ -1148,73 +1290,123 @@ fn bridge_bootstrap_source_violations(document: &str) -> Vec<String> {
             .push("the Apple bridge contains forbidden bootstrap boundary `AccountId`".to_owned());
     }
     let references = rust_qualified_item_uses(&policy_code, "tersa_keychain_macos");
-    let function_references = rust_qualified_item_uses(function, "tersa_keychain_macos");
-    for reference in &function_references {
-        let item = reference.item;
-        if !matches!(
-            item,
-            "ProductBootstrapStatus" | "bootstrap_default_account_bytes"
-        ) {
+    let mut function_reference_count = 0_usize;
+    for (function_name, policy) in &BRIDGE_BOUNDARY_POLICIES {
+        let Some(function) = rust_function_body(&policy_code, function_name) else {
             violations.push(format!(
-                "the Apple bridge references forbidden Keychain adapter item `{item}`"
+                "the Apple bridge must define the canonical macOS C ABI function `{function_name}`"
+            ));
+            continue;
+        };
+        let function_references = rust_qualified_item_uses(function, "tersa_keychain_macos");
+        function_reference_count += function_references.len();
+        for reference in &function_references {
+            if reference.item != policy.status && reference.item != policy.entry {
+                violations.push(format!(
+                    "the Apple bridge references forbidden Keychain adapter item `{}`",
+                    reference.item
+                ));
+            }
+        }
+        if function_references
+            .iter()
+            .filter(|reference| reference.item == policy.status)
+            .count()
+            != policy.status_references
+        {
+            violations.push(format!(
+                "the Apple bridge `{function_name}` must reference its reviewed Keychain status vocabulary exactly {} times",
+                policy.status_references
             ));
         }
+        let entry_call_count = function_references
+            .iter()
+            .filter(|reference| reference.item == policy.entry && reference.is_call)
+            .count();
+        let entry_reference_count = function_references
+            .iter()
+            .filter(|reference| reference.item == policy.entry)
+            .count();
+        if entry_call_count != 1 || entry_reference_count != 1 {
+            violations.push(format!(
+                "the Apple bridge `{function_name}` must call exactly one validating Keychain entry"
+            ));
+        }
+        violations.extend(bridge_boundary_pin_violations(
+            function_name,
+            policy,
+            function,
+        ));
     }
-    if references.len() != function_references.len() {
+    if references.len() != function_reference_count {
         violations.push(
-            "the Apple bridge must not reference the Keychain adapter outside the canonical bootstrap function"
+            "the Apple bridge must not reference the Keychain adapter outside the canonical boundary functions"
                 .to_owned(),
         );
     }
-    if function_references
-        .iter()
-        .filter(|reference| reference.item == "ProductBootstrapStatus")
-        .count()
-        != 1
-    {
-        violations.push(
-            "the Apple bridge must reference exactly one Keychain bootstrap status".to_owned(),
-        );
-    }
-    let bootstrap_call_count = function_references
-        .iter()
-        .filter(|reference| {
-            reference.item == "bootstrap_default_account_bytes" && reference.is_call
-        })
-        .count();
-    let bootstrap_reference_count = function_references
-        .iter()
-        .filter(|reference| reference.item == "bootstrap_default_account_bytes")
-        .count();
-    if bootstrap_call_count != 1 || bootstrap_reference_count != 1 {
-        violations.push(
-            "the Apple bridge must call exactly one validating Keychain bootstrap entry".to_owned(),
-        );
-    }
-    for required in [
-        "account_id.is_null()",
-        "account_id_len == 0",
-        "account_id_len > 256",
-        "slice::from_raw_parts(account_id, account_id_len)",
-        ".to_vec()",
-    ] {
-        if !function.contains(required) {
+    violations
+}
+
+/// Enforces the reviewed per-function source pins for one bridge boundary
+/// function: each status variant referenced individually, the command
+/// encoder and bounded write called exactly once each, and every required
+/// bounded-copy fragment present. Fragment matching canonicalizes whitespace
+/// so token-equivalent formatting cannot raise spurious violations.
+fn bridge_boundary_pin_violations(
+    function_name: &str,
+    policy: &BridgeBoundaryPolicy,
+    function: &str,
+) -> Vec<String> {
+    let canonical_function = rust_token_canonical(function);
+    let mut violations = Vec::new();
+    for variant in policy.status_variants {
+        if !canonical_function.contains(&rust_token_canonical(variant)) {
             violations.push(format!(
-                "the Apple bridge is missing required bounded-copy source `{required}`"
+                "the Apple bridge `{function_name}` must reference its reviewed Keychain status variant `{variant}`"
+            ));
+        }
+    }
+    if !policy.encoder.is_empty() {
+        let encoder = rust_token_canonical(policy.encoder);
+        if canonical_function.matches(&encoder).count() != 1 {
+            violations.push(format!(
+                "the Apple bridge `{function_name}` must call its reviewed encoder `{}` exactly once",
+                policy.encoder
+            ));
+        }
+    }
+    if !policy.bounded_write.is_empty() {
+        let bounded_write = rust_token_canonical(policy.bounded_write);
+        if canonical_function.matches(&bounded_write).count() != 1 {
+            violations.push(format!(
+                "the Apple bridge `{function_name}` must write caller output through `{}` exactly once",
+                policy.bounded_write
+            ));
+        }
+    }
+    for required in policy.required {
+        if !canonical_function.contains(&rust_token_canonical(required)) {
+            violations.push(format!(
+                "the Apple bridge `{function_name}` is missing required bounded-copy source `{required}`"
             ));
         }
     }
     violations
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RustQualifiedItemUse<'a> {
-    item: &'a str,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustQualifiedItemUse {
+    item: String,
     is_call: bool,
 }
 
 /// Finds qualified Rust path uses while treating whitespace as non-semantic.
-fn rust_qualified_item_uses<'a>(document: &'a str, module: &str) -> Vec<RustQualifiedItemUse<'a>> {
+///
+/// A lowercase first segment followed by another segment names a module, so
+/// the reported item spans both segments (for example
+/// `mailbox_read::read_default_inbox`). Type-like first segments keep the
+/// single-segment item form, including enum variant references.
+fn rust_qualified_item_uses(document: &str, module: &str) -> Vec<RustQualifiedItemUse> {
     let mut uses = Vec::new();
     for (start, _) in document.match_indices(module) {
         if !is_identifier_at(document, start, module) {
@@ -1225,22 +1417,42 @@ fn rust_qualified_item_uses<'a>(document: &'a str, module: &str) -> Vec<RustQual
             continue;
         }
         index = skip_ascii_whitespace(document, index + 2);
-        let item_start = index;
-        while document
-            .as_bytes()
-            .get(index)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            index += 1;
-        }
-        if item_start == index {
+        let Some((first, first_end)) = rust_path_segment(document, index) else {
             continue;
+        };
+        let mut item = first.to_owned();
+        let mut item_end = first_end;
+        let after_first = skip_ascii_whitespace(document, first_end);
+        if first
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+            && document[after_first..].starts_with("::")
+        {
+            let second_start = skip_ascii_whitespace(document, after_first + 2);
+            if let Some((second, second_end)) = rust_path_segment(document, second_start) {
+                item.push_str("::");
+                item.push_str(second);
+                item_end = second_end;
+            }
         }
-        let item = &document[item_start..index];
-        let is_call = document[skip_ascii_whitespace(document, index)..].starts_with('(');
+        let is_call = document[skip_ascii_whitespace(document, item_end)..].starts_with('(');
         uses.push(RustQualifiedItemUse { item, is_call });
     }
     uses
+}
+
+/// Reads one Rust path segment starting at `start`.
+fn rust_path_segment(document: &str, start: usize) -> Option<(&str, usize)> {
+    let mut index = start;
+    while document
+        .as_bytes()
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        index += 1;
+    }
+    (index != start).then_some((&document[start..index], index))
 }
 
 /// Masks test-only Rust modules before enforcing production source boundaries.
@@ -1336,6 +1548,18 @@ fn skip_ascii_whitespace(document: &str, mut index: usize) -> usize {
 
 fn is_rust_ascii_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Canonicalizes a source fragment for token comparison by dropping every
+/// Rust ASCII whitespace byte, mirroring the whitespace-insensitive qualified
+/// path matching so formatting drift cannot raise spurious violations while
+/// token content stays exactly as strict.
+fn rust_token_canonical(document: &str) -> String {
+    document
+        .bytes()
+        .filter(|byte| !is_rust_ascii_whitespace(*byte))
+        .map(char::from)
+        .collect()
 }
 
 fn is_identifier_at(document: &str, index: usize, identifier: &str) -> bool {
@@ -1900,6 +2124,34 @@ const CANONICAL_TERSA_RUST_BRIDGE_HEADER: &str = r"#ifndef TERSA_RUST_BRIDGE_H
 #include <stdint.h>
 uint32_t tersa_apple_bridge_version(void);
 int32_t tersa_macos_bootstrap_default_account(const uint8_t *account_id, size_t account_id_len);
+int32_t tersa_macos_mailbox_read_inbox(
+const uint8_t *account_id,
+size_t account_id_len,
+uint16_t limit,
+uint8_t *output,
+size_t output_capacity,
+size_t *output_len
+);
+int32_t tersa_macos_mailbox_read_thread(
+const uint8_t *account_id,
+size_t account_id_len,
+const uint8_t *thread_id,
+size_t thread_id_len,
+uint16_t limit,
+uint8_t *output,
+size_t output_capacity,
+size_t *output_len
+);
+int32_t tersa_macos_mailbox_search(
+const uint8_t *account_id,
+size_t account_id_len,
+const uint8_t *query,
+size_t query_len,
+uint16_t limit,
+uint8_t *output,
+size_t output_capacity,
+size_t *output_len
+);
 int32_t tersa_oauth_macos_begin(
 const uint8_t *client_id,
 size_t client_id_len,
@@ -4281,7 +4533,9 @@ fn protected_keychain_dependency_rename_violations(
                 | "rustix"
                 | "security-framework-sys"
                 | "sha2"
+                | "tersa-application"
                 | "tersa-platform"
+                | "tersa-presentation"
                 | "tersa-store-sqlcipher-macos"
                 | "zeroize",
         ) | ("tersa-apple-bridge", "tersa-keychain-macos")
@@ -4295,14 +4549,16 @@ fn protected_keychain_dependency_rename_violations(
 }
 
 fn keychain_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
-    const REQUIRED: [&str; 9] = [
+    const REQUIRED: [&str; 11] = [
         "core-foundation",
         "hkdf",
         "objc2-foundation",
         "rustix",
         "security-framework-sys",
         "sha2",
+        "tersa-application",
         "tersa-platform",
+        "tersa-presentation",
         "tersa-store-sqlcipher-macos",
         "zeroize",
     ];
@@ -5412,11 +5668,13 @@ fn future_macos_store_dependency_violation(
 ) -> Option<String> {
     let protected_edge = matches!(
         (package_name, dependency_name),
-        ("tersa-keychain-macos", "tersa-store-sqlcipher-macos")
-            | (
-                "tersa-cli-macos" | "tersa-apple-bridge",
-                "tersa-keychain-macos"
-            )
+        (
+            "tersa-keychain-macos",
+            "tersa-store-sqlcipher-macos" | "tersa-application" | "tersa-presentation"
+        ) | (
+            "tersa-cli-macos" | "tersa-apple-bridge",
+            "tersa-keychain-macos"
+        )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
         && matches!(
@@ -5449,7 +5707,12 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("tersa-blob-spike", BTreeSet::new()),
         (
             "tersa-keychain-macos",
-            BTreeSet::from(["tersa-platform", "tersa-store-sqlcipher-macos"]),
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-platform",
+                "tersa-presentation",
+                "tersa-store-sqlcipher-macos",
+            ]),
         ),
         (
             "tersa-cli-macos",
@@ -5558,26 +5821,26 @@ mod tests {
     use cargo_metadata::PackageId;
 
     use super::{
-        ResolvedDependencyIdentity, apple_bridge_direct_dependency_set_violations,
-        blob_dependency_graph_violations, blob_manifest_dependency_violations,
-        bridge_bootstrap_source_violations, bridge_package_source_surface_violations,
-        canonical_cli_source_anchor_violations, check_diagnostic_runtime_reachability,
-        cli_direct_dependency_set_violations, cli_keychain_source_violations,
-        collect_entitlement_paths, dependency_policy, future_macos_store_dependency_violation,
-        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
-        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
-        keychain_mutation_boundary_violations, non_owner_entitlement_violations, parse_identity,
-        parse_plist_string_array, parse_project_targets, project_generation_surface_violations,
-        project_generation_wrapper, protected_keychain_dependency_rename_violations,
-        reserved_future_policy_violations, resolved_workspace_dependency_names,
-        rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
-        rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
-        signing_configuration_violations, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
-        target_metadata_options, tracked_apple_signing_inventory,
-        tracked_project_generation_violations,
+        CANONICAL_TERSA_RUST_BRIDGE_HEADER, ResolvedDependencyIdentity,
+        apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
+        blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
+        bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
+        check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
+        cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
+        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
+        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
+        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
+        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
+        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
+        protected_keychain_dependency_rename_violations, reserved_future_policy_violations,
+        resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
+        rust_authority_source_surface_violations, rust_exported_c_abi_violations,
+        rustix_manifest_dependency_violations, signing_configuration_violations,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
+        swift_bootstrap_source_violations, swift_bridge_call_inventory, target_metadata_options,
+        tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -5716,6 +5979,19 @@ targets:
     }
 
     #[test]
+    fn activates_the_keychain_read_boundary() {
+        assert_eq!(
+            dependency_policy()["tersa-keychain-macos"],
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-platform",
+                "tersa-presentation",
+                "tersa-store-sqlcipher-macos",
+            ])
+        );
+    }
+
+    #[test]
     fn keychain_direct_dependencies_are_a_closed_exact_set() {
         let exact = BTreeSet::from([
             "core-foundation",
@@ -5724,7 +6000,9 @@ targets:
             "rustix",
             "security-framework-sys",
             "sha2",
+            "tersa-application",
             "tersa-platform",
+            "tersa-presentation",
             "tersa-store-sqlcipher-macos",
             "zeroize",
         ]);
@@ -5858,6 +6136,11 @@ let error = tersa_keychain_macos :: ReadOnlyMailboxOpenError::KeyAccess;
             "use tersa_keychain_macos::open_default_read_only_mailbox as open;",
             "pub use tersa_keychain_macos::ProductBootstrapStatus;",
             "extern crate tersa_keychain_macos as keychain;",
+            "let model = tersa_keychain_macos::mailbox_read::read_default_inbox(account, limit);",
+            "let model = tersa_keychain_macos::mailbox_read::read_default_thread(account, thread, limit);",
+            "let model = tersa_keychain_macos::mailbox_read::search_default_mailbox(account, query, limit);",
+            "let status = tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok;",
+            "use tersa_keychain_macos::mailbox_read::MailboxReadStatus;",
         ] {
             assert!(
                 !cli_keychain_source_violations("cli.rs", forbidden).is_empty(),
@@ -6116,7 +6399,7 @@ fn boundary() {
         assert!(rust_authority_source_surface_violations(path, inert).is_empty());
     }
 
-    fn reviewed_apple_bridge_export_sources() -> (&'static str, &'static str) {
+    fn reviewed_apple_bridge_export_sources() -> (&'static str, &'static str, &'static str) {
         let lib = r#"
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_apple_bridge_version() -> u32 {}
@@ -6124,6 +6407,39 @@ pub extern "C" fn tersa_apple_bridge_version() -> u32 {}
 pub unsafe extern "C" fn tersa_macos_bootstrap_default_account(
     account_id: *const u8,
     account_id_len: usize,
+) -> i32 {}
+"#;
+        let mailbox = r#"
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_macos_mailbox_read_inbox(
+    account_id: *const u8,
+    account_id_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_macos_mailbox_read_thread(
+    account_id: *const u8,
+    account_id_len: usize,
+    thread_id: *const u8,
+    thread_id_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_macos_mailbox_search(
+    account_id: *const u8,
+    account_id_len: usize,
+    query: *const u8,
+    query_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
 ) -> i32 {}
 "#;
         let oauth = r#"
@@ -6160,22 +6476,26 @@ pub extern "C" fn tersa_oauth_macos_poll(session_id: u64) -> i32 {}
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
 "#;
-        (lib, oauth)
+        (lib, mailbox, oauth)
+    }
+
+    fn reviewed_apple_bridge_documents(
+        lib: String,
+        mailbox: String,
+        oauth: String,
+    ) -> Vec<(PathBuf, String)> {
+        vec![
+            (PathBuf::from("apple/rust-bridge/src/lib.rs"), lib),
+            (PathBuf::from("apple/rust-bridge/src/mailbox.rs"), mailbox),
+            (PathBuf::from("apple/rust-bridge/src/oauth.rs"), oauth),
+        ]
     }
 
     #[test]
     fn apple_bridge_export_inventory_pins_every_reviewed_signature() {
-        let (lib, oauth) = reviewed_apple_bridge_export_sources();
-        let reviewed = vec![
-            (
-                PathBuf::from("apple/rust-bridge/src/lib.rs"),
-                lib.to_owned(),
-            ),
-            (
-                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                oauth.to_owned(),
-            ),
-        ];
+        let (lib, mailbox, oauth) = reviewed_apple_bridge_export_sources();
+        let reviewed =
+            reviewed_apple_bridge_documents(lib.to_owned(), mailbox.to_owned(), oauth.to_owned());
         assert!(rust_exported_c_abi_violations(&reviewed).is_empty());
 
         for mutation in [
@@ -6185,64 +6505,76 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
                 "tersa_macos_bootstrap_default_account",
                 "tersa_macos_bootstrap_default_account_extra",
             ),
-            format!(
-                "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn unexpected_export() -> i32 {{}}"
-            ),
         ] {
-            let contaminated = vec![
-                (PathBuf::from("apple/rust-bridge/src/lib.rs"), mutation),
-                (
-                    PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                    oauth.to_owned(),
-                ),
-            ];
+            let contaminated =
+                reviewed_apple_bridge_documents(mutation, mailbox.to_owned(), oauth.to_owned());
             assert!(
                 !rust_exported_c_abi_violations(&contaminated).is_empty(),
                 "export name, set, and parameter widths must remain exact"
             );
         }
-
-        let comment_mask_bypass = vec![
-            (
-                PathBuf::from("apple/rust-bridge/src/lib.rs"),
-                lib.to_owned(),
+        for mutation in [
+            mailbox.replace("limit: u16", "limit: u32"),
+            mailbox.replacen("output: *mut u8", "output: *const u8", 1),
+            mailbox.replace(
+                "tersa_macos_mailbox_search",
+                "tersa_macos_mailbox_search_all",
             ),
-            (
-                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                format!(
-                    r#"{oauth}
+        ] {
+            let contaminated =
+                reviewed_apple_bridge_documents(lib.to_owned(), mutation, oauth.to_owned());
+            assert!(
+                !rust_exported_c_abi_violations(&contaminated).is_empty(),
+                "read export name, set, and parameter widths must remain exact"
+            );
+        }
+
+        let twelfth_symbol = reviewed_apple_bridge_documents(
+            format!(
+                "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn unexpected_export() -> i32 {{}}"
+            ),
+            mailbox.to_owned(),
+            oauth.to_owned(),
+        );
+        let violations = rust_exported_c_abi_violations(&twelfth_symbol);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("eleven reviewed symbols")),
+            "a twelfth symbol must trip the reviewed-count message: {violations:?}"
+        );
+
+        let comment_mask_bypass = reviewed_apple_bridge_documents(
+            lib.to_owned(),
+            mailbox.to_owned(),
+            format!(
+                r#"{oauth}
 mod compatibility {{
     // Historical example: #[cfg(test)] mod scratch {{
     #[unsafe(no_mangle)]
     pub extern "C" fn tersa_oauth_debug_dump(session_id: u64) -> i32 {{ 0 }}
 }}
 "#
-                ),
             ),
-        ];
+        );
         assert!(
             !rust_exported_c_abi_violations(&comment_mask_bypass).is_empty(),
             "a comment containing a pseudo cfg(test) module must not hide a production export"
         );
 
-        let literal_mask_bypass = vec![
-            (
-                PathBuf::from("apple/rust-bridge/src/lib.rs"),
-                lib.to_owned(),
-            ),
-            (
-                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                format!(
-                    r##"{oauth}
+        let literal_mask_bypass = reviewed_apple_bridge_documents(
+            lib.to_owned(),
+            mailbox.to_owned(),
+            format!(
+                r##"{oauth}
 mod compatibility {{
     const EXAMPLE: &str = "#[cfg(test)] mod scratch {{";
     #[unsafe(no_mangle)]
     pub extern "C" fn tersa_oauth_literal_dump(session_id: u64) -> i32 {{ 0 }}
 }}
 "##
-                ),
             ),
-        ];
+        );
         assert!(
             !rust_exported_c_abi_violations(&literal_mask_bypass).is_empty(),
             "a literal containing a pseudo cfg(test) module must not hide a production export"
@@ -6251,7 +6583,7 @@ mod compatibility {{
 
     #[test]
     fn apple_bridge_export_inventory_rejects_cfg_attr_no_mangle_without_text_false_positives() {
-        let (lib, oauth) = reviewed_apple_bridge_export_sources();
+        let (lib, mailbox, oauth) = reviewed_apple_bridge_export_sources();
         for mutation in [
             format!(
                 "{lib}\n#[cfg_attr(unix, unsafe(no_mangle))]\npub extern \"C\" fn cfg_gated_export() -> i32 {{ 0 }}"
@@ -6260,13 +6592,8 @@ mod compatibility {{
                 "{lib}\n#[cfg_attr(unix, unsafe(no_mangle), inline)]\npub extern \"C\" fn cfg_gated_export() -> i32 {{ 0 }}"
             ),
         ] {
-            let contaminated = vec![
-                (PathBuf::from("apple/rust-bridge/src/lib.rs"), mutation),
-                (
-                    PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                    oauth.to_owned(),
-                ),
-            ];
+            let contaminated =
+                reviewed_apple_bridge_documents(mutation, mailbox.to_owned(), oauth.to_owned());
             assert!(
                 !rust_exported_c_abi_violations(&contaminated).is_empty(),
                 "production cfg_attr no_mangle exports must not evade the direct-attribute inventory"
@@ -6279,26 +6606,29 @@ const NOTE: &str = "#[cfg_attr(unix, unsafe(no_mangle))]";
 #[cfg(test)] mod tests {{ #[cfg_attr(unix, unsafe(no_mangle))] pub extern "C" fn test_only_export() -> i32 {{ 0 }} }}
 "##
         );
-        let sources = vec![
-            (PathBuf::from("apple/rust-bridge/src/lib.rs"), inert),
-            (
-                PathBuf::from("apple/rust-bridge/src/oauth.rs"),
-                oauth.to_owned(),
-            ),
-        ];
+        let sources = reviewed_apple_bridge_documents(inert, mailbox.to_owned(), oauth.to_owned());
         assert!(
             rust_exported_c_abi_violations(&sources).is_empty(),
             "comments, strings, and Rust test modules must remain inert to the production no_mangle inventory"
         );
     }
 
-    #[test]
-    fn bridge_source_graph_is_closed_against_build_and_external_sources() {
+    struct BridgeSourceGraphFixture {
+        manifest_path: PathBuf,
+        lib_path: PathBuf,
+        example_path: PathBuf,
+        inventory: BTreeSet<PathBuf>,
+        clean: Vec<(PathBuf, String)>,
+    }
+
+    fn bridge_source_graph_fixture() -> BridgeSourceGraphFixture {
         let manifest_path = PathBuf::from("apple/rust-bridge/Cargo.toml");
         let lib_path = PathBuf::from("apple/rust-bridge/src/lib.rs");
+        let mailbox_path = PathBuf::from("apple/rust-bridge/src/mailbox.rs");
         let oauth_path = PathBuf::from("apple/rust-bridge/src/oauth.rs");
         let example_path = PathBuf::from("apple/rust-bridge/examples/oauth_entitlement_probe.rs");
-        let inventory = BTreeSet::from([lib_path.clone(), oauth_path.clone()]);
+        let inventory =
+            BTreeSet::from([lib_path.clone(), mailbox_path.clone(), oauth_path.clone()]);
         let inert_source = r##"
 // include!("outside.rs");
 const EXAMPLE: &str = "#[path = \"outside.rs\"]";
@@ -6315,9 +6645,27 @@ mod tests {
                     .to_owned(),
             ),
             (lib_path.clone(), inert_source.to_owned()),
+            (mailbox_path.clone(), String::new()),
             (oauth_path.clone(), String::new()),
             (example_path.clone(), String::new()),
         ];
+        BridgeSourceGraphFixture {
+            manifest_path,
+            lib_path,
+            example_path,
+            inventory,
+            clean,
+        }
+    }
+
+    #[test]
+    fn bridge_source_graph_accepts_the_reviewed_surface_and_rejects_example_injection() {
+        let BridgeSourceGraphFixture {
+            example_path,
+            inventory,
+            clean,
+            ..
+        } = bridge_source_graph_fixture();
         assert!(bridge_package_source_surface_violations(&clean, &inventory).is_empty());
 
         for injected in [
@@ -6336,6 +6684,13 @@ mod tests {
                 "all reviewed target sources must reject source or authority expansion: {injected}"
             );
         }
+    }
+
+    #[test]
+    fn bridge_source_graph_rejects_unreviewed_source_items() {
+        let BridgeSourceGraphFixture {
+            inventory, clean, ..
+        } = bridge_source_graph_fixture();
 
         let mut unreviewed = clean.clone();
         unreviewed.push((
@@ -6343,6 +6698,28 @@ mod tests {
             String::new(),
         ));
         assert!(!bridge_package_source_surface_violations(&unreviewed, &inventory).is_empty());
+
+        let mut unreviewed_keychain_source = clean.clone();
+        unreviewed_keychain_source.push((
+            PathBuf::from("apple/rust-bridge/src/mailbox_extra.rs"),
+            "fn extra(account: &[u8], limit: u16) { let _ = tersa_keychain_macos::mailbox_read::read_default_inbox(account, limit); }"
+                .to_owned(),
+        ));
+        assert!(
+            !bridge_package_source_surface_violations(&unreviewed_keychain_source, &inventory)
+                .is_empty(),
+            "an unreviewed Keychain read source item must fail closed"
+        );
+    }
+
+    #[test]
+    fn bridge_source_graph_rejects_manifest_source_indirection() {
+        let BridgeSourceGraphFixture {
+            manifest_path,
+            lib_path,
+            inventory,
+            ..
+        } = bridge_source_graph_fixture();
 
         for manifest in [
             "[package]\nname = \"tersa-apple-bridge\"\nbuild = false\n",
@@ -6371,6 +6748,16 @@ mod tests {
             ),
         ];
         assert!(!bridge_package_source_surface_violations(&build_script, &inventory).is_empty());
+    }
+
+    #[test]
+    fn bridge_source_graph_rejects_production_source_expansion() {
+        let BridgeSourceGraphFixture {
+            manifest_path,
+            lib_path,
+            inventory,
+            ..
+        } = bridge_source_graph_fixture();
 
         for production_source in [
             "include!(\"../external.rs\");",
@@ -6392,9 +6779,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bridge_source_guard_pins_the_single_bounded_validating_call() {
-        let valid = r#"
+    fn reviewed_bridge_bootstrap_source() -> &'static str {
+        r#"
 pub unsafe extern "C" fn tersa_macos_bootstrap_default_account(account_id: *const u8, account_id_len: usize) -> i32 {
 if account_id.is_null() || account_id_len == 0 || account_id_len > 256 { return 1; }
 let bytes = unsafe { slice::from_raw_parts(account_id, account_id_len) }.to_vec();
@@ -6403,9 +6789,86 @@ match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
     _ => 1,
 }
 }
-"#;
-        assert!(bridge_bootstrap_source_violations(valid).is_empty());
+pub unsafe extern "C" fn tersa_macos_mailbox_read_inbox(
+    account_id: *const u8,
+    account_id_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+if account_id.is_null() || account_id_len == 0 || account_id_len > 256 || output.is_null() || output_len.is_null() { return tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput as i32; }
+let account = unsafe { slice::from_raw_parts(account_id, account_id_len) }.to_vec();
+let model = match tersa_keychain_macos::mailbox_read::read_default_inbox(&account, limit) {
+    Ok(model) => model,
+    Err(status) => return status as i32,
+};
+let encoded = encode_inbox(&model);
+if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32
+} else {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall as i32
+}
+}
+pub unsafe extern "C" fn tersa_macos_mailbox_read_thread(
+    account_id: *const u8,
+    account_id_len: usize,
+    thread_id: *const u8,
+    thread_id_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+if account_id.is_null() || account_id_len == 0 || account_id_len > 256 || thread_id.is_null() || thread_id_len == 0 || thread_id_len > 256 || output.is_null() || output_len.is_null() { return tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput as i32; }
+let account = unsafe { slice::from_raw_parts(account_id, account_id_len) }.to_vec();
+let thread = unsafe { slice::from_raw_parts(thread_id, thread_id_len) }.to_vec();
+let model = match tersa_keychain_macos::mailbox_read::read_default_thread(&account, &thread, limit) {
+    Ok(model) => model,
+    Err(status) => return status as i32,
+};
+let encoded = encode_thread(&model);
+if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32
+} else {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall as i32
+}
+}
+pub unsafe extern "C" fn tersa_macos_mailbox_search(
+    account_id: *const u8,
+    account_id_len: usize,
+    query: *const u8,
+    query_len: usize,
+    limit: u16,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+if account_id.is_null() || account_id_len == 0 || account_id_len > 256 || query.is_null() || query_len == 0 || query_len > 256 || output.is_null() || output_len.is_null() { return tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput as i32; }
+let account = unsafe { slice::from_raw_parts(account_id, account_id_len) }.to_vec();
+let query = unsafe { slice::from_raw_parts(query, query_len) }.to_vec();
+let model = match tersa_keychain_macos::mailbox_read::search_default_mailbox(&account, &query, limit) {
+    Ok(model) => model,
+    Err(status) => return status as i32,
+};
+let encoded = encode_search(&model);
+if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32
+} else {
+    tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall as i32
+}
+}
+"#
+    }
 
+    #[test]
+    fn bridge_source_guard_accepts_the_reviewed_boundary_source() {
+        assert!(bridge_bootstrap_source_violations(reviewed_bridge_bootstrap_source()).is_empty());
+    }
+
+    #[test]
+    fn bridge_source_guard_rejects_bootstrap_boundary_drift() {
+        let valid = reviewed_bridge_bootstrap_source();
         for forbidden in [
             valid.replacen(
                 "tersa_macos_bootstrap_default_account",
@@ -6447,6 +6910,155 @@ match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
                 "fixture must fail: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn bridge_source_guard_pins_the_single_bounded_validating_call() {
+        let valid = reviewed_bridge_bootstrap_source();
+        for forbidden_read in [
+            // A read function must call only its own single Keychain entry.
+            valid.replacen(
+                "tersa_keychain_macos::mailbox_read::read_default_inbox(&account, limit)",
+                "tersa_keychain_macos::mailbox_read::read_default_thread(&account, &thread, limit)",
+                1,
+            ),
+            // A whitespace-separated second call inside one read function.
+            valid.replacen(
+                "let model = match tersa_keychain_macos::mailbox_read::read_default_inbox(&account, limit) {",
+                "let model = match { let _ = tersa_keychain_macos :: mailbox_read :: read_default_inbox (&account, limit); tersa_keychain_macos::mailbox_read::read_default_inbox(&account, limit) } {",
+                1,
+            ),
+            // A read function keeps its bounded-copy source.
+            valid.replace(
+                "slice::from_raw_parts(thread_id, thread_id_len) }.to_vec()",
+                "slice::from_raw_parts(thread_id, thread_id_len) }.to_owned()",
+            ),
+            // Each read function uses its reviewed status vocabulary exactly.
+            valid.replacen(
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32",
+                "0",
+                1,
+            ),
+            // Each read function uses the read status vocabulary, not another one.
+            valid.replacen(
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::InvalidInput",
+                "tersa_keychain_macos::ProductBootstrapStatus::InvalidAccountIdentifier",
+                1,
+            ),
+            // Keychain references stay inside the canonical boundary functions.
+            format!(
+                "{valid}\nconst READ_OK: i32 = tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32;"
+            ),
+        ] {
+            assert!(
+                !bridge_bootstrap_source_violations(&forbidden_read).is_empty(),
+                "read fixture must fail: {forbidden_read}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_source_guard_pins_the_encode_and_bounded_write_per_read() {
+        let valid = reviewed_bridge_bootstrap_source();
+        for forbidden_read in [
+            // A read function must not skip its command-specific encoder.
+            valid.replacen(
+                "let encoded = encode_inbox(&model);",
+                "let encoded = model;",
+                1,
+            ),
+            // A read function must not call its encoder more than once.
+            valid.replacen(
+                "let encoded = encode_inbox(&model);",
+                "let encoded = encode_inbox(&model);\nlet encoded = encode_inbox(&model);",
+                1,
+            ),
+            // A read function must not drop the model and return Ok without
+            // encoding or calling the bounded validating write.
+            valid.replacen(
+                "let encoded = encode_inbox(&model);\nif unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {\n    tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32\n} else {\n    tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall as i32\n}",
+                "drop(model);\ntersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32",
+                1,
+            ),
+            // A read function must not write caller output through a direct,
+            // unbounded write instead of the single bounded write.
+            valid.replacen(
+                "if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {",
+                "if unsafe { output.copy_from_nonoverlapping(encoded.as_ptr(), encoded.len()); output_len.write(encoded.len()); true } {",
+                1,
+            ),
+            // A read function must reference each of the three reviewed
+            // status variants; the aggregate count alone is not enough.
+            valid.replacen(
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall as i32",
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::Ok as i32",
+                1,
+            ),
+        ] {
+            assert!(
+                !bridge_bootstrap_source_violations(&forbidden_read).is_empty(),
+                "read fixture must fail: {forbidden_read}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_source_guard_tolerates_formatting_but_not_token_drift() {
+        let valid = reviewed_bridge_bootstrap_source();
+        for reformatted in [
+            // A rustfmt-style reflow of the bounded copy.
+            valid.replace(
+                "slice::from_raw_parts(account_id, account_id_len) }.to_vec()",
+                "slice :: from_raw_parts (account_id,\n    account_id_len) }\n    .to_vec()",
+            ),
+            // A reformatted encoder call.
+            valid.replace(
+                "let encoded = encode_inbox(&model);",
+                "let encoded\n    = encode_inbox (&model);",
+            ),
+            // A line-wrapped bounded write in every read function.
+            valid.replace(
+                "if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) } {",
+                "if unsafe {\n    write_bounded_output (&encoded, output,\n        output_capacity, output_len)\n} {",
+            ),
+            // A reformatted null-output boundary check.
+            valid.replace(
+                "output.is_null() || output_len.is_null()",
+                "output\n    .is_null()\n    || output_len\n        .is_null()",
+            ),
+        ] {
+            assert!(
+                bridge_bootstrap_source_violations(&reformatted).is_empty(),
+                "token-equivalent formatting must remain valid: {reformatted}"
+            );
+        }
+        for token_drift in [
+            valid.replace("encode_inbox(&model)", "encode_inbox(model)"),
+            valid.replace(
+                "write_bounded_output(&encoded, output, output_capacity, output_len)",
+                "write_bounded_output(&encoded, output, output_capacity)",
+            ),
+            valid.replace(
+                "write_bounded_output(&encoded, output, output_capacity, output_len)",
+                "write_unbounded_output(&encoded, output, output_capacity, output_len)",
+            ),
+            valid.replace("account_id_len == 0", "account_id_len == 1"),
+            valid.replacen(
+                "MailboxReadStatus::BufferTooSmall",
+                "MailboxReadStatus::BufferToSmall",
+                1,
+            ),
+        ] {
+            assert!(
+                !bridge_bootstrap_source_violations(&token_drift).is_empty(),
+                "token drift must fail closed: {token_drift}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_source_guard_treats_comments_literals_and_whitespace_as_inert() {
+        let valid = reviewed_bridge_bootstrap_source();
         let inert_adversarial_text = format!(
             "{valid}\n// tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {{ }}\nlet _ = r#\"tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) }}\"#;\nlet character = '}}';\nlet byte = b'{{';\nfn lifetime<'a>(value: &'a ()) -> &'a () {{ value }}"
         );
@@ -6463,12 +7075,25 @@ match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
                 "tersa_keychain_macos::bootstrap_default_account_bytes(&bytes)",
                 "tersa_keychain_macos::bootstrap_default_account_bytes (&bytes)",
             ),
+            valid.replace(
+                "tersa_keychain_macos::mailbox_read::read_default_inbox(&account, limit)",
+                "tersa_keychain_macos :: mailbox_read :: read_default_inbox (&account, limit)",
+            ),
+            valid.replace(
+                "tersa_keychain_macos::mailbox_read::MailboxReadStatus::BufferTooSmall",
+                "tersa_keychain_macos :: mailbox_read :: MailboxReadStatus :: BufferTooSmall",
+            ),
         ] {
             assert!(
                 bridge_bootstrap_source_violations(&whitespace_bypass).is_empty(),
                 "token-equivalent whitespace must remain valid: {whitespace_bypass}"
             );
         }
+    }
+
+    #[test]
+    fn bridge_source_guard_rejects_hidden_calls_and_cfg_masking() {
+        let valid = reviewed_bridge_bootstrap_source();
         let hidden_second_call = valid.replace(
             "    _ => 1,",
             "    _ => { let _ = tersa_keychain_macos :: bootstrap_default_account_bytes (&bytes); 1 },",
@@ -6492,6 +7117,37 @@ match tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) {
             !bridge_bootstrap_source_violations(&cfg_test_on_non_module).is_empty(),
             "cfg(test) on a non-module item must not hide later production Keychain access"
         );
+    }
+
+    #[test]
+    fn bridge_header_canonical_form_rejects_drift() {
+        let path = Path::new("apple/macos/TersaRustBridge.h");
+        let (violations, calls) =
+            swift_bridge_call_inventory(path, true, CANONICAL_TERSA_RUST_BRIDGE_HEADER);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(calls, 0);
+
+        for drift in [
+            CANONICAL_TERSA_RUST_BRIDGE_HEADER.replace(
+                "int32_t tersa_macos_mailbox_search(",
+                "int32_t tersa_macos_mailbox_search_all(",
+            ),
+            CANONICAL_TERSA_RUST_BRIDGE_HEADER.replace("uint16_t limit,", "uint32_t limit,"),
+            CANONICAL_TERSA_RUST_BRIDGE_HEADER.replacen(
+                "int32_t tersa_macos_mailbox_read_inbox(",
+                "",
+                1,
+            ),
+            format!(
+                "{CANONICAL_TERSA_RUST_BRIDGE_HEADER}\nint32_t tersa_macos_mailbox_write(const uint8_t *account_id, size_t account_id_len);"
+            ),
+        ] {
+            let (violations, _) = swift_bridge_call_inventory(path, true, &drift);
+            assert!(
+                !violations.is_empty(),
+                "header drift must fail closed: {drift:?}"
+            );
+        }
     }
 
     #[test]
@@ -7061,6 +7717,18 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
                 "tersa-apple-bridge -> tersa-keychain-macos must not rename protected Keychain dependency to `provisioning`"
             ]
         );
+        for dependency in ["tersa-application", "tersa-presentation"] {
+            assert_eq!(
+                protected_keychain_dependency_rename_violations(
+                    "tersa-keychain-macos",
+                    dependency,
+                    Some("aliased"),
+                ),
+                vec![format!(
+                    "tersa-keychain-macos -> {dependency} must not rename protected Keychain dependency to `aliased`"
+                )]
+            );
+        }
         assert!(
             protected_keychain_dependency_rename_violations(
                 "tersa-apple-bridge",
@@ -8325,6 +8993,8 @@ targets:
     fn composition_edges_require_the_exact_macos_cfg() {
         for (owner, dependency) in [
             ("tersa-keychain-macos", "tersa-store-sqlcipher-macos"),
+            ("tersa-keychain-macos", "tersa-application"),
+            ("tersa-keychain-macos", "tersa-presentation"),
             ("tersa-cli-macos", "tersa-keychain-macos"),
             ("tersa-apple-bridge", "tersa-keychain-macos"),
         ] {
@@ -8336,9 +9006,14 @@ targets:
                 ),
                 None
             );
-            for target in [None, Some(r#"cfg(target_os = "ios")"#)] {
+            for target in [
+                None,
+                Some(r#"cfg(target_os = "ios")"#),
+                Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
+            ] {
                 assert!(
-                    future_macos_store_dependency_violation(owner, dependency, target).is_some()
+                    future_macos_store_dependency_violation(owner, dependency, target).is_some(),
+                    "target must fail closed for {owner} -> {dependency}: {target:?}"
                 );
             }
         }

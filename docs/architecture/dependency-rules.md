@@ -21,7 +21,7 @@ and feasibility adapters:
 | `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
-| `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
+| `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-application`, `tersa-presentation`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only macOS CLI source adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
 This table is the active workspace graph. PR 33a.5 activates one
@@ -103,7 +103,7 @@ ADR 0019 defines the active macOS Keychain and metadata-only CLI adapters:
 
 | Crate | Responsibility | Maximum inward dependencies |
 |---|---|---|
-| `tersa-keychain-macos` | macOS Keychain root provisioning, private versioned HKDF derivation, App Group location, and trusted read-only database composition | `tersa-platform`, `tersa-store-sqlcipher-macos` |
+| `tersa-keychain-macos` | macOS Keychain root provisioning, private versioned HKDF derivation, App Group location, and trusted read-only database composition | `tersa-platform`, `tersa-application`, `tersa-presentation`, `tersa-store-sqlcipher-macos` |
 | `tersa-cli-macos` | Fixed-profile metadata-only JSON process adapter | `tersa-application`, `tersa-domain`, `tersa-keychain-macos` |
 
 Both crates are active and have exact `xtask` policy entries. The CLI
@@ -163,7 +163,10 @@ The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
 `tersa-keychain-macos`; the macOS-only CLI and Apple bridge may reach it only
 through their exact active Keychain composition chains. ChaCha20-Poly1305 remains
 exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
-`tersa-keychain-macos` may not add direct application or domain edges. ADR 0019
+`tersa-keychain-macos` may not add a direct domain edge; the macOS-gated
+application and presentation read-composition edges are the reviewed ADR 0021
+exception (the read entries validate opaque bytes and project view models
+without exposing key material). ADR 0019
 accepts one macOS-gated PR 33a edge to `tersa-store-sqlcipher-macos` so the
 private `SecretKey` owner can consume a derived key directly into the strict
 `SqlCipherMailboxReader` opener. The classified constructor preserves only the

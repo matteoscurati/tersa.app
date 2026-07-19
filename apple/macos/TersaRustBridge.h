@@ -10,6 +10,34 @@
 
 uint32_t tersa_apple_bridge_version(void);
 int32_t tersa_macos_bootstrap_default_account(const uint8_t *account_id, size_t account_id_len);
+int32_t tersa_macos_mailbox_read_inbox(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    uint16_t limit,
+    uint8_t *output,
+    size_t output_capacity,
+    size_t *output_len
+);
+int32_t tersa_macos_mailbox_read_thread(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    const uint8_t *thread_id,
+    size_t thread_id_len,
+    uint16_t limit,
+    uint8_t *output,
+    size_t output_capacity,
+    size_t *output_len
+);
+int32_t tersa_macos_mailbox_search(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    const uint8_t *query,
+    size_t query_len,
+    uint16_t limit,
+    uint8_t *output,
+    size_t output_capacity,
+    size_t *output_len
+);
 int32_t tersa_oauth_macos_begin(
     const uint8_t *client_id,
     size_t client_id_len,
