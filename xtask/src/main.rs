@@ -2716,6 +2716,35 @@ fn swift_call_argument_is_identifier(
     })
 }
 
+/// Declarations forbidden in inventoried macOS sources because they run code the
+/// func/init body inventory cannot safely parse (`deinit`, `protocol`,
+/// `subscript`) or would place an app-lifecycle entry point outside
+/// `AppDelegate.swift` (a cross-file `extension AppDelegate`). Returns the first
+/// violation, if any.
+fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<String> {
+    for forbidden in ["deinit", "protocol", "subscript"] {
+        if contains_identifier(code, forbidden) {
+            return Some(format!(
+                "{} must not declare `{forbidden}` in inventoried macOS sources",
+                path.display()
+            ));
+        }
+    }
+    if path != Path::new("apple/macos/AppDelegate.swift") {
+        for (start, _) in code.match_indices("AppDelegate") {
+            if is_identifier_at(code, start, "AppDelegate")
+                && swift_preceding_identifier(code, start) == Some("extension")
+            {
+                return Some(format!(
+                    "{} must not extend AppDelegate; app-lifecycle members belong in AppDelegate.swift",
+                    path.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
     let code = strip_swift_non_code(document);
     if swift_has_underscored_attribute(&code) {
@@ -2742,33 +2771,8 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
             )];
         }
     }
-    // These declarations execute code the func/init body inventory does not
-    // parse, so a body-less `func` could otherwise mis-attribute their body and
-    // launder an unreviewed bootstrap call site. The macOS UI slice needs none.
-    for forbidden in ["deinit", "protocol", "subscript"] {
-        if contains_identifier(&code, forbidden) {
-            return vec![format!(
-                "{} must not declare `{forbidden}` in inventoried macOS sources",
-                path.display()
-            )];
-        }
-    }
-    // AppDelegate (and therefore every app-lifecycle entry point) may be declared
-    // and extended only in AppDelegate.swift, so the launch-entry rule that keys
-    // on that path covers every AppDelegate member. A cross-file
-    // `extension AppDelegate { func applicationWillFinishLaunching … }` would
-    // otherwise be an unguarded automatic entry.
-    if path != Path::new("apple/macos/AppDelegate.swift") {
-        for (start, _) in code.match_indices("AppDelegate") {
-            if is_identifier_at(&code, start, "AppDelegate")
-                && swift_preceding_identifier(&code, start) == Some("extension")
-            {
-                return vec![format!(
-                    "{} must not extend AppDelegate; app-lifecycle members belong in AppDelegate.swift",
-                    path.display()
-                )];
-            }
-        }
+    if let Some(violation) = swift_forbidden_declaration_violation(path, &code) {
+        return vec![violation];
     }
     let bytes = document.as_bytes();
     let mut index = 0;
@@ -2938,6 +2942,17 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
             if !is_identifier_at(document, start, keyword) {
                 continue;
             }
+            // `.init(...)` / `Type.init(...)` is a call expression, not a
+            // declaration; skip it so its body is not mis-attributed.
+            if is_initializer
+                && document[..start]
+                    .bytes()
+                    .rev()
+                    .find(|byte| !is_rust_ascii_whitespace(*byte))
+                    == Some(b'.')
+            {
+                continue;
+            }
             let mut index = skip_ascii_whitespace(document, start + keyword.len());
             let name = if keyword == "func" {
                 let name_length = document[index..]
@@ -2959,8 +2974,8 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
             };
             // Skip the balanced parameter list before locating the body brace, so
             // a default-closure parameter (`= {}`) inside the signature cannot be
-            // mistaken for the body. Generic `init<...>` is refused lexically, so
-            // the parameter list is the first `(` after the name here.
+            // mistaken for the body. The parameter list is the first `(` at or
+            // after the name (a leading generic `<...>` clause carries no `(`).
             let Some(paren_relative) = document[index..].find('(') else {
                 continue;
             };
@@ -7706,9 +7721,12 @@ func connect(_ identifier: Data) { (NSApp.delegate as? AppDelegate)?.establishOw
         // propagation stops at the intent entry, so the handler stays inert.
         // An initializer and body that do NOT reach bootstrap must not trip the
         // automatic-entry rule (no false positive on ordinary construction).
+        // A benign initializer, a default-closure parameter, and a `.init(...)`
+        // call expression must not be mis-parsed into a bootstrap entry; none is
+        // a false positive.
         let root_view = r"
-init(onReady: () -> Void = {}) { configure() }
-func configure() { }
+init(config: Int) { configure() }
+func configure(onReady: () -> Void = {}) { let helper = Helper.init(callback: {}) }
 func handleConnectTapped() { model.connect(Data()) }
 func renderBody() { handleConnectTapped() }
 ";
