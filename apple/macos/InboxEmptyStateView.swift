@@ -4,8 +4,9 @@
 
 import SwiftUI
 
-/// First-class empty state for the inbox. Static by design: no mailbox read
-/// symbols and no demo data exist in this slice.
+/// First-class empty state for the inbox. `InboxView` renders it when a live
+/// mailbox read over the 2b read C ABI returns zero rows, which is every read
+/// until Step 3 sync fills the store; no demo data is involved.
 @MainActor
 struct InboxEmptyStateView: View {
     var body: some View {
