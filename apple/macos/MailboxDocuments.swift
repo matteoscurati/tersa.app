@@ -76,8 +76,8 @@ enum MailboxDocumentDecoder {
     private static let inboxCommand = "inbox"
     private static let threadCommand = "thread"
 
-    static func decodeInbox(_ bytes: [UInt8]) -> MailboxReadOutcome {
-        guard let document = try? JSONDecoder().decode(InboxDocument.self, from: Data(bytes)),
+    static func decodeInbox(_ payload: Data) -> MailboxReadOutcome {
+        guard let document = try? JSONDecoder().decode(InboxDocument.self, from: payload),
               document.schemaVersion == supportedSchemaVersion,
               document.command == inboxCommand
         else {
@@ -86,8 +86,8 @@ enum MailboxDocumentDecoder {
         return document.messages.isEmpty ? .empty : .content(document.messages)
     }
 
-    static func decodeThread(_ bytes: [UInt8]) -> MailboxReadOutcome {
-        guard let document = try? JSONDecoder().decode(ThreadDocument.self, from: Data(bytes)),
+    static func decodeThread(_ payload: Data) -> MailboxReadOutcome {
+        guard let document = try? JSONDecoder().decode(ThreadDocument.self, from: payload),
               document.schemaVersion == supportedSchemaVersion,
               document.command == threadCommand
         else {

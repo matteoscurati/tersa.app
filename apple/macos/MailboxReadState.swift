@@ -59,18 +59,6 @@ enum MailboxReadOutcome: Equatable {
     case empty
     case failure(MailboxReadFailure)
 
-    /// Short state text exposed to assistive technologies as a value.
-    var accessibilityValue: String {
-        switch self {
-        case .content(let rows):
-            return String(rows.count) + (rows.count == 1 ? " message" : " messages")
-        case .empty:
-            return "No messages"
-        case .failure:
-            return "Mailbox read failed"
-        }
-    }
-
     /// Spoken text announced when a read finishes loading or fails.
     var announcement: String {
         switch self {

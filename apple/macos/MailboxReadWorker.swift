@@ -111,11 +111,19 @@ final class MailboxReadWorker: @unchecked Sendable {
             return .failure(MailboxReadFailure.fromStatus(status))
         }
         let validLength = min(outputLength, output.count)
-        let bytes = Array(output.prefix(validLength))
-        if threadIdentifier == nil {
-            return MailboxDocumentDecoder.decodeInbox(bytes)
+        // The transient payload copy is wiped after decoding. The decoded
+        // on-screen fields (from/subject) necessarily reside in view state and
+        // cannot be zeroed, so this is best-effort defense on the C-boundary copy.
+        var payload = Data(output[0..<validLength])
+        defer {
+            if !payload.isEmpty {
+                payload.resetBytes(in: 0..<payload.count)
+            }
         }
-        return MailboxDocumentDecoder.decodeThread(bytes)
+        if threadIdentifier == nil {
+            return MailboxDocumentDecoder.decodeInbox(payload)
+        }
+        return MailboxDocumentDecoder.decodeThread(payload)
     }
 
     /// Invokes the C ABI read symbol once. A `limit` of zero lets the Rust

@@ -62,43 +62,10 @@ struct ThreadView: View {
 
     private func threadList(_ rows: [MessageRow]) -> some View {
         List(rows) { row in
-            threadRow(row)
+            MailboxMessageRowView(row: row)
         }
         .accessibilityLabel("Thread")
         .accessibilityValue(String(rows.count) + (rows.count == 1 ? " message" : " messages"))
-    }
-
-    private func threadRow(_ row: MessageRow) -> some View {
-        HStack(spacing: 8) {
-            if row.unread {
-                Circle()
-                    .fill(Color.accentColor)
-                    .frame(width: 8, height: 8)
-                    .accessibilityHidden(true)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.from)
-                    .font(.headline)
-                    .lineLimit(1)
-                Text(row.subject)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            Text(row.receivedDate, format: .dateTime.month(.abbreviated).day().hour().minute())
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(rowLabel(row))
-    }
-
-    private func rowLabel(_ row: MessageRow) -> String {
-        let unreadText = row.unread ? "Unread, " : ""
-        let dateText = row.receivedDate.formatted(.dateTime.month(.abbreviated).day().hour().minute())
-        return unreadText + row.from + ", " + row.subject + ", " + dateText
     }
 
     private func threadFailure(_ failure: MailboxReadFailure) -> some View {
@@ -119,8 +86,6 @@ struct ThreadView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityLabel("The thread could not be loaded")
-        .accessibilityValue(failure.message)
     }
 
     private func loadThread() {

@@ -13,11 +13,9 @@ struct InboxView: View {
 
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
-    @State private var selectedMessageId: String?
-    @State private var navigationPath = NavigationPath()
 
     var body: some View {
-        NavigationStack(path: $navigationPath) {
+        NavigationStack {
             content
                 .navigationTitle("Inbox")
                 .navigationDestination(for: String.self) { threadId in
@@ -30,9 +28,6 @@ struct InboxView: View {
         .onAppear(perform: loadInbox)
         .onChange(of: outcome) { _, newOutcome in
             announceOutcome(newOutcome)
-        }
-        .onChange(of: selectedMessageId) { _, messageId in
-            handleThreadSelected(messageId)
         }
     }
 
@@ -57,52 +52,14 @@ struct InboxView: View {
             .accessibilityValue("In progress")
     }
 
-    private var loadedRows: [MessageRow] {
-        guard case .some(.content(let rows)) = outcome else {
-            return []
-        }
-        return rows
-    }
-
     private func inboxList(_ rows: [MessageRow]) -> some View {
-        List(rows, selection: $selectedMessageId) { row in
-            inboxRow(row)
+        List(rows) { row in
+            NavigationLink(value: row.threadId) {
+                MailboxMessageRowView(row: row)
+            }
         }
         .accessibilityLabel("Inbox")
         .accessibilityValue(String(rows.count) + (rows.count == 1 ? " message" : " messages"))
-    }
-
-    private func inboxRow(_ row: MessageRow) -> some View {
-        HStack(spacing: 8) {
-            if row.unread {
-                Circle()
-                    .fill(Color.accentColor)
-                    .frame(width: 8, height: 8)
-                    .accessibilityHidden(true)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.from)
-                    .font(.headline)
-                    .lineLimit(1)
-                Text(row.subject)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            Text(row.receivedDate, format: .dateTime.month(.abbreviated).day().hour().minute())
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(rowLabel(row))
-    }
-
-    private func rowLabel(_ row: MessageRow) -> String {
-        let unreadText = row.unread ? "Unread, " : ""
-        let dateText = row.receivedDate.formatted(.dateTime.month(.abbreviated).day().hour().minute())
-        return unreadText + row.from + ", " + row.subject + ", " + dateText
     }
 
     private func inboxFailure(_ failure: MailboxReadFailure) -> some View {
@@ -123,8 +80,6 @@ struct InboxView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityLabel("The inbox could not be loaded")
-        .accessibilityValue(failure.message)
     }
 
     private func loadInbox() {
@@ -140,19 +95,6 @@ struct InboxView: View {
 
     private func handleReloadTapped() {
         reloadInbox()
-    }
-
-    private func handleThreadSelected(_ messageId: String?) {
-        guard let messageId,
-              let row = loadedRows.first(where: { $0.id == messageId })
-        else {
-            return
-        }
-        openThread(row.threadId)
-    }
-
-    private func openThread(_ threadId: String) {
-        navigationPath.append(threadId)
     }
 
     private func announceOutcome(_ newOutcome: MailboxReadOutcome?) {
