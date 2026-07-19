@@ -2,10 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! C-compatible bootstrap surface for the Apple application targets.
+//! C-compatible bootstrap and read-only mailbox surface for the Apple application targets.
 
 #![deny(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+mod mailbox;
 mod oauth;
 
 #[cfg(target_os = "macos")]
@@ -47,6 +49,12 @@ pub unsafe extern "C" fn tersa_macos_bootstrap_default_account(
 
 #[doc(inline)]
 pub use oauth::{tersa_oauth_cancel, tersa_oauth_ios_begin, tersa_oauth_ios_finish};
+
+#[cfg(target_os = "macos")]
+#[doc(inline)]
+pub use mailbox::{
+    tersa_macos_mailbox_read_inbox, tersa_macos_mailbox_read_thread, tersa_macos_mailbox_search,
+};
 
 #[cfg(target_os = "macos")]
 #[doc(inline)]

@@ -27,6 +27,10 @@ use tersa_platform::secure_storage::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+/// Trusted read-only mailbox read compositions for the fixed default profile.
+#[cfg(target_os = "macos")]
+pub mod mailbox_read;
+
 /// Closed, redacted failure returned by the trusted read-only composition.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ReadOnlyMailboxOpenError {

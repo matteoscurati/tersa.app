@@ -9,6 +9,7 @@ use std::fmt;
 use tersa_application::mailbox_metadata::{
     MailboxMetadataCommand, MailboxMetadataDocument, MailboxMetadataMessage,
 };
+use tersa_application::mailbox_search::MailboxSearchDocument;
 use tersa_domain::mailbox::ThreadId;
 
 /// Reports a rejected mailbox view-model projection without exposing content.
@@ -217,6 +218,77 @@ impl fmt::Debug for ThreadViewModel {
     }
 }
 
+/// Holds an owned search result listing ready for a platform presentation adapter.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SearchViewModel {
+    account_id: String,
+    query: String,
+    limit: u16,
+    rows: Vec<MessageRowViewModel>,
+}
+
+impl SearchViewModel {
+    /// Projects a metadata search document into an owned view model.
+    ///
+    /// An empty result is a valid view model; mapping an absent result to a
+    /// not-found outcome belongs to a later adapter.
+    #[must_use]
+    pub fn from_document(document: &MailboxSearchDocument) -> Self {
+        Self {
+            account_id: document.account_id().as_str().to_owned(),
+            query: document.query().as_str().to_owned(),
+            limit: document.limit().get(),
+            rows: document
+                .messages()
+                .iter()
+                .map(MessageRowViewModel::from_message)
+                .collect(),
+        }
+    }
+
+    /// Returns the opaque account identifier.
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Returns the submitted search query text.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Returns the validated result limit.
+    #[must_use]
+    pub const fn limit(&self) -> u16 {
+        self.limit
+    }
+
+    /// Returns whether the view model has no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Returns the projected rows in document order.
+    #[must_use]
+    pub fn rows(&self) -> &[MessageRowViewModel] {
+        &self.rows
+    }
+}
+
+impl fmt::Debug for SearchViewModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchViewModel")
+            .field("account_id", &"[REDACTED]")
+            .field("query", &"[REDACTED]")
+            .field("limit", &self.limit)
+            .field("row_count", &self.rows.len())
+            .finish()
+    }
+}
+
 /// Projects every document message into an owned view row, preserving order.
 fn rows_from_document(document: &MailboxMetadataDocument) -> Vec<MessageRowViewModel> {
     document
@@ -237,6 +309,7 @@ mod tests {
 
     use tersa_application::mailbox::{BoxFuture, MailboxReader, MailboxStoreError, StoreLimit};
     use tersa_application::mailbox_metadata::{inbox_metadata, thread_metadata};
+    use tersa_application::mailbox_search::{MailboxSearchQuery, search_metadata};
     use tersa_domain::mailbox::{
         AccountId, HeaderText, MessageEnvelope, MessageId, UnixTimestampMillis,
     };
@@ -310,6 +383,69 @@ mod tests {
     fn thread_document(envelopes: Vec<MessageEnvelope>) -> MailboxMetadataDocument {
         let reader = FakeReader { envelopes };
         run(thread_metadata(&reader, &account(), &thread(), limit())).unwrap()
+    }
+
+    fn search_document(envelopes: Vec<MessageEnvelope>, query: &str) -> MailboxSearchDocument {
+        let reader = FakeReader { envelopes };
+        let query = MailboxSearchQuery::new(query).unwrap();
+        run(search_metadata(&reader, &account(), &query, limit())).unwrap()
+    }
+
+    #[test]
+    fn search_view_model_projects_every_document_field() {
+        let document = search_document(
+            vec![
+                MessageEnvelope::new(
+                    MessageId::new("hit").unwrap(),
+                    thread(),
+                    HeaderText::new("alice@example.test").unwrap(),
+                    HeaderText::new("weekly status").unwrap(),
+                    HeaderText::new("preview-hit").unwrap(),
+                    UnixTimestampMillis::new(20).unwrap(),
+                    false,
+                ),
+                envelope("miss", 10),
+            ],
+            "alice",
+        );
+        let model = SearchViewModel::from_document(&document);
+
+        assert_eq!(model.account_id(), "account-1");
+        assert_eq!(model.query(), "alice");
+        assert_eq!(model.limit(), 50);
+        assert!(!model.is_empty());
+        assert_eq!(model.rows().len(), 1);
+        let row = &model.rows()[0];
+        assert_eq!(row.message_id, "hit");
+        assert_eq!(row.thread_id, "thread-1");
+        assert_eq!(row.from, "alice@example.test");
+        assert_eq!(row.subject, "weekly status");
+        assert_eq!(row.received_at_millis, 20);
+        assert!(!row.unread);
+    }
+
+    #[test]
+    fn empty_search_document_produces_an_empty_view_model() {
+        let model = SearchViewModel::from_document(&search_document(Vec::new(), "alice"));
+        assert!(model.is_empty());
+        assert!(model.rows().is_empty());
+        assert_eq!(model.query(), "alice");
+        assert_eq!(model.limit(), 50);
+    }
+
+    #[test]
+    fn search_view_model_debug_redacts_account_query_and_rows() {
+        let document = search_document(vec![envelope("msgid-secret", 10)], "msgid-secret");
+        let model = SearchViewModel::from_document(&document);
+        let debug = format!("{model:?} {:?}", model.rows()[0]);
+
+        assert!(debug.contains("row_count"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("account-1"));
+        assert!(!debug.contains("query-secret"));
+        assert!(!debug.contains("msgid-secret"));
+        assert!(!debug.contains("from-msgid-secret"));
+        assert!(!debug.contains("subject-msgid-secret"));
     }
 
     #[test]

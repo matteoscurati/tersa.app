@@ -14,7 +14,10 @@
 use std::fmt;
 use std::pin::Pin;
 
-use tersa_domain::mailbox::{AccountId, Message, MessageEnvelope, MessageId, ThreadId};
+#[doc(inline)]
+pub use tersa_domain::mailbox::{
+    AccountId, HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+};
 
 /// Owns a `Send` future without selecting an async runtime.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -349,7 +352,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
-    use tersa_domain::mailbox::{HeaderText, MessageContent, UnixTimestampMillis};
+    use tersa_domain::mailbox::MessageContent;
 
     struct NonDebugItem(&'static str);
 
