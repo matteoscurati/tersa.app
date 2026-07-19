@@ -2955,11 +2955,20 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
                     index += 1;
                     index = skip_ascii_whitespace(document, index);
                 }
-                if document.as_bytes().get(index) != Some(&b'(') {
-                    continue;
-                }
                 "init".to_owned()
             };
+            // Skip the balanced parameter list before locating the body brace, so
+            // a default-closure parameter (`= {}`) inside the signature cannot be
+            // mistaken for the body. Generic `init<...>` is refused lexically, so
+            // the parameter list is the first `(` after the name here.
+            let Some(paren_relative) = document[index..].find('(') else {
+                continue;
+            };
+            let paren = index + paren_relative;
+            let Some(parameters) = balanced_delimited_body(document, paren, b'(', b')') else {
+                continue;
+            };
+            index = paren + parameters.len();
             let Some(opening_relative) = document[index..].find('{') else {
                 continue;
             };
@@ -7698,7 +7707,7 @@ func connect(_ identifier: Data) { (NSApp.delegate as? AppDelegate)?.establishOw
         // An initializer and body that do NOT reach bootstrap must not trip the
         // automatic-entry rule (no false positive on ordinary construction).
         let root_view = r"
-init() { configure() }
+init(onReady: () -> Void = {}) { configure() }
 func configure() { }
 func handleConnectTapped() { model.connect(Data()) }
 func renderBody() { handleConnectTapped() }
@@ -7913,6 +7922,19 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             assert!(
                 !swift_bootstrap_inventory_violations(&with_view_model(laundering)).is_empty(),
                 "a body-parse-laundering construct must fail closed: {laundering}"
+            );
+        }
+        // Initializer forms whose body the parser must not mis-attribute: a
+        // default-closure parameter (`= {}`) in the signature and a generic
+        // initializer. Both reach the reviewed intent from construction and must
+        // fail closed.
+        for initializer in [
+            "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit(callback: () -> Void = {}) { connect() }",
+            "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit<T>(value: T) { connect() }",
+        ] {
+            assert!(
+                !swift_bootstrap_inventory_violations(&with_view_model(initializer)).is_empty(),
+                "a mis-parseable initializer reaching the reviewed intent must fail closed: {initializer}"
             );
         }
     }
