@@ -6,13 +6,16 @@ import SwiftUI
 
 /// Live inbox over the 2b read C ABI. The store is empty until Step 3 sync,
 /// so a real read currently returns zero rows and renders the empty state;
-/// the list and thread navigation render once data exists.
+/// the list and thread navigation render once data exists. The toolbar opens
+/// the submit-only search screen and the read-only composer entry.
 @MainActor
 struct InboxView: View {
     let accountIdentifier: Data
 
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
+    @State private var showingSearch = false
+    @State private var showingComposer = false
 
     var body: some View {
         NavigationStack {
@@ -24,6 +27,23 @@ struct InboxView: View {
                         threadIdentifier: Data(threadId.utf8)
                     )
                 }
+                .navigationDestination(isPresented: $showingSearch) {
+                    SearchView(accountIdentifier: accountIdentifier)
+                }
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Search", action: handleSearchTapped)
+                            .accessibilityLabel("Search")
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("New Message", action: handleComposeTapped)
+                            .keyboardShortcut("n", modifiers: .command)
+                            .accessibilityLabel("New message")
+                    }
+                }
+        }
+        .sheet(isPresented: $showingComposer) {
+            ComposerView()
         }
         .onAppear(perform: loadInbox)
         .onChange(of: outcome) { _, newOutcome in
@@ -95,6 +115,14 @@ struct InboxView: View {
 
     private func handleReloadTapped() {
         reloadInbox()
+    }
+
+    private func handleSearchTapped() {
+        showingSearch = true
+    }
+
+    private func handleComposeTapped() {
+        showingComposer = true
     }
 
     private func announceOutcome(_ newOutcome: MailboxReadOutcome?) {

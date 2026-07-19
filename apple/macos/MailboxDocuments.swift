@@ -68,6 +68,25 @@ struct ThreadDocument: Decodable {
     }
 }
 
+/// The search document in the 2b bridge wire shape.
+struct SearchDocument: Decodable {
+    let schemaVersion: Int
+    let command: String
+    let accountId: String
+    let query: String
+    let limit: Int
+    let messages: [MessageRow]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case command
+        case accountId = "account_id"
+        case query
+        case limit
+        case messages
+    }
+}
+
 /// Decodes bridge read payloads. Fails closed: a wrong schema version, a
 /// wrong command, or a decoding error yields a failure outcome and never a
 /// partial render.
@@ -75,6 +94,7 @@ enum MailboxDocumentDecoder {
     private static let supportedSchemaVersion = 1
     private static let inboxCommand = "inbox"
     private static let threadCommand = "thread"
+    private static let searchCommand = "search"
 
     static func decodeInbox(_ payload: Data) -> MailboxReadOutcome {
         guard let document = try? JSONDecoder().decode(InboxDocument.self, from: payload),
@@ -90,6 +110,16 @@ enum MailboxDocumentDecoder {
         guard let document = try? JSONDecoder().decode(ThreadDocument.self, from: payload),
               document.schemaVersion == supportedSchemaVersion,
               document.command == threadCommand
+        else {
+            return .failure(.corrupted)
+        }
+        return document.messages.isEmpty ? .empty : .content(document.messages)
+    }
+
+    static func decodeSearch(_ payload: Data) -> MailboxReadOutcome {
+        guard let document = try? JSONDecoder().decode(SearchDocument.self, from: payload),
+              document.schemaVersion == supportedSchemaVersion,
+              document.command == searchCommand
         else {
             return .failure(.corrupted)
         }
