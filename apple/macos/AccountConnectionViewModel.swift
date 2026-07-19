@@ -12,6 +12,7 @@ import Foundation
 @MainActor
 final class AccountConnectionViewModel: ObservableObject {
     @Published private(set) var state: ConnectionState = .notConnected
+    @Published private(set) var connectedAccountIdentifier: Data?
     @Published var accountIdentifier: String = ""
 
     var isConnectDisabled: Bool {
@@ -27,7 +28,11 @@ final class AccountConnectionViewModel: ObservableObject {
         state = .connecting
         let accountIdentifierData = Data(trimmedIdentifier.utf8)
         let completion: @MainActor (ProductBootstrapStatus) -> Void = { [weak self] status in
-            self?.state = ConnectionState(status: status)
+            let newState = ConnectionState(status: status)
+            if newState == .connected {
+                self?.connectedAccountIdentifier = accountIdentifierData
+            }
+            self?.state = newState
         }
         (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(
             accountIdentifier: accountIdentifierData,

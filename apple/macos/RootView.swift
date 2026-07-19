@@ -5,8 +5,8 @@
 import SwiftUI
 
 /// Root of the app window: the account-connection flow until connected, then
-/// the empty-state inbox. Also announces every connection-state transition to
-/// VoiceOver.
+/// the live inbox over the read C ABI. Also announces every connection-state
+/// transition to VoiceOver.
 @MainActor
 struct RootView: View {
     @StateObject private var viewModel = AccountConnectionViewModel()
@@ -14,7 +14,11 @@ struct RootView: View {
     var body: some View {
         Group {
             if viewModel.state == .connected {
-                InboxEmptyStateView()
+                if let accountIdentifier = viewModel.connectedAccountIdentifier {
+                    InboxView(accountIdentifier: accountIdentifier)
+                } else {
+                    InboxEmptyStateView()
+                }
             } else {
                 AccountConnectionView(viewModel: viewModel)
             }
