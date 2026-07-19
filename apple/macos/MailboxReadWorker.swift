@@ -10,6 +10,13 @@ import Foundation
 final class MailboxReadWorker: @unchecked Sendable {
     private static let initialOutputCapacity = 65_536
 
+    /// One queued mailbox read: the inbox, one thread, or one search.
+    private enum ReadRequest {
+        case inbox
+        case thread(Data)
+        case search(Data)
+    }
+
     private let queue = DispatchQueue(label: "app.tersa.macos.mailbox-read", qos: .utility)
     private let state = NSLock()
     private var running = false
@@ -20,7 +27,7 @@ final class MailboxReadWorker: @unchecked Sendable {
         accountIdentifier: Data,
         completion: @escaping @MainActor (MailboxReadOutcome) -> Void
     ) {
-        enqueueOperation(accountIdentifier: accountIdentifier, threadIdentifier: nil, completion: completion)
+        enqueueOperation(accountIdentifier: accountIdentifier, request: .inbox, completion: completion)
     }
 
     /// Queues one thread read. A second queued request is rejected immediately.
@@ -31,21 +38,34 @@ final class MailboxReadWorker: @unchecked Sendable {
     ) {
         enqueueOperation(
             accountIdentifier: accountIdentifier,
-            threadIdentifier: threadIdentifier,
+            request: .thread(threadIdentifier),
+            completion: completion
+        )
+    }
+
+    /// Queues one search read. A second queued request is rejected immediately.
+    func enqueueSearch(
+        accountIdentifier: Data,
+        query: Data,
+        completion: @escaping @MainActor (MailboxReadOutcome) -> Void
+    ) {
+        enqueueOperation(
+            accountIdentifier: accountIdentifier,
+            request: .search(query),
             completion: completion
         )
     }
 
     private func enqueueOperation(
         accountIdentifier: Data,
-        threadIdentifier: Data?,
+        request: ReadRequest,
         completion: @escaping @MainActor (MailboxReadOutcome) -> Void
     ) {
         let operation = { [queue] in
             queue.async {
                 let outcome = self.performRead(
                     accountIdentifier: accountIdentifier,
-                    threadIdentifier: threadIdentifier
+                    request: request
                 )
                 DispatchQueue.main.async { completion(outcome) }
                 self.finishRead()
@@ -77,7 +97,7 @@ final class MailboxReadWorker: @unchecked Sendable {
     /// is reallocated once and the read retried exactly once. A second
     /// `bufferTooSmall` is treated as `unavailable`. Buffers may hold mail
     /// bytes and are zeroed before release.
-    private func performRead(accountIdentifier: Data, threadIdentifier: Data?) -> MailboxReadOutcome {
+    private func performRead(accountIdentifier: Data, request: ReadRequest) -> MailboxReadOutcome {
         var output = [UInt8](repeating: 0, count: Self.initialOutputCapacity)
         defer {
             output.withUnsafeMutableBufferPointer { buffer in
@@ -87,7 +107,7 @@ final class MailboxReadWorker: @unchecked Sendable {
         var outputLength = 0
         var status = readOnce(
             accountIdentifier: accountIdentifier,
-            threadIdentifier: threadIdentifier,
+            request: request,
             output: &output,
             outputLength: &outputLength
         )
@@ -99,7 +119,7 @@ final class MailboxReadWorker: @unchecked Sendable {
             outputLength = 0
             status = readOnce(
                 accountIdentifier: accountIdentifier,
-                threadIdentifier: threadIdentifier,
+                request: request,
                 output: &output,
                 outputLength: &outputLength
             )
@@ -120,23 +140,37 @@ final class MailboxReadWorker: @unchecked Sendable {
                 payload.resetBytes(in: 0..<payload.count)
             }
         }
-        if threadIdentifier == nil {
+        switch request {
+        case .inbox:
             return MailboxDocumentDecoder.decodeInbox(payload)
+        case .thread:
+            return MailboxDocumentDecoder.decodeThread(payload)
+        case .search:
+            return MailboxDocumentDecoder.decodeSearch(payload)
         }
-        return MailboxDocumentDecoder.decodeThread(payload)
     }
 
     /// Invokes the C ABI read symbol once. A `limit` of zero lets the Rust
     /// composition substitute its bounded default.
     private func readOnce(
         accountIdentifier: Data,
-        threadIdentifier: Data?,
+        request: ReadRequest,
         output: inout [UInt8],
         outputLength: inout Int
     ) -> Int32 {
         accountIdentifier.withUnsafeBytes { accountBytes in
             output.withUnsafeMutableBufferPointer { buffer in
-                if let threadIdentifier {
+                switch request {
+                case .inbox:
+                    return tersa_macos_mailbox_read_inbox(
+                        accountBytes.bindMemory(to: UInt8.self).baseAddress,
+                        accountBytes.count,
+                        0,
+                        buffer.baseAddress,
+                        buffer.count,
+                        &outputLength
+                    )
+                case .thread(let threadIdentifier):
                     return threadIdentifier.withUnsafeBytes { threadBytes in
                         tersa_macos_mailbox_read_thread(
                             accountBytes.bindMemory(to: UInt8.self).baseAddress,
@@ -149,15 +183,20 @@ final class MailboxReadWorker: @unchecked Sendable {
                             &outputLength
                         )
                     }
+                case .search(let query):
+                    return query.withUnsafeBytes { queryBytes in
+                        tersa_macos_mailbox_search(
+                            accountBytes.bindMemory(to: UInt8.self).baseAddress,
+                            accountBytes.count,
+                            queryBytes.bindMemory(to: UInt8.self).baseAddress,
+                            queryBytes.count,
+                            0,
+                            buffer.baseAddress,
+                            buffer.count,
+                            &outputLength
+                        )
+                    }
                 }
-                return tersa_macos_mailbox_read_inbox(
-                    accountBytes.bindMemory(to: UInt8.self).baseAddress,
-                    accountBytes.count,
-                    0,
-                    buffer.baseAddress,
-                    buffer.count,
-                    &outputLength
-                )
             }
         }
     }
