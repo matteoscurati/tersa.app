@@ -182,6 +182,9 @@ struct SearchView: View {
     }
 
     private func handleSearchReloadTapped() {
+        // Restore the field to the query being retried so its completed result
+        // is not dropped by the field-match guard below.
+        queryText = submittedQuery
         runSearch(submittedQuery)
     }
 
@@ -190,6 +193,13 @@ struct SearchView: View {
         outcome = nil
         worker.enqueueSearch(accountIdentifier: accountIdentifier, query: Data(query.utf8)) { result in
             self.searching = false
+            // Display the result only if the field still shows the query it was
+            // for. If the user edited the field while the search was in flight,
+            // the earlier query's result would be mismatched, so drop it — the
+            // view returns to the idle prompt and the new query can be submitted.
+            guard query == self.queryText.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return
+            }
             self.outcome = result
         }
     }
