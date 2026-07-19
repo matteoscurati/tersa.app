@@ -2989,7 +2989,13 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
             };
             let opening = index + opening_relative;
             if let Some(body) = balanced_brace_body(document, opening) {
-                declarations.push((name, body, is_initializer));
+                // The analyzed body spans the parameter list AND the brace body, so
+                // a default argument that itself executes at the call site (e.g.
+                // `= model.connect()`) is not overlooked by inspecting only the
+                // braces. This is conservative: a reference anywhere in the
+                // signature or body counts as reaching it.
+                let declaration = &document[paren..opening + body.len()];
+                declarations.push((name, declaration, is_initializer));
             }
         }
     }
@@ -7949,6 +7955,7 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
         for initializer in [
             "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit(callback: () -> Void = {}) { connect() }",
             "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit<T>(value: T) { connect() }",
+            "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit(start: Void = connect()) {}",
         ] {
             assert!(
                 !swift_bootstrap_inventory_violations(&with_view_model(initializer)).is_empty(),
