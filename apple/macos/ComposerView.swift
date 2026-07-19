@@ -26,6 +26,7 @@ struct ComposerView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("New Message")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
             unavailableNotice
             composerForm
             HStack {
@@ -44,7 +45,7 @@ struct ComposerView: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "info.circle")
                 .accessibilityHidden(true)
-            Text("Sending is not available in this version. Anything typed here is discarded when this window closes.")
+            Text("Sending is not available in this version. Anything you type here is discarded when you close this composer.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -53,7 +54,7 @@ struct ComposerView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Sending is not available in this version. Anything typed here is discarded when this window closes.")
+        .accessibilityLabel("Sending is not available in this version. Anything you type here is discarded when you close this composer.")
     }
 
     private var composerForm: some View {

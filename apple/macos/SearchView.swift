@@ -89,7 +89,6 @@ struct SearchView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Search your mailbox")
     }
 
     private var noResultsContent: some View {
@@ -108,7 +107,6 @@ struct SearchView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("No results")
     }
 
     private func resultsList(_ rows: [MessageRow]) -> some View {
@@ -142,19 +140,31 @@ struct SearchView: View {
     }
 
     private func validationBanner(_ message: String) -> some View {
-        Text(message)
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-            .padding(12)
-            .frame(maxWidth: .infinity)
-            .accessibilityLabel(message)
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(.callout)
+                .multilineTextAlignment(.center)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
     }
 
     /// Validates the field, then enqueues one bounded search. An empty field
     /// does nothing; an over-limit or control-character field sets an inline
     /// message and never reaches the ABI.
     private func handleSearchSubmit() {
+        // Serialize submits: the worker serves one request at a time, so a
+        // resubmit while a search is in flight is ignored to avoid displaying an
+        // earlier query's results under the current text.
+        guard !searching else {
+            return
+        }
+        validationMessage = nil
         let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return
@@ -167,7 +177,6 @@ struct SearchView: View {
             validationMessage = "Search text cannot contain control characters."
             return
         }
-        validationMessage = nil
         submittedQuery = trimmed
         runSearch(trimmed)
     }
