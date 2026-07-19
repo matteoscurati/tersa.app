@@ -121,6 +121,9 @@ source or development work. Ad-hoc or development evidence produced before
 the credential block never satisfies `P1-MACOS-001`, `P1-MACOS-002`, or
 `P1-MACOS-003`. The macOS UI vertical slice is planned and decomposed in the
 [macOS UI vertical-slice ADR](architecture/adr-0021-macos-ui-vertical-slice.md).
+Performance and lightweightness are governed as a primary constraint with
+early per-slice measurement in the
+[performance ADR](architecture/adr-0022-performance-primary-constraint.md).
 
 The target slice connects one account, synchronizes a bounded recent mailbox,
 shows an encrypted cached inbox and thread, supports the planned bounded
@@ -292,7 +295,8 @@ multi-account UX, composition, drafts, attachments, send and offline outbox,
 mailbox actions, encrypted search, storage controls, app lock, safe HTML,
 accessibility, English and Italian localization, performance budgets, recovery,
 independent security remediation, Google verification, public policy content,
-and a signed and notarized macOS release.
+and a signed and notarized macOS release distributed as a notarized DMG via
+Developer ID direct download.
 
 The iPhone and iPad public MVP may proceed only after the separate Phase 2
 acceptance conditions. Deferring Phase 2 does not block the macOS public MVP,
