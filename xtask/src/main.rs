@@ -2246,16 +2246,24 @@ fn swift_bootstrap_intent_entries(
             owner_in_app_delegate += references;
         } else if path == intent_path {
             owner_in_view_model += references;
-            let body_references: usize = swift_function_declarations(&code)
-                .into_iter()
-                .map(|(name, body)| {
-                    let count = identifier_occurrence_count(body, PRODUCT_BOOTSTRAP_OWNER);
-                    if count != 0 {
-                        intent_entries.insert(name);
-                    }
-                    count
-                })
-                .sum();
+            let mut body_references = 0;
+            for (name, body, is_initializer) in swift_function_declarations_with_kind(&code) {
+                let count = identifier_occurrence_count(body, PRODUCT_BOOTSTRAP_OWNER);
+                body_references += count;
+                if count == 0 {
+                    continue;
+                }
+                if is_initializer {
+                    // An initializer runs at construction, never on user intent;
+                    // it may not be the reviewed entry into product bootstrap.
+                    violations.push(format!(
+                        "{} must not reference the reviewed product bootstrap owner from an initializer",
+                        path.display()
+                    ));
+                } else {
+                    intent_entries.insert(name);
+                }
+            }
             if body_references != references {
                 violations.push(format!(
                     "{} may reference the reviewed product bootstrap owner only inside a single intent-entry function body",
@@ -2298,8 +2306,6 @@ fn swift_bootstrap_launch_entry_violations(
 ) -> Vec<String> {
     let mut violations = Vec::new();
     let intent_entries = swift_bootstrap_intent_entries(sources, &mut violations);
-    let app_delegate_path = Path::new("apple/macos/AppDelegate.swift");
-    let intent_path = Path::new(ACCOUNT_CONNECTION_VIEW_MODEL_PATH);
     let target_code = sources
         .iter()
         .filter(|(path, _document)| {
@@ -2308,28 +2314,38 @@ fn swift_bootstrap_launch_entry_violations(
         .map(|(_path, document)| strip_swift_non_code(document))
         .collect::<Vec<_>>()
         .join("\n");
-    let reachable_entries =
-        swift_bootstrap_reachable_entries(&target_code, owner_entries, &intent_entries);
+    // Two reachability closures over the same call graph:
+    // - `terminal_reachable` stops propagation at the reviewed intent entry, so
+    //   only functions reaching bootstrap through a NON-intent path appear here;
+    // - `strict_reachable` ignores the exemption, so it contains every function
+    //   that transitively reaches bootstrap, including callers of the intent.
+    let reachability = BootstrapReachability {
+        owner_entries,
+        intent_entries: &intent_entries,
+        terminal_reachable: &swift_bootstrap_reachable_entries(
+            &target_code,
+            owner_entries,
+            &intent_entries,
+        ),
+        strict_reachable: &swift_bootstrap_reachable_entries(
+            &target_code,
+            owner_entries,
+            &BTreeSet::new(),
+        ),
+    };
     for (path, document) in sources {
         if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
             continue;
         }
         let code = strip_swift_non_code(document);
-        for (name, body) in swift_function_declarations(&code) {
-            let enters_bootstrap = swift_member_call_count(body, "submit") != 0
-                || swift_unqualified_call_count(body, "submit") != 0
-                || reachable_entries.contains(&name);
-            let is_reviewed_owner = path == app_delegate_path
-                && owner_entries.contains(&name)
-                && swift_call_count(body, "bootstrapWorker.submit") == 1;
-            // A single reviewed view-model entry may drive the owner from a
-            // user action; propagation stops here so its callers stay inert.
-            let is_reviewed_intent = path == intent_path
-                && intent_entries.contains(&name)
-                && identifier_occurrence_count(body, PRODUCT_BOOTSTRAP_OWNER) == 1
-                && swift_member_call_count(body, "submit") == 0
-                && swift_unqualified_call_count(body, "submit") == 0;
-            if enters_bootstrap && !is_reviewed_owner && !is_reviewed_intent {
+        for (name, body, is_initializer) in swift_function_declarations_with_kind(&code) {
+            if swift_function_enters_bootstrap_unreviewed(
+                path,
+                &name,
+                body,
+                is_initializer,
+                &reachability,
+            ) {
                 violations.push(format!(
                     "{} must not enter bootstrap from unreviewed function `{name}`",
                     path.display()
@@ -2340,7 +2356,8 @@ fn swift_bootstrap_launch_entry_violations(
             if bodies.iter().any(|body| {
                 swift_member_call_count(body, "submit") != 0
                     || swift_unqualified_call_count(body, "submit") != 0
-                    || reachable_entries
+                    || reachability
+                        .terminal_reachable
                         .iter()
                         .any(|entry| contains_identifier(body, entry))
             }) {
@@ -2352,6 +2369,52 @@ fn swift_bootstrap_launch_entry_violations(
         }
     }
     violations
+}
+
+/// The reviewed owner/intent sets and the two reachability closures used to
+/// classify each function's relationship to product bootstrap.
+struct BootstrapReachability<'a> {
+    owner_entries: &'a BTreeSet<String>,
+    intent_entries: &'a BTreeSet<String>,
+    terminal_reachable: &'a BTreeSet<String>,
+    strict_reachable: &'a BTreeSet<String>,
+}
+
+/// Whether a function declaration reaches product bootstrap through an
+/// unreviewed path. The reviewed `AppDelegate` owner and the single reviewed
+/// view-model intent entry are allowed; every other reacher is allowed only as
+/// a user-action caller — it reaches bootstrap solely through the intent entry
+/// and is neither an initializer nor an `AppDelegate` member (both of which run
+/// automatically at construction or launch, never on user intent).
+fn swift_function_enters_bootstrap_unreviewed(
+    path: &Path,
+    name: &str,
+    body: &str,
+    is_initializer: bool,
+    reachability: &BootstrapReachability,
+) -> bool {
+    let calls_submit = swift_member_call_count(body, "submit") != 0
+        || swift_unqualified_call_count(body, "submit") != 0;
+    if !calls_submit && !reachability.strict_reachable.contains(name) {
+        return false;
+    }
+    let app_delegate_path = Path::new("apple/macos/AppDelegate.swift");
+    let intent_path = Path::new(ACCOUNT_CONNECTION_VIEW_MODEL_PATH);
+    let is_reviewed_owner = path == app_delegate_path
+        && reachability.owner_entries.contains(name)
+        && swift_call_count(body, "bootstrapWorker.submit") == 1;
+    let is_reviewed_intent = path == intent_path
+        && !is_initializer
+        && reachability.intent_entries.contains(name)
+        && identifier_occurrence_count(body, PRODUCT_BOOTSTRAP_OWNER) == 1
+        && !calls_submit;
+    if is_reviewed_owner || is_reviewed_intent {
+        return false;
+    }
+    let reaches_only_through_intent =
+        !calls_submit && !reachability.terminal_reachable.contains(name);
+    let is_automatic_entry = is_initializer || path == app_delegate_path;
+    !reaches_only_through_intent || is_automatic_entry
 }
 
 fn swift_bootstrap_reachable_entries(
@@ -2679,6 +2742,17 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
             )];
         }
     }
+    // These declarations execute code the func/init body inventory does not
+    // parse, so a body-less `func` could otherwise mis-attribute their body and
+    // launder an unreviewed bootstrap call site. The macOS UI slice needs none.
+    for forbidden in ["deinit", "protocol", "subscript"] {
+        if contains_identifier(&code, forbidden) {
+            return vec![format!(
+                "{} must not declare `{forbidden}` in inventoried macOS sources",
+                path.display()
+            )];
+        }
+    }
     let bytes = document.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -2830,8 +2904,19 @@ fn swift_function_bodies<'a>(document: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 fn swift_function_declarations(document: &str) -> Vec<(String, &str)> {
+    swift_function_declarations_with_kind(document)
+        .into_iter()
+        .map(|(name, body, _is_initializer)| (name, body))
+        .collect()
+}
+
+/// Like [`swift_function_declarations`] but also reports whether each declaration
+/// is a constructor (`init`), so callers can forbid bootstrap during
+/// construction independently of ordinary methods.
+fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, bool)> {
     let mut declarations = Vec::new();
     for keyword in ["func", "init"] {
+        let is_initializer = keyword == "init";
         for (start, _) in document.match_indices(keyword) {
             if !is_identifier_at(document, start, keyword) {
                 continue;
@@ -2863,7 +2948,7 @@ fn swift_function_declarations(document: &str) -> Vec<(String, &str)> {
             };
             let opening = index + opening_relative;
             if let Some(body) = balanced_brace_body(document, opening) {
-                declarations.push((name, body));
+                declarations.push((name, body, is_initializer));
             }
         }
     }
@@ -7593,7 +7678,11 @@ func connect(_ identifier: Data) { (NSApp.delegate as? AppDelegate)?.establishOw
 ";
         // A user-intent handler in a third file may call the reviewed entry;
         // propagation stops at the intent entry, so the handler stays inert.
+        // An initializer and body that do NOT reach bootstrap must not trip the
+        // automatic-entry rule (no false positive on ordinary construction).
         let root_view = r"
+init() { configure() }
+func configure() { }
 func handleConnectTapped() { model.connect(Data()) }
 func renderBody() { handleConnectTapped() }
 ";
@@ -7681,14 +7770,14 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             .is_empty(),
             "a doubled owner reference in one intent entry must fail closed"
         );
-        // The owner may not be reached from a view-model initializer.
+        // The owner may not be reached from a closure-valued stored property.
         assert!(
             !swift_bootstrap_inventory_violations(&with_view_model(
                 "let autoConnect: () -> Void = { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
                 None,
             ))
             .is_empty(),
-            "a view-model initializer bootstrap entry must fail closed"
+            "a closure-property bootstrap entry must fail closed"
         );
         // AppDelegate must declare the owner but never call it.
         assert!(
@@ -7707,6 +7796,84 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             .is_empty(),
             "AppDelegate calling the owner must fail closed"
         );
+    }
+
+    #[test]
+    fn swift_inventory_rejects_automatic_and_laundered_bootstrap_entries() {
+        let worker = r"class BootstrapWorker {}
+tersa_macos_bootstrap_default_account(pointer, count)";
+        let delegate = r"
+private let bootstrapWorker = BootstrapWorker()
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        let with_view_model = |view_model: &str| {
+            vec![
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    view_model.to_owned(),
+                ),
+            ]
+        };
+        // An initializer runs at construction, never on user intent: a direct
+        // owner reference inside `init` must fail closed.
+        assert!(
+            !swift_bootstrap_inventory_violations(&with_view_model(
+                "init() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+            ))
+            .is_empty(),
+            "an owner reference inside a view-model initializer must fail closed"
+        );
+        // ... and an initializer that merely CALLS the reviewed intent entry
+        // (the terminal-propagation stop must not exempt constructors).
+        assert!(
+            !swift_bootstrap_inventory_violations(&with_view_model(
+                "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }\ninit() { connect() }",
+            ))
+            .is_empty(),
+            "a view-model initializer reaching the reviewed intent must fail closed"
+        );
+        // An AppDelegate launch/lifecycle hook may not reach the reviewed intent
+        // entry either (bootstrap must never start automatically at launch).
+        assert!(
+            !swift_bootstrap_inventory_violations(&[
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    format!(
+                        "{delegate}\nfunc applicationDidFinishLaunching(_ notification: Notification) {{ model.connect() }}"
+                    ),
+                ),
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }".to_owned(),
+                ),
+            ])
+            .is_empty(),
+            "an AppDelegate launch hook reaching the reviewed intent must fail closed"
+        );
+        // Declarations whose bodies the func/init inventory does not parse are
+        // refused, so a body-less `func` cannot launder an owner call site.
+        for laundering in [
+            "func connect()\nsubscript(index: Int) -> Void { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+            "deinit { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+            "protocol Connectable { func connect() }\nfunc connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+        ] {
+            assert!(
+                !swift_bootstrap_inventory_violations(&with_view_model(laundering)).is_empty(),
+                "a body-parse-laundering construct must fail closed: {laundering}"
+            );
+        }
     }
 
     #[test]

@@ -17,14 +17,17 @@ struct AccountConnectionView: View {
             switch viewModel.state {
             case .notConnected, .connecting:
                 connectionContent(isConnecting: viewModel.state == .connecting)
-            case .connected:
-                InboxEmptyStateView()
             case .failed(let failure):
                 failureContent(failure)
+            case .connected:
+                // RootView swaps to the inbox on `.connected`; this view is only
+                // shown while not connected, so this branch is never rendered.
+                EmptyView()
             }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Account connection")
         .accessibilityValue(viewModel.state.accessibilityValue)
     }
