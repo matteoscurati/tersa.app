@@ -2753,6 +2753,23 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
             )];
         }
     }
+    // AppDelegate (and therefore every app-lifecycle entry point) may be declared
+    // and extended only in AppDelegate.swift, so the launch-entry rule that keys
+    // on that path covers every AppDelegate member. A cross-file
+    // `extension AppDelegate { func applicationWillFinishLaunching … }` would
+    // otherwise be an unguarded automatic entry.
+    if path != Path::new("apple/macos/AppDelegate.swift") {
+        for (start, _) in code.match_indices("AppDelegate") {
+            if is_identifier_at(&code, start, "AppDelegate")
+                && swift_preceding_identifier(&code, start) == Some("extension")
+            {
+                return vec![format!(
+                    "{} must not extend AppDelegate; app-lifecycle members belong in AppDelegate.swift",
+                    path.display()
+                )];
+            }
+        }
+    }
     let bytes = document.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -7861,6 +7878,30 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             ])
             .is_empty(),
             "an AppDelegate launch hook reaching the reviewed intent must fail closed"
+        );
+        // The same hook hidden in a cross-file `extension AppDelegate` must also
+        // fail closed (AppDelegate members belong only in AppDelegate.swift).
+        assert!(
+            !swift_bootstrap_inventory_violations(&[
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegateLaunch.swift"),
+                    "extension AppDelegate { func applicationWillFinishLaunching(_ notification: Notification) { model.connect() } }".to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    "func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }".to_owned(),
+                ),
+            ])
+            .is_empty(),
+            "a cross-file AppDelegate extension reaching the reviewed intent must fail closed"
         );
         // Declarations whose bodies the func/init inventory does not parse are
         // refused, so a body-less `func` cannot launder an owner call site.
