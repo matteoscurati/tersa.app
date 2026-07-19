@@ -2382,10 +2382,10 @@ struct BootstrapReachability<'a> {
 
 /// Whether a function declaration reaches product bootstrap through an
 /// unreviewed path. The reviewed `AppDelegate` owner and the single reviewed
-/// view-model intent entry are allowed; every other reacher is allowed only as
-/// a user-action caller — it reaches bootstrap solely through the intent entry
-/// and is neither an initializer nor an `AppDelegate` member (both of which run
-/// automatically at construction or launch, never on user intent).
+/// view-model intent entry are allowed; anything else that reaches bootstrap is
+/// allowed only as a user-action caller — it reaches bootstrap solely through the
+/// intent entry and is neither an initializer nor an `AppDelegate` member (both of
+/// which run automatically at construction or launch, never on user intent).
 fn swift_function_enters_bootstrap_unreviewed(
     path: &Path,
     name: &str,
@@ -2943,7 +2943,7 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
                 continue;
             }
             // `.init(...)` / `Type.init(...)` is a call expression, not a
-            // declaration; skip it so its body is not mis-attributed.
+            // declaration; skip it so its body is not wrongly attributed.
             if is_initializer
                 && document[..start]
                     .bytes()
@@ -7722,7 +7722,7 @@ func connect(_ identifier: Data) { (NSApp.delegate as? AppDelegate)?.establishOw
         // An initializer and body that do NOT reach bootstrap must not trip the
         // automatic-entry rule (no false positive on ordinary construction).
         // A benign initializer, a default-closure parameter, and a `.init(...)`
-        // call expression must not be mis-parsed into a bootstrap entry; none is
+        // call expression must not be parsed into a bootstrap entry; none is
         // a false positive.
         let root_view = r"
 init(config: Int) { configure() }
@@ -7942,7 +7942,7 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
                 "a body-parse-laundering construct must fail closed: {laundering}"
             );
         }
-        // Initializer forms whose body the parser must not mis-attribute: a
+        // Initializer forms whose body the parser must attribute correctly: a
         // default-closure parameter (`= {}`) in the signature and a generic
         // initializer. Both reach the reviewed intent from construction and must
         // fail closed.
@@ -7952,7 +7952,7 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
         ] {
             assert!(
                 !swift_bootstrap_inventory_violations(&with_view_model(initializer)).is_empty(),
-                "a mis-parseable initializer reaching the reviewed intent must fail closed: {initializer}"
+                "a tricky-signature initializer reaching the reviewed intent must fail closed: {initializer}"
             );
         }
     }
