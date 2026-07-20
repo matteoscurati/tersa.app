@@ -13,16 +13,22 @@
 # identity or provisioning profile is present; ADR-0021 authorizes development or
 # ad-hoc signing for this slice. With no team, `${TeamIdentifierPrefix}` expands
 # empty, so the application-group and keychain-access-group become the
-# unprefixed `app.tersa.shared`; whether the Keychain bootstrap works under that
-# is the documented empirical unknown recorded by this run, not a bug to fix by
-# weakening entitlements.
+# unprefixed `app.tersa.shared`. macOS rejects an app-group / keychain-access-group
+# value not prefixed by a valid Team Identifier at spawn, so the ad-hoc app DOES
+# NOT LAUNCH without an Apple team (launchd 163, reproduced in a GUI session) — the
+# same credential constraint as the PR33b block. Recorded condition, not a bug to
+# fix by weakening entitlements.
 #
-# Redaction: this script prints only the reviewed entitlement keys, aggregate
-# outcomes, the sandbox container path relative to $HOME, and the ad-hoc tier. It
-# never prints an Apple ID, team, certificate name, machine name/UUID, or an
-# absolute local path. The interactive VoiceOver / Full-Keyboard-Access walk is
-# NOT automated here — it must be run by a human in an interactive GUI session
-# (a headless/automation session cannot spawn a GUI app: launchd returns 163).
+# This script therefore captures only the DECLARATION evidence (signature, embedded
+# entitlements, size), which needs no launch. The runtime VoiceOver /
+# Full-Keyboard-Access + App Sandbox walk is DEFERRED to a real-team-signed build at
+# the credential unblock; it cannot be produced from this ad-hoc capture.
+#
+# Redaction: into evidence this script prints only the reviewed entitlement keys,
+# aggregate outcomes, the sandbox container path relative to $HOME, sizes, and the
+# ad-hoc tier — never an Apple ID, team, certificate name, machine name/UUID, or an
+# absolute local path. It prints the build path once, repo-relative (never
+# absolute), so an operator can inspect the artifact.
 
 set -eu
 
@@ -57,45 +63,59 @@ codesign -s - --entitlements "$RESOLVED_ENTITLEMENTS" --force --timestamp=none "
 printf 'ad-hoc signature applied\n'
 
 section "App Sandbox evidence: signature + embedded entitlements"
-codesign -dv --verbose=2 "$APP" 2>&1 | grep -E '^(Identifier|Signature|TeamIdentifier|CodeDirectory)' | sed 's/=.*flags=/ flags=/'
-printf -- '-- embedded entitlements (reviewed keys only) --\n'
-codesign -d --entitlements :- --xml "$APP" 2>/dev/null | plutil -p - 2>/dev/null \
-  | grep -E 'app-sandbox|network\.(client|server)|application-groups|keychain-access-groups|app\.tersa\.shared|=> (true|false)'
+# Capture into variables so a failed codesign/plutil is detected (a pipeline
+# hides upstream failure from set -e).
+SIGNATURE="$(codesign -dv --verbose=2 "$APP" 2>&1)" \
+  || { printf 'error: codesign display failed\n' >&2; exit 1; }
+printf '%s\n' "$SIGNATURE" \
+  | grep -E '^(Identifier|Signature|TeamIdentifier|CodeDirectory)' | sed 's/=.*flags=/ flags=/'
+ENTITLEMENTS_OUT="$(codesign -d --entitlements :- --xml "$APP" 2>/dev/null | plutil -p - 2>/dev/null)"
+[ -n "$ENTITLEMENTS_OUT" ] \
+  || { printf 'error: entitlement extraction produced no output\n' >&2; exit 1; }
+# Require exactly the five reviewed entitlement keys to be present.
+for key in \
+  'com.apple.security.app-sandbox' 'com.apple.security.network.client' \
+  'com.apple.security.network.server' 'com.apple.security.application-groups' \
+  'keychain-access-groups'; do
+  printf '%s\n' "$ENTITLEMENTS_OUT" | grep -q "\"$key\"" \
+    || { printf 'error: reviewed entitlement missing: %s\n' "$key" >&2; exit 1; }
+done
+printf -- '-- embedded entitlements (the five reviewed keys) --\n'
+printf '%s\n' "$ENTITLEMENTS_OUT" \
+  | grep -E '"(com\.apple\.security\.(app-sandbox|network\.(client|server)|application-groups)|keychain-access-groups)"|"app\.tersa\.shared"|=> (true|false)'
 
 section "Size (ad-hoc Release, arm64)"
 APP_BYTES="$(find "$APP" -type f -exec stat -f%z {} + | awk '{s+=$1} END {print s}')"
+[ -n "$APP_BYTES" ] || { printf 'error: size discovery produced no bytes\n' >&2; exit 1; }
 printf 'app_bytes=%s\n' "$APP_BYTES"
 
-section "MANUAL / INTERACTIVE STEPS (run in a logged-in GUI session — not automatable here)"
-cat <<'MANUAL'
-A headless/automation shell cannot launch a GUI app (launchd 163). Run the rest
-in an interactive session, and record outcomes into docs/m0/macos-ui-dev-evidence.md:
+section "Launch condition (recorded, not forced)"
+# The ad-hoc app with the reviewed entitlements is expected NOT to launch without
+# an Apple team: application-groups/keychain-access-groups require a Team
+# Identifier prefix. Attempt it, record the outcome, and never weaken entitlements
+# to force a launch. Only safe error tokens are printed (no paths/identifiers).
+if open "$APP" >/dev/null 2>"$BUILD_DIR/launch.err"; then
+  printf 'launched: yes — the runtime walk can proceed on this machine\n'
+else
+  printf 'launched: no — tokens: '
+  grep -oE 'Code=[0-9]+|Launchd job spawn failed' "$BUILD_DIR/launch.err" | tr '\n' ' '
+  printf '\n(expected on a team-less machine; see docs/m0/macos-ui-dev-evidence.md section 2)\n'
+fi
 
-  1. Launch:   open "<APP>"    (the printed app path)
-     - Record whether it launches and stays running, or the launchd/signature
-       error verbatim (redact absolute paths). If it does not launch, the runtime
-       walk cannot proceed on this machine — record the condition; do not weaken
-       entitlements to make it launch.
-  2. Sandbox container: confirm ~/Library/Containers/app.tersa.mac exists.
-  3. Keychain-under-ad-hoc probe (the empirical unknown): on the connection
-     screen, enter any opaque identifier and activate Connect. Record which
-     ConnectionState is reached (connected / a specific failure). Either is a
-     legitimate 2c screen state; the empty cache means inbox/thread/search render
-     empty regardless.
-  4. VoiceOver-only walk of the five screens (connection, inbox empty-state,
-     thread if reachable, search, composer): roles / names / values / focus
-     order / announcements. Note the three flagged items:
-       (a) ComposerView on-appear announcement — is it actually spoken?
-       (b) Body TextEditor — does Tab insert a tab; does Esc exit; any FKA trap?
-       (c) SearchView — edit the field mid-search: is the dropped result silent?
-  5. Full-Keyboard-Access-only walk: every control reachable and operable by
-     keyboard; no trap; logical order.
-  6. Sandbox-denial observation: `log show --last 3m --predicate 'sender == "Sandbox"'`
-     during the session; record aggregate denial observations only (redacted).
-  7. Perf (documented conditions: ad-hoc, empty cache, one machine class): note
-     window-interactive cold start; connect->inbox render; idle inbox RSS. Omit
-     any metric that is not meaningfully measurable (e.g. scroll / query p95 at
-     zero rows) rather than record a vacuous value.
+section "DEFERRED runtime walk (requires a real-team-signed build — not this ad-hoc capture)"
+cat <<'MANUAL'
+Because the ad-hoc build does not launch without an Apple team, the runtime
+evidence below is DEFERRED to a real-team-signed build at the credential unblock
+and is carried as the checklist in docs/m0/macos-ui-dev-evidence.md sections 3-6.
+This script signs ad-hoc only; performing the walk needs a real Apple identity
+(supplying one to this script is not enough — it always strips the team prefix):
+
+  - App Sandbox container + sender=="Sandbox" denial observation.
+  - Keychain bootstrap outcome under a team-prefixed signature.
+  - VoiceOver-only walk of the five screens; the three flagged accessibility items.
+  - Full-Keyboard-Access-only walk.
+  - ADR-0022 runtime numbers (cold start; connect->inbox render; idle inbox RSS),
+    documented conditions; omit any not meaningfully measurable at zero rows.
 MANUAL
-printf '\n<APP> = %s\n' "$APP"
-printf '\nDONE (automatable evidence captured; interactive steps above pending a GUI session)\n'
+printf '\nbuild artifact (repo-relative): apple/%s\n' "${APP#"$ROOT/"}"
+printf 'DONE (declaration evidence and launch condition captured; runtime walk deferred)\n'

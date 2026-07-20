@@ -16,8 +16,9 @@ surfaces is fixed in a separate, freshly reviewed implementation PR, never by
 editing this evidence or weakening an entitlement.
 
 Signing tier is **ad-hoc** (`codesign -s -`, a local non-Apple identity): no
-Apple-issued identity or provisioning profile is available, and ADR-0021 line 177
-authorizes development or ad-hoc signing for this slice. With no team,
+Apple-issued identity or provisioning profile is available, and ADR-0021 (the
+slice-2f row and its development-signed-evidence section) authorizes development
+or ad-hoc signing for this slice. With no team,
 `${TeamIdentifierPrefix}` expands empty, so the application-group and
 keychain-access-group are the unprefixed `app.tersa.shared`. The empirical
 finding of this run (section 2) is that the app with these reviewed entitlements
@@ -36,13 +37,16 @@ local path, an account identifier, or any mail content.
 
 ## Capture
 
-Run, at the exact commit under review, in an **interactive logged-in GUI
-session** (a headless or automation shell cannot launch a GUI app — launchd
-returns error 163):
+Run, at the exact commit under review:
 
 ```
 sh apple/scripts/capture-macos-ui-dev-evidence.sh
 ```
+
+The declaration evidence (section 1) needs no launch and is captured in any
+session. The script also attempts to launch the ad-hoc app and records the
+outcome; on a team-less machine that launch is expected to fail (section 2), so
+the runtime walk (sections 3–6) is deferred, not run here.
 
 The script builds unsigned, ad-hoc-signs with the reviewed entitlements, records
 the signature/entitlement/size evidence below automatically, then prints the
@@ -84,12 +88,14 @@ error=Error Domain=RBSRequestErrorDomain Code=5 "Launch failed."
 … NSPOSIXErrorDomain Code=163 … "Launchd job spawn failed"
 ```
 
-Root cause: `com.apple.security.application-groups` and `keychain-access-groups`
-carry the unprefixed value `app.tersa.shared` because `${TeamIdentifierPrefix}`
-expands empty under an identity with no team. macOS rejects an app-group /
-keychain-access-group value that is not prefixed by a valid Team Identifier at
-spawn time (`amfid`), so `launchd` fails the spawn. Reproduced identically in a
-logged-in GUI session (not a headless artifact). A direct `exec` of the binary
+Root cause (inferred from the reproduction below, not from the error text, which
+names no daemon): `com.apple.security.application-groups` and
+`keychain-access-groups` carry the unprefixed value `app.tersa.shared` because
+`${TeamIdentifierPrefix}` expands empty under an identity with no team. macOS
+rejects an app-group / keychain-access-group value that is not prefixed by a valid
+Team Identifier at spawn — consistent with team-prefix entitlement validation
+(`amfid`) — so `launchd` fails the spawn. Reproduced identically in a logged-in
+GUI session (not a headless artifact). A direct `exec` of the binary
 initializes the App Sandbox container (`~/Library/Containers/app.tersa.mac` is
 created) before the process is killed, confirming the rejection is the
 team-prefix entitlement validation, not the sandbox itself.
@@ -117,7 +123,11 @@ Items carried to that run:
 - Full-Keyboard-Access-only walk of the five screens.
 - ADR-0022 runtime numbers (window-interactive cold start; connect → inbox render; idle inbox RSS), documented conditions; omit any not meaningfully measurable at zero rows.
 
-The `apple/scripts/capture-macos-ui-dev-evidence.sh` capture tool and this
-document are ready for that run; only the signing identity is missing. Source-
-level accessibility was reviewed per screen in the 2c–2e PRs; this deferral
-concerns the runtime, assistive-technology-executed evidence only.
+This document's checklist above is ready for that run. The
+`apple/scripts/capture-macos-ui-dev-evidence.sh` tool signs ad-hoc only (it strips
+the empty team prefix), so it captures the declaration evidence and records the
+launch condition but cannot itself perform the deferred runtime walk — that
+requires a build signed with a real Apple team identity, not merely supplying an
+identity to this script. Source-level accessibility was reviewed per screen in the
+2c–2e PRs; this deferral concerns the runtime, assistive-technology-executed
+evidence only.
