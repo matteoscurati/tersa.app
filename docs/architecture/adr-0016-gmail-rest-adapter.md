@@ -27,9 +27,23 @@ Each adapter instance is bound to one opaque local `AccountId` before any I/O.
 A different account returns `AuthorizationRequired`; Gmail's `users/me` result
 cannot therefore be attributed to another local account. The macOS constructor
 immediately wraps a short-lived access token in `Zeroizing` before validation.
-Rotation is performed by replacing the adapter. This adapter performs no token
-exchange, refresh, persistence, Keychain access, retries, batching, history
-sync, checkpointing, or logging.
+Rotation is performed by replacing the adapter. The mailbox adapter itself
+performs no token exchange, refresh, persistence, Keychain access, retries,
+batching, history sync, checkpointing, or logging.
+
+The crate additionally hosts the ADR 0023 token transport as a distinct
+component. `GmailTokenTransport` implements the application `TokenTransport`
+port with form-encoded `POST` exchanges against Google's OAuth2 token endpoint,
+plus a best-effort revoke call against the revoke endpoint. It shares only the
+hardened reqwest client policy with the `GET` path — not the Gmail base URL,
+the account binding, or any state — bounds token responses to 64 KiB, and
+applies the same provider-data-free error discipline: token-endpoint request
+and response bodies are never logged, and the form request body, the assembled
+response buffer, and the parsed tokens are each held in `Zeroizing` memory or
+wiped after use. Residue a zeroizing allocator would be needed to remove —
+reqwest's own internal request/response buffers, and any intermediate
+allocation freed while these buffers grew — is unavoidable, as on the `GET`
+path. `GmailMailbox` remains `GET`-only.
 
 Metadata requests use a partial response selector and select only `From` and
 `Subject` headers. Missing singleton headers are represented by an empty
@@ -54,6 +68,7 @@ not an iPhone or iPad product claim.
 
 ## References
 
+- [ADR 0023: Step 3 OAuth and bounded sync](adr-0023-step3-oauth-and-bounded-sync.md)
 - [Gmail messages.list](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list)
 - [Gmail messages.get](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get)
 - [Gmail Message resource](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages#Message)
