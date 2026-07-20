@@ -2,30 +2,41 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Provides a bounded, read-only Gmail REST implementation of `RemoteMailbox`.
+//! Provides a bounded, read-only Gmail REST implementation of `RemoteMailbox`
+//! and a bounded `POST` transport for Google's OAuth 2 token endpoint.
 //!
-//! The adapter is deliberately limited to authenticated `GET` requests against
-//! Gmail's `users/me` resource. It owns one locally assigned account and a
-//! short-lived token on macOS. It neither exchanges, refreshes, persists, nor
-//! logs credentials.
+//! The mailbox adapter is deliberately limited to authenticated `GET` requests
+//! against Gmail's `users/me` resource. It owns one locally assigned account
+//! and a short-lived token on macOS. The token transport implements the
+//! ADR-0023 `TokenTransport` port as form-encoded `POST` exchanges against the
+//! OAuth 2 token endpoint, plus a best-effort revoke call. It shares the
+//! hardened client policy with the `GET` path but no endpoint or state, and
+//! `GmailMailbox` itself remains `GET`-only. The crate never persists or logs
+//! credentials.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 use std::pin::Pin;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
 
 use base64::Engine;
 use serde::Deserialize;
 use tersa_application::mailbox::{
     BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
+#[cfg(any(target_os = "macos", test))]
+use tersa_application::token::{
+    ExchangeRequest, RefreshRequest, TokenResponse, TokenTransport, TokenTransportError,
+};
 use tersa_domain::mailbox::{
     AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
     UnixTimestampMillis,
 };
 use url::Url;
-#[cfg(target_os = "macos")]
-use zeroize::Zeroizing;
+#[cfg(any(target_os = "macos", test))]
+use zeroize::{Zeroize, Zeroizing};
 
 const BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const JSON_LIMIT: usize = 2 * 1024 * 1024;
@@ -40,6 +51,12 @@ const MAX_ACCESS_TOKEN_LEN: usize = 16 * 1024;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 #[cfg(target_os = "macos")]
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+#[cfg(any(target_os = "macos", test))]
+const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+#[cfg(any(target_os = "macos", test))]
+const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
+#[cfg(any(target_os = "macos", test))]
+const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
 
 type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;
@@ -237,6 +254,14 @@ impl TransportError {
             Self::InvalidResponse => RemoteMailboxError::InvalidResponse,
         }
     }
+
+    #[cfg(any(target_os = "macos", test))]
+    const fn into_token_error(self) -> TokenTransportError {
+        match self {
+            Self::Network => TokenTransportError::Transport,
+            Self::InvalidResponse => TokenTransportError::MalformedResponse,
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -284,8 +309,19 @@ impl BoundedBody {
         Ok(())
     }
 
-    fn finish(self) -> Vec<u8> {
-        self.bytes
+    fn finish(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for BoundedBody {
+    fn drop(&mut self) {
+        // Wipe any residue left in the accumulator — e.g. a partially streamed
+        // token response abandoned on a network or overflow error. `finish`
+        // takes the bytes out first, so a completed body is not owned here and a
+        // successful caller wipes the returned buffer itself.
+        self.bytes.zeroize();
     }
 }
 
@@ -296,17 +332,22 @@ struct ReqwestTransport {
 }
 
 #[cfg(target_os = "macos")]
+fn hardened_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+}
+
+#[cfg(target_os = "macos")]
 impl ReqwestTransport {
     fn new(token: Zeroizing<String>) -> Result<Self, RemoteMailboxError> {
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
+        let client = hardened_client_builder()
             .build()
             .map_err(|_error| RemoteMailboxError::Transport)?;
         Ok(Self { client, token })
@@ -575,6 +616,257 @@ fn error_reasons(bytes: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(any(target_os = "macos", test))]
+type PostFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;
+
+/// Exchanges, refreshes, and revokes tokens against Google's OAuth 2 endpoints.
+///
+/// Implements the ADR-0023 [`TokenTransport`] port as form-encoded `POST`
+/// requests to the token endpoint, sharing the hardened client policy with the
+/// `GET` path but no endpoint or state. Request and response bodies carry
+/// credentials, so they are never logged; the form request body, the assembled
+/// response buffer, and the parsed tokens are each held in zeroizing memory or
+/// wiped after use. Some residue is unavoidable without a zeroizing allocator:
+/// reqwest's own request and response buffers, and any intermediate buffer
+/// freed while a `Vec` or `String` grew during body assembly or form
+/// encoding — as on the bearer-token `GET` path.
+#[cfg(any(target_os = "macos", test))]
+pub struct GmailTokenTransport {
+    transport: Box<dyn PostTransport>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl fmt::Debug for GmailTokenTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GmailTokenTransport([REDACTED])")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl GmailTokenTransport {
+    #[cfg(target_os = "macos")]
+    /// Creates a token transport with the hardened macOS client.
+    ///
+    /// The transport is stateless beyond the client: each request carries its
+    /// own client identity and secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenTransportError::Transport`] when the hardened client
+    /// cannot be constructed.
+    pub fn new() -> Result<Self, TokenTransportError> {
+        Ok(Self {
+            transport: Box::new(ReqwestPostTransport::new()?),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: impl PostTransport + 'static) -> Self {
+        Self {
+            transport: Box::new(transport),
+        }
+    }
+
+    async fn post_token(
+        &self,
+        parameters: &[(&'static str, Zeroizing<String>)],
+    ) -> Result<TokenResponse, TokenTransportError> {
+        let response = self
+            .transport
+            .post(TOKEN_ENDPOINT, form_body(parameters))
+            .await
+            .map_err(TransportError::into_token_error)?;
+        let mut body = response.body;
+        let result = if response.status == 200 {
+            parse_token_response(&body)
+        } else {
+            Err(map_error_response(&body))
+        };
+        // The assembled response buffer held the cleartext access and refresh
+        // tokens (or an error body that can echo request parameters); wipe this
+        // adapter-owned copy. Residue can still remain in reqwest's internal
+        // buffers and in intermediate allocations freed while this buffer grew.
+        body.zeroize();
+        result
+    }
+
+    /// Revokes a token at Google's revoke endpoint, best-effort.
+    ///
+    /// Revocation is an inherent method rather than part of the
+    /// [`TokenTransport`] port, which models only exchange and refresh. The
+    /// token is sent as the single form-encoded `token` parameter. HTTP 200 is
+    /// success; any other status, an unparsable error body, or a network
+    /// failure resolves to a [`TokenTransportError`] without provider data.
+    /// The ADR-0023 disconnect composition treats revocation as best-effort
+    /// and still deletes the local token when this call fails.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to a typed transport or protocol failure without provider data.
+    #[must_use]
+    pub fn revoke<'a>(
+        &'a self,
+        token: &'a Zeroizing<String>,
+    ) -> BoxFuture<'a, Result<(), TokenTransportError>> {
+        Box::pin(async move {
+            let response = self
+                .transport
+                .post(REVOKE_ENDPOINT, form_body(&[("token", token.clone())]))
+                .await
+                .map_err(TransportError::into_token_error)?;
+            let mut body = response.body;
+            let result = if response.status == 200 {
+                Ok(())
+            } else {
+                Err(map_error_response(&body))
+            };
+            body.zeroize();
+            result
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl TokenTransport for GmailTokenTransport {
+    fn exchange(
+        &self,
+        request: ExchangeRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+        Box::pin(async move { self.post_token(&request.parameters()).await })
+    }
+
+    fn refresh(
+        &self,
+        request: RefreshRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+        Box::pin(async move { self.post_token(&request.parameters()).await })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+trait PostTransport: Send + Sync {
+    fn post(&self, endpoint: &'static str, form: Zeroizing<String>) -> PostFuture<'_>;
+}
+
+#[cfg(target_os = "macos")]
+struct ReqwestPostTransport {
+    client: reqwest::Client,
+}
+
+#[cfg(target_os = "macos")]
+impl ReqwestPostTransport {
+    fn new() -> Result<Self, TokenTransportError> {
+        let client = hardened_client_builder()
+            .build()
+            .map_err(|_error| TokenTransportError::Transport)?;
+        Ok(Self { client })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PostTransport for ReqwestPostTransport {
+    fn post(&self, endpoint: &'static str, form: Zeroizing<String>) -> PostFuture<'_> {
+        Box::pin(async move {
+            let mut response = self
+                .client
+                .post(endpoint)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(form.to_string())
+                .send()
+                .await
+                .map_err(|_error| TransportError::Network)?;
+            drop(form);
+            let status = response.status().as_u16();
+            let content_length = response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok());
+            let mut body = BoundedBody::new(content_length, TOKEN_RESPONSE_LIMIT)?;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_error| TransportError::Network)?
+            {
+                body.push(&chunk)?;
+            }
+            Ok(HttpResponse {
+                status,
+                body: body.finish(),
+            })
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn form_body(parameters: &[(&'static str, Zeroizing<String>)]) -> Zeroizing<String> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in parameters {
+        serializer.append_pair(name, value.as_str());
+    }
+    Zeroizing::new(serializer.finish())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn deserialize_zeroizing<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Land the secret directly in a zeroizing wrapper, so a parse error on a
+    // later field drops it already wiped rather than as a plain `String`.
+    Ok(Zeroizing::new(String::deserialize(deserializer)?))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn deserialize_optional_zeroizing<'de, D>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.map(Zeroizing::new))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportError> {
+    #[derive(Deserialize)]
+    #[expect(
+        dead_code,
+        reason = "the token type and granted scope complete the provider response shape but carry no state the port retains"
+    )]
+    struct TokenResponseBody {
+        #[serde(deserialize_with = "deserialize_zeroizing")]
+        access_token: Zeroizing<String>,
+        expires_in: u64,
+        #[serde(default, deserialize_with = "deserialize_optional_zeroizing")]
+        refresh_token: Option<Zeroizing<String>>,
+        token_type: String,
+        scope: Option<String>,
+    }
+    let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
+        .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    Ok(TokenResponse::new(
+        parsed.access_token,
+        Duration::from_secs(parsed.expires_in),
+        parsed.refresh_token,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn map_error_response(bytes: &[u8]) -> TokenTransportError {
+    #[derive(Deserialize)]
+    struct TokenErrorBody {
+        error: String,
+    }
+    match serde_json::from_slice::<TokenErrorBody>(bytes) {
+        Ok(body) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
+        Ok(_body) => TokenTransportError::ProviderRejected,
+        Err(_error) => TokenTransportError::MalformedResponse,
+    }
+}
+
 // Rust guideline compliant 1.0.
 
 #[cfg(test)]
@@ -582,17 +874,27 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Duration;
 
     use tersa_application::mailbox::{PageSize, PageToken, RemoteMailbox, RemoteMailboxError};
+    use tersa_application::oauth::{
+        AuthorizationConfig, AuthorizationGrant, MonotonicClock, prepare_authorization,
+    };
+    use tersa_application::token::{
+        ExchangeRequest, RefreshRequest, TokenClientConfig, TokenTransport, TokenTransportError,
+        exchange_grant, refresh_access_token,
+    };
     use tersa_domain::mailbox::{AccountId, MessageId};
+    use zeroize::Zeroizing;
 
     use super::{
-        BoundedBody, GmailMailbox, HttpResponse, JSON_LIMIT, RAW_JSON_LIMIT, Request, Transport,
-        TransportError, TransportFuture, body_limit, decode_raw_with_limit, map_status,
-        reads_response_body,
+        BoundedBody, BoxFuture, GmailMailbox, GmailTokenTransport, HttpResponse, JSON_LIMIT,
+        PostFuture, PostTransport, RAW_JSON_LIMIT, REVOKE_ENDPOINT, Request, TOKEN_ENDPOINT,
+        TOKEN_RESPONSE_LIMIT, TokenResponse, Transport, TransportError, TransportFuture, Url,
+        body_limit, decode_raw_with_limit, map_status, reads_response_body,
     };
 
     const ACCOUNT: &str = "account-1";
@@ -733,6 +1035,202 @@ mod tests {
         format!(
             r#"{{"id":"{id}","threadId":"{thread}","internalDate":"42","labelIds":{labels},"snippet":"Preview","payload":{{"headers":[{{"name":"From","value":"Sender <sender@example.test>"}},{{"name":"Subject","value":"Subject"}}]}}}}"#
         )
+    }
+
+    #[derive(Clone)]
+    struct FakePostTransport {
+        state: Arc<FakePostState>,
+    }
+
+    struct FakePostState {
+        replies: Mutex<VecDeque<Reply>>,
+        requests: Mutex<Vec<(String, Zeroizing<String>)>>,
+    }
+
+    impl FakePostTransport {
+        fn new(replies: Vec<Reply>) -> Self {
+            Self {
+                state: Arc::new(FakePostState {
+                    replies: Mutex::new(replies.into()),
+                    requests: Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        fn requests(&self) -> Vec<(String, Zeroizing<String>)> {
+            self.state.requests.lock().map_or_else(
+                |poisoned| poisoned.into_inner().clone(),
+                |guard| guard.clone(),
+            )
+        }
+    }
+
+    impl PostTransport for FakePostTransport {
+        fn post(&self, endpoint: &'static str, form: Zeroizing<String>) -> PostFuture<'_> {
+            self.state
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((endpoint.to_owned(), form));
+            let reply = self
+                .state
+                .replies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            Box::pin(async move {
+                match reply {
+                    Some(Reply::Response {
+                        status,
+                        content_length,
+                        chunks,
+                    }) => {
+                        let mut body = BoundedBody::new(content_length, TOKEN_RESPONSE_LIMIT)?;
+                        for chunk in chunks {
+                            body.push(&chunk)?;
+                        }
+                        Ok(HttpResponse {
+                            status,
+                            body: body.finish(),
+                        })
+                    }
+                    Some(Reply::Network) | None => Err(TransportError::Network),
+                    Some(Reply::Pending(dropped)) => {
+                        let _drop_signal = DropSignal(dropped);
+                        pending::<()>().await;
+                        unreachable!("pending fake transport completed")
+                    }
+                }
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RequestCapture {
+        exchange: Mutex<Option<ExchangeRequest>>,
+        refresh: Mutex<Option<RefreshRequest>>,
+    }
+
+    impl TokenTransport for RequestCapture {
+        fn exchange(
+            &self,
+            request: ExchangeRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            *self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+            Box::pin(async { Err(TokenTransportError::Transport) })
+        }
+
+        fn refresh(
+            &self,
+            request: RefreshRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            *self
+                .refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+            Box::pin(async { Err(TokenTransportError::Transport) })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TestClock(Arc<AtomicU64>);
+
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> Duration {
+            Duration::from_secs(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    fn test_redirect() -> Url {
+        Url::parse("app.tersa.oauth.test:/oauth/callback")
+            .unwrap_or_else(|error| panic!("invalid test redirect: {error}"))
+    }
+
+    fn make_config(client_secret: Option<&str>) -> TokenClientConfig {
+        TokenClientConfig::new(
+            "public-test-client",
+            test_redirect(),
+            client_secret.map(|secret| Zeroizing::new(secret.to_owned())),
+        )
+        .unwrap_or_else(|error| panic!("invalid test token configuration: {error}"))
+    }
+
+    fn make_grant(code: &str) -> AuthorizationGrant {
+        let config = AuthorizationConfig::new(
+            "public-test-client",
+            test_redirect(),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|error| panic!("invalid test authorization configuration: {error}"));
+        let prepared = prepare_authorization(config, TestClock::default())
+            .unwrap_or_else(|error| panic!("authorization preparation failed: {error}"));
+        let state = prepared
+            .authorization_url()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap_or_else(|| panic!("missing test state"));
+        let mut callback = test_redirect();
+        callback
+            .query_pairs_mut()
+            .append_pair("state", &state)
+            .append_pair("code", code);
+        let (_, mut session) = prepared.into_parts();
+        session
+            .finish(&callback)
+            .unwrap_or_else(|error| panic!("test callback rejected: {error}"))
+    }
+
+    fn captured_exchange(client_secret: Option<&str>) -> (AuthorizationGrant, ExchangeRequest) {
+        let grant = make_grant("exchange-code");
+        let config = make_config(client_secret);
+        let capture = RequestCapture::default();
+        assert!(
+            ready(exchange_grant(
+                &grant,
+                &config,
+                &capture,
+                &TestClock::default()
+            ))
+            .is_err()
+        );
+        let request = capture
+            .exchange
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|| panic!("the exchange request was not captured"));
+        (grant, request)
+    }
+
+    fn captured_refresh(client_secret: Option<&str>) -> RefreshRequest {
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+        let config = make_config(client_secret);
+        let capture = RequestCapture::default();
+        assert!(
+            ready(refresh_access_token(
+                &refresh_token,
+                &config,
+                &capture,
+                &TestClock::default()
+            ))
+            .is_err()
+        );
+        capture
+            .refresh
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|| panic!("the refresh request was not captured"))
+    }
+
+    fn token_success_body(rotated_refresh_token: Option<&str>) -> String {
+        match rotated_refresh_token {
+            Some(token) => format!(
+                r#"{{"access_token":"fresh-access-token","expires_in":3599,"refresh_token":"{token}","scope":"https://www.googleapis.com/auth/gmail.readonly","token_type":"Bearer"}}"#
+            ),
+            None => r#"{"access_token":"fresh-access-token","expires_in":3599,"scope":"https://www.googleapis.com/auth/gmail.readonly","token_type":"Bearer"}"#.to_owned(),
+        }
     }
 
     #[test]
@@ -1142,6 +1640,248 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
         drop(future);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exchange_posts_exact_ordered_parameters_and_parses_a_rotated_token() {
+        let (grant, request) = captured_exchange(Some("non-confidential-secret"));
+        let post = FakePostTransport::new(vec![json(
+            200,
+            &token_success_body(Some("rotated-refresh-token")),
+        )]);
+        let transport = GmailTokenTransport::with_transport(post.clone());
+        let response = ready(transport.exchange(request))
+            .unwrap_or_else(|error| panic!("exchange failed: {error}"));
+
+        assert_eq!(response.access_token().as_str(), "fresh-access-token");
+        assert_eq!(response.expires_in(), Duration::from_secs(3_599));
+        assert_eq!(
+            response.rotated_refresh_token().map(|token| token.as_str()),
+            Some("rotated-refresh-token")
+        );
+
+        let requests = post.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, TOKEN_ENDPOINT);
+        assert_eq!(
+            requests[0].1.as_str(),
+            format!(
+                "grant_type=authorization_code&code=exchange-code&code_verifier={}&client_id=public-test-client&redirect_uri=app.tersa.oauth.test%3A%2Foauth%2Fcallback&client_secret=non-confidential-secret",
+                grant.verifier()
+            )
+        );
+    }
+
+    #[test]
+    fn exchange_without_a_client_secret_parses_an_absent_rotated_token() {
+        let (grant, request) = captured_exchange(None);
+        let post = FakePostTransport::new(vec![json(200, &token_success_body(None))]);
+        let transport = GmailTokenTransport::with_transport(post.clone());
+        let response = ready(transport.exchange(request))
+            .unwrap_or_else(|error| panic!("exchange failed: {error}"));
+
+        assert_eq!(response.access_token().as_str(), "fresh-access-token");
+        assert_eq!(response.expires_in(), Duration::from_secs(3_599));
+        assert!(response.rotated_refresh_token().is_none());
+
+        let requests = post.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, TOKEN_ENDPOINT);
+        assert_eq!(
+            requests[0].1.as_str(),
+            format!(
+                "grant_type=authorization_code&code=exchange-code&code_verifier={}&client_id=public-test-client&redirect_uri=app.tersa.oauth.test%3A%2Foauth%2Fcallback",
+                grant.verifier()
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_posts_exact_ordered_parameters_with_and_without_a_client_secret() {
+        let request = captured_refresh(Some("non-confidential-secret"));
+        let post = FakePostTransport::new(vec![json(200, &token_success_body(None))]);
+        let transport = GmailTokenTransport::with_transport(post.clone());
+        let response = ready(transport.refresh(request))
+            .unwrap_or_else(|error| panic!("refresh failed: {error}"));
+        assert_eq!(response.access_token().as_str(), "fresh-access-token");
+        assert!(response.rotated_refresh_token().is_none());
+        let requests = post.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, TOKEN_ENDPOINT);
+        assert_eq!(
+            requests[0].1.as_str(),
+            "grant_type=refresh_token&refresh_token=stored-refresh-token&client_id=public-test-client&client_secret=non-confidential-secret"
+        );
+
+        let request = captured_refresh(None);
+        let post = FakePostTransport::new(vec![json(
+            200,
+            &token_success_body(Some("rotated-refresh-token")),
+        )]);
+        let transport = GmailTokenTransport::with_transport(post.clone());
+        let response = ready(transport.refresh(request))
+            .unwrap_or_else(|error| panic!("refresh failed: {error}"));
+        assert_eq!(response.access_token().as_str(), "fresh-access-token");
+        assert_eq!(
+            response.rotated_refresh_token().map(|token| token.as_str()),
+            Some("rotated-refresh-token")
+        );
+        let requests = post.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].1.as_str(),
+            "grant_type=refresh_token&refresh_token=stored-refresh-token&client_id=public-test-client"
+        );
+    }
+
+    #[test]
+    fn maps_invalid_grant_to_invalid_grant() {
+        let (_, request) = captured_exchange(None);
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+            400,
+            r#"{"error":"invalid_grant","error_description":"the grant expired"}"#,
+        )]));
+        assert_eq!(
+            ready(transport.exchange(request)).err(),
+            Some(TokenTransportError::InvalidGrant)
+        );
+    }
+
+    #[test]
+    fn maps_other_provider_errors_to_provider_rejected() {
+        for body in [
+            r#"{"error":"invalid_client","error_description":"unknown client"}"#,
+            r#"{"error":"access_denied"}"#,
+        ] {
+            let (_, request) = captured_exchange(None);
+            let transport =
+                GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(400, body)]));
+            assert_eq!(
+                ready(transport.exchange(request)).err(),
+                Some(TokenTransportError::ProviderRejected)
+            );
+        }
+    }
+
+    #[test]
+    fn maps_unparsable_success_and_error_bodies_to_malformed_response() {
+        for (status, body) in [
+            (200, "not json"),
+            (200, r#"{"access_token":"fresh-access-token"}"#),
+            (
+                200,
+                r#"{"access_token":"fresh-access-token","expires_in":"3599","token_type":"Bearer"}"#,
+            ),
+            (400, "not json"),
+            (400, r#"{"error_description":"missing the error code"}"#),
+        ] {
+            let (_, request) = captured_exchange(None);
+            let transport =
+                GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+                    status, body,
+                )]));
+            assert_eq!(
+                ready(transport.exchange(request)).err(),
+                Some(TokenTransportError::MalformedResponse)
+            );
+        }
+    }
+
+    #[test]
+    fn maps_network_and_oversized_token_failures_without_payloads() {
+        let (_, request) = captured_exchange(None);
+        let transport =
+            GmailTokenTransport::with_transport(FakePostTransport::new(vec![Reply::Network]));
+        assert_eq!(
+            ready(transport.exchange(request)).err(),
+            Some(TokenTransportError::Transport)
+        );
+
+        let (_, request) = captured_exchange(None);
+        let transport =
+            GmailTokenTransport::with_transport(FakePostTransport::new(vec![Reply::Response {
+                status: 200,
+                content_length: Some(TOKEN_RESPONSE_LIMIT + 1),
+                chunks: vec![],
+            }]));
+        assert_eq!(
+            ready(transport.exchange(request)).err(),
+            Some(TokenTransportError::MalformedResponse)
+        );
+
+        let (_, request) = captured_exchange(None);
+        let transport =
+            GmailTokenTransport::with_transport(FakePostTransport::new(vec![Reply::Response {
+                status: 200,
+                content_length: None,
+                chunks: vec![vec![b'x'; TOKEN_RESPONSE_LIMIT], vec![b'x']],
+            }]));
+        assert_eq!(
+            ready(transport.exchange(request)).err(),
+            Some(TokenTransportError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn revoke_posts_the_token_and_maps_success_and_failures() {
+        let token = Zeroizing::new("stored-refresh-token".to_owned());
+
+        let post = FakePostTransport::new(vec![Reply::Response {
+            status: 200,
+            content_length: Some(0),
+            chunks: vec![],
+        }]);
+        let transport = GmailTokenTransport::with_transport(post.clone());
+        assert_eq!(ready(transport.revoke(&token)), Ok(()));
+        let requests = post.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, REVOKE_ENDPOINT);
+        assert_eq!(requests[0].1.as_str(), "token=stored-refresh-token");
+
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+            400,
+            r#"{"error":"unsupported_token_type"}"#,
+        )]));
+        assert_eq!(
+            ready(transport.revoke(&token)),
+            Err(TokenTransportError::ProviderRejected)
+        );
+
+        let transport =
+            GmailTokenTransport::with_transport(FakePostTransport::new(vec![Reply::Network]));
+        assert_eq!(
+            ready(transport.revoke(&token)),
+            Err(TokenTransportError::Transport)
+        );
+    }
+
+    #[test]
+    fn dropping_a_pending_token_operation_releases_future_owned_state() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let transport =
+            GmailTokenTransport::with_transport(FakePostTransport::new(vec![Reply::Pending(
+                Arc::clone(&dropped),
+            )]));
+        let (_, request) = captured_exchange(None);
+        let mut future = transport.exchange(request);
+        assert!(poll_once(future.as_mut()).is_pending());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(future);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn token_transport_debug_output_is_redacted() {
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![]));
+        let rendered = format!("{transport:?}");
+        assert_eq!(rendered, "GmailTokenTransport([REDACTED])");
+        for secret in [
+            "fresh-access-token",
+            "stored-refresh-token",
+            "non-confidential-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[cfg(target_os = "macos")]

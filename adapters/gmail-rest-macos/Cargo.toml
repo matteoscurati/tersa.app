@@ -1,6 +1,6 @@
 [package]
 name = "tersa-gmail-rest-macos"
-description = "macOS-only read-only Gmail REST mailbox adapter for tersa.app"
+description = "macOS-only read-only Gmail REST mailbox adapter and OAuth token transport for tersa.app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,10 +16,10 @@ serde_json.workspace = true
 tersa-application = { workspace = true }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 url.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 reqwest.workspace = true
-zeroize.workspace = true
 
 [lints]
 workspace = true
