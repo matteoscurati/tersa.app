@@ -72,7 +72,8 @@ printf '%s\n' "$SIGNATURE" \
 ENTITLEMENTS_OUT="$(codesign -d --entitlements :- --xml "$APP" 2>/dev/null | plutil -p - 2>/dev/null)"
 [ -n "$ENTITLEMENTS_OUT" ] \
   || { printf 'error: entitlement extraction produced no output\n' >&2; exit 1; }
-# Require exactly the five reviewed entitlement keys to be present.
+# Require each reviewed key present AND that there are exactly five top-level
+# entitlement keys (no unreviewed entitlement is embedded or printed).
 for key in \
   'com.apple.security.app-sandbox' 'com.apple.security.network.client' \
   'com.apple.security.network.server' 'com.apple.security.application-groups' \
@@ -80,9 +81,14 @@ for key in \
   printf '%s\n' "$ENTITLEMENTS_OUT" | grep -q "\"$key\"" \
     || { printf 'error: reviewed entitlement missing: %s\n' "$key" >&2; exit 1; }
 done
+TOP_LEVEL_KEYS="$(printf '%s\n' "$ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>')"
+[ "$TOP_LEVEL_KEYS" -eq 5 ] \
+  || { printf 'error: expected exactly 5 entitlement keys, found %s\n' "$TOP_LEVEL_KEYS" >&2; exit 1; }
 printf -- '-- embedded entitlements (the five reviewed keys) --\n'
+# Print only the reviewed key lines (booleans are inline) and the reviewed group
+# value; no bare `=> true|false` match, so an unreviewed Boolean cannot print.
 printf '%s\n' "$ENTITLEMENTS_OUT" \
-  | grep -E '"(com\.apple\.security\.(app-sandbox|network\.(client|server)|application-groups)|keychain-access-groups)"|"app\.tersa\.shared"|=> (true|false)'
+  | grep -E '"(com\.apple\.security\.(app-sandbox|network\.(client|server)|application-groups)|keychain-access-groups)" =>|"app\.tersa\.shared"'
 
 section "Size (ad-hoc Release, arm64)"
 APP_BYTES="$(find "$APP" -type f -exec stat -f%z {} + | awk '{s+=$1} END {print s}')"
