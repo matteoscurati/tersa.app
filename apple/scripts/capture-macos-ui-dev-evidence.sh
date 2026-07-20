@@ -78,9 +78,13 @@ for key in \
   'com.apple.security.app-sandbox' 'com.apple.security.network.client' \
   'com.apple.security.network.server' 'com.apple.security.application-groups' \
   'keychain-access-groups'; do
-  printf '%s\n' "$ENTITLEMENTS_OUT" | grep -q "\"$key\"" \
-    || { printf 'error: reviewed entitlement missing: %s\n' "$key" >&2; exit 1; }
+  # Anchor to a TOP-LEVEL key line so a reviewed key nested inside another
+  # entitlement cannot satisfy the check.
+  printf '%s\n' "$ENTITLEMENTS_OUT" | grep -qE "^  \"$key\" =>" \
+    || { printf 'error: reviewed entitlement missing at top level: %s\n' "$key" >&2; exit 1; }
 done
+# Exactly five top-level keys, all five reviewed above => the top-level entitlement
+# set equals the reviewed set (no unreviewed key hides top-level).
 TOP_LEVEL_KEYS="$(printf '%s\n' "$ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>')"
 [ "$TOP_LEVEL_KEYS" -eq 5 ] \
   || { printf 'error: expected exactly 5 entitlement keys, found %s\n' "$TOP_LEVEL_KEYS" >&2; exit 1; }
