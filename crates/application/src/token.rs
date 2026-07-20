@@ -1,0 +1,1100 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Implements the portable token exchange and refresh state machine.
+//!
+//! This module models the token endpoint conversation as I/O-free structured
+//! data: request values describe the endpoint POST parameters, a
+//! `TokenTransport` port sends them, and the state machine interprets parsed
+//! responses into typed outcomes. It intentionally does not encode wire
+//! formats, perform HTTP, parse JSON, persist tokens, or revoke consent.
+//! Platform adapters own the transport; the composition owns persistence and
+//! re-connect routing.
+
+use std::fmt;
+use std::time::Duration;
+
+use url::Url;
+use zeroize::Zeroizing;
+
+use crate::mailbox::BoxFuture;
+use crate::oauth::{AuthorizationGrant, MonotonicClock};
+
+// Rust guideline compliant 1.0.
+
+/// Configures the OAuth client identity presented to the token endpoint.
+#[derive(Clone)]
+pub struct TokenClientConfig {
+    client_id: String,
+    redirect_uri: Url,
+    client_secret: Option<Zeroizing<String>>,
+}
+
+impl TokenClientConfig {
+    /// Creates a validated token client configuration.
+    ///
+    /// The client secret is optional because the Desktop client posture is
+    /// resolved empirically before the request shape freezes: both the
+    /// secret-required and secret-absent shapes stay representable, and any
+    /// secret sent is the non-confidential Desktop client value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::InvalidConfiguration`] when the client identifier
+    /// is blank, the redirect contains credentials, a query, or a fragment, or
+    /// a present client secret is blank.
+    pub fn new<T: Into<String>>(
+        client_id: T,
+        redirect_uri: Url,
+        client_secret: Option<Zeroizing<String>>,
+    ) -> Result<Self, TokenError> {
+        let client_id = client_id.into();
+        let has_credentials =
+            !redirect_uri.username().is_empty() || redirect_uri.password().is_some();
+        let blank_secret = client_secret
+            .as_ref()
+            .is_some_and(|secret| secret.trim().is_empty());
+        if client_id.trim().is_empty()
+            || has_credentials
+            || redirect_uri.query().is_some()
+            || redirect_uri.fragment().is_some()
+            || blank_secret
+        {
+            return Err(TokenError::InvalidConfiguration);
+        }
+
+        Ok(Self {
+            client_id,
+            redirect_uri,
+            client_secret,
+        })
+    }
+
+    /// Returns the public OAuth client identifier.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the exact registered redirect URI.
+    #[must_use]
+    pub fn redirect_uri(&self) -> &Url {
+        &self.redirect_uri
+    }
+
+    /// Returns the optional non-confidential client secret.
+    #[must_use]
+    pub fn client_secret(&self) -> Option<&Zeroizing<String>> {
+        self.client_secret.as_ref()
+    }
+}
+
+impl fmt::Debug for TokenClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenClientConfig")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_secret| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Describes an authorization-code exchange as ordered endpoint parameters.
+///
+/// The parameters are structured data for a transport to encode, never wire
+/// bytes: no percent- or form-encoding happens here.
+pub struct ExchangeRequest {
+    code: Zeroizing<String>,
+    code_verifier: Zeroizing<String>,
+    client_id: String,
+    redirect_uri: Url,
+    client_secret: Option<Zeroizing<String>>,
+}
+
+impl ExchangeRequest {
+    fn new(grant: &AuthorizationGrant, config: &TokenClientConfig) -> Self {
+        Self {
+            code: Zeroizing::new(grant.code().to_owned()),
+            code_verifier: Zeroizing::new(grant.verifier().to_owned()),
+            client_id: config.client_id().to_owned(),
+            redirect_uri: config.redirect_uri().clone(),
+            client_secret: config.client_secret().cloned(),
+        }
+    }
+
+    /// Returns the ordered parameters a transport encodes for the endpoint.
+    ///
+    /// `client_secret` is emitted last and only when configured, so the
+    /// secret-present and secret-absent shapes share one parameter prefix.
+    #[must_use]
+    pub fn parameters(&self) -> Vec<(&'static str, Zeroizing<String>)> {
+        let mut parameters = vec![
+            (
+                "grant_type",
+                Zeroizing::new("authorization_code".to_owned()),
+            ),
+            ("code", self.code.clone()),
+            ("code_verifier", self.code_verifier.clone()),
+            ("client_id", Zeroizing::new(self.client_id.clone())),
+            (
+                "redirect_uri",
+                Zeroizing::new(self.redirect_uri.as_str().to_owned()),
+            ),
+        ];
+        if let Some(secret) = &self.client_secret {
+            parameters.push(("client_secret", secret.clone()));
+        }
+        parameters
+    }
+}
+
+impl fmt::Debug for ExchangeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExchangeRequest")
+            .field("code", &"[REDACTED]")
+            .field("code_verifier", &"[REDACTED]")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_secret| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Describes a refresh-token exchange as ordered endpoint parameters.
+///
+/// The parameters are structured data for a transport to encode, never wire
+/// bytes: no percent- or form-encoding happens here.
+pub struct RefreshRequest {
+    refresh_token: Zeroizing<String>,
+    client_id: String,
+    client_secret: Option<Zeroizing<String>>,
+}
+
+impl RefreshRequest {
+    fn new(refresh_token: &Zeroizing<String>, config: &TokenClientConfig) -> Self {
+        Self {
+            refresh_token: refresh_token.clone(),
+            client_id: config.client_id().to_owned(),
+            client_secret: config.client_secret().cloned(),
+        }
+    }
+
+    /// Returns the ordered parameters a transport encodes for the endpoint.
+    ///
+    /// `client_secret` is emitted last and only when configured, so the
+    /// secret-present and secret-absent shapes share one parameter prefix.
+    #[must_use]
+    pub fn parameters(&self) -> Vec<(&'static str, Zeroizing<String>)> {
+        let mut parameters = vec![
+            ("grant_type", Zeroizing::new("refresh_token".to_owned())),
+            ("refresh_token", self.refresh_token.clone()),
+            ("client_id", Zeroizing::new(self.client_id.clone())),
+        ];
+        if let Some(secret) = &self.client_secret {
+            parameters.push(("client_secret", secret.clone()));
+        }
+        parameters
+    }
+}
+
+impl fmt::Debug for RefreshRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefreshRequest")
+            .field("refresh_token", &"[REDACTED]")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_secret| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Carries an already-parsed token endpoint response.
+///
+/// The transport parses the response body; this value never holds wire bytes
+/// or JSON. The optional refresh token models provider rotation.
+pub struct TokenResponse {
+    access_token: Zeroizing<String>,
+    expires_in: Duration,
+    rotated_refresh_token: Option<Zeroizing<String>>,
+}
+
+impl TokenResponse {
+    /// Creates a token response from its parsed fields.
+    #[must_use]
+    pub fn new(
+        access_token: Zeroizing<String>,
+        expires_in: Duration,
+        rotated_refresh_token: Option<Zeroizing<String>>,
+    ) -> Self {
+        Self {
+            access_token,
+            expires_in,
+            rotated_refresh_token,
+        }
+    }
+
+    /// Returns the granted access token without transferring ownership.
+    ///
+    /// Returns the `Zeroizing` wrapper so callers clone without minting a
+    /// non-zeroizing plaintext copy of this hot secret.
+    #[must_use]
+    pub fn access_token(&self) -> &Zeroizing<String> {
+        &self.access_token
+    }
+
+    /// Returns the access-token lifetime measured in seconds.
+    #[must_use]
+    pub fn expires_in(&self) -> Duration {
+        self.expires_in
+    }
+
+    /// Returns the rotated refresh token when the provider rotated it.
+    #[must_use]
+    pub fn rotated_refresh_token(&self) -> Option<&Zeroizing<String>> {
+        self.rotated_refresh_token.as_ref()
+    }
+
+    /// Separates the response into its owned fields.
+    #[must_use]
+    pub fn into_parts(self) -> (Zeroizing<String>, Duration, Option<Zeroizing<String>>) {
+        (
+            self.access_token,
+            self.expires_in,
+            self.rotated_refresh_token,
+        )
+    }
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .field(
+                "rotated_refresh_token",
+                &self
+                    .rotated_refresh_token
+                    .as_ref()
+                    .map(|_token| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Sends token requests to the provider token endpoint.
+///
+/// Implementations own the wire encoding, the HTTP exchange, and response
+/// parsing; this layer supplies structured parameters and consumes parsed
+/// values only.
+pub trait TokenTransport: fmt::Debug + Send + Sync {
+    /// Exchanges an authorization-code request for a token response.
+    ///
+    /// The port is asynchronous and runtime-agnostic (a [`BoxFuture`], matching
+    /// the crate's other network ports), so the composition-owned current-thread
+    /// runtime drives it without a nested `block_on`.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to a typed transport or protocol failure without provider data.
+    fn exchange(
+        &self,
+        request: ExchangeRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>>;
+
+    /// Exchanges a refresh-token request for a token response.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to a typed transport or protocol failure without provider data.
+    fn refresh(
+        &self,
+        request: RefreshRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>>;
+}
+
+/// Describes a token transport or protocol failure without provider data.
+///
+/// Variants never carry echoed request parameters or response bodies: the
+/// parsing transport reduces provider error bodies to bare variants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TokenTransportError {
+    /// The request could not be delivered or no response arrived.
+    Transport,
+    /// The endpoint answered the well-formed `invalid_grant` error.
+    InvalidGrant,
+    /// The endpoint answered any other well-formed error.
+    ProviderRejected,
+    /// The response did not parse into a complete token response.
+    MalformedResponse,
+}
+
+impl fmt::Display for TokenTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Transport => "the token endpoint could not be reached",
+            Self::InvalidGrant => "the token endpoint reported an invalid grant",
+            Self::ProviderRejected => "the token endpoint rejected the request",
+            Self::MalformedResponse => "the token endpoint returned an incomplete response",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for TokenTransportError {}
+
+/// Describes a terminal token lifecycle failure without sensitive values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TokenError {
+    /// A required configuration value is absent or unusable.
+    InvalidConfiguration,
+    /// The token endpoint could not be reached.
+    Transport,
+    /// The provider rejected the request with an error other than `invalid_grant`.
+    ProviderRejected,
+    /// The endpoint response did not parse into a complete token response.
+    MalformedResponse,
+    /// The grant or refresh token lost validity and re-consent is required.
+    ConsentRevoked,
+}
+
+impl fmt::Display for TokenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidConfiguration => "invalid token client configuration",
+            Self::Transport => "the token endpoint could not be reached",
+            Self::ProviderRejected => "the token endpoint rejected the request",
+            Self::MalformedResponse => "the token endpoint returned an incomplete response",
+            Self::ConsentRevoked => "the granted consent was revoked and re-connect is required",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+/// Holds an access token and its monotonic expiry deadline.
+///
+/// The access token is in-memory only and never persisted. `expires_at` is a
+/// monotonic `Duration` comparable only against the same [`MonotonicClock`]
+/// origin that minted it (a fresh origin per process); it must never be
+/// persisted across restarts or compared against a different clock.
+pub struct AccessToken {
+    secret: Zeroizing<String>,
+    expires_at: Duration,
+}
+
+impl AccessToken {
+    /// Returns the access token without transferring ownership.
+    ///
+    /// Returns the `Zeroizing` wrapper so callers clone without minting a
+    /// non-zeroizing plaintext copy of this hot secret.
+    #[must_use]
+    pub fn secret(&self) -> &Zeroizing<String> {
+        &self.secret
+    }
+
+    /// Returns the monotonic deadline after which the token is expired.
+    ///
+    /// Comparable only against the originating clock; never persist it.
+    #[must_use]
+    pub fn expires_at(&self) -> Duration {
+        self.expires_at
+    }
+
+    /// Returns whether a refresh is due before driving a fetch.
+    ///
+    /// Refresh is proactive: it is due as soon as the remaining lifetime has
+    /// fallen to `skew_margin`, so a fetch never starts with a token that can
+    /// expire mid-flight. The deadline is tracked from `expires_in`, never
+    /// inferred from a rejected request.
+    #[must_use]
+    pub fn needs_refresh<C: MonotonicClock>(&self, clock: &C, skew_margin: Duration) -> bool {
+        clock.now().saturating_add(skew_margin) >= self.expires_at
+    }
+}
+
+impl fmt::Debug for AccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessToken")
+            .field("secret", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Carries a granted access token and any rotated refresh token.
+pub struct TokenSuccess {
+    access_token: AccessToken,
+    rotated_refresh_token: Option<Zeroizing<String>>,
+}
+
+impl TokenSuccess {
+    fn from_response(response: TokenResponse, now: Duration) -> Result<Self, TokenError> {
+        let (access_token, expires_in, rotated_refresh_token) = response.into_parts();
+        if access_token.is_empty() {
+            return Err(TokenError::MalformedResponse);
+        }
+        // `expires_in` is provider-controlled (parsed by the transport), so an
+        // overflow is a malformed response, not a client-configuration fault.
+        let expires_at = now
+            .checked_add(expires_in)
+            .ok_or(TokenError::MalformedResponse)?;
+        Ok(Self {
+            access_token: AccessToken {
+                secret: access_token,
+                expires_at,
+            },
+            rotated_refresh_token,
+        })
+    }
+
+    /// Returns the granted access token with its monotonic expiry.
+    #[must_use]
+    pub fn access_token(&self) -> &AccessToken {
+        &self.access_token
+    }
+
+    /// Returns the rotated refresh token when the provider rotated it.
+    ///
+    /// Google may return a new refresh token on exchange or refresh; its
+    /// presence replaces the stored token and its absence keeps it.
+    #[must_use]
+    pub fn rotated_refresh_token(&self) -> Option<&Zeroizing<String>> {
+        self.rotated_refresh_token.as_ref()
+    }
+
+    /// Separates the access token from any rotated refresh token.
+    #[must_use]
+    pub fn into_parts(self) -> (AccessToken, Option<Zeroizing<String>>) {
+        (self.access_token, self.rotated_refresh_token)
+    }
+}
+
+impl fmt::Debug for TokenSuccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenSuccess")
+            .field("access_token", &self.access_token)
+            .field(
+                "rotated_refresh_token",
+                &self
+                    .rotated_refresh_token
+                    .as_ref()
+                    .map(|_token| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Exchanges a validated authorization grant for a token success.
+///
+/// Builds the authorization-code request from the grant and client
+/// configuration, sends it through the transport, and interprets the outcome.
+/// An `invalid_grant` protocol answer maps to [`TokenError::ConsentRevoked`],
+/// the terminal the composition routes to the re-connect state.
+///
+/// # Errors
+///
+/// Returns [`TokenError::ConsentRevoked`] when consent was withdrawn or the
+/// grant expired, [`TokenError::Transport`] when the endpoint is unreachable,
+/// [`TokenError::ProviderRejected`] for any other provider error, and
+/// [`TokenError::MalformedResponse`] for an unparsable response.
+pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
+    grant: &AuthorizationGrant,
+    config: &TokenClientConfig,
+    transport: &'a T,
+    clock: &'a C,
+) -> BoxFuture<'a, Result<TokenSuccess, TokenError>> {
+    let request = ExchangeRequest::new(grant, config);
+    Box::pin(async move {
+        let response = transport
+            .exchange(request)
+            .await
+            .map_err(map_transport_error)?;
+        TokenSuccess::from_response(response, clock.now())
+    })
+}
+
+/// Refreshes an access token using the stored refresh token.
+///
+/// Builds the refresh-token request from the stored token and client
+/// configuration, sends it through the transport, and interprets the outcome
+/// exactly like [`exchange_grant`], including the [`TokenError::ConsentRevoked`]
+/// mapping.
+///
+/// # Errors
+///
+/// Returns [`TokenError::ConsentRevoked`] when consent was withdrawn or the
+/// refresh token expired, [`TokenError::Transport`] when the endpoint is
+/// unreachable, [`TokenError::ProviderRejected`] for any other provider error,
+/// and [`TokenError::MalformedResponse`] for an unparsable response.
+pub fn refresh_access_token<'a, T: TokenTransport, C: MonotonicClock>(
+    refresh_token: &Zeroizing<String>,
+    config: &TokenClientConfig,
+    transport: &'a T,
+    clock: &'a C,
+) -> BoxFuture<'a, Result<TokenSuccess, TokenError>> {
+    let request = RefreshRequest::new(refresh_token, config);
+    Box::pin(async move {
+        let response = transport
+            .refresh(request)
+            .await
+            .map_err(map_transport_error)?;
+        TokenSuccess::from_response(response, clock.now())
+    })
+}
+
+fn map_transport_error(error: TokenTransportError) -> TokenError {
+    match error {
+        TokenTransportError::Transport => TokenError::Transport,
+        TokenTransportError::InvalidGrant => TokenError::ConsentRevoked,
+        TokenTransportError::ProviderRejected => TokenError::ProviderRejected,
+        TokenTransportError::MalformedResponse => TokenError::MalformedResponse,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test fixtures use static URLs and assert setup success before behavior"
+    )]
+
+    use std::fmt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use url::Url;
+    use zeroize::Zeroizing;
+
+    use super::{
+        ExchangeRequest, RefreshRequest, TokenClientConfig, TokenError, TokenResponse,
+        TokenTransport, TokenTransportError, exchange_grant, refresh_access_token,
+    };
+    use crate::mailbox::BoxFuture;
+    use crate::oauth::{
+        AuthorizationConfig, AuthorizationGrant, MonotonicClock, prepare_authorization,
+    };
+
+    /// Drives an immediately-ready fake-transport future to completion.
+    fn now_ready<T>(mut future: BoxFuture<'_, T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the fake transport future must be immediately ready"),
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TestClock(Arc<AtomicU64>);
+
+    impl TestClock {
+        fn advance(&self, seconds: u64) {
+            self.0.fetch_add(seconds, Ordering::Relaxed);
+        }
+    }
+
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> Duration {
+            Duration::from_secs(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    #[derive(Debug)]
+    enum RecordedRequest {
+        Exchange(ExchangeRequest),
+        Refresh(RefreshRequest),
+    }
+
+    impl RecordedRequest {
+        fn parameters(&self) -> Vec<(&'static str, Zeroizing<String>)> {
+            match self {
+                Self::Exchange(request) => request.parameters(),
+                Self::Refresh(request) => request.parameters(),
+            }
+        }
+    }
+
+    struct FakeTransport {
+        error: Option<TokenTransportError>,
+        rotated_refresh_token: Option<Zeroizing<String>>,
+        recorded: Mutex<Vec<RecordedRequest>>,
+    }
+
+    impl fmt::Debug for FakeTransport {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("FakeTransport")
+                .field("error", &self.error)
+                .field(
+                    "rotated_refresh_token",
+                    &self
+                        .rotated_refresh_token
+                        .as_ref()
+                        .map(|_token| "[REDACTED]"),
+                )
+                .field("recorded", &self.recorded)
+                .finish()
+        }
+    }
+
+    impl FakeTransport {
+        fn success(rotated_refresh_token: Option<&str>) -> Self {
+            Self {
+                error: None,
+                rotated_refresh_token: rotated_refresh_token
+                    .map(|token| Zeroizing::new(token.to_owned())),
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(error: TokenTransportError) -> Self {
+            Self {
+                error: Some(error),
+                rotated_refresh_token: None,
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn outcome(&self) -> Result<TokenResponse, TokenTransportError> {
+            match self.error {
+                Some(error) => Err(error),
+                None => Ok(TokenResponse::new(
+                    Zeroizing::new("fake-access-token".to_owned()),
+                    Duration::from_secs(3_600),
+                    self.rotated_refresh_token.clone(),
+                )),
+            }
+        }
+    }
+
+    impl TokenTransport for FakeTransport {
+        fn exchange(
+            &self,
+            request: ExchangeRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            Box::pin(async move {
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .push(RecordedRequest::Exchange(request));
+                self.outcome()
+            })
+        }
+
+        fn refresh(
+            &self,
+            request: RefreshRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            Box::pin(async move {
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .push(RecordedRequest::Refresh(request));
+                self.outcome()
+            })
+        }
+    }
+
+    fn test_redirect() -> Url {
+        Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap()
+    }
+
+    fn make_config(client_secret: Option<&str>) -> TokenClientConfig {
+        TokenClientConfig::new(
+            "public-test-client",
+            test_redirect(),
+            client_secret.map(|secret| Zeroizing::new(secret.to_owned())),
+        )
+        .unwrap()
+    }
+
+    fn make_grant(code: &str) -> AuthorizationGrant {
+        let config = AuthorizationConfig::new(
+            "public-test-client",
+            test_redirect(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let prepared = prepare_authorization(config, TestClock::default()).unwrap();
+        let state = prepared
+            .authorization_url()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let mut callback = test_redirect();
+        callback
+            .query_pairs_mut()
+            .append_pair("state", &state)
+            .append_pair("code", code);
+        let (_, mut session) = prepared.into_parts();
+        session.finish(&callback).unwrap()
+    }
+
+    #[test]
+    fn rejects_invalid_client_configuration() {
+        let secret = || Some(Zeroizing::new("non-confidential-secret".to_owned()));
+        let with_query = Url::parse("app.tersa.oauth.test:/oauth/callback?probe=1").unwrap();
+        assert_eq!(
+            TokenClientConfig::new("   ", test_redirect(), secret()).unwrap_err(),
+            TokenError::InvalidConfiguration
+        );
+        assert_eq!(
+            TokenClientConfig::new("public-test-client", with_query, secret()).unwrap_err(),
+            TokenError::InvalidConfiguration
+        );
+        assert_eq!(
+            TokenClientConfig::new(
+                "public-test-client",
+                test_redirect(),
+                Some(Zeroizing::new("   ".to_owned())),
+            )
+            .unwrap_err(),
+            TokenError::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn builds_exchange_requests_with_and_without_client_secret() {
+        let grant = make_grant("exchange-code");
+
+        let transport = FakeTransport::success(None);
+        let config = make_config(Some("non-confidential-secret"));
+        now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let parameters = recorded[0].parameters();
+        let pairs: Vec<(&str, &str)> = parameters
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("grant_type", "authorization_code"),
+                ("code", "exchange-code"),
+                ("code_verifier", grant.verifier()),
+                ("client_id", "public-test-client"),
+                ("redirect_uri", "app.tersa.oauth.test:/oauth/callback"),
+                ("client_secret", "non-confidential-secret"),
+            ]
+        );
+        drop(recorded);
+
+        let transport = FakeTransport::success(None);
+        let config = make_config(None);
+        now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let parameters = recorded[0].parameters();
+        let pairs: Vec<(&str, &str)> = parameters
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("grant_type", "authorization_code"),
+                ("code", "exchange-code"),
+                ("code_verifier", grant.verifier()),
+                ("client_id", "public-test-client"),
+                ("redirect_uri", "app.tersa.oauth.test:/oauth/callback"),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_refresh_requests_with_and_without_client_secret() {
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+
+        let transport = FakeTransport::success(None);
+        let config = make_config(Some("non-confidential-secret"));
+        now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let parameters = recorded[0].parameters();
+        let pairs: Vec<(&str, &str)> = parameters
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "stored-refresh-token"),
+                ("client_id", "public-test-client"),
+                ("client_secret", "non-confidential-secret"),
+            ]
+        );
+        drop(recorded);
+
+        let transport = FakeTransport::success(None);
+        let config = make_config(None);
+        now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let parameters = recorded[0].parameters();
+        let pairs: Vec<(&str, &str)> = parameters
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "stored-refresh-token"),
+                ("client_id", "public-test-client"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exchange_success_models_rotation_presence_and_absence() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let clock = TestClock::default();
+
+        let transport = FakeTransport::success(Some("rotated-refresh-token"));
+        let success = now_ready(exchange_grant(&grant, &config, &transport, &clock)).unwrap();
+        assert_eq!(
+            success.access_token().secret().as_str(),
+            "fake-access-token"
+        );
+        assert_eq!(
+            success.access_token().expires_at(),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            success.rotated_refresh_token().map(|token| token.as_str()),
+            Some("rotated-refresh-token")
+        );
+
+        let transport = FakeTransport::success(None);
+        let success = now_ready(exchange_grant(&grant, &config, &transport, &clock)).unwrap();
+        assert_eq!(
+            success.access_token().secret().as_str(),
+            "fake-access-token"
+        );
+        assert!(success.rotated_refresh_token().is_none());
+    }
+
+    #[test]
+    fn refresh_success_rotates_or_keeps_the_stored_refresh_token() {
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+        let config = make_config(None);
+        let clock = TestClock::default();
+
+        let transport = FakeTransport::success(Some("rotated-refresh-token"));
+        let success = now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &transport,
+            &clock,
+        ))
+        .unwrap();
+        let (access_token, rotated) = success.into_parts();
+        assert_eq!(access_token.secret().as_str(), "fake-access-token");
+        assert_eq!(access_token.expires_at(), Duration::from_secs(3_600));
+        assert_eq!(
+            rotated.as_ref().map(|token| token.as_str()),
+            Some("rotated-refresh-token")
+        );
+
+        let transport = FakeTransport::success(None);
+        let success = now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &transport,
+            &clock,
+        ))
+        .unwrap();
+        assert!(success.rotated_refresh_token().is_none());
+    }
+
+    #[test]
+    fn maps_invalid_grant_to_consent_revoked_on_both_flows() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::failing(TokenTransportError::InvalidGrant);
+        assert_eq!(
+            now_ready(exchange_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::ConsentRevoked
+        );
+
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+        let transport = FakeTransport::failing(TokenTransportError::InvalidGrant);
+        assert_eq!(
+            now_ready(refresh_access_token(
+                &refresh_token,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::ConsentRevoked
+        );
+    }
+
+    #[test]
+    fn maps_remaining_transport_failures_to_distinct_terminals() {
+        let cases = [
+            (TokenTransportError::Transport, TokenError::Transport),
+            (
+                TokenTransportError::ProviderRejected,
+                TokenError::ProviderRejected,
+            ),
+            (
+                TokenTransportError::MalformedResponse,
+                TokenError::MalformedResponse,
+            ),
+        ];
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        for (transport_error, expected) in cases {
+            let transport = FakeTransport::failing(transport_error);
+            assert_eq!(
+                now_ready(exchange_grant(
+                    &grant,
+                    &config,
+                    &transport,
+                    &TestClock::default()
+                ))
+                .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn proactive_refresh_decision_respects_the_skew_margin() {
+        let clock = TestClock::default();
+        let transport = FakeTransport::success(None);
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let success = now_ready(exchange_grant(&grant, &config, &transport, &clock)).unwrap();
+        let access_token = success.access_token();
+        let skew_margin = Duration::from_secs(300);
+
+        // Well outside the margin: 3_300 seconds remain.
+        assert!(!access_token.needs_refresh(&clock, skew_margin));
+        // Still outside: exactly the margin plus one second of slack.
+        clock.advance(3_000);
+        assert!(!access_token.needs_refresh(&clock, skew_margin));
+        // At the margin boundary the remaining lifetime equals the margin.
+        clock.advance(300);
+        assert!(access_token.needs_refresh(&clock, skew_margin));
+        // Inside the margin.
+        clock.advance(200);
+        assert!(access_token.needs_refresh(&clock, skew_margin));
+        // Past expiry.
+        clock.advance(200);
+        assert!(access_token.needs_refresh(&clock, skew_margin));
+    }
+
+    #[test]
+    fn secrets_never_appear_in_debug_output() {
+        let grant = make_grant("super-secret-code");
+        let config = make_config(Some("super-client-secret"));
+        let transport = FakeTransport::success(Some("super-rotated-refresh"));
+        let success = now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+
+        let response = TokenResponse::new(
+            Zeroizing::new("super-access-token".to_owned()),
+            Duration::from_secs(60),
+            Some(Zeroizing::new("super-rotated-refresh".to_owned())),
+        );
+        for rendered in [
+            format!("{:?}", recorded[0]),
+            format!("{config:?}"),
+            format!("{success:?}"),
+            format!("{:?}", success.access_token()),
+            format!("{response:?}"),
+        ] {
+            assert!(rendered.contains("[REDACTED]"));
+            for secret in [
+                "super-secret-code",
+                "super-client-secret",
+                "super-rotated-refresh",
+                "super-access-token",
+                "fake-access-token",
+                grant.verifier(),
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+        drop(recorded);
+
+        let refresh_token = Zeroizing::new("super-stored-refresh".to_owned());
+        let transport = FakeTransport::success(None);
+        now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        let recorded = transport.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let rendered = format!("{:?}", recorded[0]);
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("super-stored-refresh"));
+        assert!(!rendered.contains("super-client-secret"));
+    }
+}

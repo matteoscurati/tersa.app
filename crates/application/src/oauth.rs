@@ -21,8 +21,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 // Rust guideline compliant 1.0.
 
-/// The only Gmail scope requested by the feasibility flow.
-pub const GMAIL_MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// The only Gmail scope requested by the flow, granting read-only access.
+pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
 const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const SECRET_BYTES: usize = 32;
@@ -378,7 +378,7 @@ fn prepare_with_secrets<C: MonotonicClock>(
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", config.redirect_uri.as_str())
-        .append_pair("scope", GMAIL_MODIFY_SCOPE)
+        .append_pair("scope", GMAIL_READONLY_SCOPE)
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -439,8 +439,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        AuthorizationConfig, GMAIL_MODIFY_SCOPE, MonotonicClock, OAuthError, SystemMonotonicClock,
-        pkce_challenge, prepare_authorization, prepare_with_secrets,
+        AuthorizationConfig, GMAIL_READONLY_SCOPE, MonotonicClock, OAuthError,
+        SystemMonotonicClock, pkce_challenge, prepare_authorization, prepare_with_secrets,
     };
     use std::time::Duration;
     use url::Url;
@@ -498,7 +498,11 @@ mod tests {
         let parameters: BTreeMap<_, _> = pairs.iter().cloned().collect();
         assert_eq!(pairs.len(), 8);
         assert_eq!(parameters.len(), pairs.len());
-        assert_eq!(parameters.get("scope").unwrap(), GMAIL_MODIFY_SCOPE);
+        assert_eq!(parameters.get("scope").unwrap(), GMAIL_READONLY_SCOPE);
+        assert_eq!(
+            GMAIL_READONLY_SCOPE,
+            "https://www.googleapis.com/auth/gmail.readonly"
+        );
         assert_eq!(parameters.get("code_challenge_method").unwrap(), "S256");
         assert_eq!(parameters.get("response_type").unwrap(), "code");
         assert_eq!(parameters.get("client_id").unwrap(), "public-test-client");
