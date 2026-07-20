@@ -24,9 +24,11 @@ Much of the machinery exists and is reviewed:
 - the PKCE authorization state machine and callback validation
   (`crates/application/src/oauth.rs`);
 - the macOS loopback transport and the `tersa_oauth_macos_begin/poll/cancel`
-  C ABI, already in the byte-pinned header and export fixtures;
+  C ABI, already in the canonical (whitespace-normalized) pinned header and export
+  fixtures;
 - the Swift session driver `apple/macos/OAuthAuthorizationSession.swift`,
-  instantiated but never started;
+  instantiated and wrapped in a dormant `AppDelegate` method that is not reachable
+  from any launch or UI path;
 - the official Gmail read adapter ([ADR 0016](adr-0016-gmail-rest-adapter.md),
   `adapters/gmail-rest-macos`), `AccountId`-bound, `Zeroizing` tokens, GET-only
   under a fixed base;
@@ -60,70 +62,133 @@ runtime measurements enabled by a populated store are recorded on each PR's
 ADR 0022 checklist, but the dedicated performance harness and its thresholds
 remain **Step 4**; Step 3 does not build that harness or assert a threshold.
 
-### Client-secret posture (amends an M0 invariant)
+### Client-secret posture (amends an M0 invariant, empirically resolved)
 
 The evidenced macOS transport binds an ephemeral `http://127.0.0.1:{port}/`
 loopback; only Google's **Desktop app** client type accepts unregistered loopback
-redirects. Google's token endpoint requires the `client_secret` for a Desktop
-client even under PKCE. Per RFC 8252 §8.5 that secret is **not confidential** for
-an installed app. This ADR therefore amends the
+redirects. Whether the token endpoint requires the Desktop client's `client_secret`
+under PKCE is contested — Google's native-app guidance has described it as optional,
+while Desktop clients have historically been issued a secret and rejected exchanges
+without it. This ADR does not settle it by reading docs: a one-off `curl` probe of
+the token endpoint with the real Desktop client (a 3f prerequisite, run **before**
+3a freezes its request shape) determines it empirically. Either result yields the
+same posture: if a secret is required it is the Desktop client's, which is **not
+confidential** for an installed app (RFC 8252 §8.5); if none is required, none is
+sent. This ADR therefore amends the
 [OAuth/PKCE feasibility](../m0/oauth-pkce-feasibility.md) deferred-work invariant
 "exchange the validated code **without a client secret**" to "without a
-**confidential** secret": the non-confidential Desktop client secret is carried
-as a build-injected value alongside the client ID and used only at the token
-endpoint. The alternative — an iOS-type client with no secret — would force a
-reversed-client-ID custom-scheme redirect and discard the reviewed loopback
-transport, and is rejected. No other feasibility invariant is weakened.
+**confidential** secret", so the plan holds under either outcome: any secret sent is
+a build-injected non-confidential value carried alongside the client ID and used
+only at the token endpoint. The alternative — an iOS-type client with no secret —
+would force a reversed-client-ID custom-scheme redirect and discard the reviewed
+loopback transport, and is rejected. No other feasibility invariant is weakened.
 
 ### Token lifecycle and ownership
 
-- The **refresh token** is the only persisted credential: a single device-only
-  Keychain item per canonical `AccountId`, in the existing access group, with
-  device-only accessibility; never written to SQLCipher, never crossed over the
-  C ABI, never logged. Owned by a new trusted composition entry in
-  `tersa-keychain-macos`; store/load/delete only.
+- The **refresh token** is the only persisted credential: a single Keychain item
+  per canonical `AccountId`, in the existing access group, with
+  `WhenUnlockedThisDeviceOnly` accessibility (stricter than the root key and
+  sufficient, since sync is user-triggered with no background work); never written
+  to SQLCipher, never crossed over the C ABI, never logged. Owned by a new trusted
+  composition entry in `tersa-keychain-macos`.
+- **Rotation is an atomic replace.** Google may return a new refresh token on
+  refresh or re-consent; replacing the stored item must be crash-safe
+  (write-new-then-remove-old, never delete-then-add, so a crash never leaves the
+  account with no persisted credential). ADR 0019's Keychain surface is add-only and
+  forbids deletion, so 3c amends its guard with a **token-item-specific** atomic
+  store-or-replace and delete while the installation root key stays add-only and
+  deletion-forbidden.
 - The **access token** stays in memory as a `Zeroizing` value (already
-  adapter-side) and is never persisted.
-- Refresh is **serialized per account**. Token exchange and refresh are modeled
-  as a portable, I/O-free state machine (ports + fakes) with the network
-  transport behind an adapter, mirroring ADR 0016.
-- **Revocation on disconnect:** disconnecting an account calls the token
-  `/revoke` endpoint and deletes the Keychain item. Step 3 ships the disconnect
-  affordance to complete the consent story.
+  adapter-side) and is never persisted. Refresh is **proactive**: the composition
+  refreshes when the cached access token is within a clock-skew margin of its
+  `expires_in` before driving a fetch. Reactive-refresh-on-401 is *not* used — the
+  reviewed Gmail adapter (ADR 0016) fails a page on any non-404 error and cannot
+  cleanly signal auth expiry — so expiry is tracked from `expires_in`, not inferred
+  from a response.
+- Refresh is **serialized per account**. Token exchange and refresh are modeled as
+  a portable, I/O-free state machine (ports + fakes) with the network transport
+  behind an adapter.
+- **Refresh failure / revoked consent** (the common path: External + Testing
+  expires the refresh token roughly weekly) is a first-class defined transition, not
+  an error: an `invalid_grant` or a revoked token deletes the stored refresh token
+  and surfaces a **re-connect** UI state; the encrypted store is **preserved** (no
+  wipe — the read UI keeps working on cached mail) and the condition is never
+  presented as store corruption.
+- **Disconnect withdraws both consent and the harvested data.** Disconnecting an
+  account calls the token `/revoke` endpoint, deletes the Keychain item, **and
+  clears that `AccountId`'s cached mailbox from the store through the owning writer**
+  — revoking consent while leaving the fetched mail readable would not be a complete
+  consent story. Because Phase 1 uses a single fixed `default` `AccountId` (see
+  Identity binding), connecting a different Google account is an account switch: the
+  previous account's cached mailbox is cleared before the new sync writes, so two
+  accounts' mail can never coexist under one slot. Step 3 ships the disconnect
+  affordance.
 
-### Read-only enforcement is structural, not conventional
+### Read-only enforcement
 
-Three independent layers, no single point of trust:
+Two server/build-enforced boundaries plus one source-convention layer, defense in
+depth:
 
-1. Google-enforced scope: `https://www.googleapis.com/auth/gmail.readonly` only
-   (the metadata scope cannot fetch bodies; a modify/write scope is forbidden).
-2. The adapter is GET-only under the fixed Gmail base (ADR 0016).
-3. No write/send symbol exists in the exported C ABI allowlist (xtask-enforced).
+1. The genuinely enforced boundary is the Google-side scope
+   `https://www.googleapis.com/auth/gmail.readonly` only (the metadata scope cannot
+   fetch bodies; a modify/write scope is forbidden). 3a must **replace** the current
+   `GMAIL_MODIFY_SCOPE` constant, not add a read-only one beside it, so no code path
+   can still request `gmail.modify`; `access_type=offline` (already present,
+   required for the refresh token) is retained.
+2. No write/send symbol exists in the exported C ABI allowlist (xtask-enforced) —
+   also structural.
+3. The adapter is GET-only under the fixed Gmail base (ADR 0016) — a source
+   convention reinforcing the two boundaries above, not itself a compile boundary.
 
-The CLI reachability caveat now extends to the token surface: the `xtask` source
+The CLI reachability caveat extends to the token surface: the `xtask` source
 allowlist must explicitly deny any CLI-reachable path to the token, exchange,
 refresh, or revoke entries — defense in depth atop the compile boundary.
 
 ### Sync composition and write-path authority
 
 Sync writes run **only** through a new trusted `tersa-keychain-macos` composition
-entry that loads the refresh token, refreshes if needed, drives the existing
-`GmailMailbox` fetch and `SyncCoordinator` bounded recent sync, and reconciles
-into the store over the existing **validated read-write** SQLCipher path. The
-store remains the sole writer and migration authority; the sync entry is an
-authorized caller, not a second authority. Sync stays bounded and single-flight
-per ADR 0018; sync status crossing the bridge is a closed integer set with no
-addresses, subjects, or counts of a person's mail beyond ADR 0018's aggregate.
+entry that loads the refresh token, refreshes proactively, drives the existing
+`GmailMailbox` fetch and `SyncCoordinator` bounded recent sync, and reconciles into
+the store over the existing **validated read-write** SQLCipher path. The store
+remains the sole writer and migration authority; the sync entry is an authorized
+caller, not a second authority.
 
-### Bridge and FFI additions
+Concurrency: the store runs persistent WAL — one writer, many readers. Step 3 adds
+a second read-write open (sync reconcile) alongside the bootstrap read-write open
+and the ADR 0021 read-only UI readers. The sync write is serialized against the
+bootstrap write path under the existing global bootstrap lock (a single owning
+writer at a time); WAL leaves the read-only UI readers unaffected. Sync stays
+bounded and single-flight per ADR 0018; sync status crossing the bridge is a closed
+integer set with no addresses, subjects, or per-person mail counts beyond
+ADR 0018's aggregate.
 
+### Adapters, bridge, and FFI additions
+
+- The token exchange/refresh/revoke transport is a **distinct component from the
+  GET-only `GmailMailbox`**: 3b adds it in the `tersa-gmail-rest-macos` crate to
+  reuse that crate's pinned HTTP client policy (HTTPS-only, no redirects/proxies,
+  bounded), but as its own `POST`-to-the-token-endpoint transport, while
+  `GmailMailbox` stays GET-only under the fixed Gmail base. ADR 0016 is amended to
+  record that the crate hosts both bounded transports.
+- The token transport applies ADR 0016's provider-data-free error discipline to
+  **all** of its secrets: the authorization code, PKCE verifier, any client secret,
+  and the access/refresh tokens are `Zeroizing` on the wire and never logged, and no
+  token-endpoint request or response body is logged (Google error bodies can echo
+  request parameters).
 - `complete_callback` (and the iOS finish path) forward the validated grant into
   the token exchange instead of dropping it.
 - New `tersa_mailbox_macos_sync_*` begin/poll symbols run the bounded sync on a
-  dedicated worker, never the main thread — the same pattern as the read symbols.
-- These changes require the same atomic obligation ADR 0021 set for 2b: the exact
-  export allowlist, its count and message, the byte-pinned header, and the test
-  fixtures are updated together in one reviewed PR.
+  **Rust-owned** dedicated worker (not the Swift `DispatchQueue` the synchronous
+  read symbols hop onto), never the main thread.
+- These bridge changes carry the same atomic obligation ADR 0021 set for 2b: the
+  exact export allowlist, its count and message, the canonical (whitespace-
+  normalized) pinned header, and the test fixtures are updated together in one
+  reviewed PR.
+- The trusted composition's new dependencies require boundary amendments, updated
+  atomically with their `xtask` fixtures (direct and resolved graphs):
+  `tersa-keychain-macos` gains an edge to `tersa-gmail-rest-macos` and to the pinned
+  `tokio` (both currently rejected by the maximum and exact dependency sets), plus
+  the token-item Keychain mutation-guard amendment from Token lifecycle.
 - A new **OAuth/sync invocation seam** guard clones the Step-2 bootstrap
   launch-entry policy (`swift_bootstrap_intent_entries`): `OAuthAuthorizationSession`
   start/cancel and the sync trigger are each confined to a single reviewed
@@ -132,11 +197,15 @@ addresses, subjects, or counts of a person's mail beyond ADR 0018's aggregate.
 
 ### Asynchronous runtime
 
-The Gmail adapter's client is asynchronous. Step 3 introduces an exact-pinned,
-current-thread `tokio` runtime, target-scoped to the composition that drives sync,
-as an [ADR 0014](adr-0014-macos-production-dependency-boundaries.md)
-dependency-boundary amendment mirroring how `reqwest` entered — no workspace-wide
-async, no runtime in the domain or the bridge surface.
+The Gmail adapter's client and the token transport are asynchronous. Step 3
+introduces an exact-pinned, current-thread `tokio` runtime, target-scoped to the
+trusted composition, as an
+[ADR 0014](adr-0014-macos-production-dependency-boundaries.md) dependency-boundary
+amendment mirroring how `reqwest` entered — no workspace-wide async, no runtime in
+the domain or the bridge surface. The runtime scope covers **both** network entry
+points: the connect-time authorization-code→token exchange (driven from the
+grant-forwarding path on the OAuth loopback worker) and the sync worker — the
+grant-forwarding change must have a runtime to run on.
 
 ### Identity binding
 
@@ -162,22 +231,30 @@ Everything except the final live-run builds and is reviewed against the
 live client.
 
 - **ADR 0023** (this document): the plan.
-- **3a** — portable token exchange/refresh state machine and port; narrow the
-  Gmail scope to `gmail.readonly`. No I/O; deterministic tests.
-- **3b** — the token-endpoint transport (`/token`, `/revoke`) implementing 3a's
-  port inside the adapter that already owns the pinned HTTP policy.
-- **3c** — the refresh-token Keychain surface in `tersa-keychain-macos`
-  (security-adjacent: senior review).
-- **3d** — the composition and bridge: grant-forwarding exchange+persist, the
-  `connect`/`sync` trusted entries, the new sync C ABI on a bounded worker, the
-  atomic allowlist/header/fixture update, and the pinned `tokio` boundary
-  (security-adjacent: senior review).
-- **3e** — wire OAuth start/cancel and sync to the account-connection view-model
-  as the single reviewed intent entries; real connection and sync states; the new
-  Swift OAuth/sync invocation-seam guard (security-adjacent: senior review; taste
-  per ADR 0020). No change to the 2b read surface — the ADR 0021 invariance test.
-- **3f** — evidence: the live client on the developer's own account; real consent,
-  bounded sync populating the store, inbox/thread/search rendering real mail; the
+- **3a** — portable token exchange/refresh state machine and port; **replace**
+  `GMAIL_MODIFY_SCOPE` with `gmail.readonly` so no `gmail.modify` code path remains.
+  No I/O; deterministic tests. Its request shape is frozen only after the
+  client-secret `curl` probe above.
+- **3b** — the token-endpoint transport (`/token`, `/revoke`) as a distinct `POST`
+  component in `tersa-gmail-rest-macos` (reusing its pinned HTTP policy;
+  `GmailMailbox` unchanged), implementing 3a's port; carries the ADR 0016 amendment.
+- **3c** — the refresh-token Keychain surface in `tersa-keychain-macos` with atomic
+  rotation and the token-item mutation-guard + fixture amendment (root key stays
+  add-only, deletion-forbidden). Security-adjacent: senior review.
+- **3d** — the composition and bridge: grant-forwarding exchange+persist, proactive
+  refresh, the `connect` / `sync` / `disconnect` trusted entries (disconnect revokes
+  and clears the cached mailbox), the new sync C ABI on a Rust-owned bounded worker,
+  the atomic export allowlist/header/fixture update, and the `tokio` +
+  `tersa-gmail-rest-macos` dependency-boundary amendments with their graph fixtures.
+  Security-adjacent: senior review.
+- **3e** — wire OAuth start/cancel, sync, and disconnect to the account-connection
+  view-model as the single reviewed intent entries; real connection / sync /
+  re-connect / disconnect states; the new Swift OAuth/sync invocation-seam guard
+  (security-adjacent: senior review; taste per ADR 0020). No change to the 2b read
+  surface — the ADR 0021 invariance test.
+- **3f** — evidence: the live client on the developer's own account; the
+  client-secret probe result; real consent, bounded sync populating the store,
+  inbox/thread/search rendering real mail; disconnect and re-connect exercised; the
   ADR 0022 measurements a populated store enables. Run by the lead with the user's
   client.
 
