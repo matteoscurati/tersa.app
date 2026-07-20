@@ -53,7 +53,11 @@ here.
 
 ## 1. Signature and embedded entitlements (automated)
 
-Exact commit: `<fill: git rev-parse HEAD>`
+Captured by `capture-macos-ui-dev-evidence.sh` from this branch (capture tool
+committed at `d716504`); the evidenced app is built from the base `af975b5`
+sources — slice 2f adds only the capture tool and this document, no app-source
+change, so the signature, entitlements, and size below are properties of the
+shipped 2c–2e UI build.
 
 Signature: **ad-hoc** (`Signature=adhoc`, `TeamIdentifier=not set`, bundle
 identifier `app.tersa.mac`). Embedded entitlements — the exact five reviewed
