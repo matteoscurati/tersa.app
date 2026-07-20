@@ -91,13 +91,19 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   sufficient, since sync is user-triggered with no background work); never written
   to SQLCipher, never crossed over the C ABI, never logged. Owned by a new trusted
   composition entry in `tersa-keychain-macos`.
-- **Rotation is an atomic replace.** Google may return a new refresh token on
-  refresh or re-consent; replacing the stored item must be crash-safe
-  (write-new-then-remove-old, never delete-then-add, so a crash never leaves the
-  account with no persisted credential). ADR 0019's Keychain surface is add-only and
-  forbids deletion, so 3c amends its guard with a **token-item-specific** atomic
-  store-or-replace and delete while the installation root key stays add-only and
-  deletion-forbidden.
+- **Rotation is an atomic in-place replace.** Google may return a new refresh token
+  on refresh or re-consent. A refresh-token item has one fixed Keychain primary key
+  (service + `AccountId` + access group), so a second `SecItemAdd` returns
+  `errSecDuplicateItem` and there is no rename: the only atomic replace primitive is
+  `SecItemUpdate`, which rotates the stored value in place with no window in which the
+  account has no persisted credential (never delete-then-add). ADR 0019 made the
+  Keychain surface add-only and deletion-forbidden specifically to keep the
+  installation **root key** immutable and non-rotatable; the refresh token is a
+  distinct item with a distinct lifecycle that is *designed* to rotate and to be
+  withdrawn, so 3c amends the guard with a **token-item-specific** rule —
+  `SecItemAdd` for the first store, `SecItemUpdate` for atomic rotation,
+  `SecItemDelete` on disconnect and on `invalid_grant` — while the root key stays
+  add-only, update- and deletion-forbidden.
 - The **access token** stays in memory as a `Zeroizing` value (already
   adapter-side) and is never persisted. Refresh is **proactive**: the composition
   refreshes when the cached access token is within a clock-skew margin of its
@@ -113,16 +119,33 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   an error: an `invalid_grant` or a revoked token deletes the stored refresh token
   and surfaces a **re-connect** UI state; the encrypted store is **preserved** (no
   wipe — the read UI keeps working on cached mail) and the condition is never
-  presented as store corruption.
+  presented as store corruption. Preservation is **conditional on same-account
+  re-consent** (see Account-identity gate): if the user re-consents with a different
+  Google account, the preserved store would otherwise merge two accounts' mail under
+  the one `default` slot, so the identity gate clears it before the first sync write.
 - **Disconnect withdraws both consent and the harvested data.** Disconnecting an
   account calls the token `/revoke` endpoint, deletes the Keychain item, **and
   clears that `AccountId`'s cached mailbox from the store through the owning writer**
-  — revoking consent while leaving the fetched mail readable would not be a complete
-  consent story. Because Phase 1 uses a single fixed `default` `AccountId` (see
-  Identity binding), connecting a different Google account is an account switch: the
-  previous account's cached mailbox is cleared before the new sync writes, so two
-  accounts' mail can never coexist under one slot. Step 3 ships the disconnect
+  in a single account-scoped transaction — revoking consent while leaving the fetched
+  mail readable would not be a complete consent story. Step 3 ships the disconnect
   affordance.
+- **Account-identity gate.** Because Phase 1 uses a single fixed `default`
+  `AccountId` (see Identity binding), the store is guarded so two accounts' mail can
+  never coexist under it — on **every** path that reaches a sync write, not only
+  explicit disconnect. On the first successful connect the composition records a
+  salted hash of the account's address (`users.getProfile.emailAddress`, a GET
+  returned under `gmail.readonly` — no new scope, no identity *displayed*, only a
+  per-installation-salted hash stored in the encrypted store). Before any later sync
+  write — a fresh connect or a re-connect after refresh failure — it re-fetches
+  `getProfile` and compares: a match preserves the store, a mismatch clears the
+  previous account's cached mailbox before the new sync writes and records the new
+  hash. The gate is **fail-closed** — if the pre-write `getProfile` re-fetch fails
+  (transient or network), the sync write is blocked rather than falling through to
+  preserve-and-write — and the mailbox clear and the new-hash record commit in one
+  account-scoped transaction. This makes the "never coexist" invariant hold for the
+  account-switch, fresh-connect, and re-connect paths uniformly. Storing only a salted hash (not the
+  address) keeps this consistent with Identity binding, which forbids *displaying* an
+  address, not gating data lifecycle on a local hash.
 
 ### Read-only enforcement
 
@@ -155,12 +178,17 @@ caller, not a second authority.
 
 Concurrency: the store runs persistent WAL — one writer, many readers. Step 3 adds
 a second read-write open (sync reconcile) alongside the bootstrap read-write open
-and the ADR 0021 read-only UI readers. The sync write is serialized against the
-bootstrap write path under the existing global bootstrap lock (a single owning
-writer at a time); WAL leaves the read-only UI readers unaffected. Sync stays
-bounded and single-flight per ADR 0018; sync status crossing the bridge is a closed
-integer set with no addresses, subjects, or per-person mail counts beyond
-ADR 0018's aggregate.
+and the ADR 0021 read-only UI readers. ADR 0019 scoped the global bootstrap lock to
+"serialize cooperative bootstraps"; this ADR **amends** that contract to widen it to
+serialize **every** read-write store open — bootstrap and sync alike — so a single
+owning writer holds it at a time; WAL leaves the read-only UI readers unaffected.
+The lock guards only the store-open-plus-reconcile-write critical section and is
+**never held across network I/O**: bounded message bodies are fetched (per ADR 0018)
+*before* the lock is taken and written under it in one short transaction, so a
+network stall can never hold the writer. Sync stays bounded and single-flight per
+ADR 0018 (only one sync runs at a time regardless of the lock); sync status crossing
+the bridge is a closed integer set with no addresses, subjects, or per-person mail
+counts beyond ADR 0018's aggregate.
 
 ### Adapters, bridge, and FFI additions
 
@@ -216,19 +244,22 @@ identity display are MVP-completion work.
 ### Client configuration and injection
 
 The committed `apple/project.yml` OAuth placeholders stay `UNCONFIGURED`; the
-client ID and the non-confidential secret are injected locally at build time
-through a small reviewed override that leaves the pinned `project.yml` structure
-unchanged, and are never committed. The Google Cloud requirements are: a project
-with the Gmail API enabled; an OAuth consent screen (External, Testing, with the
-developer's own address as a test user); the `gmail.readonly` scope; and a
-**Desktop app** OAuth client (client ID + non-confidential secret; loopback needs
-no redirect registration).
+client ID and — only if the client-secret probe shows the token endpoint requires
+one — the non-confidential secret are injected locally at build time through a small
+reviewed override that leaves the pinned `project.yml` structure unchanged, and are
+never committed. The Google Cloud requirements are: a project with the Gmail API
+enabled; an OAuth consent screen (External, Testing, with the developer's own
+address as a test user); the `gmail.readonly` scope; and a **Desktop app** OAuth
+client (client ID, plus the client's non-confidential secret if the probe requires
+it; loopback needs no redirect registration).
 
 ### Decomposition into bounded, independently reviewed PRs
 
-Everything except the final live-run builds and is reviewed against the
-`UNCONFIGURED` placeholder, which fails closed at every layer; only 3f needs the
-live client.
+Everything except the final live run builds and is reviewed against the
+`UNCONFIGURED` placeholder, which fails closed at every layer. Only 3f **builds or
+runs** against the live client; the sole earlier touch of a live credential is the
+one-off out-of-band `curl` client-secret probe before 3a (manual evidence, no build
+artifact, the secret never committed or logged).
 
 - **ADR 0023** (this document): the plan.
 - **3a** — portable token exchange/refresh state machine and port; **replace**
@@ -239,14 +270,20 @@ live client.
   component in `tersa-gmail-rest-macos` (reusing its pinned HTTP policy;
   `GmailMailbox` unchanged), implementing 3a's port; carries the ADR 0016 amendment.
 - **3c** — the refresh-token Keychain surface in `tersa-keychain-macos` with atomic
-  rotation and the token-item mutation-guard + fixture amendment (root key stays
-  add-only, deletion-forbidden). Security-adjacent: senior review.
+  in-place `SecItemUpdate` rotation and the token-item mutation-guard + fixture
+  amendment (token item: `SecItemAdd` / `SecItemUpdate` / `SecItemDelete`; root key
+  stays add-only, update- and deletion-forbidden). The token-item `SecItemUpdate` is
+  the low-level primitive, not the high-level generic-password setter ADR 0019
+  banned, and the fixture must prove the root key still rejects `Update` and
+  `Delete`. Security-adjacent: senior review.
 - **3d** — the composition and bridge: grant-forwarding exchange+persist, proactive
-  refresh, the `connect` / `sync` / `disconnect` trusted entries (disconnect revokes
-  and clears the cached mailbox), the new sync C ABI on a Rust-owned bounded worker,
-  the atomic export allowlist/header/fixture update, and the `tokio` +
-  `tersa-gmail-rest-macos` dependency-boundary amendments with their graph fixtures.
-  Security-adjacent: senior review.
+  refresh, the account-identity gate (salted `getProfile` hash; clear-before-sync on
+  mismatch), the `connect` / `sync` / `disconnect` trusted entries (disconnect and
+  the mismatch clear are account-scoped transactional deletes through the owning
+  writer), the new sync C ABI on a Rust-owned bounded worker that fetches bodies
+  before taking the write lock, the atomic export allowlist/header/fixture update,
+  and the `tokio` + `tersa-gmail-rest-macos` dependency-boundary amendments with
+  their graph fixtures. Security-adjacent: senior review.
 - **3e** — wire OAuth start/cancel, sync, and disconnect to the account-connection
   view-model as the single reviewed intent entries; real connection / sync /
   re-connect / disconnect states; the new Swift OAuth/sync invocation-seam guard
@@ -279,8 +316,12 @@ verification (CASA) is MVP-completion work.
 
 Step 3 is mostly integration over reviewed parts, concentrated on one new
 security-critical subsystem — the token lifecycle — which the senior/security lane
-owns end to end (3c, 3d, the guard extensions, and the 3e wiring review). The read
-UI is unchanged and its 2b surface stays invariant. The store gains real data, so
+owns end to end (3c, 3d, the guard extensions, and the 3e wiring review). This
+concentrates Keychain, SQLCipher, key derivation, token exchange, and network entry
+in the one trusted `tersa-keychain-macos` composition; the concentration follows the
+ADR 0019 precedent and is accepted for Phase 1, with a dedicated composition crate
+noted as a candidate refactor if that surface grows past Step 3. The read UI is
+unchanged and its 2b surface stays invariant. The store gains real data, so
 ADR 0022 runtime measurements become meaningful and are recorded per slice. The
 account-connection screen gains a real Google sign-in and a disconnect affordance;
 the developer configures a free Google Cloud Desktop client (about fifteen
