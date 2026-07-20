@@ -30,6 +30,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// Trusted read-only mailbox read compositions for the fixed default profile.
 #[cfg(target_os = "macos")]
 pub mod mailbox_read;
+/// Per-account OAuth refresh-token Keychain surface (add / rotate / delete).
+pub mod oauth_token;
 
 /// Closed, redacted failure returned by the trusted read-only composition.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -82,10 +84,6 @@ impl std::error::Error for ReadOnlyMailboxOpenError {}
 
 // Rust guideline compliant 1.0.
 
-#[cfg(target_os = "macos")]
-const SERVICE: &str = "app.tersa.mac.storage-root.v1";
-#[cfg(target_os = "macos")]
-const ACCOUNT: &str = "default";
 #[cfg(any(target_os = "macos", test))]
 const ROOT_SALT: &[u8] = b"tersa.app/macos/root-key/v1";
 #[cfg(any(target_os = "macos", test))]
@@ -1545,6 +1543,13 @@ fn configured_group(group: Option<&'static str>) -> Result<&'static str, KeyStor
         .ok_or(KeyStorageError::Unavailable)
 }
 
+/// Resolves the signing-time App Group so the token store need not read the
+/// environment itself (keeping its source free of construction intrinsics).
+#[cfg(target_os = "macos")]
+fn configured_app_group() -> Result<&'static str, KeyStorageError> {
+    configured_group(option_env!("TERSA_MACOS_APP_GROUP"))
+}
+
 fn configured_profile_group(
     group: Option<&'static str>,
 ) -> Result<&'static str, ProfileStorageError> {
@@ -1578,6 +1583,13 @@ mod macos_keychain {
     use core_foundation::string::{CFString, CFStringRef};
     use security_framework_sys::{access_control, base, item, keychain_item, random};
     use std::ffi::c_void;
+
+    // Private to the root-key module: a sibling module (the OAuth token store)
+    // cannot name these, so no other Keychain surface can target the
+    // installation root key's item identity by referencing its service or
+    // account. The root key is add-only; only the token module mutates.
+    const SERVICE: &str = "app.tersa.mac.storage-root.v1";
+    const ACCOUNT: &str = "default";
 
     // security-framework-sys 2.17.0 omits only this stable dictionary-key
     // symbol. All other Security constants come from the audited sys crate.
@@ -1686,8 +1698,8 @@ mod macos_keychain {
         class: Option<CFType>,
         synchronizable: Option<CFType>,
     ) -> CFDictionary<CFType, CFType> {
-        let service = CFString::new(super::SERVICE);
-        let account = CFString::new(super::ACCOUNT);
+        let service = CFString::new(SERVICE);
+        let account = CFString::new(ACCOUNT);
         let group = CFString::new(group);
         let accessible_key = security_string!(kSecAttrAccessible);
         let accessible =
@@ -1757,8 +1769,8 @@ mod macos_keychain {
     }
 
     fn decode_record(dictionary: &CFDictionary, group: &str) -> Result<SecretKey, KeyStorageError> {
-        let service = CFString::new(super::SERVICE);
-        let account = CFString::new(super::ACCOUNT);
+        let service = CFString::new(SERVICE);
+        let account = CFString::new(ACCOUNT);
         let group = CFString::new(group);
         let required = [
             (security_string!(item::kSecAttrService), service.as_CFType()),

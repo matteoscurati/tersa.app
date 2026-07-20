@@ -664,17 +664,24 @@ fn keychain_mutation_boundary_violations(
     for (path, document) in authority_sources {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("rs") => {
+                let is_owner = owner_paths.contains(path);
                 let code = strip_rust_non_code(document);
                 let production = strip_rust_test_modules(&code);
-                for forbidden in FORBIDDEN {
-                    if contains_identifier(&production, forbidden) {
-                        violations.push(format!(
-                            "{} contains forbidden Keychain mutation boundary `{forbidden}`",
-                            path.display()
-                        ));
+                // Owner adapter files are governed by the owner partition below,
+                // which permits the single token file (and only it) to mutate the
+                // token item while keeping every other owner file add-only. Callers
+                // may never mutate at all, so the full ban still applies to them.
+                if !is_owner {
+                    for forbidden in FORBIDDEN {
+                        if contains_identifier(&production, forbidden) {
+                            violations.push(format!(
+                                "{} contains forbidden Keychain mutation boundary `{forbidden}`",
+                                path.display()
+                            ));
+                        }
                     }
                 }
-                if !owner_paths.contains(path) && contains_identifier(&production, "SecItemAdd") {
+                if !is_owner && contains_identifier(&production, "SecItemAdd") {
                     violations.push(format!(
                         "{} contains Keychain insertion authority outside the owning adapter",
                         path.display()
@@ -686,7 +693,9 @@ fn keychain_mutation_boundary_violations(
                         path.display()
                     ));
                 }
-                violations.extend(rust_authority_dynamic_alias_violations(path, document));
+                if !is_owner {
+                    violations.extend(rust_authority_dynamic_alias_violations(path, document));
+                }
             }
             Some("swift") => {
                 violations.extend(swift_keychain_authority_violations(path, document));
@@ -695,6 +704,7 @@ fn keychain_mutation_boundary_violations(
             _ => {}
         }
     }
+    violations.extend(keychain_owner_partition_violations(owner_sources));
     let aggregate = production_owner_sources.join("\n");
     for required in REQUIRED {
         if !contains_identifier(&aggregate, required) {
@@ -702,6 +712,217 @@ fn keychain_mutation_boundary_violations(
                 "the macOS Keychain adapter is missing required production boundary `{required}`"
             ));
         }
+    }
+    violations
+}
+
+/// The one owner file permitted to mutate (rotate/delete) the token item.
+const TOKEN_MUTATION_FILE: &str = "adapters/keychain-macos/src/oauth_token.rs";
+
+/// Partitions the Keychain adapter's own sources so that exactly one file — the
+/// OAuth token store — may call `SecItemUpdate` / `SecItemDelete`, and only ever
+/// against the token service, while every other owner file stays add-only.
+///
+/// Because the Phase-1 token and root items share account and access group, the
+/// service string is their only discriminator, so the token file is held
+/// lexically fixed to its own service: it may not name the root service, use a
+/// string escape, byte literal, external include, or assembly intrinsic, and any
+/// service-prefixed literal it carries must be exactly the token service value.
+/// This is defense in depth plus reviewability, NOT a runtime guarantee: a
+/// lexical guard provably cannot stop runtime construction of the root service
+/// value — string concatenation (`"a" + "b"`), a `[u8]` array with `from_utf8`
+/// (un-bannable, the decode path needs it), char-by-char assembly, or a helper in
+/// another owner module all evade any denylist. Only a distinct Keychain access
+/// group (out of ADR-0023 scope, tracked as a follow-up) closes those at runtime.
+/// What this guard DOES enforce is that no root service can be reached by a
+/// direct, literal, escaped, raw/byte-string, or listed-intrinsic path — i.e. it
+/// fails closed on every accidental or plainly review-visible retarget, and any
+/// remaining route is a deliberate runtime computation a reviewer would see.
+///
+/// This lexical set is intentionally FINAL: further bans chase an unwinnable
+/// in-repo arms race (a malicious committer edits the guard in the same commit as
+/// the bypass, so it can never be in scope). The runtime barrier is the tracked
+/// access-group follow-up, not another denylist entry.
+fn keychain_owner_partition_violations(owner_sources: &[(PathBuf, String)]) -> Vec<String> {
+    const OWNER_FORBIDDEN: [&str; 3] = ["SecItemUpdate", "SecItemDelete", "set_generic_password"];
+    const LINK_MECHANISMS: [&str; 8] = [
+        "asm",
+        "dlopen",
+        "dlsym",
+        "export_name",
+        "global_asm",
+        "link_name",
+        "llvm_asm",
+        "naked_asm",
+    ];
+    let token_path = Path::new(TOKEN_MUTATION_FILE);
+    let mut violations = Vec::new();
+    for (path, document) in owner_sources {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let comments_masked = strip_rust_comments(document);
+        let production = strip_rust_non_code(&strip_rust_test_modules(&comments_masked));
+        // Legacy Keychain APIs and dynamic-linkage mechanisms are forbidden in
+        // every owner file, including the token file (it uses only the audited
+        // `security_framework_sys` bindings).
+        if contains_identifier_with_prefix(&production, "SecKeychain") {
+            violations.push(format!(
+                "{} contains forbidden legacy Keychain authority",
+                path.display()
+            ));
+        }
+        for mechanism in LINK_MECHANISMS {
+            if contains_identifier(&production, mechanism) {
+                violations.push(format!(
+                    "{} declares forbidden dynamic linkage `{mechanism}` in the Keychain adapter",
+                    path.display()
+                ));
+            }
+        }
+
+        if path == token_path {
+            violations.extend(token_mutation_boundary_violations(
+                path,
+                &production,
+                document,
+            ));
+        } else {
+            // Every other owner file stays add-only: the root key can never be
+            // rotated or deleted.
+            for forbidden in OWNER_FORBIDDEN {
+                if contains_identifier(&production, forbidden) {
+                    violations.push(format!(
+                        "{} contains forbidden Keychain mutation boundary `{forbidden}` outside the token file",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// The lexical checks that keep the single token-mutation file fixed to the
+/// token service. See [`keychain_owner_partition_violations`] for the threat
+/// model: the token file may `SecItemUpdate` / `SecItemDelete`, but must stay
+/// unable to plainly name or construct the root service value. Every dynamic or
+/// external string-construction path is banned, and any service-prefixed literal
+/// it carries must be exactly the token service value.
+fn token_mutation_boundary_violations(
+    path: &Path,
+    production: &str,
+    document: &str,
+) -> Vec<String> {
+    const CONSTRUCTION_INTRINSICS: [&str; 8] = [
+        "format!",
+        "concat!",
+        "concat_bytes!",
+        ".join(",
+        "push_str",
+        "include_str!",
+        "include_bytes!",
+        "env!",
+    ];
+    const BYTE_LITERALS: [&str; 4] = ["b\"", "br\"", "br#", "b'"];
+    const ESCAPES: [&str; 2] = ["\\u{", "\\x"];
+    const ROOT_LITERALS: [&str; 2] = ["storage-root", "AfterFirstUnlock"];
+    const TOKEN_REQUIRED: [&str; 2] = [
+        "TOKEN_SERVICE",
+        "kSecAttrAccessibleWhenUnlockedThisDeviceOnly",
+    ];
+    const SERVICE_PREFIX: &str = "app.tersa.mac.";
+    const TOKEN_SERVICE_VALUE: &str = "app.tersa.mac.oauth-refresh-token.v1";
+
+    let mut violations = Vec::new();
+    if contains_identifier(production, "set_generic_password") {
+        violations.push(format!(
+            "{} contains forbidden Keychain mutation boundary `set_generic_password`",
+            path.display()
+        ));
+    }
+    for required in TOKEN_REQUIRED {
+        if !contains_identifier(production, required) {
+            violations.push(format!(
+                "{} must positively scope the token mutation boundary to `{required}`",
+                path.display()
+            ));
+        }
+    }
+    if contains_identifier(production, "SERVICE") {
+        violations.push(format!(
+            "{} must not name the root key service identifier `SERVICE`",
+            path.display()
+        ));
+    }
+    for intrinsic in CONSTRUCTION_INTRINSICS {
+        if production.contains(intrinsic) {
+            violations.push(format!(
+                "{} must not build or import a string (`{intrinsic}`) in the token mutation boundary",
+                path.display()
+            ));
+        }
+    }
+    // The literal / escape / byte / service-prefix checks scan comment-stripped
+    // source (string literals intact, so an escaped or byte-built service is
+    // caught; comments cannot construct anything and would only false-positive).
+    let literals = strip_rust_comments(document);
+    for literal in ROOT_LITERALS {
+        if literals.contains(literal) {
+            violations.push(format!(
+                "{} must not name the root key literal `{literal}`",
+                path.display()
+            ));
+        }
+    }
+    for byte_literal in BYTE_LITERALS {
+        if literals.contains(byte_literal) {
+            violations.push(format!(
+                "{} must not use byte literals (`{byte_literal}`) in the token mutation boundary",
+                path.display()
+            ));
+        }
+    }
+    for escape in ESCAPES {
+        if literals.contains(escape) {
+            violations.push(format!(
+                "{} must not use string escapes (`{escape}`) in the token mutation boundary",
+                path.display()
+            ));
+        }
+    }
+    // Raw string literals let a `"` inside the value defeat the closing-quote
+    // allowlist below; the token file has no raw string. Matched at an identifier
+    // boundary so a word ending in `r` before a closing quote (`behavior"`) is not
+    // a false positive.
+    for prefix in ["r\"", "r#"] {
+        if literals.match_indices(prefix).any(|(index, _matched)| {
+            literals[..index]
+                .bytes()
+                .next_back()
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+        }) {
+            violations.push(format!(
+                "{} must not use raw string literals in the token mutation boundary",
+                path.display()
+            ));
+        }
+    }
+    // Positive allowlist: every service-prefixed literal must be EXACTLY the
+    // token service value, immediately closed by `"`. Any suffix — `.v1.evil`,
+    // `.v1/evil`, an escaped separator, or the root service — fails closed.
+    let mut rest = literals.as_str();
+    while let Some(index) = rest.find(SERVICE_PREFIX) {
+        let tail = &rest[index..];
+        let exact = tail.starts_with(TOKEN_SERVICE_VALUE)
+            && tail[TOKEN_SERVICE_VALUE.len()..].starts_with('"');
+        if !exact {
+            violations.push(format!(
+                "{} may only carry the token service literal `{TOKEN_SERVICE_VALUE}`, not another `{SERVICE_PREFIX}` value",
+                path.display()
+            ));
+        }
+        rest = &rest[index + SERVICE_PREFIX.len()..];
     }
     violations
 }
@@ -6495,6 +6716,98 @@ unsafe extern "C" { fn hidden_string_alias(); }
             keychain_mutation_boundary_violations(&comments_only, &comments_only).len(),
             5,
             "comments must not satisfy required production boundaries"
+        );
+    }
+
+    #[test]
+    fn keychain_token_mutation_is_fixed_to_the_token_service() {
+        let root = |body: &str| {
+            (
+                PathBuf::from("adapters/keychain-macos/src/lib.rs"),
+                format!(
+                    "fn boundary() {{ SecItemAdd(); SecItemCopyMatching(); SecRandomCopyBytes(); kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly(); kSecUseDataProtectionKeychain(); }}\n{body}"
+                ),
+            )
+        };
+        let token = |body: &str| (PathBuf::from(super::TOKEN_MUTATION_FILE), body.to_owned());
+        let valid_token = r#"
+fn token_ops() {
+    const TOKEN_SERVICE: &str = "app.tersa.mac.oauth-refresh-token.v1";
+    let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
+    keychain_item::SecItemUpdate(query, attrs);
+    keychain_item::SecItemDelete(query);
+}
+"#;
+
+        // The canonical token file, scoped to TOKEN_SERVICE, may rotate + delete.
+        let clean = vec![root(""), token(valid_token)];
+        assert!(
+            keychain_mutation_boundary_violations(&clean, &clean).is_empty(),
+            "a token file scoped to TOKEN_SERVICE may rotate and delete its item"
+        );
+
+        // Every attempt to escape the token boundary must fail closed.
+        for bad in [
+            // No positive TOKEN_SERVICE / accessibility scope.
+            "fn t() { keychain_item::SecItemUpdate(q, a); }",
+            // Names the root service identifier.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = SERVICE; keychain_item::SecItemDelete(q); }",
+            // Names the root service literal directly.
+            "fn t() { const TOKEN_SERVICE: &str = \"app.tersa.mac.storage-root.v1\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; keychain_item::SecItemDelete(q); }",
+            // Uses the root accessibility literal.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly; keychain_item::SecItemDelete(q); }",
+            // Assembles a service string dynamically.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = format!(\"a{}\", p); keychain_item::SecItemDelete(q); }",
+            // Hand-declares the mutation symbol instead of using the sys binding.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; } #[link_name = \"SecItemDelete\"] unsafe extern \"C\" { fn a(); }",
+            // Hides the root separator behind a unicode escape (Sol's bypass).
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = \"app.tersa.mac.storage\\u{2d}root.v1\"; keychain_item::SecItemDelete(q); }",
+            // Imports the service from external content.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = include_str!(\"svc.txt\"); keychain_item::SecItemDelete(q); }",
+            // Reads a compile-time env var as the service.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = env!(\"SVC\"); keychain_item::SecItemDelete(q); }",
+            // Builds the root service from a byte-string literal.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = b\"app.tersa.mac.storage-root.v1\"; keychain_item::SecItemDelete(q); }",
+            // Suffixes the token service so a `starts_with` allowlist would admit it.
+            "fn t() { const TOKEN_SERVICE: &str = \"app.tersa.mac.oauth-refresh-token.v1.evil\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; keychain_item::SecItemDelete(q); }",
+            // Raw byte-string evades a plain `b\"` / `br\"` byte-literal ban.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = br#\"svc\"#; keychain_item::SecItemDelete(q); }",
+            // Suffix with a `/` the continuation-char set missed (Sol round-2b).
+            "fn t() { const TOKEN_SERVICE: &str = \"app.tersa.mac.oauth-refresh-token.v1/evil\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; keychain_item::SecItemDelete(q); }",
+            // Raw string with an embedded quote defeats a naive closing-quote check.
+            "fn t() { const TOKEN_SERVICE: &str = \"x\"; let _ = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; let s = r#\"app.tersa.mac.oauth-refresh-token.v1\"/evil\"#; keychain_item::SecItemDelete(q); }",
+        ] {
+            let sources = vec![root(""), token(bad)];
+            assert!(
+                !keychain_mutation_boundary_violations(&sources, &sources).is_empty(),
+                "token file must fail closed: {bad}"
+            );
+        }
+
+        // Every other owner file stays add-only: the root key is immutable.
+        for forbidden in ["SecItemUpdate", "SecItemDelete", "set_generic_password"] {
+            let sources = vec![
+                root(&format!("fn rogue() {{ {forbidden}(); }}")),
+                token(valid_token),
+            ];
+            assert!(
+                !keychain_mutation_boundary_violations(&sources, &sources).is_empty(),
+                "root-key owner files must stay add-only: {forbidden}"
+            );
+        }
+
+        // A second owner file (not the canonical token file) may not mutate.
+        let second = vec![
+            root(""),
+            token(valid_token),
+            (
+                PathBuf::from("adapters/keychain-macos/src/rogue.rs"),
+                "fn r() { keychain_item::SecItemUpdate(q, a); }".to_owned(),
+            ),
+        ];
+        assert!(
+            !keychain_mutation_boundary_violations(&second, &second).is_empty(),
+            "only the canonical token file may mutate the token item"
         );
     }
 
