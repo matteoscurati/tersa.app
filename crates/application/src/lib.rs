@@ -15,5 +15,7 @@ pub mod mailbox_search;
 pub mod oauth;
 /// Bounded recent-snapshot mailbox synchronization and cache orchestration.
 pub mod sync;
+/// Portable token exchange and refresh lifecycle over a transport port.
+pub mod token;
 
 // Rust guideline compliant 1.0.
