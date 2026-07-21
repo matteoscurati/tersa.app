@@ -18,3 +18,9 @@ CREATE INDEX messages_list_order
     ON messages (received_at DESC, message_id ASC);
 CREATE INDEX messages_thread_order
     ON messages (thread_id ASC, received_at ASC, message_id ASC);
+
+CREATE TABLE account_identity (
+    account_id TEXT PRIMARY KEY,
+    identity_hash BLOB NOT NULL,
+    algo_version INTEGER NOT NULL
+);

@@ -28,6 +28,7 @@ mod macos {
     use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
     use rustix::fd::OwnedFd;
     use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags};
+    use tersa_application::identity::{AccountIdentityStore, IdentityHash, IdentityReconcile};
     use tersa_application::mailbox::{
         BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
     };
@@ -39,8 +40,18 @@ mod macos {
 
     // Fixed ownership marker for this product account-store schema.
     const APPLICATION_ID: i64 = 0x5453_4D31;
+    // The schema is fresh-create only: `MIGRATION` runs on an empty file and the
+    // open path rejects any store whose objects differ from `canonical_schema`.
+    // Phase 1 is pre-release with no shipped stores, so adding the
+    // `account_identity` table intentionally keeps `VERSION` at 1 rather than
+    // introducing a v2 upgrade path — a store created before this change opens as
+    // `Corrupted` and is re-bootstrapped fresh. Once a store ships, a schema
+    // change must bump `VERSION` and add an upgrade migration instead.
     const VERSION: i64 = 1;
-    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 4;
+    // Derivation version of the stored account-identity hash. A row written by a
+    // future algorithm reads as incompatible (fail closed), never a first connect.
+    const IDENTITY_ALGO_VERSION: i64 = 1;
+    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 5;
     const MAX_SCHEMA_KIND_LEN: i64 = 16;
     const MAX_SCHEMA_NAME_LEN: i64 = 256;
     const MAX_SCHEMA_SQL_LEN: i64 = 16 * 1_024;
@@ -521,6 +532,67 @@ mod macos {
                 }
                 transaction.commit().map_err(store_error)?;
                 Ok(survivors)
+            })
+        }
+
+        fn read_identity_hash(
+            &self,
+            account: &AccountId,
+        ) -> Result<Option<[u8; 32]>, MailboxStoreError> {
+            self.with_connection(|connection| {
+                let row = connection.query_row(
+                    "SELECT CASE WHEN typeof(identity_hash) = 'blob' AND length(identity_hash) = 32 THEN identity_hash END, CASE WHEN typeof(algo_version) = 'integer' THEN algo_version END FROM account_identity WHERE account_id = ?1",
+                    params![account.as_str()],
+                    |row| {
+                        let hash: Option<Vec<u8>> = row.get(0)?;
+                        let version: Option<i64> = row.get(1)?;
+                        Ok((hash, version))
+                    },
+                );
+                match row {
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(store_error(error)),
+                    Ok((Some(hash), Some(version))) if version == IDENTITY_ALGO_VERSION => {
+                        let bytes: [u8; 32] = hash
+                            .try_into()
+                            .map_err(|_length| MailboxStoreError::Corrupted)?;
+                        Ok(Some(bytes))
+                    }
+                    // A present-but-unreadable or version-incompatible row must
+                    // fail closed, never degrade to "no identity yet".
+                    Ok(_) => Err(MailboxStoreError::Corrupted),
+                }
+            })
+        }
+
+        fn write_identity_hash(
+            &self,
+            account: &AccountId,
+            fresh: &[u8; 32],
+            clear_mailbox: bool,
+        ) -> Result<(), MailboxStoreError> {
+            self.with_connection(|connection| {
+                let transaction = connection.transaction().map_err(store_error)?;
+                if clear_mailbox {
+                    transaction
+                        .execute("DELETE FROM messages", [])
+                        .map_err(store_error)?;
+                    #[cfg(test)]
+                    if self.take_failpoint()? {
+                        return Err(MailboxStoreError::Storage);
+                    }
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO account_identity (account_id, identity_hash, algo_version) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET identity_hash = excluded.identity_hash, algo_version = excluded.algo_version",
+                        params![account.as_str(), &fresh[..], IDENTITY_ALGO_VERSION],
+                    )
+                    .map_err(store_error)?;
+                #[cfg(test)]
+                if self.take_failpoint()? {
+                    return Err(MailboxStoreError::Storage);
+                }
+                transaction.commit().map_err(store_error)
             })
         }
 
@@ -1761,6 +1833,33 @@ mod macos {
         }
     }
 
+    impl AccountIdentityStore for SqlCipherMailboxStore {
+        fn load_identity<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<Option<IdentityHash>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                Ok(self
+                    .read_identity_hash(account)?
+                    .map(IdentityHash::from_bytes))
+            })
+        }
+
+        fn reconcile_identity<'a>(
+            &'a self,
+            account: &'a AccountId,
+            fresh: &'a IdentityHash,
+            action: IdentityReconcile,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                let clear_mailbox = matches!(action, IdentityReconcile::ClearMailboxAndRecord);
+                self.write_identity_hash(account, fresh.as_bytes(), clear_mailbox)
+            })
+        }
+    }
+
     impl MailboxReader for SqlCipherMailboxStore {
         fn list_envelopes<'a>(
             &'a self,
@@ -2188,6 +2287,13 @@ mod macos {
                 "account_binding".into(),
                 normalize(
                     "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL )",
+                ),
+            ),
+            (
+                "table".into(),
+                "account_identity".into(),
+                normalize(
+                    "CREATE TABLE account_identity ( account_id TEXT PRIMARY KEY, identity_hash BLOB NOT NULL, algo_version INTEGER NOT NULL )",
                 ),
             ),
             (
@@ -4154,6 +4260,129 @@ mod macos {
                 run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
                 vec![initial]
             );
+        }
+
+        #[test]
+        fn identity_first_record_persists_and_reloads() {
+            let (database, store) = open("identity-first-record");
+            assert!(run(store.load_identity(&account())).unwrap().is_none());
+            let hash = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(&account(), &hash, IdentityReconcile::RecordOnly))
+                .unwrap();
+            assert_eq!(
+                run(store.load_identity(&account())).unwrap(),
+                Some(hash.clone())
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(run(reopened.load_identity(&account())).unwrap(), Some(hash));
+        }
+
+        #[test]
+        fn identity_mismatch_clears_the_mailbox_but_keeps_the_new_hash() {
+            let (database, store) = open("identity-mismatch-clear");
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                &[envelope("m1", "thread", 10), envelope("m2", "thread", 20)],
+                StoreLimit::new(5).unwrap(),
+            ))
+            .unwrap();
+            let first = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(&account(), &first, IdentityReconcile::RecordOnly))
+                .unwrap();
+            // A different account connects: clear the cached mailbox and record the
+            // new hash in one transaction.
+            let second = IdentityHash::from_bytes([2; 32]);
+            run(store.reconcile_identity(
+                &account(),
+                &second,
+                IdentityReconcile::ClearMailboxAndRecord,
+            ))
+            .unwrap();
+            assert!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .is_empty()
+            );
+            // The clear deletes messages; the just-recorded hash must survive it.
+            assert_eq!(
+                run(store.load_identity(&account())).unwrap(),
+                Some(second.clone())
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                run(reopened.load_identity(&account())).unwrap(),
+                Some(second)
+            );
+        }
+
+        #[test]
+        fn identity_reconcile_rolls_back_the_clear_and_the_record_together() {
+            let (database, store) = open("identity-reconcile-rollback");
+            let seeded = envelope("seeded", "thread", 10);
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                std::slice::from_ref(&seeded),
+                StoreLimit::new(5).unwrap(),
+            ))
+            .unwrap();
+            let recorded = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(&account(), &recorded, IdentityReconcile::RecordOnly))
+                .unwrap();
+            store.fail_next_mutation();
+            let replacement = IdentityHash::from_bytes([2; 32]);
+            assert_eq!(
+                run(store.reconcile_identity(
+                    &account(),
+                    &replacement,
+                    IdentityReconcile::ClearMailboxAndRecord,
+                )),
+                Err(MailboxStoreError::Storage)
+            );
+            // Neither the mailbox clear nor the hash record took effect.
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![seeded.clone()]
+            );
+            assert_eq!(
+                run(store.load_identity(&account())).unwrap(),
+                Some(recorded.clone())
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![seeded]
+            );
+            assert_eq!(
+                run(reopened.load_identity(&account())).unwrap(),
+                Some(recorded)
+            );
+        }
+
+        #[test]
+        fn identity_record_only_rolls_back_the_hash_on_failpoint() {
+            // A RecordOnly reconcile skips the DELETE, so the single armed
+            // failpoint fires at the checkpoint AFTER the UPSERT — proving the
+            // record itself rolls back, the boundary the clear-path test cannot
+            // reach.
+            let (database, store) = open("identity-record-only-rollback");
+            store.fail_next_mutation();
+            let recorded = IdentityHash::from_bytes([1; 32]);
+            assert_eq!(
+                run(store.reconcile_identity(&account(), &recorded, IdentityReconcile::RecordOnly)),
+                Err(MailboxStoreError::Storage)
+            );
+            assert!(run(store.load_identity(&account())).unwrap().is_none());
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert!(run(reopened.load_identity(&account())).unwrap().is_none());
         }
 
         #[test]
