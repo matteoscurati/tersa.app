@@ -90,6 +90,8 @@ const ROOT_SALT: &[u8] = b"tersa.app/macos/root-key/v1";
 const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
 #[cfg(any(target_os = "macos", test))]
 const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
+#[cfg(any(target_os = "macos", test))]
+const ACCOUNT_IDENTITY_PURPOSE: &[u8] = b"account-identity/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_LOCK: &str = ".tersa-profile-bootstrap-v1.lock";
@@ -289,6 +291,68 @@ fn framed_info(account: &AccountId, purpose: &[u8]) -> Result<Vec<u8>, KeyStorag
     Ok(result)
 }
 
+/// Derives the account-bound identity hash of a normalized address.
+///
+/// The hash is a 32-byte HKDF-SHA256 expansion keyed by the installation root
+/// key (the same root-key/`ROOT_SALT` facility as the database key), domain-
+/// separated from that key by [`ACCOUNT_IDENTITY_PURPOSE`], and bound to the
+/// account and the address via a fully length-framed `info`. HKDF-Expand is an
+/// iterated-HMAC PRF over `info`, so this yields a salted, account-bound MAC of
+/// the address without a separate HMAC primitive. The root key is the secret; a
+/// bare address cannot be pre-hashed without it. The output is a comparison
+/// value, not a secret; the framed `info` (which carries the address) is wiped.
+#[cfg(any(target_os = "macos", test))]
+fn derive_account_identity_hash(
+    root: &SecretKey,
+    account: &AccountId,
+    normalized_address: &[u8],
+) -> Result<[u8; 32], KeyStorageError> {
+    let mut info = framed_identity_info(account, ACCOUNT_IDENTITY_PURPOSE, normalized_address)?;
+    let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root.as_bytes());
+    let mut output = [0_u8; 32];
+    let expanded = hkdf
+        .expand(&info, &mut output)
+        .map_err(|_invalid_length| KeyStorageError::Invalid);
+    info.zeroize();
+    expanded?;
+    Ok(output)
+}
+
+/// Frames HKDF `info` as `framed_info(account, purpose) || len(address) || address`.
+///
+/// Every segment is length-prefixed, so no two distinct account/purpose/address
+/// triples share an `info` string.
+#[cfg(any(target_os = "macos", test))]
+fn framed_identity_info(
+    account: &AccountId,
+    purpose: &[u8],
+    address: &[u8],
+) -> Result<Vec<u8>, KeyStorageError> {
+    let mut info = framed_info(account, purpose)?;
+    let address_len = u16::try_from(address.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
+    info.reserve(2 + address.len());
+    info.extend_from_slice(&address_len.to_be_bytes());
+    info.extend_from_slice(address);
+    Ok(info)
+}
+
+/// Retrieves the root key and derives the identity hash, failing closed.
+///
+/// A missing root key is an error, never a silent "no identity yet": the caller
+/// must not treat an unavailable hasher as a first connect (which would clear
+/// nothing and re-baseline the store to whoever connected).
+#[cfg(any(target_os = "macos", test))]
+fn hash_account_identity(
+    retriever: &impl RootKeyRetriever,
+    account: &AccountId,
+    normalized_address: &[u8],
+) -> Result<[u8; 32], KeyStorageError> {
+    let root = retriever.copy()?.ok_or(KeyStorageError::Invalid)?;
+    let hash = derive_account_identity_hash(&root, account, normalized_address);
+    drop(root);
+    hash
+}
+
 fn hex_digest(account: &AccountId) -> String {
     let digest = Sha256::digest(account.as_str().as_bytes());
     hex_encode(&digest)
@@ -416,6 +480,53 @@ fn open_read_only_mailbox(
             ReadOnlyMailboxOpenError::MailboxCorrupted
         }
     })
+}
+
+/// Derives account-identity hashes for the sync-composition identity gate.
+///
+/// Confines the root-key-derived HMAC key to this crate: the composition passes
+/// a normalized address in and receives an opaque hash back, never the salt. The
+/// derivation reuses the installation root key and never mints a new Keychain
+/// item, so the hash is stable for the life of the installation (the root key is
+/// add-only). Fails closed when the root key is unavailable.
+#[cfg(target_os = "macos")]
+pub struct DataProtectionAccountIdentityHasher {
+    backend: ProductionBackend,
+}
+
+#[cfg(target_os = "macos")]
+impl DataProtectionAccountIdentityHasher {
+    /// Creates a hasher bound to the fixed installation App Group.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed [`KeyStorageError`] when the App Group is misconfigured.
+    pub fn new() -> Result<Self, KeyStorageError> {
+        Ok(Self {
+            backend: ProductionBackend::new()?,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for DataProtectionAccountIdentityHasher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DataProtectionAccountIdentityHasher([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl tersa_application::identity::AccountIdentityHasher for DataProtectionAccountIdentityHasher {
+    fn hash(
+        &self,
+        account: &AccountId,
+        normalized: &Zeroizing<String>,
+    ) -> Result<tersa_application::identity::IdentityHash, tersa_application::identity::HasherError>
+    {
+        let bytes = hash_account_identity(&self.backend, account, normalized.as_bytes())
+            .map_err(|_error| tersa_application::identity::HasherError::Unavailable)?;
+        Ok(tersa_application::identity::IdentityHash::from_bytes(bytes))
+    }
 }
 
 /// Validates opaque bytes and establishes the one fixed product profile.
@@ -2096,6 +2207,91 @@ mod tests {
 
     fn account_id() -> AccountId {
         AccountId::new("acct-test-1").unwrap()
+    }
+
+    #[test]
+    fn identity_hash_is_deterministic() {
+        let root = SecretKey::new([3; 32]);
+        let first =
+            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
+        let second =
+            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn identity_hash_binds_the_address() {
+        let root = SecretKey::new([3; 32]);
+        let one = derive_account_identity_hash(&root, &account_id(), b"one@example.test").unwrap();
+        let two = derive_account_identity_hash(&root, &account_id(), b"two@example.test").unwrap();
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn identity_hash_binds_the_account() {
+        let root = SecretKey::new([3; 32]);
+        let other = AccountId::new("acct-test-2").unwrap();
+        let here =
+            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
+        let there = derive_account_identity_hash(&root, &other, b"user@example.test").unwrap();
+        assert_ne!(here, there);
+    }
+
+    #[test]
+    fn identity_hash_binds_the_root_key() {
+        let account = account_id();
+        let one =
+            derive_account_identity_hash(&SecretKey::new([3; 32]), &account, b"user@example.test")
+                .unwrap();
+        let two =
+            derive_account_identity_hash(&SecretKey::new([4; 32]), &account, b"user@example.test")
+                .unwrap();
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn identity_hash_is_domain_separated_from_the_database_key() {
+        let root = SecretKey::new([3; 32]);
+        let identity = derive_account_identity_hash(&root, &account_id(), b"").unwrap();
+        let database = derive_account_key(
+            &root,
+            &account_id(),
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        assert_ne!(&identity, database.as_bytes());
+    }
+
+    #[test]
+    fn identity_hash_length_frames_the_account_and_address() {
+        // "ab"+"c" and "a"+"bc" both concatenate to "abc"; length framing must
+        // keep them distinct so a crafted address cannot impersonate an account.
+        let root = SecretKey::new([3; 32]);
+        let left =
+            derive_account_identity_hash(&root, &AccountId::new("ab").unwrap(), b"c").unwrap();
+        let right =
+            derive_account_identity_hash(&root, &AccountId::new("a").unwrap(), b"bc").unwrap();
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn hash_account_identity_fails_closed_without_a_root_key() {
+        let empty = Fake::default();
+        assert!(hash_account_identity(&empty, &account_id(), b"user@example.test").is_err());
+    }
+
+    #[test]
+    fn hash_account_identity_uses_the_retrieved_root_key() {
+        let seeded = Fake::default();
+        seeded.add(&SecretKey::new([7; 32])).unwrap();
+        let via = hash_account_identity(&seeded, &account_id(), b"user@example.test").unwrap();
+        let direct = derive_account_identity_hash(
+            &SecretKey::new([7; 32]),
+            &account_id(),
+            b"user@example.test",
+        )
+        .unwrap();
+        assert_eq!(via, direct);
     }
 
     struct FakeLocator(Result<PathBuf, ProfileStorageError>);

@@ -148,6 +148,21 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   account-switch, fresh-connect, and re-connect paths uniformly. Storing only a salted hash (not the
   address) keeps this consistent with Identity binding, which forbids *displaying* an
   address, not gating data lifecycle on a local hash.
+- **Identity source — `sub` is a 3f-blocking requirement (amended 2026-07-21).**
+  The gate as first built (3d-2a) hashes `getProfile.emailAddress`, but an email
+  address is **not** an immutable Google-account identifier: Google documents it as
+  mutable and reusable, and Workspace permits reassigning a removed address to a new
+  account. Under `emailAddress`, that reassignment produces a silent false *match*
+  that merges two principals' mail — precisely the outcome this gate exists to
+  exclude. The gate is therefore **required to key on the OIDC `sub`** (unique, never
+  reused) before the 3f live run; this is a **merge-blocking gate on 3f**, not a
+  Phase-1 mechanism change. The gate mechanism is identifier-agnostic — it hashes an
+  opaque string and stores only the salted hash — so the swap is confined to adding
+  the `openid` scope, reading `sub` from the token-exchange `id_token`, and having the
+  connected session implement the profile port from its held `sub`; the salted-hash
+  store, the decision logic, and the fail-closed/atomic-clear guarantees are
+  unchanged. (Source: the 3d-2a independent review — a confirmed critical — and the
+  Fable judgement verdict.)
 
 ### Read-only enforcement
 
@@ -199,6 +214,21 @@ network stall can never hold the writer. Sync stays bounded and single-flight pe
 ADR 0018 (only one sync runs at a time regardless of the lock); sync status crossing
 the bridge is a closed integer set with no addresses, subjects, or per-person mail
 counts beyond ADR 0018's aggregate.
+
+The identity gate and the sync write it guards are distinct steps, so the
+**whole gate-to-write cycle** must be serialized per account slot, not just each
+transaction — otherwise two overlapping cycles could interleave a stale
+identity record over a committed one and let two accounts' mail coexist. The 3d-2a
+`gated_sync` building block documents this precondition but does not enforce it;
+enforcement is a **3d-3 acceptance criterion with two parts (amended 2026-07-21)**:
+(1) the Rust-owned sync worker is the **sole** production caller and holds one
+whole-cycle permit per account slot — a concurrent begin returns busy rather than
+queuing a second cycle; and (2) an **in-transaction identity fence** — the sync
+carries the cycle's fresh identity hash and every mailbox-write transaction commits
+only if the slot's recorded hash still equals it, aborting on mismatch. The permit
+is convention; the in-transaction fence is the guarantee, holding even cross-process
+or under a future caller that ignores the worker discipline. (Source: the 3d-2a
+independent review — a confirmed critical — and the Fable judgement verdict.)
 
 ### Adapters, bridge, and FFI additions
 
@@ -253,8 +283,12 @@ grant-forwarding change must have a runtime to run on.
 ### Identity binding
 
 Phase 1 keeps the single fixed `default` account. Step 3 does **not** add a
-profile or `openid`/`email` scope to display an address; multi-account and
-identity display are MVP-completion work.
+profile or `openid`/`email` scope to *display* an address; multi-account and
+identity display are MVP-completion work. One narrow exception is required before
+the 3f live run (see Account-identity gate → Identity source): the `openid` scope
+is added solely to obtain the immutable OIDC `sub` for the account-identity gate —
+never to display an address — because the gate cannot correctly key on the mutable,
+reusable `emailAddress`. `sub` is used only as gate input (hashed, never shown).
 
 ### Client configuration and injection
 
