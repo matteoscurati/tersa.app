@@ -25,7 +25,7 @@ mod macos {
     use std::time::Duration;
 
     use rusqlite::config::DbConfig;
-    use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
+    use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior, params};
     use rustix::fd::OwnedFd;
     use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags};
     use tersa_application::identity::{AccountIdentityStore, IdentityHash, IdentityReconcile};
@@ -484,14 +484,21 @@ mod macos {
 
         fn reconcile(
             &self,
+            account: &AccountId,
             envelopes: &[MessageEnvelope],
             keep_limit: StoreLimit,
+            fence: &IdentityHash,
         ) -> Result<Vec<MessageId>, MailboxStoreError> {
             if envelopes.len() > usize::from(StoreLimit::MAX) {
                 return Err(MailboxStoreError::Storage);
             }
             self.with_connection(|connection| {
-                let transaction = connection.transaction().map_err(store_error)?;
+                // BEGIN IMMEDIATE takes the write lock up front, so the identity
+                // fence read below cannot race a concurrent identity change and the
+                // abort is deterministic rather than a snapshot-conflict at commit.
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(store_error)?;
                 let has_null_identifier: bool = transaction
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id IS NULL)",
@@ -535,6 +542,7 @@ mod macos {
                         }
                     }
                 }
+                assert_identity_unchanged(&transaction, account, fence)?;
                 transaction.commit().map_err(store_error)?;
                 Ok(survivors)
             })
@@ -619,9 +627,16 @@ mod macos {
             })
         }
 
-        fn cache_if_present(&self, message: &Message) -> Result<bool, MailboxStoreError> {
+        fn cache_if_present(
+            &self,
+            account: &AccountId,
+            message: &Message,
+            fence: &IdentityHash,
+        ) -> Result<bool, MailboxStoreError> {
             self.with_connection(|connection| {
-                let transaction = connection.transaction().map_err(store_error)?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(store_error)?;
                 let changed = transaction.execute(
                     "UPDATE messages SET thread_id = ?2, sender = ?3, subject = ?4, preview = ?5, received_at = ?6, unread = ?7, content = ?8 WHERE message_id = ?1",
                     params![message.envelope().message_id().as_str(), message.envelope().thread_id().as_str(), message.envelope().from().as_str(), message.envelope().subject().as_str(), message.envelope().preview().as_str(), message.envelope().received_at().as_millis(), i64::from(message.envelope().is_unread()), message.content().as_bytes()],
@@ -630,6 +645,11 @@ mod macos {
                 if self.take_failpoint()? {
                     return Err(MailboxStoreError::Storage);
                 }
+                // Fence the body write too: `messages` is keyed by message_id alone,
+                // and Gmail message IDs are not guaranteed distinct across accounts,
+                // so a stale body-fetch could otherwise land on a colliding row in a
+                // different account's mailbox.
+                assert_identity_unchanged(&transaction, account, fence)?;
                 transaction.commit().map_err(store_error)?;
                 Ok(changed == 1)
             })
@@ -1828,20 +1848,22 @@ mod macos {
             account: &'a AccountId,
             envelopes: &'a [MessageEnvelope],
             keep_limit: StoreLimit,
+            fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
-                self.reconcile(envelopes, keep_limit)
+                self.reconcile(account, envelopes, keep_limit, fence)
             })
         }
         fn cache_message_if_present<'a>(
             &'a self,
             account: &'a AccountId,
             message: &'a Message,
+            fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
-                self.cache_if_present(message)
+                self.cache_if_present(account, message, fence)
             })
         }
         fn message<'a>(
@@ -1929,6 +1951,53 @@ mod macos {
                 self.checked_account(account)?;
                 self.list(Some(thread_id), limit)
             })
+        }
+    }
+
+    /// The in-transaction identity fence: aborts the enclosing write unless the
+    /// slot's recorded identity still equals `fence`.
+    ///
+    /// Fails closed on every anomaly, but with two distinct categories so the
+    /// caller (and the sync failure surface) can tell them apart:
+    /// - a missing row or a hash that no longer equals `fence` means the identity
+    ///   changed (or was torn down by a concurrent disconnect) between the gate's
+    ///   decision and this write — [`MailboxStoreError::IdentityChanged`];
+    /// - a version-incompatible row, or a NULL / wrong-length / wrong-typeof
+    ///   `identity_hash`/`algo_version` (filtered by the `CASE … typeof/length`
+    ///   projection), is an unreadable identity, not a known account change —
+    ///   [`MailboxStoreError::Corrupted`], matching the store's general rule that a
+    ///   present-but-unreadable identity row never degrades to "no identity yet".
+    ///
+    /// Either category aborts the write; neither ever re-baselines or commits. The
+    /// hash is compared in constant time via [`IdentityHash`]'s equality.
+    fn assert_identity_unchanged(
+        transaction: &Transaction<'_>,
+        account: &AccountId,
+        fence: &IdentityHash,
+    ) -> Result<(), MailboxStoreError> {
+        let row = transaction.query_row(
+            "SELECT CASE WHEN typeof(identity_hash) = 'blob' AND length(identity_hash) = 32 THEN identity_hash END, CASE WHEN typeof(algo_version) = 'integer' THEN algo_version END FROM account_identity WHERE account_id = ?1",
+            params![account.as_str()],
+            |row| {
+                let hash: Option<Vec<u8>> = row.get(0)?;
+                let version: Option<i64> = row.get(1)?;
+                Ok((hash, version))
+            },
+        );
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(MailboxStoreError::IdentityChanged),
+            Err(error) => Err(store_error(error)),
+            Ok((Some(hash), Some(version))) if version == IDENTITY_ALGO_VERSION => {
+                let bytes: [u8; 32] = hash
+                    .try_into()
+                    .map_err(|_length| MailboxStoreError::Corrupted)?;
+                if IdentityHash::from_bytes(bytes) == *fence {
+                    Ok(())
+                } else {
+                    Err(MailboxStoreError::IdentityChanged)
+                }
+            }
+            Ok(_) => Err(MailboxStoreError::Corrupted),
         }
     }
 
@@ -2442,6 +2511,19 @@ mod macos {
             let database = TestDatabase::new(name);
             let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             (database, store)
+        }
+
+        fn fence() -> IdentityHash {
+            IdentityHash::from_bytes([9; 32])
+        }
+
+        /// Records the baseline account identity a fenced write expects, mirroring
+        /// what the gate persists before the first reconcile of a cycle in
+        /// production. A reconcile or cache write whose commit reaches the fence
+        /// assert requires this row to exist and match [`fence`].
+        fn record_fence(store: &SqlCipherMailboxStore) {
+            run(store.reconcile_identity(&account(), &fence(), IdentityReconcile::RecordOnly))
+                .unwrap();
         }
 
         fn crash_store_at(database: &TestDatabase, point: &str) {
@@ -4189,6 +4271,7 @@ mod macos {
         #[test]
         fn reconcile_prunes_in_exact_order_preserves_bodies_and_caches_conditionally() {
             let (_database, store) = open("reconcile");
+            record_fence(&store);
             let retained = envelope("retained", "thread", 70);
             let displaced = envelope("displaced", "thread", 40);
             run(store.upsert_envelopes(&account(), &[retained.clone(), displaced.clone()]))
@@ -4209,6 +4292,7 @@ mod macos {
                 &account(),
                 &input,
                 StoreLimit::new(3).unwrap(),
+                &fence(),
             ))
             .unwrap();
             assert_eq!(
@@ -4234,12 +4318,12 @@ mod macos {
                 envelope("missing", "thread", 60),
                 MessageContent::new(b"missing body".to_vec()).unwrap(),
             );
-            assert!(!run(store.cache_message_if_present(&account(), &missing)).unwrap());
+            assert!(!run(store.cache_message_if_present(&account(), &missing, &fence())).unwrap());
             let cached = Message::new(
                 envelope("tie-a", "thread", 50),
                 MessageContent::new(b"cached body".to_vec()).unwrap(),
             );
-            assert!(run(store.cache_message_if_present(&account(), &cached)).unwrap());
+            assert!(run(store.cache_message_if_present(&account(), &cached, &fence())).unwrap());
             assert_eq!(
                 run(store.message(&account(), cached.envelope().message_id()))
                     .unwrap()
@@ -4265,6 +4349,7 @@ mod macos {
                     &account(),
                     &[envelope("new", "thread", 20)],
                     StoreLimit::new(1).unwrap(),
+                    &fence(),
                 )),
                 Err(MailboxStoreError::Storage)
             );
@@ -4274,7 +4359,12 @@ mod macos {
             );
             store.fail_next_mutation();
             assert_eq!(
-                run(store.reconcile_recent_envelopes(&account(), &[], StoreLimit::new(1).unwrap(),)),
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[],
+                    StoreLimit::new(1).unwrap(),
+                    &fence(),
+                )),
                 Err(MailboxStoreError::Storage)
             );
             drop(store);
@@ -4319,10 +4409,12 @@ mod macos {
         #[test]
         fn identity_mismatch_clears_the_mailbox_but_keeps_the_new_hash() {
             let (database, store) = open("identity-mismatch-clear");
+            record_fence(&store);
             run(store.reconcile_recent_envelopes(
                 &account(),
                 &[envelope("m1", "thread", 10), envelope("m2", "thread", 20)],
                 StoreLimit::new(5).unwrap(),
+                &fence(),
             ))
             .unwrap();
             let first = IdentityHash::from_bytes([1; 32]);
@@ -4363,11 +4455,13 @@ mod macos {
         #[test]
         fn identity_reconcile_rolls_back_the_clear_and_the_record_together() {
             let (database, store) = open("identity-reconcile-rollback");
+            record_fence(&store);
             let seeded = envelope("seeded", "thread", 10);
             run(store.reconcile_recent_envelopes(
                 &account(),
                 std::slice::from_ref(&seeded),
                 StoreLimit::new(5).unwrap(),
+                &fence(),
             ))
             .unwrap();
             let recorded = IdentityHash::from_bytes([1; 32]);
@@ -4424,6 +4518,82 @@ mod macos {
         }
 
         #[test]
+        fn a_reconcile_aborts_and_rolls_back_when_the_recorded_identity_moved_past_the_fence() {
+            // Models an identity change between the gate (which produced the fence)
+            // and this commit: the recorded identity no longer matches the fence the
+            // stale cycle carries, so the envelope write must roll back rather than
+            // land under a different account's mailbox.
+            let (_database, store) = open("reconcile-stale-fence");
+            let changed = IdentityHash::from_bytes([7; 32]);
+            run(store.reconcile_identity(&account(), &changed, IdentityReconcile::RecordOnly))
+                .unwrap();
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[envelope("stale", "thread", 10)],
+                    StoreLimit::new(3).unwrap(),
+                    &fence(),
+                )),
+                Err(MailboxStoreError::IdentityChanged)
+            );
+            // Nothing persisted, and the recorded identity itself is untouched.
+            assert!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(run(store.load_identity(&account())).unwrap(), Some(changed));
+        }
+
+        #[test]
+        fn a_reconcile_aborts_and_rolls_back_when_the_identity_row_is_absent() {
+            // No recorded identity at all is treated as "changed", never as a silent
+            // first-connect re-baseline — the write fails closed.
+            let (_database, store) = open("reconcile-absent-identity");
+            assert_eq!(
+                run(store.reconcile_recent_envelopes(
+                    &account(),
+                    &[envelope("orphan", "thread", 10)],
+                    StoreLimit::new(3).unwrap(),
+                    &fence(),
+                )),
+                Err(MailboxStoreError::IdentityChanged)
+            );
+            assert!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn a_body_cache_carrying_a_stale_fence_aborts_and_leaves_the_envelope_bodyless() {
+            // The body write is fenced too: `messages` is keyed by message_id alone,
+            // and Gmail IDs are not distinct across accounts, so a stale body-fetch
+            // must not overwrite a colliding row once the identity has moved on.
+            let (_database, store) = open("cache-stale-fence");
+            let present = envelope("present", "thread", 20);
+            run(store.upsert_envelopes(&account(), std::slice::from_ref(&present))).unwrap();
+            let changed = IdentityHash::from_bytes([7; 32]);
+            run(store.reconcile_identity(&account(), &changed, IdentityReconcile::RecordOnly))
+                .unwrap();
+            let body = Message::new(
+                present.clone(),
+                MessageContent::new(b"secret body".to_vec()).unwrap(),
+            );
+            assert_eq!(
+                run(store.cache_message_if_present(&account(), &body, &fence())),
+                Err(MailboxStoreError::IdentityChanged)
+            );
+            // The body write rolled back: the envelope remains bodyless.
+            assert!(
+                run(store.message(&account(), present.message_id()))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
         fn conditional_cache_rolls_back_and_never_reinserts_a_missing_row() {
             let (database, store) = open("conditional-cache-rollback");
             let present = envelope("present", "thread", 20);
@@ -4434,12 +4604,13 @@ mod macos {
             );
             store.fail_next_mutation();
             assert_eq!(
-                run(store.cache_message_if_present(&account(), &body)),
+                run(store.cache_message_if_present(&account(), &body, &fence())),
                 Err(MailboxStoreError::Storage)
             );
             drop(store);
 
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            record_fence(&reopened);
             assert!(
                 run(reopened.message(&account(), present.message_id()))
                     .unwrap()
@@ -4449,9 +4620,10 @@ mod macos {
                 &account(),
                 &[envelope("newer", "thread", 30)],
                 StoreLimit::new(1).unwrap(),
+                &fence(),
             ))
             .unwrap();
-            assert!(!run(reopened.cache_message_if_present(&account(), &body)).unwrap());
+            assert!(!run(reopened.cache_message_if_present(&account(), &body, &fence())).unwrap());
             assert_eq!(
                 run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
                     .unwrap()
@@ -4480,6 +4652,7 @@ mod macos {
                     &account(),
                     &[envelope("new", "thread", 100)],
                     StoreLimit::new(1).unwrap(),
+                    &fence(),
                 )),
                 Err(MailboxStoreError::Corrupted)
             );

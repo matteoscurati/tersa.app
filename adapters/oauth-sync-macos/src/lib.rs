@@ -29,7 +29,7 @@ use core::fmt;
 
 use tersa_application::identity::{
     AccountIdentityHasher, AccountIdentityStore, AccountProfile, GateError, IdentityDecision,
-    IdentityReconcile, decide, normalize_subject,
+    IdentityHash, IdentityReconcile, decide, normalize_subject,
 };
 use tersa_application::mailbox::{AccountId, MailboxStore, RemoteMailbox};
 #[cfg(target_os = "macos")]
@@ -89,7 +89,7 @@ async fn run_identity_gate<P, H, St>(
     profile: &P,
     hasher: &H,
     store: &St,
-) -> Result<(), GateError>
+) -> Result<IdentityHash, GateError>
 where
     P: AccountProfile,
     H: AccountIdentityHasher,
@@ -106,14 +106,17 @@ where
         .map_err(GateError::Store)?;
     let action = match decide(stored.as_ref(), &fresh) {
         // The same account: preserve the cached mailbox, write nothing.
-        IdentityDecision::Match => return Ok(()),
+        IdentityDecision::Match => return Ok(fresh),
         IdentityDecision::FirstRecord => IdentityReconcile::RecordOnly,
         IdentityDecision::ClearAndRecord => IdentityReconcile::ClearMailboxAndRecord,
     };
     store
         .reconcile_identity(account, &fresh, action)
         .await
-        .map_err(GateError::Store)
+        .map_err(GateError::Store)?;
+    // The gate returns the hash it just committed as the fence for the sync: every
+    // subsequent mailbox write re-checks the recorded identity still equals it.
+    Ok(fresh)
 }
 
 /// Runs the account-identity gate, then the bounded recent sync — over one
@@ -170,12 +173,12 @@ where
     St: MailboxStore + AccountIdentityStore,
     H: AccountIdentityHasher,
 {
-    run_identity_gate(account, &session, hasher, &store)
+    let fence = run_identity_gate(account, &session, hasher, &store)
         .await
         .map_err(GatedSyncError::Gate)?;
     let coordinator = SyncCoordinator::new(session, store);
     coordinator
-        .sync_recent(account, policy)
+        .sync_recent(account, policy, &fence)
         .await
         .map_err(GatedSyncError::Sync)
 }
@@ -594,6 +597,7 @@ mod tests {
         reconcile_error: bool,
         identity_reconciles: Mutex<Vec<([u8; 32], IdentityReconcile)>>,
         sync_reconciles: Arc<AtomicUsize>,
+        sync_fences: Arc<Mutex<Vec<[u8; 32]>>>,
     }
 
     impl FakeStore {
@@ -610,6 +614,12 @@ mod tests {
         /// moved into `gated_sync`, so a test can prove the write did or did not run.
         fn sync_probe(&self) -> Arc<AtomicUsize> {
             Arc::clone(&self.sync_reconciles)
+        }
+        /// A shared handle to the fences threaded into the sync writes, so a test
+        /// can prove the gate handed the freshly-committed identity hash to the
+        /// coordinator rather than a stale, constant, or unrelated value.
+        fn fence_probe(&self) -> Arc<Mutex<Vec<[u8; 32]>>> {
+            Arc::clone(&self.sync_fences)
         }
     }
 
@@ -684,14 +694,17 @@ mod tests {
             _account: &'a AccountId,
             _envelopes: &'a [MessageEnvelope],
             _keep_limit: StoreLimit,
+            fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
             self.sync_reconciles.fetch_add(1, Ordering::SeqCst);
+            self.sync_fences.lock().unwrap().push(*fence.as_bytes());
             Box::pin(async { Ok(Vec::new()) })
         }
         fn cache_message_if_present<'a>(
             &'a self,
             _account: &'a AccountId,
             _message: &'a Message,
+            _fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
             Box::pin(async { Ok(false) })
         }
@@ -730,7 +743,10 @@ mod tests {
         hasher: &FakeHasher,
         store: &FakeStore,
     ) -> Result<(), GateError> {
-        drive(run_identity_gate(&account(), profile, hasher, store))
+        // Existing gate tests assert only the reconcile side effects, not the
+        // returned fence, so collapse the fence to `()` for them; the fence path
+        // itself is exercised where `gated_sync` threads it into the writers.
+        drive(run_identity_gate(&account(), profile, hasher, store)).map(|_fence| ())
     }
 
     #[test]
@@ -868,6 +884,7 @@ mod tests {
     fn a_passing_gate_runs_the_bounded_sync() {
         let store = FakeStore::default();
         let sync_writes = store.sync_probe();
+        let sync_fences = store.fence_probe();
         let report = drive(gated_sync(
             &account(),
             FakeProfile(subject("user-sub")),
@@ -878,6 +895,45 @@ mod tests {
         assert!(report.is_ok());
         // The gate passed, so the bounded sync ran exactly once.
         assert_eq!(sync_writes.load(Ordering::SeqCst), 1);
+        // ...and it received the freshly-committed identity hash as its fence, so
+        // the handoff is behaviorally verified — not merely that a write happened.
+        // First connect: the fence is the hasher output the gate just recorded.
+        assert_eq!(*sync_fences.lock().unwrap(), vec![[5; 32]]);
+    }
+
+    #[test]
+    fn a_matching_gate_threads_the_verified_hash_as_the_fence() {
+        // Same account: the gate writes nothing, but the sync still runs and its
+        // fence is the verified identity hash the store already held.
+        let store = FakeStore::with_stored([5; 32]);
+        let sync_fences = store.fence_probe();
+        let report = drive(gated_sync(
+            &account(),
+            FakeProfile(subject("user-sub")),
+            &FakeHasher::ok([5; 32]),
+            store,
+            policy(),
+        ));
+        assert!(report.is_ok());
+        assert_eq!(*sync_fences.lock().unwrap(), vec![[5; 32]]);
+    }
+
+    #[test]
+    fn a_changed_account_threads_the_newly_committed_hash_as_the_fence() {
+        // A different account connects: the gate clears and records the NEW hash,
+        // and the fence handed to the sync must be that new hash, never the prior
+        // one — otherwise a stale fence could match the wrong recorded identity.
+        let store = FakeStore::with_stored([1; 32]);
+        let sync_fences = store.fence_probe();
+        let report = drive(gated_sync(
+            &account(),
+            FakeProfile(subject("other-sub")),
+            &FakeHasher::ok([9; 32]),
+            store,
+            policy(),
+        ));
+        assert!(report.is_ok());
+        assert_eq!(*sync_fences.lock().unwrap(), vec![[9; 32]]);
     }
 }
 

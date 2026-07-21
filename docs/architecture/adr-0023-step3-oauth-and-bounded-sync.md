@@ -264,15 +264,55 @@ The identity gate and the sync write it guards are distinct steps, so the
 transaction — otherwise two overlapping cycles could interleave a stale
 identity record over a committed one and let two accounts' mail coexist. The 3d-2a
 `gated_sync` building block documents this precondition but does not enforce it;
-enforcement is a **3d-3 acceptance criterion with two parts (amended 2026-07-21)**:
-(1) the Rust-owned sync worker is the **sole** production caller and holds one
+enforcement is a **3d-3 acceptance criterion (amended 2026-07-22, superseding the
+2026-07-21 two-part framing)**. Part (2), an **in-transaction identity fence**, has
+the sync carry the cycle's fresh identity hash so every mailbox-write transaction
+commits only if the slot's recorded hash still equals it, aborting on mismatch
+(landed in 3d-3b; see below). Part (1) is **whole-cycle serialization** of the
+gate-to-write span, with two halves that are both hard, blocking 3d-3c criteria:
+(1a) the Rust-owned sync worker is the **sole** production caller and holds one
 whole-cycle permit per account slot — a concurrent begin returns busy rather than
-queuing a second cycle; and (2) an **in-transaction identity fence** — the sync
-carries the cycle's fresh identity hash and every mailbox-write transaction commits
-only if the slot's recorded hash still equals it, aborting on mismatch. The permit
-is convention; the in-transaction fence is the guarantee, holding even cross-process
-or under a future caller that ignores the worker discipline. (Source: the 3d-2a
-independent review — a confirmed critical — and the Fable judgement verdict.)
+queuing a second cycle; and (1b) a **compare-and-set identity record** —
+`reconcile_identity` re-validates the observed prior state inside its own
+`BEGIN IMMEDIATE` transaction (a `FirstRecord` inserts only if the row is still
+absent; a `ClearAndRecord` only if the prior hash still matches what `decide`
+observed), aborting to a fresh gate cycle on mismatch.
+
+The fence guarantees no mailbox write commits under an identity other than its
+cycle's fence, even cross-process — but it does **not** serialize the gate's own
+read-decide-record step: a stale `RecordOnly` from a concurrent cycle can overwrite
+a just-recorded different identity *without a clear*, letting the first cycle's
+already-committed mail coexist with the second account's. The fence is therefore
+**necessary but not sufficient**. The whole-cycle permit is required, not
+convention, for in-process serialization; cross-process (and undisciplined-caller)
+safety additionally requires the compare-and-set identity record — or a
+cross-process whole-cycle exclusion proven held across the entire gate-to-write
+span. Both are hard 3d-3c acceptance criteria, verified by a two-gate interleaving
+regression test (empty store, concurrent double-`FirstRecord`, assert exactly one
+account's mail survives). (Sources: the 3d-2a independent review — a confirmed
+critical; and the 2026-07-22 Fable judgement verdict, which **reverses** the earlier
+verdict that the fence alone was the guarantee.)
+
+  - **3d-3b landed part (2), the fence (amended 2026-07-21).** `run_identity_gate`
+    now returns the identity hash it committed (on `Match`, the hash it just
+    verified) as the cycle's fence; `gated_sync` threads it into `sync_recent`, and
+    `MailboxStore::reconcile_recent_envelopes` / `cache_message_if_present` both take
+    it. The SQLCipher store opens each writer transaction `BEGIN IMMEDIATE` (the
+    write lock is taken up front, so the fence read cannot race a concurrent identity
+    change *within that transaction*) and re-reads `account_identity` inside the
+    transaction just before commit. A hash that no longer equals the fence, or a row
+    that vanished, aborts the write with the new `MailboxStoreError::IdentityChanged`
+    (surfaced by the coordinator as its own `SyncFailureSource::IdentityFenced`
+    category rather than a generic store fault). A version-incompatible or otherwise
+    unreadable identity row aborts as `MailboxStoreError::Corrupted` instead —
+    matching the store's general rule that a present-but-unreadable identity never
+    degrades to "no identity yet" — so it surfaces as `Store(Corrupted)`, not
+    `IdentityFenced`; either way the write fails closed. Both the envelope write and
+    the body cache are fenced (message IDs are not distinct across accounts, so a
+    stale body-fetch could otherwise land on a colliding row). Part (1) —
+    whole-cycle serialization (the sole-caller worker's permit **and** the
+    compare-and-set identity record) — remains a 3d-3c criterion; the fence alone is
+    necessary but not sufficient (see above).
 
 ### Adapters, bridge, and FFI additions
 
