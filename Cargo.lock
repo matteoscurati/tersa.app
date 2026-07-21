@@ -7591,6 +7591,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-oauth-sync-macos"
+version = "0.0.0"
+dependencies = [
+ "tersa-application",
+ "tersa-domain",
+ "tersa-gmail-rest-macos",
+ "tersa-keychain-macos",
+ "tersa-store-sqlcipher-macos",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "tersa-platform"
 version = "0.0.0"
 dependencies = [

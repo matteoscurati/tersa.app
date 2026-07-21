@@ -1,0 +1,28 @@
+# This Source Code Form is subject to the terms of the Mozilla Public License,
+# v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain
+# one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-oauth-sync-macos"
+description = "macOS-only trusted OAuth token-lifecycle and bounded Gmail sync composition for tersa.app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tersa-application = { path = "../../crates/application", version = "=0.0.0" }
+tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
+zeroize = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tersa-gmail-rest-macos = { path = "../gmail-rest-macos", version = "=0.0.0" }
+tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0" }
+tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0.0.0" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

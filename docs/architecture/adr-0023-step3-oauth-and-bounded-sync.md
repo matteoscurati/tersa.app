@@ -89,8 +89,10 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   per canonical `AccountId`, in the existing access group, with
   `WhenUnlockedThisDeviceOnly` accessibility (stricter than the root key and
   sufficient, since sync is user-triggered with no background work); never written
-  to SQLCipher, never crossed over the C ABI, never logged. Owned by a new trusted
-  composition entry in `tersa-keychain-macos`.
+  to SQLCipher, never crossed over the C ABI, never logged. The store is the 3c
+  `RefreshTokenStore` in `tersa-keychain-macos`; the trusted composition that loads
+  and rotates it is the dedicated `tersa-oauth-sync-macos` crate (see Sync
+  composition, amended 2026-07-21).
 - **Rotation is an atomic in-place replace.** Google may return a new refresh token
   on refresh or re-consent. A refresh-token item has one fixed Keychain primary key
   (service + `AccountId` + access group), so a second `SecItemAdd` returns
@@ -169,11 +171,19 @@ refresh, or revoke entries — defense in depth atop the compile boundary.
 
 ### Sync composition and write-path authority
 
-Sync writes run **only** through a new trusted `tersa-keychain-macos` composition
-entry that loads the refresh token, refreshes proactively, drives the existing
-`GmailMailbox` fetch and `SyncCoordinator` bounded recent sync, and reconciles into
-the store over the existing **validated read-write** SQLCipher path. The store
-remains the sole writer and migration authority; the sync entry is an authorized
+Sync writes run **only** through the new trusted `tersa-oauth-sync-macos`
+composition crate — a dedicated crate, not an entry in `tersa-keychain-macos`
+(amended 2026-07-21): giving `tersa-keychain-macos` the `tersa-gmail-rest-macos` /
+`tokio` edges would make everything that depends on it — including the
+**retrieval-only CLI** — transitively link `reqwest` (network), permanently deleting
+the machine-checked reqwest-exclusivity that expresses the CLI's retrieval-only,
+zero-network invariant. The composition crate keeps `tersa-keychain-macos` (the token
+store) and the CLI off the network graph, realizing the dedicated-composition-crate
+refactor the Consequences section anticipates. It loads the refresh token, refreshes
+proactively, drives the existing `GmailMailbox` fetch and `SyncCoordinator` bounded
+recent sync, and reconciles into the store over the existing **validated read-write**
+SQLCipher path. The store remains the sole writer and migration authority; the sync
+entry is an authorized
 caller, not a second authority.
 
 Concurrency: the store runs persistent WAL — one writer, many readers. Step 3 adds
@@ -213,10 +223,15 @@ counts beyond ADR 0018's aggregate.
   normalized) pinned header, and the test fixtures are updated together in one
   reviewed PR.
 - The trusted composition's new dependencies require boundary amendments, updated
-  atomically with their `xtask` fixtures (direct and resolved graphs):
-  `tersa-keychain-macos` gains an edge to `tersa-gmail-rest-macos` and to the pinned
-  `tokio` (both currently rejected by the maximum and exact dependency sets), plus
-  the token-item Keychain mutation-guard amendment from Token lifecycle.
+  atomically with their `xtask` fixtures (direct and resolved graphs). The new
+  `tersa-oauth-sync-macos` crate declares edges to `tersa-keychain-macos` (the token
+  store), `tersa-gmail-rest-macos` (token transport + read adapter),
+  `tersa-application`, `tersa-domain`, `tersa-store-sqlcipher-macos`, and the pinned
+  current-thread `tokio`; it is added to the reqwest / SQLCipher / HMAC reachability
+  owner-sets. `tersa-keychain-macos` gains **no** network edge, so the retrieval-only
+  CLI stays off the `reqwest` / `tokio` graph (amended 2026-07-21). The token-item
+  Keychain mutation-guard amendment from Token lifecycle (3c) stays in
+  `tersa-keychain-macos`.
 - A new **OAuth/sync invocation seam** guard clones the Step-2 bootstrap
   launch-entry policy (`swift_bootstrap_intent_entries`): `OAuthAuthorizationSession`
   start/cancel and the sync trigger are each confined to a single reviewed
@@ -317,10 +332,13 @@ verification (CASA) is MVP-completion work.
 Step 3 is mostly integration over reviewed parts, concentrated on one new
 security-critical subsystem — the token lifecycle — which the senior/security lane
 owns end to end (3c, 3d, the guard extensions, and the 3e wiring review). This
-concentrates Keychain, SQLCipher, key derivation, token exchange, and network entry
-in the one trusted `tersa-keychain-macos` composition; the concentration follows the
-ADR 0019 precedent and is accepted for Phase 1, with a dedicated composition crate
-noted as a candidate refactor if that surface grows past Step 3. The read UI is
+concentrates token exchange, network entry, and the sync write path in the one
+trusted `tersa-oauth-sync-macos` composition crate, which consumes the Keychain token
+store and the SQLCipher store rather than absorbing them. 3d realizes the
+dedicated-composition-crate refactor this section anticipated (Step 3 is the growth
+that warrants it); keeping the composition out of `tersa-keychain-macos` keeps the
+token store and, critically, the retrieval-only CLI off the `reqwest` / `tokio`
+network graph — the machine-checked expression of the CLI's retrieval-only invariant. The read UI is
 unchanged and its 2b surface stays invariant. The store gains real data, so
 ADR 0022 runtime measurements become meaningful and are recorded per slice. The
 account-connection screen gains a real Google sign-in and a disconnect affordance;
