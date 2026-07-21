@@ -31,7 +31,7 @@ use tersa_application::identity::{
     AccountIdentityHasher, AccountIdentityStore, AccountProfile, GateError, IdentityDecision,
     IdentityHash, IdentityReconcile, decide, normalize_subject,
 };
-use tersa_application::mailbox::{AccountId, MailboxStore, RemoteMailbox};
+use tersa_application::mailbox::{AccountId, MailboxStore, MailboxStoreError, RemoteMailbox};
 #[cfg(target_os = "macos")]
 use tersa_application::mailbox::{
     BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize, PageToken, RemoteMailboxError,
@@ -84,6 +84,12 @@ impl std::error::Error for GatedSyncError {}
 /// store to whoever happens to be connected. The subject itself is in-hand and
 /// already validated (by the session at construction), so obtaining it is
 /// infallible.
+/// The most gate read-decide-record attempts before failing closed. Each lost
+/// race means a concurrent cycle committed its own identity, which happens at most
+/// once per racer, so a small bound converges in practice; exhaustion is a fault
+/// (a livelock or tamper), never a reason to sync under an uncommitted identity.
+const MAX_GATE_ATTEMPTS: u8 = 4;
+
 async fn run_identity_gate<P, H, St>(
     account: &AccountId,
     profile: &P,
@@ -100,23 +106,40 @@ where
         .hash(account, &normalized)
         .map_err(GateError::Hasher)?;
     drop(normalized);
-    let stored = store
-        .load_identity(account)
-        .await
-        .map_err(GateError::Store)?;
-    let action = match decide(stored.as_ref(), &fresh) {
-        // The same account: preserve the cached mailbox, write nothing.
-        IdentityDecision::Match => return Ok(fresh),
-        IdentityDecision::FirstRecord => IdentityReconcile::RecordOnly,
-        IdentityDecision::ClearAndRecord => IdentityReconcile::ClearMailboxAndRecord,
-    };
-    store
-        .reconcile_identity(account, &fresh, action)
-        .await
-        .map_err(GateError::Store)?;
-    // The gate returns the hash it just committed as the fence for the sync: every
-    // subsequent mailbox write re-checks the recorded identity still equals it.
-    Ok(fresh)
+    // Read → decide → compare-and-set record, retried on a lost race. A concurrent
+    // cycle (cross-process, or an undisciplined caller without the whole-cycle
+    // permit) can change the recorded identity between our read and our record; the
+    // store's CAS aborts that stale decision with `IdentityRaced`, and we re-read
+    // and re-decide against the new state. It converges because a racer commits its
+    // identity exactly once, so a bounded number of attempts always reaches a settled
+    // state; exhaustion fails closed rather than syncing under an unknown one.
+    for _ in 0..MAX_GATE_ATTEMPTS {
+        let stored = store
+            .load_identity(account)
+            .await
+            .map_err(GateError::Store)?;
+        let action = match decide(stored.as_ref(), &fresh) {
+            // The same account: preserve the cached mailbox, write nothing.
+            IdentityDecision::Match => return Ok(fresh),
+            IdentityDecision::FirstRecord => IdentityReconcile::RecordOnly,
+            IdentityDecision::ClearAndRecord => IdentityReconcile::ClearMailboxAndRecord,
+        };
+        match store
+            .reconcile_identity(account, &fresh, action, stored.as_ref())
+            .await
+        {
+            // The gate returns the committed hash as the fence for the sync: every
+            // subsequent mailbox write re-checks the recorded identity equals it.
+            Ok(()) => return Ok(fresh),
+            // A racing cycle recorded a different identity under us — fall through to
+            // the next attempt, which re-reads and re-decides against the new state
+            // (it may now be Match, or a clear).
+            Err(MailboxStoreError::IdentityRaced) => {}
+            Err(other) => return Err(GateError::Store(other)),
+        }
+    }
+    // Persistently lost the race: never sync under an identity we could not commit.
+    Err(GateError::Store(MailboxStoreError::IdentityRaced))
 }
 
 /// Runs the account-identity gate, then the bounded recent sync — over one
@@ -590,14 +613,22 @@ mod tests {
         }
     }
 
+    /// Shared log of the identity-record actions a gate applied, readable after the
+    /// store is moved into `gated_sync`.
+    type IdentityReconcileLog = Arc<Mutex<Vec<([u8; 32], IdentityReconcile)>>>;
+
     #[derive(Default)]
     struct FakeStore {
         stored: Mutex<Option<[u8; 32]>>,
         load_error: bool,
         reconcile_error: bool,
-        identity_reconciles: Mutex<Vec<([u8; 32], IdentityReconcile)>>,
+        identity_reconciles: IdentityReconcileLog,
         sync_reconciles: Arc<AtomicUsize>,
         sync_fences: Arc<Mutex<Vec<[u8; 32]>>>,
+        // When set, the next `reconcile_identity` simulates a concurrent cycle
+        // having recorded this identity first (then unsets), so the caller's
+        // compare-and-set loses the race once and must re-read and re-decide.
+        race_next: Mutex<Option<[u8; 32]>>,
     }
 
     impl FakeStore {
@@ -607,8 +638,21 @@ mod tests {
                 ..Self::default()
             }
         }
+        /// A store whose first `reconcile_identity` loses the compare-and-set to a
+        /// concurrent cycle that recorded `bytes`, exercising the gate's retry.
+        fn racing_first_write_to(bytes: [u8; 32]) -> Self {
+            Self {
+                race_next: Mutex::new(Some(bytes)),
+                ..Self::default()
+            }
+        }
         fn identity_reconciles(&self) -> Vec<([u8; 32], IdentityReconcile)> {
             self.identity_reconciles.lock().unwrap().clone()
+        }
+        /// A shared handle to the recorded reconcile actions, kept after the store
+        /// is moved into `gated_sync`, so a test can prove a retried gate re-decided.
+        fn identity_reconciles_probe(&self) -> IdentityReconcileLog {
+            Arc::clone(&self.identity_reconciles)
         }
         /// A shared handle to the sync-write counter, kept after the store is
         /// moved into `gated_sync`, so a test can prove the write did or did not run.
@@ -641,8 +685,18 @@ mod tests {
             _account: &'a AccountId,
             fresh: &'a IdentityHash,
             action: IdentityReconcile,
+            expected: Option<&'a IdentityHash>,
         ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            let expected = expected.map(|hash| *hash.as_bytes());
             Box::pin(async move {
+                // A concurrent cycle records its identity just before our read, once.
+                if let Some(winner) = self.race_next.lock().unwrap().take() {
+                    *self.stored.lock().unwrap() = Some(winner);
+                }
+                // Compare-and-set against the identity the gate observed.
+                if *self.stored.lock().unwrap() != expected {
+                    return Err(MailboxStoreError::IdentityRaced);
+                }
                 self.identity_reconciles
                     .lock()
                     .unwrap()
@@ -790,6 +844,66 @@ mod tests {
             store.identity_reconciles(),
             vec![([9; 32], IdentityReconcile::ClearMailboxAndRecord)]
         );
+    }
+
+    #[test]
+    fn a_lost_first_record_race_re_decides_and_clears_instead_of_re_recording() {
+        // A concurrent cycle records a DIFFERENT account's identity ([1;32]) between
+        // this gate's read and its compare-and-set. The gate must not blindly retry
+        // its stale first-record (which would leave the other account's cached mail
+        // in place under the new identity); it re-reads, re-decides ClearAndRecord,
+        // and only then records — the cross-process backstop the permit cannot give.
+        let store = FakeStore::racing_first_write_to([1; 32]);
+        let reconciles = store.identity_reconciles_probe();
+        let report = drive(gated_sync(
+            &account(),
+            FakeProfile(subject("user-sub")),
+            &FakeHasher::ok([9; 32]),
+            store,
+            policy(),
+        ));
+        assert!(report.is_ok());
+        // The raced RecordOnly recorded nothing; only the re-decided clear did.
+        assert_eq!(
+            *reconciles.lock().unwrap(),
+            vec![([9; 32], IdentityReconcile::ClearMailboxAndRecord)]
+        );
+    }
+
+    #[test]
+    fn a_persistently_lost_race_fails_closed_without_syncing() {
+        // If every attempt loses the race, the gate exhausts its bounded retries and
+        // fails closed rather than syncing under an identity it could not commit.
+        struct AlwaysRacingStore;
+        impl AccountIdentityStore for AlwaysRacingStore {
+            fn load_identity<'a>(
+                &'a self,
+                _account: &'a AccountId,
+            ) -> BoxFuture<'a, Result<Option<IdentityHash>, MailboxStoreError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn reconcile_identity<'a>(
+                &'a self,
+                _account: &'a AccountId,
+                _fresh: &'a IdentityHash,
+                _action: IdentityReconcile,
+                _expected: Option<&'a IdentityHash>,
+            ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+                Box::pin(async { Err(MailboxStoreError::IdentityRaced) })
+            }
+        }
+        let hasher = FakeHasher::ok([9; 32]);
+        let error = drive(run_identity_gate(
+            &account(),
+            &FakeProfile(subject("user-sub")),
+            &hasher,
+            &AlwaysRacingStore,
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GateError::Store(MailboxStoreError::IdentityRaced)
+        ));
     }
 
     #[test]

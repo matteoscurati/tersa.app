@@ -293,6 +293,22 @@ account's mail survives). (Sources: the 3d-2a independent review — a confirmed
 critical; and the 2026-07-22 Fable judgement verdict, which **reverses** the earlier
 verdict that the fence alone was the guarantee.)
 
+  - **3d-3c-1 landed part (1b), the compare-and-set (amended 2026-07-22).**
+    `AccountIdentityStore::reconcile_identity` gained an `expected: Option<&Identity
+    Hash>` (the identity `decide` observed); the SQLCipher store opens the record
+    transaction `BEGIN IMMEDIATE` and, before any clear or upsert, re-reads
+    `account_identity` and proceeds only if it still equals `expected` (a `None`
+    requires the row still absent), else aborts the whole transaction with the new
+    `MailboxStoreError::IdentityRaced`. `run_identity_gate` now loops read → decide →
+    compare-and-set record, retrying on `IdentityRaced` (bounded, fail-closed on
+    exhaustion): a lost first-connect race re-reads and re-decides to a
+    clear-and-record rather than blindly re-recording, so the racing account's cached
+    mail is wiped before its sync writes. The fence's and the CAS's in-transaction
+    identity read are one shared fail-closed reader. Verified by the two-gate
+    interleaving regression test above plus store-level CAS-abort tests. Part (1a) —
+    the sole-caller worker's per-slot whole-cycle permit — remains a 3d-3c-2
+    criterion (defense-in-depth in-process; the CAS is the cross-process guarantee).
+
   - **3d-3b landed part (2), the fence (amended 2026-07-21).** `run_identity_gate`
     now returns the identity hash it committed (on `Match`, the hash it just
     verified) as the cycle's fence; `gated_sync` threads it into `sync_recent`, and
