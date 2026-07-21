@@ -226,6 +226,11 @@ pub enum MailboxStoreError {
     /// decision and this write — the in-transaction identity fence aborted the
     /// write so a stale cycle can never persist under a different account.
     IdentityChanged,
+    /// A concurrent cycle recorded a different account identity between the gate's
+    /// read and its compare-and-set record, so this stale decision was aborted.
+    /// Unlike [`Self::IdentityChanged`] (which fails a mailbox write), the caller
+    /// must re-read and re-decide the gate against the new state, then retry.
+    IdentityRaced,
 }
 impl fmt::Display for MailboxStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -233,6 +238,7 @@ impl fmt::Display for MailboxStoreError {
             Self::Storage => "local mailbox storage failed",
             Self::Corrupted => "local mailbox storage is corrupted",
             Self::IdentityChanged => "the account identity changed during the write",
+            Self::IdentityRaced => "the account identity was recorded concurrently",
         })
     }
 }

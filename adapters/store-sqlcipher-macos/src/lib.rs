@@ -583,9 +583,17 @@ mod macos {
             account: &AccountId,
             fresh: &[u8; 32],
             clear_mailbox: bool,
+            expected: Option<&[u8; 32]>,
         ) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
-                let transaction = connection.transaction().map_err(store_error)?;
+                // BEGIN IMMEDIATE takes the write lock up front so the compare-and-
+                // set read below cannot race a concurrent identity record and the
+                // abort is deterministic — not a snapshot conflict at commit, and no
+                // cross-process lock-upgrade busy from a read-then-write in DEFERRED.
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(store_error)?;
+                assert_identity_matches_expected(&transaction, account, expected)?;
                 if clear_mailbox {
                     transaction
                         .execute("DELETE FROM messages", [])
@@ -1896,11 +1904,17 @@ mod macos {
             account: &'a AccountId,
             fresh: &'a IdentityHash,
             action: IdentityReconcile,
+            expected: Option<&'a IdentityHash>,
         ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
                 let clear_mailbox = matches!(action, IdentityReconcile::ClearMailboxAndRecord);
-                self.write_identity_hash(account, fresh.as_bytes(), clear_mailbox)
+                self.write_identity_hash(
+                    account,
+                    fresh.as_bytes(),
+                    clear_mailbox,
+                    expected.map(IdentityHash::as_bytes),
+                )
             })
         }
     }
@@ -1975,6 +1989,48 @@ mod macos {
         account: &AccountId,
         fence: &IdentityHash,
     ) -> Result<(), MailboxStoreError> {
+        match read_recorded_identity(transaction, account)? {
+            Some(current) if IdentityHash::from_bytes(current) == *fence => Ok(()),
+            // A present-but-different hash, or a vanished row, both mean the identity
+            // changed (or was torn down by a concurrent disconnect) since the gate.
+            Some(_) | None => Err(MailboxStoreError::IdentityChanged),
+        }
+    }
+
+    /// The gate's compare-and-set precondition, read inside the write transaction:
+    /// the recorded identity must still equal what the gate's `decide` observed
+    /// (`expected`), else a concurrent cycle recorded a different identity and this
+    /// stale decision must abort with [`MailboxStoreError::IdentityRaced`] so the
+    /// caller re-decides against the new state. A `None` expected requires the row to
+    /// still be absent (first connect); a `Some` expected requires the recorded hash
+    /// to still match it exactly.
+    fn assert_identity_matches_expected(
+        transaction: &Transaction<'_>,
+        account: &AccountId,
+        expected: Option<&[u8; 32]>,
+    ) -> Result<(), MailboxStoreError> {
+        match (read_recorded_identity(transaction, account)?, expected) {
+            (None, None) => Ok(()),
+            (Some(current), Some(expected)) if current == *expected => Ok(()),
+            // Absent-vs-present, present-vs-absent, or a moved hash: a racing cycle
+            // changed the recorded identity between the gate's read and this write.
+            _ => Err(MailboxStoreError::IdentityRaced),
+        }
+    }
+
+    /// Reads the recorded identity hash for `account` inside an open transaction —
+    /// the single fail-closed reader shared by the fence and the compare-and-set
+    /// gate precondition.
+    ///
+    /// Returns `Ok(None)` only when the row is genuinely absent. A present but
+    /// unreadable or version-incompatible row (filtered by the `CASE … typeof/
+    /// length` projection) is `Err(`[`MailboxStoreError::Corrupted`]`)` — never a
+    /// silent "no identity yet", matching the store's rule that a present-but-
+    /// unreadable identity always fails closed.
+    fn read_recorded_identity(
+        transaction: &Transaction<'_>,
+        account: &AccountId,
+    ) -> Result<Option<[u8; 32]>, MailboxStoreError> {
         let row = transaction.query_row(
             "SELECT CASE WHEN typeof(identity_hash) = 'blob' AND length(identity_hash) = 32 THEN identity_hash END, CASE WHEN typeof(algo_version) = 'integer' THEN algo_version END FROM account_identity WHERE account_id = ?1",
             params![account.as_str()],
@@ -1985,18 +2041,16 @@ mod macos {
             },
         );
         match row {
-            Err(rusqlite::Error::QueryReturnedNoRows) => Err(MailboxStoreError::IdentityChanged),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(store_error(error)),
             Ok((Some(hash), Some(version))) if version == IDENTITY_ALGO_VERSION => {
                 let bytes: [u8; 32] = hash
                     .try_into()
                     .map_err(|_length| MailboxStoreError::Corrupted)?;
-                if IdentityHash::from_bytes(bytes) == *fence {
-                    Ok(())
-                } else {
-                    Err(MailboxStoreError::IdentityChanged)
-                }
+                Ok(Some(bytes))
             }
+            // A present-but-unreadable or version-incompatible row must fail closed,
+            // never degrade to "no identity yet".
             Ok(_) => Err(MailboxStoreError::Corrupted),
         }
     }
@@ -2522,8 +2576,13 @@ mod macos {
         /// production. A reconcile or cache write whose commit reaches the fence
         /// assert requires this row to exist and match [`fence`].
         fn record_fence(store: &SqlCipherMailboxStore) {
-            run(store.reconcile_identity(&account(), &fence(), IdentityReconcile::RecordOnly))
-                .unwrap();
+            run(store.reconcile_identity(
+                &account(),
+                &fence(),
+                IdentityReconcile::RecordOnly,
+                None,
+            ))
+            .unwrap();
         }
 
         fn crash_store_at(database: &TestDatabase, point: &str) {
@@ -4380,7 +4439,7 @@ mod macos {
             let (database, store) = open("identity-first-record");
             assert!(run(store.load_identity(&account())).unwrap().is_none());
             let hash = IdentityHash::from_bytes([1; 32]);
-            run(store.reconcile_identity(&account(), &hash, IdentityReconcile::RecordOnly))
+            run(store.reconcile_identity(&account(), &hash, IdentityReconcile::RecordOnly, None))
                 .unwrap();
             assert_eq!(
                 run(store.load_identity(&account())).unwrap(),
@@ -4409,24 +4468,26 @@ mod macos {
         #[test]
         fn identity_mismatch_clears_the_mailbox_but_keeps_the_new_hash() {
             let (database, store) = open("identity-mismatch-clear");
-            record_fence(&store);
+            // First account connects (records its identity on the empty slot), then a
+            // snapshot is cached under it — the fence equals the just-recorded hash.
+            let first = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(&account(), &first, IdentityReconcile::RecordOnly, None))
+                .unwrap();
             run(store.reconcile_recent_envelopes(
                 &account(),
                 &[envelope("m1", "thread", 10), envelope("m2", "thread", 20)],
                 StoreLimit::new(5).unwrap(),
-                &fence(),
+                &first,
             ))
             .unwrap();
-            let first = IdentityHash::from_bytes([1; 32]);
-            run(store.reconcile_identity(&account(), &first, IdentityReconcile::RecordOnly))
-                .unwrap();
             // A different account connects: clear the cached mailbox and record the
-            // new hash in one transaction.
+            // new hash in one transaction, compare-and-set against the prior identity.
             let second = IdentityHash::from_bytes([2; 32]);
             run(store.reconcile_identity(
                 &account(),
                 &second,
                 IdentityReconcile::ClearMailboxAndRecord,
+                Some(&first),
             ))
             .unwrap();
             assert!(
@@ -4455,18 +4516,22 @@ mod macos {
         #[test]
         fn identity_reconcile_rolls_back_the_clear_and_the_record_together() {
             let (database, store) = open("identity-reconcile-rollback");
-            record_fence(&store);
+            let recorded = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(
+                &account(),
+                &recorded,
+                IdentityReconcile::RecordOnly,
+                None,
+            ))
+            .unwrap();
             let seeded = envelope("seeded", "thread", 10);
             run(store.reconcile_recent_envelopes(
                 &account(),
                 std::slice::from_ref(&seeded),
                 StoreLimit::new(5).unwrap(),
-                &fence(),
+                &recorded,
             ))
             .unwrap();
-            let recorded = IdentityHash::from_bytes([1; 32]);
-            run(store.reconcile_identity(&account(), &recorded, IdentityReconcile::RecordOnly))
-                .unwrap();
             store.fail_next_mutation();
             let replacement = IdentityHash::from_bytes([2; 32]);
             assert_eq!(
@@ -4474,6 +4539,7 @@ mod macos {
                     &account(),
                     &replacement,
                     IdentityReconcile::ClearMailboxAndRecord,
+                    Some(&recorded),
                 )),
                 Err(MailboxStoreError::Storage)
             );
@@ -4508,13 +4574,130 @@ mod macos {
             store.fail_next_mutation();
             let recorded = IdentityHash::from_bytes([1; 32]);
             assert_eq!(
-                run(store.reconcile_identity(&account(), &recorded, IdentityReconcile::RecordOnly)),
+                run(store.reconcile_identity(
+                    &account(),
+                    &recorded,
+                    IdentityReconcile::RecordOnly,
+                    None,
+                )),
                 Err(MailboxStoreError::Storage)
             );
             assert!(run(store.load_identity(&account())).unwrap().is_none());
             drop(store);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert!(run(reopened.load_identity(&account())).unwrap().is_none());
+        }
+
+        #[test]
+        fn two_racing_first_connects_leave_exactly_one_accounts_mail_via_compare_and_set() {
+            // Cycle A first-connects, records [1;32], caches its mail. Cycle B started
+            // from the same empty read, so it still holds a stale first-connect
+            // decision; its compare-and-set must lose (the row is now [1;32], not
+            // absent). Re-deciding against the new state yields a clear-and-record
+            // that wipes A's mail before B writes — so exactly one account's mail ever
+            // coexists with the recorded identity. This is the gate's cross-process
+            // backstop the whole-cycle permit cannot provide.
+            let (_database, store) = open("two-racing-first-connects");
+            let a = IdentityHash::from_bytes([1; 32]);
+            let b = IdentityHash::from_bytes([2; 32]);
+            run(store.reconcile_identity(&account(), &a, IdentityReconcile::RecordOnly, None))
+                .unwrap();
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                &[envelope("a-mail", "thread", 10)],
+                StoreLimit::new(5).unwrap(),
+                &a,
+            ))
+            .unwrap();
+            // Cycle B's stale first-connect loses: the row is no longer absent.
+            assert_eq!(
+                run(store.reconcile_identity(&account(), &b, IdentityReconcile::RecordOnly, None,)),
+                Err(MailboxStoreError::IdentityRaced)
+            );
+            // A's mail and identity are untouched by the aborted stale write.
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["a-mail"]
+            );
+            assert_eq!(
+                run(store.load_identity(&account())).unwrap(),
+                Some(a.clone())
+            );
+            // B re-decides against the new state (clear-and-record) and only then writes.
+            run(store.reconcile_identity(
+                &account(),
+                &b,
+                IdentityReconcile::ClearMailboxAndRecord,
+                Some(&a),
+            ))
+            .unwrap();
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                &[envelope("b-mail", "thread", 20)],
+                StoreLimit::new(5).unwrap(),
+                &b,
+            ))
+            .unwrap();
+            // Exactly one account's mail survives: A's was cleared, only B's remains.
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["b-mail"]
+            );
+            assert_eq!(run(store.load_identity(&account())).unwrap(), Some(b));
+        }
+
+        #[test]
+        fn a_stale_clear_and_record_loses_the_compare_and_set_when_the_prior_hash_moved() {
+            // A cycle observed [1;32] and decided clear-and-record, but a concurrent
+            // cycle already moved the recorded identity to [2;32]. The stale
+            // clear-and-record must abort rather than wipe a mailbox and record over
+            // an identity it never observed.
+            let (_database, store) = open("stale-clear-loses-cas");
+            let recorded = IdentityHash::from_bytes([2; 32]);
+            run(store.reconcile_identity(
+                &account(),
+                &recorded,
+                IdentityReconcile::RecordOnly,
+                None,
+            ))
+            .unwrap();
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                &[envelope("kept", "thread", 10)],
+                StoreLimit::new(5).unwrap(),
+                &recorded,
+            ))
+            .unwrap();
+            let stale_prior = IdentityHash::from_bytes([1; 32]);
+            let fresh = IdentityHash::from_bytes([3; 32]);
+            assert_eq!(
+                run(store.reconcile_identity(
+                    &account(),
+                    &fresh,
+                    IdentityReconcile::ClearMailboxAndRecord,
+                    Some(&stale_prior),
+                )),
+                Err(MailboxStoreError::IdentityRaced)
+            );
+            // Neither the clear nor the record took effect.
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                run(store.load_identity(&account())).unwrap(),
+                Some(recorded)
+            );
         }
 
         #[test]
@@ -4525,8 +4708,13 @@ mod macos {
             // land under a different account's mailbox.
             let (_database, store) = open("reconcile-stale-fence");
             let changed = IdentityHash::from_bytes([7; 32]);
-            run(store.reconcile_identity(&account(), &changed, IdentityReconcile::RecordOnly))
-                .unwrap();
+            run(store.reconcile_identity(
+                &account(),
+                &changed,
+                IdentityReconcile::RecordOnly,
+                None,
+            ))
+            .unwrap();
             assert_eq!(
                 run(store.reconcile_recent_envelopes(
                     &account(),
@@ -4575,8 +4763,13 @@ mod macos {
             let present = envelope("present", "thread", 20);
             run(store.upsert_envelopes(&account(), std::slice::from_ref(&present))).unwrap();
             let changed = IdentityHash::from_bytes([7; 32]);
-            run(store.reconcile_identity(&account(), &changed, IdentityReconcile::RecordOnly))
-                .unwrap();
+            run(store.reconcile_identity(
+                &account(),
+                &changed,
+                IdentityReconcile::RecordOnly,
+                None,
+            ))
+            .unwrap();
             let body = Message::new(
                 present.clone(),
                 MessageContent::new(b"secret body".to_vec()).unwrap(),

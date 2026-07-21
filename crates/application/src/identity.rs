@@ -165,17 +165,29 @@ pub trait AccountIdentityStore: Send + Sync {
         account: &'a AccountId,
     ) -> BoxFuture<'a, Result<Option<IdentityHash>, MailboxStoreError>>;
 
-    /// Applies `action` for `account` in one transaction.
+    /// Applies `action` for `account` in one transaction, as a compare-and-set
+    /// against the identity the caller observed.
+    ///
+    /// `expected` is the recorded identity [`decide`] saw (`None` for a first
+    /// connect). The store re-reads the recorded identity **inside** the write
+    /// transaction and proceeds only if it still equals `expected`; otherwise a
+    /// concurrent cycle won the race and it returns
+    /// [`MailboxStoreError::IdentityRaced`] without mutating anything, so the
+    /// caller must re-read, re-[`decide`], and retry rather than blindly applying
+    /// a stale clear-or-preserve decision. This closes the gate's read-decide-
+    /// record window even cross-process, where the whole-cycle permit cannot.
     ///
     /// # Errors
     ///
-    /// Returns [`MailboxStoreError`]; on failure the transaction rolls back and
-    /// neither the mailbox nor the recorded hash changes.
+    /// Returns [`MailboxStoreError::IdentityRaced`] on a lost race, or another
+    /// [`MailboxStoreError`] on storage failure; on any error the transaction
+    /// rolls back and neither the mailbox nor the recorded hash changes.
     fn reconcile_identity<'a>(
         &'a self,
         account: &'a AccountId,
         fresh: &'a IdentityHash,
         action: IdentityReconcile,
+        expected: Option<&'a IdentityHash>,
     ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
 }
 
