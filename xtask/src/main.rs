@@ -28,15 +28,22 @@ struct ResolvedDependencyIdentity {
     package_id: PackageId,
 }
 
-const SQLCIPHER_OWNERS: [&str; 5] = [
+const SQLCIPHER_OWNERS: [&str; 6] = [
     "tersa-search-spike",
     "tersa-sqlcipher-spike",
     "tersa-store-sqlcipher-macos",
     "tersa-keychain-macos",
     "tersa-cli-macos",
+    // 3d: the trusted composition reconciles sync into the encrypted store.
+    "tersa-oauth-sync-macos",
 ];
 const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const HMAC_OWNERS: [&str; 2] = ["tersa-blob-spike", "tersa-keychain-macos"];
+const HMAC_OWNERS: [&str; 3] = [
+    "tersa-blob-spike",
+    "tersa-keychain-macos",
+    // 3d: reaches HMAC transitively through the Keychain HKDF key derivation.
+    "tersa-oauth-sync-macos",
+];
 const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 0] = [];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
 const MACOS_GMAIL_TARGET: &str = r#"cfg(target_os = "macos")"#;
@@ -240,6 +247,7 @@ fn check_architecture() -> TaskResult {
                 dependency.rename.as_deref(),
             ));
             check_rustix_dependency(&package_name, dependency, &mut violations);
+            check_tokio_dependency(&package_name, dependency, &mut violations);
             if let Some(violation) = future_macos_store_dependency_violation(
                 &package_name,
                 dependency.name.as_str(),
@@ -291,6 +299,44 @@ fn protected_package_shape_violations(package: &Package, metadata: &Metadata) ->
         violations.extend(cli_direct_dependency_set_violations(&direct_dependencies));
         violations.extend(custom_build_target_violations(package));
         violations.extend(authority_package_target_violations(package, metadata));
+    }
+    if package_name == "tersa-oauth-sync-macos" {
+        violations.extend(oauth_sync_direct_dependency_set_violations(
+            &direct_dependencies,
+        ));
+        violations.extend(custom_build_target_violations(package));
+    }
+    violations
+}
+
+/// The trusted composition's direct dependency set is closed: it may compose the
+/// Keychain token store, the Gmail network adapter, the `SQLCipher` store, the
+/// portable application/domain, and its pinned tokio runtime — and NOTHING else.
+/// Because it is (necessarily) in the `SQLCipher` and `HMAC` reachability
+/// owner-sets, this closed set is what stops it from DIRECTLY declaring
+/// `rusqlite`, `hmac`, or any other capability crate and bypassing the store or
+/// key-derivation abstractions.
+fn oauth_sync_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
+    const REQUIRED: [&str; 7] = [
+        "tersa-application",
+        "tersa-domain",
+        "tersa-gmail-rest-macos",
+        "tersa-keychain-macos",
+        "tersa-store-sqlcipher-macos",
+        "tokio",
+        "zeroize",
+    ];
+    let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for dependency in dependencies.difference(&required) {
+        violations.push(format!(
+            "tersa-oauth-sync-macos -> {dependency} (dependency is outside the closed composition set)"
+        ));
+    }
+    for dependency in required.difference(dependencies) {
+        violations.push(format!(
+            "tersa-oauth-sync-macos is missing required direct dependency {dependency}"
+        ));
     }
     violations
 }
@@ -4778,6 +4824,7 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
         check_mime_dependency_graph(&dependency_graph, target, violations);
         check_blob_dependency_graph(&dependency_graph, target, violations);
         check_gmail_dependency_graph(&dependency_graph, target, violations);
+        check_retrieval_crates_off_tokio_graph(&dependency_graph, target, violations);
         check_keychain_dependency_graph(&dependency_graph, target, violations);
         check_rustix_dependency_graph(&dependency_graph, target, violations);
         check_diagnostic_runtime_dependency_graph(&dependency_graph, target, violations);
@@ -5065,6 +5112,67 @@ fn check_rustix_dependency(
     ));
 }
 
+fn check_tokio_dependency(
+    package_name: &str,
+    dependency: &cargo_metadata::Dependency,
+    violations: &mut Vec<String>,
+) {
+    if dependency.name != "tokio" {
+        return;
+    }
+    violations.extend(tokio_manifest_dependency_violations(
+        package_name,
+        &dependency.req.to_string(),
+        dependency.uses_default_features,
+        dependency
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        &dependency.features,
+    ));
+}
+
+/// tokio (the async runtime) is directly declared only by the trusted
+/// composition; every other crate reaches it transitively through reqwest. The
+/// composition pins an exact, current-thread, macOS-scoped runtime.
+fn tokio_manifest_dependency_violations(
+    package_name: &str,
+    version: &str,
+    uses_default_features: bool,
+    target: Option<&str>,
+    features: &[String],
+) -> Vec<String> {
+    const OWNER: &str = "tersa-oauth-sync-macos";
+    if package_name != OWNER {
+        return vec![format!(
+            "{package_name} -> tokio is outside the trusted composition owner {OWNER}"
+        )];
+    }
+    let mut violations = Vec::new();
+    if version != "=1.52.3" {
+        violations.push(format!("{package_name} -> tokio must pin exactly 1.52.3"));
+    }
+    if uses_default_features {
+        violations.push(format!(
+            "{package_name} -> tokio must disable default features"
+        ));
+    }
+    if target != Some(MACOS_KEYCHAIN_TARGET) {
+        violations.push(format!(
+            "{package_name} -> tokio must use target `{MACOS_KEYCHAIN_TARGET}`"
+        ));
+    }
+    let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = ["net", "rt", "time"].into_iter().collect();
+    if features != expected {
+        violations.push(format!(
+            "{package_name} -> tokio must enable exactly the current-thread runtime features net, rt, time"
+        ));
+    }
+    violations
+}
+
 fn rustix_manifest_dependency_violations(
     package_name: &str,
     version: &str,
@@ -5128,6 +5236,80 @@ fn cli_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<St
         violations.push(format!(
             "tersa-cli-macos is missing required direct dependency {dependency}"
         ));
+    }
+    violations
+}
+
+/// Asserts the secret-storage and retrieval-only crates never link the async
+/// runtime. A full tokio owner-set does not fit — `dioxus-desktop`'s
+/// `tokio_runtime` feature legitimately pulls tokio into the Dioxus spike — so
+/// this is a targeted denial for exactly the crates whose invariant is "no
+/// ambient async runtime": `tersa-keychain-macos` (secret storage) and the
+/// retrieval-only `tersa-cli-macos`. It fails closed if any future transitive
+/// path (not just reqwest) links tokio into either.
+fn check_retrieval_crates_off_tokio_graph(
+    metadata: &Metadata,
+    target: &str,
+    violations: &mut Vec<String>,
+) {
+    let package_names: BTreeMap<String, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.to_string(), package.name.to_string()))
+        .collect();
+    let tokio: BTreeSet<String> = metadata
+        .packages
+        .iter()
+        .filter_map(|package| (package.name == "tokio").then_some(package.id.to_string()))
+        .collect();
+    let Some(resolve) = &metadata.resolve else {
+        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
+        return;
+    };
+    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.deps.iter().map(|d| d.pkg.to_string()).collect(),
+            )
+        })
+        .collect();
+    let members: Vec<String> = metadata
+        .workspace_members
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    violations.extend(retrieval_tokio_denial_violations(
+        &package_names,
+        &members,
+        &dependencies,
+        &tokio,
+        target,
+    ));
+}
+
+fn retrieval_tokio_denial_violations(
+    package_names: &BTreeMap<String, String>,
+    workspace_members: &[String],
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    tokio_packages: &BTreeSet<String>,
+    target: &str,
+) -> Vec<String> {
+    const DENIED: [&str; 2] = ["tersa-keychain-macos", "tersa-cli-macos"];
+    let mut violations = Vec::new();
+    for member_id in workspace_members {
+        let Some(name) = package_names.get(member_id) else {
+            continue;
+        };
+        if DENIED.contains(&name.as_str())
+            && dependency_reaches(member_id, tokio_packages, dependencies)
+        {
+            violations.push(format!(
+                "{name} reaches tokio but must stay off the async-runtime graph for {target}"
+            ));
+        }
     }
     violations
 }
@@ -5211,7 +5393,11 @@ fn gmail_dependency_graph_violations(
     reqwest_packages: &BTreeSet<String>,
     target: &str,
 ) -> Vec<String> {
-    const OWNER: &str = "tersa-gmail-rest-macos";
+    // reqwest (network) may be REACHED only by the Gmail adapter that owns it
+    // and the one trusted composition that drives it. tersa-keychain-macos and
+    // the retrieval-only tersa-cli-macos are deliberately absent: the check must
+    // still fire if either ever reaches reqwest.
+    const OWNERS: [&str; 2] = ["tersa-gmail-rest-macos", "tersa-oauth-sync-macos"];
     let mut violations = Vec::new();
     for member_id in workspace_members {
         let Some(name) = package_names.get(member_id) else {
@@ -5223,13 +5409,13 @@ fn gmail_dependency_graph_violations(
         if !dependency_reaches(member_id, reqwest_packages, dependencies) {
             continue;
         }
-        if name != OWNER {
+        if !OWNERS.contains(&name.as_str()) {
             violations.push(format!(
-                "{name} reaches reqwest outside {OWNER} for {target}"
+                "{name} reaches reqwest outside the authorized network crates {OWNERS:?} for {target}"
             ));
         } else if target != "aarch64-apple-darwin" {
             violations.push(format!(
-                "{OWNER} reaches reqwest on non-macOS target {target}"
+                "{name} reaches reqwest on non-macOS target {target}"
             ));
         }
     }
@@ -6116,6 +6302,14 @@ fn future_macos_store_dependency_violation(
         ) | (
             "tersa-cli-macos" | "tersa-apple-bridge",
             "tersa-keychain-macos"
+        ) | (
+            // The trusted composition's capability edges must stay macOS-scoped, so
+            // no future un-scoping can make it reach the SQLCipher store or the
+            // Keychain (and thus HMAC key derivation) on a non-macOS target. Its
+            // gmail-rest edge is likewise pinned so it never reaches reqwest off
+            // macOS.
+            "tersa-oauth-sync-macos",
+            "tersa-gmail-rest-macos" | "tersa-keychain-macos" | "tersa-store-sqlcipher-macos"
         )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
@@ -6166,6 +6360,20 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         (
             "tersa-store-sqlcipher-macos",
             BTreeSet::from(["tersa-application", "tersa-domain"]),
+        ),
+        (
+            // 3d: the sole trusted OAuth token-lifecycle + bounded-sync
+            // composition. It is the one crate that consumes both the Keychain
+            // token store and the network Gmail adapter; the retrieval-only CLI
+            // never depends on it, so the CLI stays off the network graph.
+            "tersa-oauth-sync-macos",
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-domain",
+                "tersa-gmail-rest-macos",
+                "tersa-keychain-macos",
+                "tersa-store-sqlcipher-macos",
+            ]),
         ),
         ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
@@ -6273,16 +6481,18 @@ mod tests {
         gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
         is_dioxus_runtime_dependency, is_slint_runtime_dependency,
         keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        non_owner_entitlement_violations, parse_identity, parse_plist_string_array,
-        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
+        non_owner_entitlement_violations, oauth_sync_direct_dependency_set_violations,
+        parse_identity, parse_plist_string_array, parse_project_targets,
+        project_generation_surface_violations, project_generation_wrapper,
         protected_keychain_dependency_rename_violations, reserved_future_policy_violations,
-        resolved_workspace_dependency_names, rusqlite_resolved_feature_violations,
-        rust_authority_source_surface_violations, rust_exported_c_abi_violations,
-        rustix_manifest_dependency_violations, signing_configuration_violations,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
-        swift_bootstrap_source_violations, swift_bridge_call_inventory, target_metadata_options,
-        tracked_apple_signing_inventory, tracked_project_generation_violations,
+        resolved_workspace_dependency_names, retrieval_tokio_denial_violations,
+        rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
+        rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
+        signing_configuration_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
+        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
+        swift_bridge_call_inventory, target_metadata_options, tracked_apple_signing_inventory,
+        tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -9782,6 +9992,11 @@ targets:
             ("tersa-keychain-macos", "tersa-presentation"),
             ("tersa-cli-macos", "tersa-keychain-macos"),
             ("tersa-apple-bridge", "tersa-keychain-macos"),
+            // The composition's capability edges are equally pinned to macOS, so a
+            // future un-scoping cannot reach SQLCipher / Keychain / reqwest off macOS.
+            ("tersa-oauth-sync-macos", "tersa-gmail-rest-macos"),
+            ("tersa-oauth-sync-macos", "tersa-keychain-macos"),
+            ("tersa-oauth-sync-macos", "tersa-store-sqlcipher-macos"),
         ] {
             assert_eq!(
                 future_macos_store_dependency_violation(
@@ -10001,7 +10216,7 @@ targets:
                 "aarch64-apple-darwin",
             ),
             vec![
-                "tersa-application reaches reqwest outside tersa-gmail-rest-macos for aarch64-apple-darwin"
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\"] for aarch64-apple-darwin"
             ]
         );
         assert_eq!(
@@ -10013,10 +10228,151 @@ targets:
                 "aarch64-apple-ios",
             ),
             vec![
-                "tersa-application reaches reqwest outside tersa-gmail-rest-macos for aarch64-apple-ios",
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\"] for aarch64-apple-ios",
                 "tersa-gmail-rest-macos reaches reqwest on non-macOS target aarch64-apple-ios",
             ]
         );
+    }
+
+    #[test]
+    fn retrieval_only_cli_and_keychain_stay_off_the_network_graph() {
+        // The reqwest reachability owner-set authorizes only the Gmail adapter
+        // and the trusted composition. The retrieval-only CLI and the Keychain
+        // crate must fail closed if they ever reach reqwest, so a future change
+        // wiring network code into either is rejected at the graph level.
+        let package_names = BTreeMap::from([
+            ("gmail".to_owned(), "tersa-gmail-rest-macos".to_owned()),
+            ("sync".to_owned(), "tersa-oauth-sync-macos".to_owned()),
+            ("keychain".to_owned(), "tersa-keychain-macos".to_owned()),
+            ("cli".to_owned(), "tersa-cli-macos".to_owned()),
+            ("reqwest".to_owned(), "reqwest".to_owned()),
+        ]);
+        let workspace_members = vec![
+            "gmail".to_owned(),
+            "sync".to_owned(),
+            "keychain".to_owned(),
+            "cli".to_owned(),
+        ];
+        // Every crate reaches reqwest in this hostile graph; only gmail + sync
+        // are authorized.
+        let dependencies = BTreeMap::from([
+            ("gmail".to_owned(), BTreeSet::from(["reqwest".to_owned()])),
+            ("sync".to_owned(), BTreeSet::from(["reqwest".to_owned()])),
+            (
+                "keychain".to_owned(),
+                BTreeSet::from(["reqwest".to_owned()]),
+            ),
+            ("cli".to_owned(), BTreeSet::from(["reqwest".to_owned()])),
+        ]);
+        let reqwest = BTreeSet::from(["reqwest".to_owned()]);
+        let violations = gmail_dependency_graph_violations(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            &reqwest,
+            "aarch64-apple-darwin",
+        );
+        // The authorized crates produce no violation; the CLI and Keychain do.
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("tersa-cli-macos reaches reqwest")),
+            "the retrieval-only CLI reaching reqwest must fail closed: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("tersa-keychain-macos reaches reqwest")),
+            "the Keychain crate reaching reqwest must fail closed: {violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|violation| violation
+                .contains("tersa-gmail-rest-macos reaches reqwest outside")
+                || violation.contains("tersa-oauth-sync-macos reaches reqwest outside")),
+            "the Gmail adapter and the composition are authorized to reach reqwest: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn secret_and_retrieval_crates_fail_closed_on_a_transitive_tokio_path() {
+        // A hostile transitive path (e.g. a future `hyper` in tersa-application)
+        // links tokio into the CLI and Keychain WITHOUT reqwest. Both must fail
+        // closed, while a legitimate non-denied tokio user (the Dioxus spike, via
+        // dioxus-desktop's tokio_runtime) is not flagged.
+        let package_names = BTreeMap::from([
+            ("keychain".to_owned(), "tersa-keychain-macos".to_owned()),
+            ("cli".to_owned(), "tersa-cli-macos".to_owned()),
+            ("dioxus".to_owned(), "tersa-dioxus-spike".to_owned()),
+            ("app".to_owned(), "tersa-application".to_owned()),
+            ("hyper".to_owned(), "hyper".to_owned()),
+            ("tokio".to_owned(), "tokio".to_owned()),
+        ]);
+        let workspace_members = vec![
+            "keychain".to_owned(),
+            "cli".to_owned(),
+            "dioxus".to_owned(),
+            "app".to_owned(),
+        ];
+        let dependencies = BTreeMap::from([
+            ("keychain".to_owned(), BTreeSet::from(["app".to_owned()])),
+            ("cli".to_owned(), BTreeSet::from(["keychain".to_owned()])),
+            ("app".to_owned(), BTreeSet::from(["hyper".to_owned()])),
+            ("hyper".to_owned(), BTreeSet::from(["tokio".to_owned()])),
+            ("dioxus".to_owned(), BTreeSet::from(["tokio".to_owned()])),
+        ]);
+        let tokio = BTreeSet::from(["tokio".to_owned()]);
+        let violations = retrieval_tokio_denial_violations(
+            &package_names,
+            &workspace_members,
+            &dependencies,
+            &tokio,
+            "aarch64-apple-darwin",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("tersa-keychain-macos reaches tokio")),
+            "the Keychain crate reaching tokio must fail closed: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("tersa-cli-macos reaches tokio")),
+            "the retrieval-only CLI reaching tokio must fail closed: {violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.contains("tersa-dioxus-spike")),
+            "the Dioxus spike legitimately uses tokio and must not be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_sync_composition_dependency_set_is_closed() {
+        let exact = BTreeSet::from([
+            "tersa-application",
+            "tersa-domain",
+            "tersa-gmail-rest-macos",
+            "tersa-keychain-macos",
+            "tersa-store-sqlcipher-macos",
+            "tokio",
+            "zeroize",
+        ]);
+        assert!(oauth_sync_direct_dependency_set_violations(&exact).is_empty());
+        // Directly declaring a capability crate (bypassing the store or the
+        // key-derivation abstraction it is only allowed to REACH) is rejected.
+        for capability in ["rusqlite", "hmac", "reqwest"] {
+            let mut hostile = exact.clone();
+            hostile.insert(capability);
+            assert!(
+                !oauth_sync_direct_dependency_set_violations(&hostile).is_empty(),
+                "the composition must not directly declare `{capability}`"
+            );
+        }
+        let mut missing = exact.clone();
+        missing.remove("tersa-gmail-rest-macos");
+        assert!(!oauth_sync_direct_dependency_set_violations(&missing).is_empty());
     }
 
     #[test]
