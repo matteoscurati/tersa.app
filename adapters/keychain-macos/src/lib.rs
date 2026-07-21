@@ -91,7 +91,7 @@ const HKDF_PREFIX: &[u8] = b"tersa.app/macos/hkdf-sha256/v1";
 #[cfg(any(target_os = "macos", test))]
 const DATABASE_PURPOSE: &[u8] = b"sqlcipher/account-database/v1";
 #[cfg(any(target_os = "macos", test))]
-const ACCOUNT_IDENTITY_PURPOSE: &[u8] = b"account-identity/v1";
+const ACCOUNT_IDENTITY_PURPOSE: &[u8] = b"account-subject/v1";
 const PROFILE_PREFIX: &[&str] = &["profiles", "default", "accounts"];
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_LOCK: &str = ".tersa-profile-bootstrap-v1.lock";
@@ -291,23 +291,23 @@ fn framed_info(account: &AccountId, purpose: &[u8]) -> Result<Vec<u8>, KeyStorag
     Ok(result)
 }
 
-/// Derives the account-bound identity hash of a normalized address.
+/// Derives the account-bound identity hash of a normalized subject.
 ///
 /// The hash is a 32-byte HKDF-SHA256 expansion keyed by the installation root
 /// key (the same root-key/`ROOT_SALT` facility as the database key), domain-
 /// separated from that key by [`ACCOUNT_IDENTITY_PURPOSE`], and bound to the
-/// account and the address via a fully length-framed `info`. HKDF-Expand is an
+/// account and the subject via a fully length-framed `info`. HKDF-Expand is an
 /// iterated-HMAC PRF over `info`, so this yields a salted, account-bound MAC of
-/// the address without a separate HMAC primitive. The root key is the secret; a
-/// bare address cannot be pre-hashed without it. The output is a comparison
-/// value, not a secret; the framed `info` (which carries the address) is wiped.
+/// the subject without a separate HMAC primitive. The root key is the secret; a
+/// bare subject cannot be pre-hashed without it. The output is a comparison
+/// value, not a secret; the framed `info` (which carries the subject) is wiped.
 #[cfg(any(target_os = "macos", test))]
 fn derive_account_identity_hash(
     root: &SecretKey,
     account: &AccountId,
-    normalized_address: &[u8],
+    normalized_subject: &[u8],
 ) -> Result<[u8; 32], KeyStorageError> {
-    let mut info = framed_identity_info(account, ACCOUNT_IDENTITY_PURPOSE, normalized_address)?;
+    let mut info = framed_identity_info(account, ACCOUNT_IDENTITY_PURPOSE, normalized_subject)?;
     let hkdf = Hkdf::<Sha256>::new(Some(ROOT_SALT), root.as_bytes());
     let mut output = [0_u8; 32];
     let expanded = hkdf
@@ -318,21 +318,21 @@ fn derive_account_identity_hash(
     Ok(output)
 }
 
-/// Frames HKDF `info` as `framed_info(account, purpose) || len(address) || address`.
+/// Frames HKDF `info` as `framed_info(account, purpose) || len(subject) || subject`.
 ///
-/// Every segment is length-prefixed, so no two distinct account/purpose/address
+/// Every segment is length-prefixed, so no two distinct account/purpose/subject
 /// triples share an `info` string.
 #[cfg(any(target_os = "macos", test))]
 fn framed_identity_info(
     account: &AccountId,
     purpose: &[u8],
-    address: &[u8],
+    subject: &[u8],
 ) -> Result<Vec<u8>, KeyStorageError> {
     let mut info = framed_info(account, purpose)?;
-    let address_len = u16::try_from(address.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
-    info.reserve(2 + address.len());
-    info.extend_from_slice(&address_len.to_be_bytes());
-    info.extend_from_slice(address);
+    let subject_len = u16::try_from(subject.len()).map_err(|_too_long| KeyStorageError::Invalid)?;
+    info.reserve(2 + subject.len());
+    info.extend_from_slice(&subject_len.to_be_bytes());
+    info.extend_from_slice(subject);
     Ok(info)
 }
 
@@ -345,10 +345,10 @@ fn framed_identity_info(
 fn hash_account_identity(
     retriever: &impl RootKeyRetriever,
     account: &AccountId,
-    normalized_address: &[u8],
+    normalized_subject: &[u8],
 ) -> Result<[u8; 32], KeyStorageError> {
     let root = retriever.copy()?.ok_or(KeyStorageError::Invalid)?;
-    let hash = derive_account_identity_hash(&root, account, normalized_address);
+    let hash = derive_account_identity_hash(&root, account, normalized_subject);
     drop(root);
     hash
 }
@@ -485,7 +485,7 @@ fn open_read_only_mailbox(
 /// Derives account-identity hashes for the sync-composition identity gate.
 ///
 /// Confines the root-key-derived HMAC key to this crate: the composition passes
-/// a normalized address in and receives an opaque hash back, never the salt. The
+/// a normalized subject in and receives an opaque hash back, never the salt. The
 /// derivation reuses the installation root key and never mints a new Keychain
 /// item, so the hash is stable for the life of the installation (the root key is
 /// add-only). Fails closed when the root key is unavailable.
@@ -2212,18 +2212,16 @@ mod tests {
     #[test]
     fn identity_hash_is_deterministic() {
         let root = SecretKey::new([3; 32]);
-        let first =
-            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
-        let second =
-            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
+        let first = derive_account_identity_hash(&root, &account_id(), b"subject-abc").unwrap();
+        let second = derive_account_identity_hash(&root, &account_id(), b"subject-abc").unwrap();
         assert_eq!(first, second);
     }
 
     #[test]
-    fn identity_hash_binds_the_address() {
+    fn identity_hash_binds_the_subject() {
         let root = SecretKey::new([3; 32]);
-        let one = derive_account_identity_hash(&root, &account_id(), b"one@example.test").unwrap();
-        let two = derive_account_identity_hash(&root, &account_id(), b"two@example.test").unwrap();
+        let one = derive_account_identity_hash(&root, &account_id(), b"subject-one").unwrap();
+        let two = derive_account_identity_hash(&root, &account_id(), b"subject-two").unwrap();
         assert_ne!(one, two);
     }
 
@@ -2231,21 +2229,18 @@ mod tests {
     fn identity_hash_binds_the_account() {
         let root = SecretKey::new([3; 32]);
         let other = AccountId::new("acct-test-2").unwrap();
-        let here =
-            derive_account_identity_hash(&root, &account_id(), b"user@example.test").unwrap();
-        let there = derive_account_identity_hash(&root, &other, b"user@example.test").unwrap();
+        let here = derive_account_identity_hash(&root, &account_id(), b"subject-abc").unwrap();
+        let there = derive_account_identity_hash(&root, &other, b"subject-abc").unwrap();
         assert_ne!(here, there);
     }
 
     #[test]
     fn identity_hash_binds_the_root_key() {
         let account = account_id();
-        let one =
-            derive_account_identity_hash(&SecretKey::new([3; 32]), &account, b"user@example.test")
-                .unwrap();
-        let two =
-            derive_account_identity_hash(&SecretKey::new([4; 32]), &account, b"user@example.test")
-                .unwrap();
+        let one = derive_account_identity_hash(&SecretKey::new([3; 32]), &account, b"subject-abc")
+            .unwrap();
+        let two = derive_account_identity_hash(&SecretKey::new([4; 32]), &account, b"subject-abc")
+            .unwrap();
         assert_ne!(one, two);
     }
 
@@ -2263,9 +2258,9 @@ mod tests {
     }
 
     #[test]
-    fn identity_hash_length_frames_the_account_and_address() {
+    fn identity_hash_length_frames_the_account_and_subject() {
         // "ab"+"c" and "a"+"bc" both concatenate to "abc"; length framing must
-        // keep them distinct so a crafted address cannot impersonate an account.
+        // keep them distinct so a crafted subject cannot impersonate an account.
         let root = SecretKey::new([3; 32]);
         let left =
             derive_account_identity_hash(&root, &AccountId::new("ab").unwrap(), b"c").unwrap();
@@ -2277,20 +2272,17 @@ mod tests {
     #[test]
     fn hash_account_identity_fails_closed_without_a_root_key() {
         let empty = Fake::default();
-        assert!(hash_account_identity(&empty, &account_id(), b"user@example.test").is_err());
+        assert!(hash_account_identity(&empty, &account_id(), b"subject-abc").is_err());
     }
 
     #[test]
     fn hash_account_identity_uses_the_retrieved_root_key() {
         let seeded = Fake::default();
         seeded.add(&SecretKey::new([7; 32])).unwrap();
-        let via = hash_account_identity(&seeded, &account_id(), b"user@example.test").unwrap();
-        let direct = derive_account_identity_hash(
-            &SecretKey::new([7; 32]),
-            &account_id(),
-            b"user@example.test",
-        )
-        .unwrap();
+        let via = hash_account_identity(&seeded, &account_id(), b"subject-abc").unwrap();
+        let direct =
+            derive_account_identity_hash(&SecretKey::new([7; 32]), &account_id(), b"subject-abc")
+                .unwrap();
         assert_eq!(via, direct);
     }
 

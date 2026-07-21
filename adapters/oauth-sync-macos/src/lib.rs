@@ -16,10 +16,12 @@
 //! network (reqwest, transitively through `tersa-gmail-rest-macos`); the
 //! retrieval-only CLI never depends on it, so the CLI stays network-free.
 //!
-//! 3d-2 lands the account-identity gate and the gated bounded sync over the
-//! inward ports ([`gated_sync`]). The concrete macOS token-lifecycle wiring
-//! (grant-forward exchange, proactive refresh, and the bridge entry points on
-//! the `tokio` runtime) lands in 3d-3.
+//! 3d-2 landed the account-identity gate and the gated bounded sync over the
+//! inward ports ([`gated_sync`]) plus the token-lifecycle composition. 3d-3a adds
+//! the concrete `GmailSession` — one access token backing both the gate's
+//! subject and the mailbox surface — with `id_token` freshness validated against a
+//! wall clock at construction. The bridge entry points on the `tokio` runtime and
+//! the Rust-owned sync worker land in later 3d-3 slices.
 
 #![forbid(unsafe_code)]
 
@@ -27,17 +29,23 @@ use core::fmt;
 
 use tersa_application::identity::{
     AccountIdentityHasher, AccountIdentityStore, AccountProfile, GateError, IdentityDecision,
-    IdentityReconcile, decide, normalize_address,
+    IdentityReconcile, decide, normalize_subject,
 };
 use tersa_application::mailbox::{AccountId, MailboxStore, RemoteMailbox};
 #[cfg(target_os = "macos")]
-use tersa_application::oauth::{AuthorizationGrant, MonotonicClock};
+use tersa_application::mailbox::{
+    BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize, PageToken, RemoteMailboxError,
+};
+#[cfg(target_os = "macos")]
+use tersa_application::oauth::{AuthorizationGrant, MonotonicClock, WallClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
 #[cfg(target_os = "macos")]
 use tersa_application::token::{
-    AccessToken, AccountSubject, TokenClientConfig, TokenError, TokenTransport, exchange_grant,
-    refresh_access_token,
+    AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenTransport,
+    exchange_grant, refresh_access_token,
 };
+#[cfg(target_os = "macos")]
+use tersa_gmail_rest_macos::GmailMailbox;
 #[cfg(target_os = "macos")]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 
@@ -64,16 +72,18 @@ impl std::error::Error for GatedSyncError {}
 
 /// Resolves the account-identity gate before any sync write.
 ///
-/// Fetches the connected account's own address, hashes it against the
+/// Hashes the connected account's validated subject against the
 /// installation-derived salt, compares it with the recorded hash for the fixed
 /// account slot, and either records it (first connect), preserves the cached
 /// mailbox (same account), or clears the cached mailbox and records the new hash
 /// in one transaction (different account).
 ///
-/// Fails closed: a profile-fetch, hasher, or store-read failure returns a
-/// [`GateError`] and the caller must not proceed to any sync write. A read
-/// failure is never mistaken for a first connect, so an unavailable identity can
-/// never re-baseline the store to whoever happens to be connected.
+/// Fails closed: a hasher or store-read failure returns a [`GateError`] and the
+/// caller must not proceed to any sync write. A read failure is never mistaken
+/// for a first connect, so an unavailable identity can never re-baseline the
+/// store to whoever happens to be connected. The subject itself is in-hand and
+/// already validated (by the session at construction), so obtaining it is
+/// infallible.
 async fn run_identity_gate<P, H, St>(
     account: &AccountId,
     profile: &P,
@@ -85,12 +95,7 @@ where
     H: AccountIdentityHasher,
     St: AccountIdentityStore,
 {
-    let address = profile
-        .email_address(account)
-        .await
-        .map_err(GateError::Profile)?;
-    let normalized = normalize_address(&address);
-    drop(address);
+    let normalized = normalize_subject(profile.subject());
     let fresh = hasher
         .hash(account, &normalized)
         .map_err(GateError::Hasher)?;
@@ -186,6 +191,7 @@ where
 pub struct ConnectedAccount {
     access_token: AccessToken,
     subject: AccountSubject,
+    identity_expiry: IdentityExpiry,
 }
 
 #[cfg(target_os = "macos")]
@@ -202,10 +208,18 @@ impl ConnectedAccount {
         &self.subject
     }
 
-    /// Splits the connected account into the access token and the subject.
+    /// Returns the `id_token`'s Unix-second freshness window, validated at session
+    /// construction against a wall clock.
     #[must_use]
-    pub fn into_parts(self) -> (AccessToken, AccountSubject) {
-        (self.access_token, self.subject)
+    pub fn identity_expiry(&self) -> IdentityExpiry {
+        self.identity_expiry
+    }
+
+    /// Splits the connected account into the access token, subject, and freshness
+    /// window.
+    #[must_use]
+    pub fn into_parts(self) -> (AccessToken, AccountSubject, IdentityExpiry) {
+        (self.access_token, self.subject, self.identity_expiry)
     }
 }
 
@@ -274,7 +288,7 @@ where
         .await
         .map_err(TokenLifecycleError::Token)?;
     drop(grant);
-    let (access_token, rotated_refresh, subject) = success.into_parts();
+    let (access_token, rotated_refresh, subject, identity_expiry) = success.into_parts();
     let refresh = rotated_refresh.ok_or(TokenLifecycleError::MissingRefreshToken)?;
     refresh_store
         .store(account, &refresh)
@@ -282,6 +296,7 @@ where
     Ok(ConnectedAccount {
         access_token,
         subject,
+        identity_expiry,
     })
 }
 
@@ -319,7 +334,7 @@ where
         .await
         .map_err(TokenLifecycleError::Token)?;
     drop(stored);
-    let (access_token, rotated_refresh, subject) = success.into_parts();
+    let (access_token, rotated_refresh, subject, identity_expiry) = success.into_parts();
     if let Some(refresh) = rotated_refresh {
         refresh_store
             .store(account, &refresh)
@@ -328,6 +343,7 @@ where
     Ok(ConnectedAccount {
         access_token,
         subject,
+        identity_expiry,
     })
 }
 
@@ -363,6 +379,111 @@ where
     }
 }
 
+/// The maximum accepted clock skew when validating `id_token` freshness (2 min).
+#[cfg(target_os = "macos")]
+const IDENTITY_SKEW_SECS: u64 = 120;
+
+/// Reports why a [`GmailSession`] could not be built.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GmailSessionError {
+    /// The `id_token` was expired or future-dated — non-destructive, retryable.
+    Identity(TokenError),
+    /// The mailbox surface could not be constructed from the access token.
+    Mailbox(RemoteMailboxError),
+}
+
+#[cfg(target_os = "macos")]
+impl core::fmt::Display for GmailSessionError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Identity(_) => formatter.write_str("the id_token failed freshness validation"),
+            Self::Mailbox(_) => formatter.write_str("the mailbox surface could not be built"),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for GmailSessionError {}
+
+/// One connected account's mailbox surface plus its validated OIDC subject, both
+/// derived from a SINGLE access token.
+///
+/// The gate hashes the subject and the sync reads the mailbox, both backed by the
+/// one token — so the checked identity and the written identity necessarily
+/// coincide (the type-level guarantee [`gated_sync`] relies on). It is built only
+/// from a [`ConnectedAccount`] whose subject the token layer already validated, so
+/// the gate is never fed a hand-minted subject; construction also validates the
+/// `id_token`'s freshness against a wall clock before the session can drive
+/// anything.
+#[cfg(target_os = "macos")]
+pub struct GmailSession {
+    mailbox: GmailMailbox,
+    subject: AccountSubject,
+}
+
+#[cfg(target_os = "macos")]
+impl GmailSession {
+    /// Builds a session from a connected account, validating `id_token` freshness
+    /// against `wall_clock` first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GmailSessionError::Identity`] when the `id_token` is expired or
+    /// future-dated (non-destructive), and [`GmailSessionError::Mailbox`] when the
+    /// access token cannot construct the mailbox surface.
+    pub fn new<W: WallClock>(
+        account: AccountId,
+        connected: ConnectedAccount,
+        wall_clock: &W,
+    ) -> Result<Self, GmailSessionError> {
+        connected
+            .identity_expiry()
+            .validate_fresh(wall_clock.unix_time(), IDENTITY_SKEW_SECS)
+            .map_err(GmailSessionError::Identity)?;
+        let (access_token, subject, _identity_expiry) = connected.into_parts();
+        let mailbox = GmailMailbox::new(account, access_token.secret().as_str().to_owned())
+            .map_err(GmailSessionError::Mailbox)?;
+        Ok(Self { mailbox, subject })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for GmailSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GmailSession([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AccountProfile for GmailSession {
+    fn subject(&self) -> &AccountSubject {
+        &self.subject
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl RemoteMailbox for GmailSession {
+    fn list_recent_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        size: PageSize,
+        page_token: Option<&'a PageToken>,
+    ) -> BoxFuture<'a, Result<Page<MessageEnvelope>, RemoteMailboxError>> {
+        self.mailbox
+            .list_recent_envelopes(account, size, page_token)
+    }
+
+    fn fetch_message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
+        self.mailbox.fetch_message(account, message_id)
+    }
+}
+
 /// Builds the pinned current-thread `tokio` runtime that will drive the
 /// connect-time token exchange and the bounded sync worker.
 ///
@@ -393,7 +514,7 @@ mod tests {
 
     use tersa_application::identity::{
         AccountIdentityHasher, AccountIdentityStore, AccountProfile, GateError, HasherError,
-        IdentityHash, IdentityReconcile, ProfileAddress, ProfileError,
+        IdentityHash, IdentityReconcile,
     };
     use tersa_application::mailbox::{
         AccountId, BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, Message,
@@ -401,9 +522,14 @@ mod tests {
         StoreLimit, ThreadId,
     };
     use tersa_application::sync::SyncPolicy;
+    use tersa_application::token::AccountSubject;
     use zeroize::Zeroizing;
 
     use super::{GatedSyncError, gated_sync, run_identity_gate};
+
+    fn subject(value: &str) -> AccountSubject {
+        AccountSubject::from_raw_for_test(Zeroizing::new(value.to_owned()))
+    }
 
     fn account() -> AccountId {
         AccountId::new("account-a").unwrap()
@@ -419,19 +545,11 @@ mod tests {
         }
     }
 
-    struct FakeProfile(Result<String, ProfileError>);
+    struct FakeProfile(AccountSubject);
 
     impl AccountProfile for FakeProfile {
-        fn email_address<'a>(
-            &'a self,
-            _account: &'a AccountId,
-        ) -> BoxFuture<'a, Result<ProfileAddress, ProfileError>> {
-            let result = self
-                .0
-                .as_ref()
-                .map(|address| ProfileAddress::new(Zeroizing::new(address.clone())))
-                .map_err(|error| *error);
-            Box::pin(async move { result })
+        fn subject(&self) -> &AccountSubject {
+            &self.0
         }
     }
 
@@ -619,7 +737,7 @@ mod tests {
     fn first_connect_records_only() {
         let store = FakeStore::default();
         run_gate(
-            &FakeProfile(Ok("user@example.test".to_owned())),
+            &FakeProfile(subject("user-sub")),
             &FakeHasher::ok([5; 32]),
             &store,
         )
@@ -634,7 +752,7 @@ mod tests {
     fn same_account_preserves_the_store() {
         let store = FakeStore::with_stored([5; 32]);
         run_gate(
-            &FakeProfile(Ok("user@example.test".to_owned())),
+            &FakeProfile(subject("user-sub")),
             &FakeHasher::ok([5; 32]),
             &store,
         )
@@ -647,7 +765,7 @@ mod tests {
     fn different_account_clears_and_records() {
         let store = FakeStore::with_stored([5; 32]);
         run_gate(
-            &FakeProfile(Ok("other@example.test".to_owned())),
+            &FakeProfile(subject("other-sub")),
             &FakeHasher::ok([9; 32]),
             &store,
         )
@@ -659,40 +777,25 @@ mod tests {
     }
 
     #[test]
-    fn address_is_normalized_before_hashing() {
+    fn subject_is_normalized_before_hashing() {
         let store = FakeStore::default();
         let hasher = FakeHasher::ok([5; 32]);
         drive(run_identity_gate(
             &account(),
-            &FakeProfile(Ok("  User@Example.TEST \n".to_owned())),
+            &FakeProfile(subject("  Sub-XYZ-123  ")),
             &hasher,
             &store,
         ))
         .unwrap();
-        assert_eq!(
-            hasher.seen.lock().unwrap().as_slice(),
-            ["user@example.test"]
-        );
-    }
-
-    #[test]
-    fn a_profile_failure_fails_closed() {
-        let store = FakeStore::with_stored([5; 32]);
-        let result = run_gate(
-            &FakeProfile(Err(ProfileError::Transport)),
-            &FakeHasher::ok([9; 32]),
-            &store,
-        );
-        assert_eq!(result, Err(GateError::Profile(ProfileError::Transport)));
-        // No write ever reached the store.
-        assert!(store.identity_reconciles().is_empty());
+        // Trim only — a `sub` is case-sensitive, so casing must be preserved.
+        assert_eq!(hasher.seen.lock().unwrap().as_slice(), ["Sub-XYZ-123"]);
     }
 
     #[test]
     fn a_hasher_failure_fails_closed() {
         let store = FakeStore::with_stored([5; 32]);
         let result = run_gate(
-            &FakeProfile(Ok("user@example.test".to_owned())),
+            &FakeProfile(subject("user-sub")),
             &FakeHasher::failing(),
             &store,
         );
@@ -708,7 +811,7 @@ mod tests {
             ..FakeStore::default()
         };
         let result = run_gate(
-            &FakeProfile(Ok("user@example.test".to_owned())),
+            &FakeProfile(subject("user-sub")),
             &FakeHasher::ok([9; 32]),
             &store,
         );
@@ -724,7 +827,7 @@ mod tests {
             ..FakeStore::default()
         };
         let result = run_gate(
-            &FakeProfile(Ok("user@example.test".to_owned())),
+            &FakeProfile(subject("user-sub")),
             &FakeHasher::ok([9; 32]),
             &store,
         );
@@ -747,15 +850,15 @@ mod tests {
         let sync_writes = store.sync_probe();
         let error = drive(gated_sync(
             &account(),
-            FakeProfile(Err(ProfileError::Transport)),
-            &FakeHasher::ok([9; 32]),
+            FakeProfile(subject("user-sub")),
+            &FakeHasher::failing(),
             store,
             policy(),
         ))
         .unwrap_err();
         assert!(matches!(
             error,
-            GatedSyncError::Gate(GateError::Profile(ProfileError::Transport))
+            GatedSyncError::Gate(GateError::Hasher(HasherError::Unavailable))
         ));
         // The gate blocked before the coordinator existed: no sync write ran.
         assert_eq!(sync_writes.load(Ordering::SeqCst), 0);
@@ -767,7 +870,7 @@ mod tests {
         let sync_writes = store.sync_probe();
         let report = drive(gated_sync(
             &account(),
-            FakeProfile(Ok("user@example.test".to_owned())),
+            FakeProfile(subject("user-sub")),
             &FakeHasher::ok([5; 32]),
             store,
             policy(),
@@ -790,9 +893,10 @@ mod token_lifecycle_tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use tersa_application::identity::AccountProfile;
     use tersa_application::mailbox::{AccountId, BoxFuture};
     use tersa_application::oauth::{
-        AuthorizationConfig, AuthorizationGrant, MonotonicClock, prepare_authorization,
+        AuthorizationConfig, AuthorizationGrant, MonotonicClock, WallClock, prepare_authorization,
     };
     use tersa_application::token::{
         ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
@@ -802,7 +906,56 @@ mod token_lifecycle_tests {
     use url::Url;
     use zeroize::Zeroizing;
 
-    use super::{TokenLifecycleError, connect_account, refresh_account, refresh_if_due};
+    use super::{
+        GmailSession, GmailSessionError, TokenLifecycleError, connect_account, refresh_account,
+        refresh_if_due,
+    };
+
+    #[derive(Debug)]
+    struct FakeWallClock(u64);
+
+    impl WallClock for FakeWallClock {
+        fn unix_time(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn connect_for_session() -> super::ConnectedAccount {
+        let store = FakeRefreshStore::empty();
+        drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &FakeTransport::success(Some("granted-refresh")),
+            &store,
+            &TestClock::at(0),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn session_accepts_a_fresh_id_token_and_exposes_the_subject() {
+        // valid_claims: iat=1000, exp=5000; now=3000 is within the window.
+        let session = GmailSession::new(account(), connect_for_session(), &FakeWallClock(3_000))
+            .expect("a fresh id_token builds a session");
+        assert_eq!(session.subject().as_str(), TEST_SUBJECT);
+    }
+
+    #[test]
+    fn session_rejects_a_stale_id_token_non_destructively() {
+        // now well past exp + skew -> expired.
+        let error = GmailSession::new(account(), connect_for_session(), &FakeWallClock(10_000))
+            .expect_err("a stale id_token must not build a session");
+        assert!(matches!(error, GmailSessionError::Identity(_)));
+    }
+
+    #[test]
+    fn session_rejects_a_future_minted_id_token() {
+        // now well before iat -> future-minted.
+        let error = GmailSession::new(account(), connect_for_session(), &FakeWallClock(1))
+            .expect_err("a future-minted id_token must not build a session");
+        assert!(matches!(error, GmailSessionError::Identity(_)));
+    }
 
     const CLIENT_ID: &str = "public-test-client";
     const TEST_SUBJECT: &str = "sub-000123";
@@ -847,12 +1000,17 @@ mod token_lifecycle_tests {
         session.finish(&callback).unwrap()
     }
 
+    const TEST_IAT: u64 = 1_000;
+    const TEST_EXP: u64 = 5_000;
+
     fn valid_claims() -> IdTokenClaims {
         IdTokenClaims::new(
             Zeroizing::new(TEST_SUBJECT.to_owned()),
             vec![CLIENT_ID.to_owned()],
             "https://accounts.google.com".to_owned(),
             None,
+            TEST_IAT,
+            TEST_EXP,
         )
     }
 
@@ -1097,7 +1255,7 @@ mod token_lifecycle_tests {
             &clock,
         ))
         .unwrap();
-        let (access_token, _subject) = connected.into_parts();
+        let (access_token, _subject, _expiry) = connected.into_parts();
 
         // Still fresh at t=0 with a 60s skew: no refresh runs.
         let outcome = drive(refresh_if_due(

@@ -18,6 +18,13 @@ tersa-application = { path = "../../crates/application", version = "=0.0.0" }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+# `test-util` exposes AccountSubject's test constructor so the gate fakes can
+# supply a subject; never enabled by a production dependency.
+tersa-application = { path = "../../crates/application", version = "=0.0.0", features = [
+    "test-util",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 tersa-gmail-rest-macos = { path = "../gmail-rest-macos", version = "=0.0.0" }
 tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0" }

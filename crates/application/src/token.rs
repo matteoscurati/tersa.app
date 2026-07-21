@@ -246,6 +246,17 @@ impl AccountSubject {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Constructs a subject from a raw value for tests in OTHER crates.
+    ///
+    /// Available only under `cfg(test)` or the `test-util` feature, so production
+    /// callers still cannot mint an unvalidated subject — the invariant that only
+    /// `validate_account_subject` produces one holds in shipped code.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn from_raw_for_test(subject: Zeroizing<String>) -> Self {
+        Self(subject)
+    }
 }
 
 impl fmt::Debug for AccountSubject {
@@ -267,6 +278,8 @@ pub struct IdTokenClaims {
     audiences: Vec<String>,
     issuer: String,
     authorized_party: Option<String>,
+    issued_at: u64,
+    expires_at: u64,
 }
 
 impl IdTokenClaims {
@@ -274,18 +287,26 @@ impl IdTokenClaims {
     ///
     /// `authorized_party` is the OIDC `azp` claim, required to trust an
     /// `id_token` whose `aud` carries audiences beyond the client identifier.
+    /// `issued_at`/`expires_at` are the `iat`/`exp` Unix-second claims; their
+    /// presence is a structural requirement (the transport rejects a token
+    /// missing them), and their freshness is validated later against a wall clock
+    /// in the concrete session — never in this monotonic-clock-only layer.
     #[must_use]
     pub fn new(
         subject: Zeroizing<String>,
         audiences: Vec<String>,
         issuer: String,
         authorized_party: Option<String>,
+        issued_at: u64,
+        expires_at: u64,
     ) -> Self {
         Self {
             subject,
             audiences,
             issuer,
             authorized_party,
+            issued_at,
+            expires_at,
         }
     }
 }
@@ -298,7 +319,49 @@ impl fmt::Debug for IdTokenClaims {
             .field("audiences", &self.audiences.len())
             .field("issuer", &self.issuer)
             .field("authorized_party", &self.authorized_party)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
             .finish()
+    }
+}
+
+/// The `iat`/`exp` freshness window of an `id_token`, in Unix seconds.
+///
+/// Carried out of the token layer so the concrete session can validate it against
+/// a wall clock. The check itself is pure arithmetic over a caller-supplied `now`,
+/// so the token layer stays clock-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityExpiry {
+    issued_at: u64,
+    expires_at: u64,
+}
+
+impl IdentityExpiry {
+    #[cfg(test)]
+    fn new_for_test(issued_at: u64, expires_at: u64) -> Self {
+        Self {
+            issued_at,
+            expires_at,
+        }
+    }
+
+    /// Validates the token is fresh at `now` (Unix seconds) within `skew_secs`.
+    ///
+    /// Rejects an expired token (`now >= exp + skew`) and a future-minted one
+    /// (`iat > now + skew`) with the non-destructive [`TokenError::IdentityUnverified`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::IdentityUnverified`] when the token is expired or
+    /// implausibly future-dated.
+    pub fn validate_fresh(&self, now: u64, skew_secs: u64) -> Result<(), TokenError> {
+        if now >= self.expires_at.saturating_add(skew_secs) {
+            return Err(TokenError::IdentityUnverified);
+        }
+        if self.issued_at > now.saturating_add(skew_secs) {
+            return Err(TokenError::IdentityUnverified);
+        }
+        Ok(())
     }
 }
 
@@ -561,6 +624,7 @@ pub struct TokenSuccess {
     access_token: AccessToken,
     rotated_refresh_token: Option<Zeroizing<String>>,
     subject: AccountSubject,
+    identity_expiry: IdentityExpiry,
 }
 
 impl TokenSuccess {
@@ -579,7 +643,7 @@ impl TokenSuccess {
         let expires_at = now
             .checked_add(expires_in)
             .ok_or(TokenError::MalformedResponse)?;
-        let subject = validate_account_subject(id_token_claims, config)?;
+        let (subject, identity_expiry) = validate_account_subject(id_token_claims, config)?;
         Ok(Self {
             access_token: AccessToken {
                 secret: access_token,
@@ -587,6 +651,7 @@ impl TokenSuccess {
             },
             rotated_refresh_token,
             subject,
+            identity_expiry,
         })
     }
 
@@ -602,6 +667,13 @@ impl TokenSuccess {
         &self.subject
     }
 
+    /// Returns the `id_token`'s Unix-second freshness window, for the session to
+    /// validate against a wall clock.
+    #[must_use]
+    pub fn identity_expiry(&self) -> IdentityExpiry {
+        self.identity_expiry
+    }
+
     /// Returns the rotated refresh token when the provider rotated it.
     ///
     /// Google may return a new refresh token on exchange or refresh; its
@@ -611,10 +683,23 @@ impl TokenSuccess {
         self.rotated_refresh_token.as_ref()
     }
 
-    /// Separates the access token, any rotated refresh token, and the subject.
+    /// Separates the access token, any rotated refresh token, the subject, and the
+    /// identity freshness window.
     #[must_use]
-    pub fn into_parts(self) -> (AccessToken, Option<Zeroizing<String>>, AccountSubject) {
-        (self.access_token, self.rotated_refresh_token, self.subject)
+    pub fn into_parts(
+        self,
+    ) -> (
+        AccessToken,
+        Option<Zeroizing<String>>,
+        AccountSubject,
+        IdentityExpiry,
+    ) {
+        (
+            self.access_token,
+            self.rotated_refresh_token,
+            self.subject,
+            self.identity_expiry,
+        )
     }
 }
 
@@ -630,7 +715,7 @@ impl TokenSuccess {
 fn validate_account_subject(
     claims: Option<IdTokenClaims>,
     config: &TokenClientConfig,
-) -> Result<AccountSubject, TokenError> {
+) -> Result<(AccountSubject, IdentityExpiry), TokenError> {
     let claims = claims.ok_or(TokenError::IdentityUnverified)?;
     let client_id = config.client_id();
     // A single audience must equal this client. An id_token carrying additional
@@ -655,7 +740,14 @@ fn validate_account_subject(
     }
     // Store the trimmed subject so a padded value cannot hash differently than
     // the same account's un-padded value.
-    Ok(AccountSubject::new(Zeroizing::new(subject.to_owned())))
+    let subject = AccountSubject::new(Zeroizing::new(subject.to_owned()));
+    // `exp`/`iat` presence is guaranteed structurally by the transport parse; the
+    // freshness comparison happens later in the session against a wall clock.
+    let identity_expiry = IdentityExpiry {
+        issued_at: claims.issued_at,
+        expires_at: claims.expires_at,
+    };
+    Ok((subject, identity_expiry))
 }
 
 impl fmt::Debug for TokenSuccess {
@@ -671,6 +763,7 @@ impl fmt::Debug for TokenSuccess {
                     .map(|_token| "[REDACTED]"),
             )
             .field("subject", &self.subject)
+            .field("identity_expiry", &self.identity_expiry)
             .finish()
     }
 }
@@ -816,12 +909,17 @@ mod tests {
 
     const TEST_SUBJECT: &str = "test-subject-123";
 
+    const TEST_IAT: u64 = 1_000;
+    const TEST_EXP: u64 = 5_000;
+
     fn valid_claims() -> IdTokenClaims {
         IdTokenClaims::new(
             Zeroizing::new(TEST_SUBJECT.to_owned()),
             vec!["public-test-client".to_owned()],
             "https://accounts.google.com".to_owned(),
             None,
+            TEST_IAT,
+            TEST_EXP,
         )
     }
 
@@ -976,7 +1074,28 @@ mod tests {
                 .collect(),
             issuer.to_owned(),
             azp.map(str::to_owned),
+            TEST_IAT,
+            TEST_EXP,
         )
+    }
+
+    #[test]
+    fn identity_expiry_accepts_fresh_and_rejects_stale_or_future_tokens() {
+        let expiry = super::IdentityExpiry::new_for_test(1_000, 5_000);
+        // Fresh: iat <= now <= exp.
+        assert!(expiry.validate_fresh(3_000, 60).is_ok());
+        // Within skew of expiry: still fresh.
+        assert!(expiry.validate_fresh(5_030, 60).is_ok());
+        // Expired: now >= exp + skew.
+        assert_eq!(
+            expiry.validate_fresh(5_100, 60),
+            Err(TokenError::IdentityUnverified)
+        );
+        // Future-minted: iat > now + skew.
+        assert_eq!(
+            expiry.validate_fresh(900, 60),
+            Err(TokenError::IdentityUnverified)
+        );
     }
 
     #[test]
@@ -1345,8 +1464,12 @@ mod tests {
             &clock,
         ))
         .unwrap();
-        let (access_token, rotated, subject) = success.into_parts();
+        let (access_token, rotated, subject, expiry) = success.into_parts();
         assert_eq!(subject.as_str(), TEST_SUBJECT);
+        assert_eq!(
+            expiry,
+            super::IdentityExpiry::new_for_test(TEST_IAT, TEST_EXP)
+        );
         assert_eq!(access_token.secret().as_str(), "fake-access-token");
         assert_eq!(access_token.expires_at(), Duration::from_secs(3_600));
         assert_eq!(
