@@ -170,6 +170,17 @@ impl SyncFailure {
     pub fn progress(self) -> SyncProgress {
         self.progress
     }
+    /// Constructs a failure from a source for cross-crate tests (e.g. the sync
+    /// worker's status mapping), which cannot otherwise build a `SyncFailure`
+    /// because its fields are private. Never compiled into production.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn from_source_for_test(source: SyncFailureSource) -> Self {
+        Self {
+            source,
+            progress: SyncProgress::default(),
+        }
+    }
 }
 impl fmt::Debug for SyncFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
