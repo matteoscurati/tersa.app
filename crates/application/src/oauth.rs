@@ -21,8 +21,19 @@ use zeroize::{Zeroize, Zeroizing};
 
 // Rust guideline compliant 1.0.
 
-/// The only Gmail scope requested by the flow, granting read-only access.
+/// The Gmail scope requested by the flow, granting read-only access.
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
+
+/// The `OpenID` Connect scope requested alongside the Gmail scope.
+///
+/// Requested solely to obtain the immutable OIDC `sub` for the account-identity
+/// gate — never to display an address. `openid` does not touch the read-only
+/// posture, which is governed by the Gmail scope. See ADR-0023 Identity source.
+pub const OPENID_SCOPE: &str = "openid";
+
+/// The full space-separated scope string sent in the authorization request:
+/// `openid` (for the identity-gate `sub`) plus Gmail read-only.
+pub const REQUESTED_SCOPE: &str = "openid https://www.googleapis.com/auth/gmail.readonly";
 
 const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const SECRET_BYTES: usize = 32;
@@ -378,7 +389,7 @@ fn prepare_with_secrets<C: MonotonicClock>(
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", config.redirect_uri.as_str())
-        .append_pair("scope", GMAIL_READONLY_SCOPE)
+        .append_pair("scope", REQUESTED_SCOPE)
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -439,8 +450,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        AuthorizationConfig, GMAIL_READONLY_SCOPE, MonotonicClock, OAuthError,
-        SystemMonotonicClock, pkce_challenge, prepare_authorization, prepare_with_secrets,
+        AuthorizationConfig, GMAIL_READONLY_SCOPE, MonotonicClock, OAuthError, OPENID_SCOPE,
+        REQUESTED_SCOPE, SystemMonotonicClock, pkce_challenge, prepare_authorization,
+        prepare_with_secrets,
     };
     use std::time::Duration;
     use url::Url;
@@ -498,10 +510,21 @@ mod tests {
         let parameters: BTreeMap<_, _> = pairs.iter().cloned().collect();
         assert_eq!(pairs.len(), 8);
         assert_eq!(parameters.len(), pairs.len());
-        assert_eq!(parameters.get("scope").unwrap(), GMAIL_READONLY_SCOPE);
+        assert_eq!(parameters.get("scope").unwrap(), REQUESTED_SCOPE);
         assert_eq!(
             GMAIL_READONLY_SCOPE,
             "https://www.googleapis.com/auth/gmail.readonly"
+        );
+        // `openid` is requested additively for the identity-gate `sub`; the Gmail
+        // read-only scope is unchanged.
+        assert_eq!(
+            REQUESTED_SCOPE,
+            format!("{OPENID_SCOPE} {GMAIL_READONLY_SCOPE}")
+        );
+        assert!(
+            REQUESTED_SCOPE
+                .split(' ')
+                .any(|s| s == GMAIL_READONLY_SCOPE)
         );
         assert_eq!(parameters.get("code_challenge_method").unwrap(), "S256");
         assert_eq!(parameters.get("response_type").unwrap(), "code");

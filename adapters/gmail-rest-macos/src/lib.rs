@@ -30,7 +30,8 @@ use tersa_application::mailbox::{
 };
 #[cfg(any(target_os = "macos", test))]
 use tersa_application::token::{
-    ExchangeRequest, RefreshRequest, TokenResponse, TokenTransport, TokenTransportError,
+    ExchangeRequest, IdTokenClaims, RefreshRequest, TokenResponse, TokenTransport,
+    TokenTransportError,
 };
 use tersa_domain::mailbox::{
     AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
@@ -960,14 +961,99 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
         refresh_token: Option<Zeroizing<String>>,
         token_type: String,
         scope: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_zeroizing")]
+        id_token: Option<Zeroizing<String>>,
     }
     let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    let id_token_claims = match parsed.id_token {
+        Some(id_token) => Some(parse_id_token_claims(id_token.as_str())?),
+        None => None,
+    };
     Ok(TokenResponse::new(
         parsed.access_token,
         Duration::from_secs(parsed.expires_in),
         parsed.refresh_token,
+        id_token_claims,
     ))
+}
+
+/// Decodes the identity claims from an `id_token` WITHOUT verifying its signature.
+///
+/// The signature is intentionally not checked: this is only ever called on an
+/// `id_token` received in the token-endpoint response over the crate's hardened
+/// TLS client, directly from the token endpoint — the TLS origin authenticates
+/// the issuer (OIDC Core 3.1.3.7). This helper is deliberately private and its
+/// sole caller is [`parse_token_response`]; it must NEVER be fed a token from a
+/// front channel, cache, or IPC, where signature verification would be mandatory.
+/// It performs only a STRUCTURAL decode — the semantic `aud`/`iss`/`sub` checks
+/// live in the application layer, which holds the client identity as a typed value.
+#[cfg(any(target_os = "macos", test))]
+fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransportError> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Audience {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    #[derive(Deserialize)]
+    struct IdTokenPayload {
+        #[serde(deserialize_with = "deserialize_zeroizing")]
+        sub: Zeroizing<String>,
+        aud: Audience,
+        iss: String,
+        #[serde(default)]
+        azp: Option<String>,
+    }
+
+    // A Google id_token is a signed JWT: exactly header.payload.signature.
+    let mut segments = id_token.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(TokenTransportError::MalformedResponse);
+    };
+    // Require all three segments to be non-empty valid base64url — a structurally
+    // complete compact JWS — even though the signature is not verified (the TLS
+    // origin authenticates the issuer). This rejects a token with an empty or
+    // malformed header/signature that only happens to carry a decodable payload.
+    decode_b64url_segment(header)?;
+    decode_b64url_segment(signature)?;
+    let payload_bytes = decode_b64url_segment(payload)?;
+    let payload = serde_json::from_slice::<IdTokenPayload>(&payload_bytes)
+        .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    let audiences = match payload.aud {
+        Audience::One(audience) => vec![audience],
+        Audience::Many(audiences) => audiences,
+    };
+    Ok(IdTokenClaims::new(
+        payload.sub,
+        audiences,
+        payload.iss,
+        payload.azp,
+    ))
+}
+
+/// Decodes one non-empty base64url JWT segment into a zeroizing buffer.
+///
+/// Decoding into caller-owned zeroizing storage wipes any partially decoded
+/// bytes on the error path too — `base64`'s own `decode` would drop its internal
+/// buffer unzeroized, potentially leaving account-identifying `sub` residue.
+#[cfg(any(target_os = "macos", test))]
+fn decode_b64url_segment(segment: &str) -> Result<Zeroizing<Vec<u8>>, TokenTransportError> {
+    if segment.is_empty() {
+        return Err(TokenTransportError::MalformedResponse);
+    }
+    let mut buffer = Zeroizing::new(vec![0_u8; base64::decoded_len_estimate(segment.len())]);
+    let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode_slice(segment, buffer.as_mut_slice())
+        .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    buffer.truncate(written);
+    Ok(buffer)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1011,7 +1097,7 @@ mod tests {
         HttpResponse, JSON_LIMIT, PostFuture, PostTransport, ProfileError, RAW_JSON_LIMIT,
         REVOKE_ENDPOINT, Request, TOKEN_ENDPOINT, TOKEN_RESPONSE_LIMIT, TokenResponse, Transport,
         TransportError, TransportFuture, Url, body_limit, decode_raw_with_limit, map_status,
-        reads_response_body,
+        parse_id_token_claims, parse_token_response, reads_response_body,
     };
 
     const ACCOUNT: &str = "account-1";
@@ -1972,6 +2058,78 @@ mod tests {
                 Some(TokenTransportError::MalformedResponse)
             );
         }
+    }
+
+    fn jwt(payload: &str) -> String {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.{}",
+            engine.encode(br#"{"alg":"RS256"}"#),
+            engine.encode(payload.as_bytes()),
+            engine.encode(b"signature")
+        )
+    }
+
+    #[test]
+    fn parse_token_response_decodes_a_present_id_token() {
+        let payload =
+            r#"{"sub":"sub-123","aud":"public-client","iss":"https://accounts.google.com"}"#;
+        let body = format!(
+            r#"{{"access_token":"a","expires_in":3599,"token_type":"Bearer","id_token":"{}"}}"#,
+            jwt(payload)
+        );
+        let (_access, _expires, _refresh, claims) = parse_token_response(body.as_bytes())
+            .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+            .into_parts();
+        assert!(claims.is_some());
+    }
+
+    #[test]
+    fn parse_token_response_without_an_id_token_carries_no_claims() {
+        let body = r#"{"access_token":"a","expires_in":3599,"token_type":"Bearer"}"#;
+        let (_access, _expires, _refresh, claims) = parse_token_response(body.as_bytes())
+            .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+            .into_parts();
+        assert!(claims.is_none());
+    }
+
+    #[test]
+    fn parse_id_token_claims_rejects_structurally_malformed_tokens() {
+        let good = r#"{"sub":"s","aud":"c","iss":"i"}"#;
+        let engine = {
+            use base64::Engine as _;
+            |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        let good_payload = engine(good.as_bytes());
+        let cases: Vec<String> = vec![
+            "onlyonesegment".to_owned(),
+            "two.segments".to_owned(),
+            "four.seg.ments.here".to_owned(),
+            "header.!!!notbase64.signature".to_owned(),
+            jwt("not json"),
+            jwt(r#"{"aud":"c","iss":"i"}"#),
+            jwt(r#"{"sub":"s","iss":"i"}"#),
+            jwt(r#"{"sub":"s","aud":"c"}"#),
+            // Structurally incomplete JWS: empty or malformed header/signature.
+            format!(".{good_payload}.{}", engine(b"sig")),
+            format!("{}.{good_payload}.", engine(b"header")),
+            format!("!!!.{good_payload}.{}", engine(b"sig")),
+            format!("{}.{good_payload}.!!!", engine(b"header")),
+        ];
+        for token in cases {
+            assert_eq!(
+                parse_id_token_claims(&token).err(),
+                Some(TokenTransportError::MalformedResponse),
+                "token {token} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_id_token_claims_accepts_an_array_audience() {
+        let token = jwt(r#"{"sub":"s","aud":["a","b"],"iss":"accounts.google.com"}"#);
+        assert!(parse_id_token_claims(&token).is_ok());
     }
 
     #[test]

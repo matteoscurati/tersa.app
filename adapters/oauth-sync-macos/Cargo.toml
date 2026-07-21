@@ -24,5 +24,8 @@ tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0" }
 tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0.0.0" }
 tokio = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+url = { workspace = true }
+
 [lints]
 workspace = true
