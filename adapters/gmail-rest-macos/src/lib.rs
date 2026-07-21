@@ -23,8 +23,6 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde::Deserialize;
-#[cfg(any(target_os = "macos", test))]
-use tersa_application::identity::{AccountProfile, ProfileAddress, ProfileError};
 use tersa_application::mailbox::{
     BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
@@ -200,120 +198,6 @@ impl RemoteMailbox for GmailMailbox {
                 .map(|content| Message::new(envelope, content))
         })
     }
-}
-
-/// Reads the connected account's own profile address for the identity gate.
-///
-/// A dedicated `GET users/me/profile?fields=emailAddress` surface, kept off
-/// [`GmailMailbox`] so that contract stays purely message-oriented. Constructed
-/// with the SAME short-lived access token as the sync, so the checked identity
-/// cannot drift from the account the sync then writes.
-#[cfg(any(target_os = "macos", test))]
-pub struct GmailProfile {
-    account: AccountId,
-    transport: Box<dyn Transport>,
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl fmt::Debug for GmailProfile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("GmailProfile([REDACTED])")
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl GmailProfile {
-    #[cfg(target_os = "macos")]
-    /// Creates a profile-fetch adapter with a short-lived access token for `account`.
-    ///
-    /// The token is retained only in zeroizing memory and is never logged. It is
-    /// the caller's responsibility to pass the same token instance the sync uses.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RemoteMailboxError::AuthorizationRequired`] for an empty,
-    /// oversized, or control-character-containing token. Client construction
-    /// failures return [`RemoteMailboxError::Transport`].
-    pub fn new(account: AccountId, access_token: String) -> Result<Self, RemoteMailboxError> {
-        let access_token = Zeroizing::new(access_token);
-        validate_access_token(&access_token)?;
-        Ok(Self {
-            account,
-            transport: Box::new(ReqwestTransport::new(access_token)?),
-        })
-    }
-
-    #[cfg(test)]
-    fn with_transport(account: AccountId, transport: impl Transport + 'static) -> Self {
-        Self {
-            account,
-            transport: Box::new(transport),
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl AccountProfile for GmailProfile {
-    fn email_address<'a>(
-        &'a self,
-        account: &'a AccountId,
-    ) -> BoxFuture<'a, Result<ProfileAddress, ProfileError>> {
-        Box::pin(async move {
-            if self.account != *account {
-                return Err(ProfileError::InvalidResponse);
-            }
-            let request = profile_request().map_err(profile_error_from)?;
-            let response = self
-                .transport
-                .get(request, PROFILE_JSON_LIMIT)
-                .await
-                .map_err(|error| profile_error_from(error.into_mailbox_error()))?;
-            if !(200..300).contains(&response.status) {
-                let mut body = response.body;
-                let mapped = map_status(response.status, &body);
-                body.zeroize();
-                return Err(profile_error_from(mapped));
-            }
-            let mut body = response.body;
-            let parsed = serde_json::from_slice::<ProfileResponseBody>(&body);
-            body.zeroize();
-            let parsed = parsed.map_err(|_error| ProfileError::InvalidResponse)?;
-            if parsed.email_address.trim().is_empty() {
-                return Err(ProfileError::InvalidResponse);
-            }
-            Ok(ProfileAddress::new(parsed.email_address))
-        })
-    }
-}
-
-/// Caps the profile response: `{"emailAddress":"…"}` is a few hundred bytes.
-#[cfg(any(target_os = "macos", test))]
-const PROFILE_JSON_LIMIT: usize = 4 * 1024;
-
-#[cfg(any(target_os = "macos", test))]
-fn profile_request() -> Result<Request, RemoteMailboxError> {
-    Request::new(
-        Url::parse(BASE_URL).map_err(|_error| RemoteMailboxError::InvalidResponse)?,
-        &["profile"],
-        &[("fields", "emailAddress".to_owned())],
-    )
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn profile_error_from(error: RemoteMailboxError) -> ProfileError {
-    match error {
-        RemoteMailboxError::AuthorizationRequired => ProfileError::ConsentRevoked,
-        RemoteMailboxError::Transport | RemoteMailboxError::RateLimited => ProfileError::Transport,
-        _ => ProfileError::InvalidResponse,
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileResponseBody {
-    #[serde(deserialize_with = "deserialize_zeroizing")]
-    email_address: Zeroizing<String>,
 }
 
 trait Transport: Send + Sync {
@@ -1005,6 +889,11 @@ fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransport
         iss: String,
         #[serde(default)]
         azp: Option<String>,
+        // `iat`/`exp` are required OIDC claims: a token missing either is
+        // structurally incomplete (MalformedResponse). Freshness is validated
+        // later in the session against a wall clock.
+        iat: u64,
+        exp: u64,
     }
 
     // A Google id_token is a signed JWT: exactly header.payload.signature.
@@ -1035,6 +924,8 @@ fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransport
         audiences,
         payload.iss,
         payload.azp,
+        payload.iat,
+        payload.exp,
     ))
 }
 
@@ -1093,11 +984,11 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        AccountProfile, BoundedBody, BoxFuture, GmailMailbox, GmailProfile, GmailTokenTransport,
-        HttpResponse, JSON_LIMIT, PostFuture, PostTransport, ProfileError, RAW_JSON_LIMIT,
-        REVOKE_ENDPOINT, Request, TOKEN_ENDPOINT, TOKEN_RESPONSE_LIMIT, TokenResponse, Transport,
-        TransportError, TransportFuture, Url, body_limit, decode_raw_with_limit, map_status,
-        parse_id_token_claims, parse_token_response, reads_response_body,
+        BoundedBody, BoxFuture, GmailMailbox, GmailTokenTransport, HttpResponse, JSON_LIMIT,
+        PostFuture, PostTransport, RAW_JSON_LIMIT, REVOKE_ENDPOINT, Request, TOKEN_ENDPOINT,
+        TOKEN_RESPONSE_LIMIT, TokenResponse, Transport, TransportError, TransportFuture, Url,
+        body_limit, decode_raw_with_limit, map_status, parse_id_token_claims, parse_token_response,
+        reads_response_body,
     };
 
     const ACCOUNT: &str = "account-1";
@@ -1238,76 +1129,6 @@ mod tests {
         format!(
             r#"{{"id":"{id}","threadId":"{thread}","internalDate":"42","labelIds":{labels},"snippet":"Preview","payload":{{"headers":[{{"name":"From","value":"Sender <sender@example.test>"}},{{"name":"Subject","value":"Subject"}}]}}}}"#
         )
-    }
-
-    fn profile_body(address: &str) -> String {
-        format!(r#"{{"emailAddress":"{address}","messagesTotal":9,"historyId":"5"}}"#)
-    }
-
-    #[test]
-    fn profile_fetch_returns_the_account_address() {
-        let transport = FakeTransport::new(vec![json(200, &profile_body("User@Example.test"))]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport.clone());
-        let address = ready(profile.email_address(&account(ACCOUNT)))
-            .unwrap_or_else(|error| panic!("expected an address, got {error:?}"));
-        // The adapter returns the provider-exact bytes; the composition normalizes.
-        assert_eq!(address.as_str(), "User@Example.test");
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].0.contains("users/me/profile"));
-        assert!(requests[0].0.contains("fields=emailAddress"));
-    }
-
-    #[test]
-    fn profile_fetch_maps_a_revoked_token_to_consent_revoked() {
-        let transport = FakeTransport::new(vec![json(401, "")]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport);
-        assert!(matches!(
-            ready(profile.email_address(&account(ACCOUNT))),
-            Err(ProfileError::ConsentRevoked)
-        ));
-    }
-
-    #[test]
-    fn profile_fetch_maps_a_network_failure_to_transport() {
-        let transport = FakeTransport::new(vec![Reply::Network]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport);
-        assert!(matches!(
-            ready(profile.email_address(&account(ACCOUNT))),
-            Err(ProfileError::Transport)
-        ));
-    }
-
-    #[test]
-    fn profile_fetch_rejects_a_response_without_an_address() {
-        let transport = FakeTransport::new(vec![json(200, r#"{"messagesTotal":9}"#)]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport);
-        assert!(matches!(
-            ready(profile.email_address(&account(ACCOUNT))),
-            Err(ProfileError::InvalidResponse)
-        ));
-    }
-
-    #[test]
-    fn profile_fetch_rejects_a_blank_address() {
-        let transport = FakeTransport::new(vec![json(200, &profile_body("   "))]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport);
-        assert!(matches!(
-            ready(profile.email_address(&account(ACCOUNT))),
-            Err(ProfileError::InvalidResponse)
-        ));
-    }
-
-    #[test]
-    fn profile_fetch_rejects_a_mismatched_account() {
-        let transport = FakeTransport::new(vec![json(200, &profile_body("user@example.test"))]);
-        let profile = GmailProfile::with_transport(account(ACCOUNT), transport.clone());
-        assert!(matches!(
-            ready(profile.email_address(&account("other-account"))),
-            Err(ProfileError::InvalidResponse)
-        ));
-        // A rejected account never reaches the transport.
-        assert!(transport.requests().is_empty());
     }
 
     #[derive(Clone)]
@@ -2073,8 +1894,7 @@ mod tests {
 
     #[test]
     fn parse_token_response_decodes_a_present_id_token() {
-        let payload =
-            r#"{"sub":"sub-123","aud":"public-client","iss":"https://accounts.google.com"}"#;
+        let payload = r#"{"sub":"sub-123","aud":"public-client","iss":"https://accounts.google.com","iat":1000,"exp":5000}"#;
         let body = format!(
             r#"{{"access_token":"a","expires_in":3599,"token_type":"Bearer","id_token":"{}"}}"#,
             jwt(payload)
@@ -2096,7 +1916,7 @@ mod tests {
 
     #[test]
     fn parse_id_token_claims_rejects_structurally_malformed_tokens() {
-        let good = r#"{"sub":"s","aud":"c","iss":"i"}"#;
+        let good = r#"{"sub":"s","aud":"c","iss":"i","iat":1,"exp":2}"#;
         let engine = {
             use base64::Engine as _;
             |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -2108,9 +1928,12 @@ mod tests {
             "four.seg.ments.here".to_owned(),
             "header.!!!notbase64.signature".to_owned(),
             jwt("not json"),
-            jwt(r#"{"aud":"c","iss":"i"}"#),
-            jwt(r#"{"sub":"s","iss":"i"}"#),
-            jwt(r#"{"sub":"s","aud":"c"}"#),
+            // Each missing a single required claim (sub / aud / iss / iat / exp).
+            jwt(r#"{"aud":"c","iss":"i","iat":1,"exp":2}"#),
+            jwt(r#"{"sub":"s","iss":"i","iat":1,"exp":2}"#),
+            jwt(r#"{"sub":"s","aud":"c","iat":1,"exp":2}"#),
+            jwt(r#"{"sub":"s","aud":"c","iss":"i","exp":2}"#),
+            jwt(r#"{"sub":"s","aud":"c","iss":"i","iat":1}"#),
             // Structurally incomplete JWS: empty or malformed header/signature.
             format!(".{good_payload}.{}", engine(b"sig")),
             format!("{}.{good_payload}.", engine(b"header")),
@@ -2128,7 +1951,8 @@ mod tests {
 
     #[test]
     fn parse_id_token_claims_accepts_an_array_audience() {
-        let token = jwt(r#"{"sub":"s","aud":["a","b"],"iss":"accounts.google.com"}"#);
+        let token =
+            jwt(r#"{"sub":"s","aud":["a","b"],"iss":"accounts.google.com","iat":1,"exp":2}"#);
         assert!(parse_id_token_claims(&token).is_ok());
     }
 

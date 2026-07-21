@@ -49,8 +49,13 @@ mod macos {
     // change must bump `VERSION` and add an upgrade migration instead.
     const VERSION: i64 = 1;
     // Derivation version of the stored account-identity hash. A row written by a
-    // future algorithm reads as incompatible (fail closed), never a first connect.
-    const IDENTITY_ALGO_VERSION: i64 = 1;
+    // different algorithm reads as incompatible (fail closed), never a first
+    // connect. Bumped 1 -> 2 in 3d-3a when the gate switched from hashing the
+    // mutable email address to the immutable OIDC subject: a stale v1 (email-scheme)
+    // row now fails closed rather than being value-compared against a sub-scheme
+    // hash, so a scheme change can never produce a false match. Pre-release with no
+    // shipped stores, so a v1 dev store reads `Corrupted` and is re-bootstrapped.
+    const IDENTITY_ALGO_VERSION: i64 = 2;
     const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 5;
     const MAX_SCHEMA_KIND_LEN: i64 = 16;
     const MAX_SCHEMA_NAME_LEN: i64 = 256;
@@ -593,6 +598,24 @@ mod macos {
                     return Err(MailboxStoreError::Storage);
                 }
                 transaction.commit().map_err(store_error)
+            })
+        }
+
+        #[cfg(test)]
+        fn write_identity_hash_with_version(
+            &self,
+            account: &AccountId,
+            fresh: &[u8; 32],
+            version: i64,
+        ) -> Result<(), MailboxStoreError> {
+            self.with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO account_identity (account_id, identity_hash, algo_version) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET identity_hash = excluded.identity_hash, algo_version = excluded.algo_version",
+                        params![account.as_str(), &fresh[..], version],
+                    )
+                    .map_err(store_error)?;
+                Ok(())
             })
         }
 
@@ -4276,6 +4299,21 @@ mod macos {
             drop(store);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert_eq!(run(reopened.load_identity(&account())).unwrap(), Some(hash));
+        }
+
+        #[test]
+        fn a_stale_algorithm_version_row_reads_corrupted() {
+            // A pre-existing v1 (email-scheme) row after the algo bump to v2 must
+            // fail closed — never Ok(None) (which would re-baseline as first
+            // connect) and never a value comparison (which could false-match).
+            let (_database, store) = open("identity-stale-version");
+            store
+                .write_identity_hash_with_version(&account(), &[1; 32], IDENTITY_ALGO_VERSION - 1)
+                .unwrap();
+            assert_eq!(
+                run(store.load_identity(&account())),
+                Err(MailboxStoreError::Corrupted)
+            );
         }
 
         #[test]

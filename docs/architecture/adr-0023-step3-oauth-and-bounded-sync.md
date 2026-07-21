@@ -135,19 +135,21 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   `AccountId` (see Identity binding), the store is guarded so two accounts' mail can
   never coexist under it — on **every** path that reaches a sync write, not only
   explicit disconnect. On the first successful connect the composition records a
-  salted hash of the account's address (`users.getProfile.emailAddress`, a GET
-  returned under `gmail.readonly` — no new scope, no identity *displayed*, only a
+  salted hash of the account's immutable OIDC `sub` (in hand from the `id_token` of
+  each token response — no network fetch, no identity *displayed*, only a
   per-installation-salted hash stored in the encrypted store). Before any later sync
-  write — a fresh connect or a re-connect after refresh failure — it re-fetches
-  `getProfile` and compares: a match preserves the store, a mismatch clears the
-  previous account's cached mailbox before the new sync writes and records the new
-  hash. The gate is **fail-closed** — if the pre-write `getProfile` re-fetch fails
-  (transient or network), the sync write is blocked rather than falling through to
+  write — a fresh connect or a re-connect after refresh failure — it hashes the
+  connected account's `sub` and compares: a match preserves the store, a mismatch
+  clears the previous account's cached mailbox before the new sync writes and
+  records the new hash. The gate is **fail-closed** — if the hasher or the store
+  read fails, the sync write is blocked rather than falling through to
   preserve-and-write — and the mailbox clear and the new-hash record commit in one
   account-scoped transaction. This makes the "never coexist" invariant hold for the
-  account-switch, fresh-connect, and re-connect paths uniformly. Storing only a salted hash (not the
-  address) keeps this consistent with Identity binding, which forbids *displaying* an
-  address, not gating data lifecycle on a local hash.
+  account-switch, fresh-connect, and re-connect paths uniformly. Storing only a
+  salted hash (not the subject) keeps this consistent with Identity binding, which
+  forbids *displaying* an identity, not gating data lifecycle on a local hash.
+  (3d-3a implemented the `sub` keying; see Identity source below for why the mutable
+  `emailAddress` it originally used was replaced.)
 - **Identity source — `sub` is a 3f-blocking requirement (amended 2026-07-21).**
   The gate as first built (3d-2a) hashes `getProfile.emailAddress`, but an email
   address is **not** an immutable Google-account identifier: Google documents it as
@@ -200,6 +202,11 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
     AND `exp`/`iat`/`nonce` validation become mandatory at the acceptance point** —
     no deferral. (Source: the 3d-2b independent review — a Sol confirmed finding —
     and the Fable judgement verdict.)
+    - **3d-3a landed** the freshness check at `GmailSession::new` (validated against
+      a `WallClock`, 2-minute skew, non-destructive on failure). Because the session
+      validates freshness ONCE at construction, the **3d-3c sync worker MUST build a
+      fresh `GmailSession` per connect/refresh cycle** and never hold one long-term.
+      (Source: the 3d-3a review.)
 
 ### Read-only enforcement
 

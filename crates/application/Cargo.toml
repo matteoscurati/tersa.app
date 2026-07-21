@@ -18,5 +18,10 @@ tersa-domain = { path = "../domain", version = "=0.0.0" }
 url.workspace = true
 zeroize.workspace = true
 
+[features]
+# Exposes test-only constructors (e.g. AccountSubject::from_raw_for_test) to
+# tests in OTHER workspace crates. Never enabled by a production dependency.
+test-util = []
+
 [lints]
 workspace = true

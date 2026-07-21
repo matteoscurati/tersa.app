@@ -72,6 +72,32 @@ impl MonotonicClock for SystemMonotonicClock {
     }
 }
 
+/// Supplies wall-clock (Unix) time for validating token-response timestamps.
+///
+/// Distinct from [`MonotonicClock`]: an `id_token`'s `exp`/`iat` are absolute Unix
+/// timestamps, so validating their freshness needs a real calendar clock. The pure
+/// token layer never uses this — it is injected only into the concrete session that
+/// validates `id_token` freshness, keeping that layer monotonic-clock-only.
+pub trait WallClock: fmt::Debug + Send + Sync {
+    /// Returns seconds since the Unix epoch.
+    fn unix_time(&self) -> u64;
+}
+
+/// Uses the operating-system clock as the production wall clock.
+#[derive(Debug, Default)]
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn unix_time(&self) -> u64 {
+        // A clock before the Unix epoch is impossible in practice; on that error
+        // return the maximum so every token reads as expired (fail closed) rather
+        // than as freshly issued.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+    }
+}
+
 /// Configures one Google OAuth authorization attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationConfig {
