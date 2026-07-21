@@ -220,14 +220,104 @@ impl fmt::Debug for RefreshRequest {
     }
 }
 
+/// The immutable `OpenID` Connect subject (`sub`) of the connected account.
+///
+/// Not a secret, but account-identifying: held in zeroizing memory, redacted in
+/// `Debug`, and never logged or displayed. It is the account-identity gate input
+/// (a stable per-`(issuer, client)` identifier that Google never reuses), unlike
+/// an email address, which is mutable and reusable.
+pub struct AccountSubject(Zeroizing<String>);
+
+impl AccountSubject {
+    /// Wraps a validated subject.
+    ///
+    /// Deliberately crate-private: the only producer is
+    /// [`validate_account_subject`], so an [`AccountSubject`] is proof that the
+    /// `id_token`'s `aud`/`iss`/`sub` were validated. The identity gate must be
+    /// fed a subject only via [`TokenSuccess::subject`] (never a hand-minted one),
+    /// so a caller cannot fabricate an unvalidated identity.
+    #[must_use]
+    pub(crate) fn new(subject: Zeroizing<String>) -> Self {
+        Self(subject)
+    }
+
+    /// Returns the subject without transferring ownership.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AccountSubject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountSubject([REDACTED])")
+    }
+}
+
+/// The identity claims decoded from an `id_token`, BEFORE semantic validation.
+///
+/// The transport decodes these from the token-endpoint response body — received
+/// over its hardened TLS channel directly from the token endpoint, never from a
+/// front channel — so the signature is not verified (the TLS origin authenticates
+/// the issuer). The application layer validates `audience` and `issuer` before
+/// trusting `subject`; an unvalidated value must never reach the gate.
+#[derive(Clone)]
+pub struct IdTokenClaims {
+    subject: Zeroizing<String>,
+    audiences: Vec<String>,
+    issuer: String,
+    authorized_party: Option<String>,
+}
+
+impl IdTokenClaims {
+    /// Assembles decoded claims from the transport.
+    ///
+    /// `authorized_party` is the OIDC `azp` claim, required to trust an
+    /// `id_token` whose `aud` carries audiences beyond the client identifier.
+    #[must_use]
+    pub fn new(
+        subject: Zeroizing<String>,
+        audiences: Vec<String>,
+        issuer: String,
+        authorized_party: Option<String>,
+    ) -> Self {
+        Self {
+            subject,
+            audiences,
+            issuer,
+            authorized_party,
+        }
+    }
+}
+
+impl fmt::Debug for IdTokenClaims {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdTokenClaims")
+            .field("subject", &"[REDACTED]")
+            .field("audiences", &self.audiences.len())
+            .field("issuer", &self.issuer)
+            .field("authorized_party", &self.authorized_party)
+            .finish()
+    }
+}
+
+/// The accepted `OpenID` Connect issuers for Google-minted `id_token`s.
+const GOOGLE_ISSUERS: &[&str] = &["accounts.google.com", "https://accounts.google.com"];
+
+/// Caps the accepted subject length. A Google `sub` is ~21 digits.
+const MAX_SUBJECT_LEN: usize = 255;
+
 /// Carries an already-parsed token endpoint response.
 ///
 /// The transport parses the response body; this value never holds wire bytes
-/// or JSON. The optional refresh token models provider rotation.
+/// or JSON. The optional refresh token models provider rotation. The optional
+/// identity claims are present when the response carried an `id_token`.
 pub struct TokenResponse {
     access_token: Zeroizing<String>,
     expires_in: Duration,
     rotated_refresh_token: Option<Zeroizing<String>>,
+    id_token_claims: Option<IdTokenClaims>,
 }
 
 impl TokenResponse {
@@ -237,11 +327,13 @@ impl TokenResponse {
         access_token: Zeroizing<String>,
         expires_in: Duration,
         rotated_refresh_token: Option<Zeroizing<String>>,
+        id_token_claims: Option<IdTokenClaims>,
     ) -> Self {
         Self {
             access_token,
             expires_in,
             rotated_refresh_token,
+            id_token_claims,
         }
     }
 
@@ -268,11 +360,19 @@ impl TokenResponse {
 
     /// Separates the response into its owned fields.
     #[must_use]
-    pub fn into_parts(self) -> (Zeroizing<String>, Duration, Option<Zeroizing<String>>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Zeroizing<String>,
+        Duration,
+        Option<Zeroizing<String>>,
+        Option<IdTokenClaims>,
+    ) {
         (
             self.access_token,
             self.expires_in,
             self.rotated_refresh_token,
+            self.id_token_claims,
         )
     }
 }
@@ -290,6 +390,7 @@ impl fmt::Debug for TokenResponse {
                     .as_ref()
                     .map(|_token| "[REDACTED]"),
             )
+            .field("id_token_claims", &self.id_token_claims)
             .finish()
     }
 }
@@ -370,6 +471,14 @@ pub enum TokenError {
     MalformedResponse,
     /// The grant or refresh token lost validity and re-consent is required.
     ConsentRevoked,
+    /// The token op succeeded but its `id_token` was absent or failed identity
+    /// validation (`aud`/`iss`/`sub`).
+    ///
+    /// This is deliberately DISTINCT from [`Self::ConsentRevoked`]: it is
+    /// non-destructive. The refresh token stays valid and stored — the sync is
+    /// blocked and the op may be retried, rather than the credential being
+    /// deleted for a merely missing claim.
+    IdentityUnverified,
 }
 
 impl fmt::Display for TokenError {
@@ -380,6 +489,7 @@ impl fmt::Display for TokenError {
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
             Self::ConsentRevoked => "the granted consent was revoked and re-connect is required",
+            Self::IdentityUnverified => "the token response carried no verified account identity",
         };
         formatter.write_str(message)
     }
@@ -438,15 +548,29 @@ impl fmt::Debug for AccessToken {
     }
 }
 
-/// Carries a granted access token and any rotated refresh token.
+/// Carries a granted access token, any rotated refresh token, and the validated
+/// account subject.
+///
+/// A validated [`AccountSubject`] is MANDATORY to construct: a token op that
+/// yields an access token but no verified `sub` fails entirely
+/// ([`TokenError::IdentityUnverified`]). This is structural — the access token
+/// and the identity gate's `sub` therefore always originate from the SAME token
+/// response, and no path can drive a sync with an access token whose account
+/// identity was never verified.
 pub struct TokenSuccess {
     access_token: AccessToken,
     rotated_refresh_token: Option<Zeroizing<String>>,
+    subject: AccountSubject,
 }
 
 impl TokenSuccess {
-    fn from_response(response: TokenResponse, now: Duration) -> Result<Self, TokenError> {
-        let (access_token, expires_in, rotated_refresh_token) = response.into_parts();
+    fn from_response(
+        response: TokenResponse,
+        now: Duration,
+        config: &TokenClientConfig,
+    ) -> Result<Self, TokenError> {
+        let (access_token, expires_in, rotated_refresh_token, id_token_claims) =
+            response.into_parts();
         if access_token.is_empty() {
             return Err(TokenError::MalformedResponse);
         }
@@ -455,12 +579,14 @@ impl TokenSuccess {
         let expires_at = now
             .checked_add(expires_in)
             .ok_or(TokenError::MalformedResponse)?;
+        let subject = validate_account_subject(id_token_claims, config)?;
         Ok(Self {
             access_token: AccessToken {
                 secret: access_token,
                 expires_at,
             },
             rotated_refresh_token,
+            subject,
         })
     }
 
@@ -468,6 +594,12 @@ impl TokenSuccess {
     #[must_use]
     pub fn access_token(&self) -> &AccessToken {
         &self.access_token
+    }
+
+    /// Returns the validated subject of the account this token grants access to.
+    #[must_use]
+    pub fn subject(&self) -> &AccountSubject {
+        &self.subject
     }
 
     /// Returns the rotated refresh token when the provider rotated it.
@@ -479,11 +611,51 @@ impl TokenSuccess {
         self.rotated_refresh_token.as_ref()
     }
 
-    /// Separates the access token from any rotated refresh token.
+    /// Separates the access token, any rotated refresh token, and the subject.
     #[must_use]
-    pub fn into_parts(self) -> (AccessToken, Option<Zeroizing<String>>) {
-        (self.access_token, self.rotated_refresh_token)
+    pub fn into_parts(self) -> (AccessToken, Option<Zeroizing<String>>, AccountSubject) {
+        (self.access_token, self.rotated_refresh_token, self.subject)
     }
+}
+
+/// Validates decoded `id_token` claims and extracts the account subject.
+///
+/// Returns [`TokenError::IdentityUnverified`] — never a destructive terminal —
+/// when the claims are absent, minted for another client (`aud`), issued by a
+/// non-Google issuer (`iss`), or carry an empty or oversized `sub`. The
+/// `id_token` signature is intentionally NOT verified: it is only ever received
+/// over the transport's hardened TLS channel directly from the token endpoint,
+/// which authenticates the issuer (OIDC Core 3.1.3.7). The `aud == client_id`
+/// check is what makes that decode-only posture sound.
+fn validate_account_subject(
+    claims: Option<IdTokenClaims>,
+    config: &TokenClientConfig,
+) -> Result<AccountSubject, TokenError> {
+    let claims = claims.ok_or(TokenError::IdentityUnverified)?;
+    let client_id = config.client_id();
+    // A single audience must equal this client. An id_token carrying additional
+    // audiences is trusted only when `azp` names this client (OIDC Core 3.1.3.7):
+    // otherwise a token minted for another client that merely lists this one is
+    // rejected.
+    let single_exact_audience = claims.audiences.len() == 1 && claims.audiences[0] == client_id;
+    let multi_audience_authorized = claims
+        .audiences
+        .iter()
+        .any(|audience| audience == client_id)
+        && claims.authorized_party.as_deref() == Some(client_id);
+    if !(single_exact_audience || multi_audience_authorized) {
+        return Err(TokenError::IdentityUnverified);
+    }
+    if !GOOGLE_ISSUERS.contains(&claims.issuer.as_str()) {
+        return Err(TokenError::IdentityUnverified);
+    }
+    let subject = claims.subject.trim();
+    if subject.is_empty() || subject.len() > MAX_SUBJECT_LEN {
+        return Err(TokenError::IdentityUnverified);
+    }
+    // Store the trimmed subject so a padded value cannot hash differently than
+    // the same account's un-padded value.
+    Ok(AccountSubject::new(Zeroizing::new(subject.to_owned())))
 }
 
 impl fmt::Debug for TokenSuccess {
@@ -498,6 +670,7 @@ impl fmt::Debug for TokenSuccess {
                     .as_ref()
                     .map(|_token| "[REDACTED]"),
             )
+            .field("subject", &self.subject)
             .finish()
     }
 }
@@ -517,7 +690,7 @@ impl fmt::Debug for TokenSuccess {
 /// [`TokenError::MalformedResponse`] for an unparsable response.
 pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
     grant: &AuthorizationGrant,
-    config: &TokenClientConfig,
+    config: &'a TokenClientConfig,
     transport: &'a T,
     clock: &'a C,
 ) -> BoxFuture<'a, Result<TokenSuccess, TokenError>> {
@@ -527,7 +700,7 @@ pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
             .exchange(request)
             .await
             .map_err(map_transport_error)?;
-        TokenSuccess::from_response(response, clock.now())
+        TokenSuccess::from_response(response, clock.now(), config)
     })
 }
 
@@ -546,7 +719,7 @@ pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
 /// and [`TokenError::MalformedResponse`] for an unparsable response.
 pub fn refresh_access_token<'a, T: TokenTransport, C: MonotonicClock>(
     refresh_token: &Zeroizing<String>,
-    config: &TokenClientConfig,
+    config: &'a TokenClientConfig,
     transport: &'a T,
     clock: &'a C,
 ) -> BoxFuture<'a, Result<TokenSuccess, TokenError>> {
@@ -556,7 +729,7 @@ pub fn refresh_access_token<'a, T: TokenTransport, C: MonotonicClock>(
             .refresh(request)
             .await
             .map_err(map_transport_error)?;
-        TokenSuccess::from_response(response, clock.now())
+        TokenSuccess::from_response(response, clock.now(), config)
     })
 }
 
@@ -586,8 +759,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        ExchangeRequest, RefreshRequest, TokenClientConfig, TokenError, TokenResponse,
-        TokenTransport, TokenTransportError, exchange_grant, refresh_access_token,
+        ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
+        TokenResponse, TokenTransport, TokenTransportError, exchange_grant, refresh_access_token,
     };
     use crate::mailbox::BoxFuture;
     use crate::oauth::{
@@ -637,7 +810,19 @@ mod tests {
     struct FakeTransport {
         error: Option<TokenTransportError>,
         rotated_refresh_token: Option<Zeroizing<String>>,
+        id_token_claims: Option<IdTokenClaims>,
         recorded: Mutex<Vec<RecordedRequest>>,
+    }
+
+    const TEST_SUBJECT: &str = "test-subject-123";
+
+    fn valid_claims() -> IdTokenClaims {
+        IdTokenClaims::new(
+            Zeroizing::new(TEST_SUBJECT.to_owned()),
+            vec!["public-test-client".to_owned()],
+            "https://accounts.google.com".to_owned(),
+            None,
+        )
     }
 
     impl fmt::Debug for FakeTransport {
@@ -652,6 +837,7 @@ mod tests {
                         .as_ref()
                         .map(|_token| "[REDACTED]"),
                 )
+                .field("id_token_claims", &self.id_token_claims)
                 .field("recorded", &self.recorded)
                 .finish()
         }
@@ -663,6 +849,7 @@ mod tests {
                 error: None,
                 rotated_refresh_token: rotated_refresh_token
                     .map(|token| Zeroizing::new(token.to_owned())),
+                id_token_claims: Some(valid_claims()),
                 recorded: Mutex::new(Vec::new()),
             }
         }
@@ -671,8 +858,14 @@ mod tests {
             Self {
                 error: Some(error),
                 rotated_refresh_token: None,
+                id_token_claims: Some(valid_claims()),
                 recorded: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_id_token_claims(mut self, claims: Option<IdTokenClaims>) -> Self {
+            self.id_token_claims = claims;
+            self
         }
 
         fn outcome(&self) -> Result<TokenResponse, TokenTransportError> {
@@ -682,6 +875,7 @@ mod tests {
                     Zeroizing::new("fake-access-token".to_owned()),
                     Duration::from_secs(3_600),
                     self.rotated_refresh_token.clone(),
+                    self.id_token_claims.clone(),
                 )),
             }
         }
@@ -770,6 +964,222 @@ mod tests {
             )
             .unwrap_err(),
             TokenError::InvalidConfiguration
+        );
+    }
+
+    fn claims(subject: &str, audiences: &[&str], issuer: &str, azp: Option<&str>) -> IdTokenClaims {
+        IdTokenClaims::new(
+            Zeroizing::new(subject.to_owned()),
+            audiences
+                .iter()
+                .map(|audience| (*audience).to_owned())
+                .collect(),
+            issuer.to_owned(),
+            azp.map(str::to_owned),
+        )
+    }
+
+    #[test]
+    fn exchange_exposes_the_validated_subject() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let success = now_ready(exchange_grant(
+            &grant,
+            &config,
+            &FakeTransport::success(Some("refresh")),
+            &TestClock::default(),
+        ))
+        .unwrap();
+        assert_eq!(success.subject().as_str(), TEST_SUBJECT);
+        // The subject must never leak through Debug.
+        assert_eq!(
+            format!("{:?}", success.subject()),
+            "AccountSubject([REDACTED])"
+        );
+    }
+
+    #[test]
+    fn refresh_exposes_the_validated_subject() {
+        let config = make_config(None);
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+        let success = now_ready(refresh_access_token(
+            &refresh_token,
+            &config,
+            &FakeTransport::success(None),
+            &TestClock::default(),
+        ))
+        .unwrap();
+        assert_eq!(success.subject().as_str(), TEST_SUBJECT);
+    }
+
+    #[test]
+    fn a_missing_id_token_fails_closed_without_deleting_the_credential() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let error = now_ready(exchange_grant(
+            &grant,
+            &config,
+            &FakeTransport::success(None).with_id_token_claims(None),
+            &TestClock::default(),
+        ))
+        .unwrap_err();
+        // Non-destructive: NOT ConsentRevoked (which would delete the token).
+        assert_eq!(error, TokenError::IdentityUnverified);
+        assert_ne!(error, TokenError::ConsentRevoked);
+    }
+
+    #[test]
+    fn a_wrong_audience_is_rejected() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::success(None).with_id_token_claims(Some(claims(
+            "subject",
+            &["another-client"],
+            "https://accounts.google.com",
+            None,
+        )));
+        assert_eq!(
+            now_ready(exchange_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::IdentityUnverified
+        );
+    }
+
+    #[test]
+    fn a_non_google_issuer_is_rejected() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::success(None).with_id_token_claims(Some(claims(
+            "subject",
+            &["public-test-client"],
+            "https://accounts.evil.example",
+            None,
+        )));
+        assert_eq!(
+            now_ready(exchange_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::IdentityUnverified
+        );
+    }
+
+    #[test]
+    fn an_empty_subject_is_rejected() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::success(None).with_id_token_claims(Some(claims(
+            "   ",
+            &["public-test-client"],
+            "https://accounts.google.com",
+            None,
+        )));
+        assert_eq!(
+            now_ready(exchange_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::IdentityUnverified
+        );
+    }
+
+    #[test]
+    fn the_bare_google_issuer_form_is_accepted() {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::success(None).with_id_token_claims(Some(claims(
+            "subject-xyz",
+            &["public-test-client"],
+            "accounts.google.com",
+            None,
+        )));
+        let success = now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap();
+        assert_eq!(success.subject().as_str(), "subject-xyz");
+    }
+
+    fn exchange_claims(claims: IdTokenClaims) -> Result<String, TokenError> {
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::success(None).with_id_token_claims(Some(claims));
+        now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .map(|success| success.subject().as_str().to_owned())
+    }
+
+    #[test]
+    fn a_multi_audience_without_azp_is_rejected() {
+        assert_eq!(
+            exchange_claims(claims(
+                "subject",
+                &["public-test-client", "another-client"],
+                "https://accounts.google.com",
+                None,
+            ))
+            .err(),
+            Some(TokenError::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn a_multi_audience_with_a_matching_azp_is_accepted() {
+        assert_eq!(
+            exchange_claims(claims(
+                "subject",
+                &["public-test-client", "another-client"],
+                "https://accounts.google.com",
+                Some("public-test-client"),
+            ))
+            .ok(),
+            Some("subject".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_multi_audience_with_a_wrong_azp_is_rejected() {
+        assert_eq!(
+            exchange_claims(claims(
+                "subject",
+                &["public-test-client", "another-client"],
+                "https://accounts.google.com",
+                Some("another-client"),
+            ))
+            .err(),
+            Some(TokenError::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn a_padded_subject_is_trimmed_before_use() {
+        assert_eq!(
+            exchange_claims(claims(
+                "  padded-subject  ",
+                &["public-test-client"],
+                "https://accounts.google.com",
+                None,
+            ))
+            .ok(),
+            Some("padded-subject".to_owned())
         );
     }
 
@@ -935,7 +1345,8 @@ mod tests {
             &clock,
         ))
         .unwrap();
-        let (access_token, rotated) = success.into_parts();
+        let (access_token, rotated, subject) = success.into_parts();
+        assert_eq!(subject.as_str(), TEST_SUBJECT);
         assert_eq!(access_token.secret().as_str(), "fake-access-token");
         assert_eq!(access_token.expires_at(), Duration::from_secs(3_600));
         assert_eq!(
@@ -1059,6 +1470,7 @@ mod tests {
             Zeroizing::new("super-access-token".to_owned()),
             Duration::from_secs(60),
             Some(Zeroizing::new("super-rotated-refresh".to_owned())),
+            Some(valid_claims()),
         );
         for rendered in [
             format!("{:?}", recorded[0]),

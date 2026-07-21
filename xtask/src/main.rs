@@ -15,7 +15,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use cargo_metadata::{CrateType, Metadata, MetadataCommand, Package, PackageId, TargetKind};
+use cargo_metadata::{
+    CrateType, Dependency, DependencyKind, Metadata, MetadataCommand, Package, PackageId,
+    TargetKind,
+};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // Rust guideline compliant 1.0.
@@ -268,13 +271,23 @@ fn check_architecture() -> TaskResult {
     finish_architecture_check(&violations)
 }
 
+/// Collects the names of a package's SHIPPED direct dependencies.
+///
+/// The closed-composition and required-dependency invariants govern the shipped
+/// production graph, so only normal dependencies count. Dev-dependencies (test
+/// fixtures) and build-dependencies never enter the shipped binary and cannot
+/// grant it a capability, so they are excluded.
+fn shipped_direct_dependency_names(dependencies: &[Dependency]) -> BTreeSet<&str> {
+    dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Normal)
+        .map(|dependency| dependency.name.as_str())
+        .collect()
+}
+
 fn protected_package_shape_violations(package: &Package, metadata: &Metadata) -> Vec<String> {
     let package_name = package.name.as_str();
-    let direct_dependencies: BTreeSet<&str> = package
-        .dependencies
-        .iter()
-        .map(|dependency| dependency.name.as_str())
-        .collect();
+    let direct_dependencies = shipped_direct_dependency_names(&package.dependencies);
     let mut violations = Vec::new();
     if package_name == "tersa-blob-spike" && !direct_dependencies.contains("rustix") {
         violations.push("tersa-blob-spike must depend directly on exact-pinned rustix".to_owned());
@@ -402,11 +415,7 @@ fn custom_build_target_violations(package: &Package) -> Vec<String> {
 }
 
 fn apple_bridge_package_violations(package: &Package, canonical_library: &str) -> Vec<String> {
-    let direct_dependencies = package
-        .dependencies
-        .iter()
-        .map(|dependency| dependency.name.as_str())
-        .collect();
+    let direct_dependencies = shipped_direct_dependency_names(&package.dependencies);
     let mut violations = apple_bridge_direct_dependency_set_violations(&direct_dependencies);
     if package
         .targets
@@ -6488,11 +6497,11 @@ mod tests {
         resolved_workspace_dependency_names, retrieval_tokio_denial_violations,
         rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
         rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
-        signing_configuration_violations, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
-        swift_bridge_call_inventory, target_metadata_options, tracked_apple_signing_inventory,
-        tracked_project_generation_violations,
+        shipped_direct_dependency_names, signing_configuration_violations,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
+        swift_bootstrap_source_violations, swift_bridge_call_inventory, target_metadata_options,
+        tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -10373,6 +10382,38 @@ targets:
         let mut missing = exact.clone();
         missing.remove("tersa-gmail-rest-macos");
         assert!(!oauth_sync_direct_dependency_set_violations(&missing).is_empty());
+    }
+
+    #[test]
+    fn shipped_dependency_names_exclude_dev_and_build_dependencies() {
+        fn dependency(name: &str, kind: &str) -> cargo_metadata::Dependency {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "source": null,
+                "req": "*",
+                "kind": kind,
+                "rename": null,
+                "optional": false,
+                "uses_default_features": true,
+                "features": [],
+                "target": null,
+                "registry": null,
+                "path": null,
+            }))
+            .expect("valid dependency fixture")
+        }
+        let dependencies = [
+            dependency("tersa-application", "normal"),
+            dependency("url", "dev"),
+            dependency("cc", "build"),
+        ];
+        let names = shipped_direct_dependency_names(&dependencies);
+        // Normal deps are governed by the closed-composition set; dev- and
+        // build-dependencies never ship, so they are excluded — this is what
+        // admits the `url` dev-dependency without widening the production set.
+        assert!(names.contains("tersa-application"));
+        assert!(!names.contains("url"));
+        assert!(!names.contains("cc"));
     }
 
     #[test]

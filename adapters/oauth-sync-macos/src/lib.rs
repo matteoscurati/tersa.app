@@ -30,7 +30,16 @@ use tersa_application::identity::{
     IdentityReconcile, decide, normalize_address,
 };
 use tersa_application::mailbox::{AccountId, MailboxStore, RemoteMailbox};
+#[cfg(target_os = "macos")]
+use tersa_application::oauth::{AuthorizationGrant, MonotonicClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
+#[cfg(target_os = "macos")]
+use tersa_application::token::{
+    AccessToken, AccountSubject, TokenClientConfig, TokenError, TokenTransport, exchange_grant,
+    refresh_access_token,
+};
+#[cfg(target_os = "macos")]
+use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 
 /// Reports why a gated sync stopped before or during the bounded sync.
 #[derive(Debug)]
@@ -164,6 +173,194 @@ where
         .sync_recent(account, policy)
         .await
         .map_err(GatedSyncError::Sync)
+}
+
+/// A connected account's short-lived access token and validated OIDC subject.
+///
+/// Produced by [`connect_account`] and [`refresh_account`] from a SINGLE token
+/// response, so the access token and the identity-gate `subject` always share an
+/// origin (the same principal). 3d-3 builds the sync session from both, feeding
+/// the subject to the gate and the access token to the mailbox surface.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct ConnectedAccount {
+    access_token: AccessToken,
+    subject: AccountSubject,
+}
+
+#[cfg(target_os = "macos")]
+impl ConnectedAccount {
+    /// Returns the short-lived access token with its monotonic expiry.
+    #[must_use]
+    pub fn access_token(&self) -> &AccessToken {
+        &self.access_token
+    }
+
+    /// Returns the validated subject of the connected account.
+    #[must_use]
+    pub fn subject(&self) -> &AccountSubject {
+        &self.subject
+    }
+
+    /// Splits the connected account into the access token and the subject.
+    #[must_use]
+    pub fn into_parts(self) -> (AccessToken, AccountSubject) {
+        (self.access_token, self.subject)
+    }
+}
+
+/// Reports why a token-lifecycle step failed.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TokenLifecycleError {
+    /// The token exchange or refresh failed. Includes
+    /// [`TokenError::IdentityUnverified`], which is non-destructive — the stored
+    /// refresh token is left intact for a retry.
+    Token(TokenError),
+    /// The refresh-token store rejected a read or write.
+    Store(RefreshTokenError),
+    /// A refresh was requested but no refresh token is stored; re-connect needed.
+    NoStoredToken,
+    /// The exchange returned no refresh token, so offline refresh is impossible.
+    MissingRefreshToken,
+}
+
+#[cfg(target_os = "macos")]
+impl core::fmt::Display for TokenLifecycleError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let message = match self {
+            Self::Token(_) => "the token exchange or refresh failed",
+            Self::Store(_) => "the refresh-token store failed",
+            Self::NoStoredToken => "no refresh token is stored; re-connect is required",
+            Self::MissingRefreshToken => "the token exchange returned no refresh token",
+        };
+        formatter.write_str(message)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for TokenLifecycleError {}
+
+/// Exchanges a forwarded authorization grant and persists the refresh token.
+///
+/// Forwards `grant` into the token exchange, requires a validated `subject` (a
+/// subject-less response fails, so a connected account's identity is always
+/// verified), persists the granted refresh token to `refresh_store`, and returns
+/// the short-lived access token with that subject. The grant is dropped (wiped)
+/// as soon as the exchange consumes it.
+///
+/// # Errors
+///
+/// Returns [`TokenLifecycleError::Token`] when the exchange fails (including a
+/// missing/invalid identity), [`TokenLifecycleError::MissingRefreshToken`] when
+/// the exchange returns no refresh token, and [`TokenLifecycleError::Store`] when
+/// the Keychain rejects the write.
+#[cfg(target_os = "macos")]
+pub async fn connect_account<T, S, C>(
+    account: &AccountId,
+    grant: AuthorizationGrant,
+    config: &TokenClientConfig,
+    transport: &T,
+    refresh_store: &S,
+    clock: &C,
+) -> Result<ConnectedAccount, TokenLifecycleError>
+where
+    T: TokenTransport,
+    S: RefreshTokenStore,
+    C: MonotonicClock,
+{
+    let success = exchange_grant(&grant, config, transport, clock)
+        .await
+        .map_err(TokenLifecycleError::Token)?;
+    drop(grant);
+    let (access_token, rotated_refresh, subject) = success.into_parts();
+    let refresh = rotated_refresh.ok_or(TokenLifecycleError::MissingRefreshToken)?;
+    refresh_store
+        .store(account, &refresh)
+        .map_err(TokenLifecycleError::Store)?;
+    Ok(ConnectedAccount {
+        access_token,
+        subject,
+    })
+}
+
+/// Refreshes the access token from the stored refresh token.
+///
+/// Loads the stored refresh token, refreshes, persists a rotated refresh token
+/// when the provider returns one, and returns the fresh access token with the
+/// re-verified subject. A subject-less refresh fails (fail-closed identity),
+/// leaving the stored token intact for a retry.
+///
+/// # Errors
+///
+/// Returns [`TokenLifecycleError::NoStoredToken`] when nothing is stored,
+/// [`TokenLifecycleError::Token`] when the refresh fails (including a
+/// missing/invalid identity), and [`TokenLifecycleError::Store`] on a Keychain
+/// read or write failure.
+#[cfg(target_os = "macos")]
+pub async fn refresh_account<T, S, C>(
+    account: &AccountId,
+    config: &TokenClientConfig,
+    transport: &T,
+    refresh_store: &S,
+    clock: &C,
+) -> Result<ConnectedAccount, TokenLifecycleError>
+where
+    T: TokenTransport,
+    S: RefreshTokenStore,
+    C: MonotonicClock,
+{
+    let stored = refresh_store
+        .load(account)
+        .map_err(TokenLifecycleError::Store)?
+        .ok_or(TokenLifecycleError::NoStoredToken)?;
+    let success = refresh_access_token(&stored, config, transport, clock)
+        .await
+        .map_err(TokenLifecycleError::Token)?;
+    drop(stored);
+    let (access_token, rotated_refresh, subject) = success.into_parts();
+    if let Some(refresh) = rotated_refresh {
+        refresh_store
+            .store(account, &refresh)
+            .map_err(TokenLifecycleError::Store)?;
+    }
+    Ok(ConnectedAccount {
+        access_token,
+        subject,
+    })
+}
+
+/// Proactively refreshes only when the access token is within `skew_margin` of
+/// expiry, so a sync never begins on a token that could expire mid-flight.
+///
+/// Returns `Ok(None)` when the current token is still fresh (no refresh
+/// performed), or `Ok(Some(..))` with the refreshed account.
+///
+/// # Errors
+///
+/// Propagates [`refresh_account`]'s errors when a refresh is due and fails.
+#[cfg(target_os = "macos")]
+pub async fn refresh_if_due<T, S, C>(
+    account: &AccountId,
+    access_token: &AccessToken,
+    skew_margin: core::time::Duration,
+    config: &TokenClientConfig,
+    transport: &T,
+    refresh_store: &S,
+    clock: &C,
+) -> Result<Option<ConnectedAccount>, TokenLifecycleError>
+where
+    T: TokenTransport,
+    S: RefreshTokenStore,
+    C: MonotonicClock,
+{
+    if access_token.needs_refresh(clock, skew_margin) {
+        let refreshed = refresh_account(account, config, transport, refresh_store, clock).await?;
+        Ok(Some(refreshed))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Builds the pinned current-thread `tokio` runtime that will drive the
@@ -578,5 +775,356 @@ mod tests {
         assert!(report.is_ok());
         // The gate passed, so the bounded sync ran exactly once.
         assert_eq!(sync_writes.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod token_lifecycle_tests {
+    #![expect(clippy::unwrap_used, reason = "tests construct valid fixtures")]
+
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use tersa_application::mailbox::{AccountId, BoxFuture};
+    use tersa_application::oauth::{
+        AuthorizationConfig, AuthorizationGrant, MonotonicClock, prepare_authorization,
+    };
+    use tersa_application::token::{
+        ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
+        TokenResponse, TokenTransport, TokenTransportError,
+    };
+    use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
+    use url::Url;
+    use zeroize::Zeroizing;
+
+    use super::{TokenLifecycleError, connect_account, refresh_account, refresh_if_due};
+
+    const CLIENT_ID: &str = "public-test-client";
+    const TEST_SUBJECT: &str = "sub-000123";
+
+    fn account() -> AccountId {
+        AccountId::new("account-a").unwrap()
+    }
+
+    fn redirect() -> Url {
+        Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap()
+    }
+
+    fn config() -> TokenClientConfig {
+        TokenClientConfig::new(CLIENT_ID, redirect(), None).unwrap()
+    }
+
+    fn drive<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("composition future must complete synchronously"),
+        }
+    }
+
+    fn make_grant() -> AuthorizationGrant {
+        let authorization_config =
+            AuthorizationConfig::new(CLIENT_ID, redirect(), Duration::from_secs(60)).unwrap();
+        let prepared = prepare_authorization(authorization_config, TestClock::at(0)).unwrap();
+        let state = prepared
+            .authorization_url()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let mut callback = redirect();
+        callback
+            .query_pairs_mut()
+            .append_pair("state", &state)
+            .append_pair("code", "test-code");
+        let (_config, mut session) = prepared.into_parts();
+        session.finish(&callback).unwrap()
+    }
+
+    fn valid_claims() -> IdTokenClaims {
+        IdTokenClaims::new(
+            Zeroizing::new(TEST_SUBJECT.to_owned()),
+            vec![CLIENT_ID.to_owned()],
+            "https://accounts.google.com".to_owned(),
+            None,
+        )
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestClock(Arc<AtomicU64>);
+
+    impl TestClock {
+        fn at(seconds: u64) -> Self {
+            Self(Arc::new(AtomicU64::new(seconds)))
+        }
+        fn set(&self, seconds: u64) {
+            self.0.store(seconds, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> Duration {
+            Duration::from_secs(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeTransport {
+        rotated_refresh_token: Option<Zeroizing<String>>,
+        claims: Option<IdTokenClaims>,
+    }
+
+    impl FakeTransport {
+        fn success(rotated: Option<&str>) -> Self {
+            Self {
+                rotated_refresh_token: rotated.map(|token| Zeroizing::new(token.to_owned())),
+                claims: Some(valid_claims()),
+            }
+        }
+        fn without_id_token() -> Self {
+            Self {
+                rotated_refresh_token: Some(Zeroizing::new("refresh".to_owned())),
+                claims: None,
+            }
+        }
+        fn response(&self) -> TokenResponse {
+            TokenResponse::new(
+                Zeroizing::new("fake-access-token".to_owned()),
+                Duration::from_secs(3_600),
+                self.rotated_refresh_token.clone(),
+                self.claims.clone(),
+            )
+        }
+    }
+
+    impl TokenTransport for FakeTransport {
+        fn exchange(
+            &self,
+            _request: ExchangeRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            let response = self.response();
+            Box::pin(async move { Ok(response) })
+        }
+        fn refresh(
+            &self,
+            _request: RefreshRequest,
+        ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+            let response = self.response();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    struct FakeRefreshStore {
+        stored: Mutex<Option<Zeroizing<String>>>,
+        fail: bool,
+    }
+
+    impl FakeRefreshStore {
+        fn empty() -> Self {
+            Self {
+                stored: Mutex::new(None),
+                fail: false,
+            }
+        }
+        fn with_token(token: &str) -> Self {
+            Self {
+                stored: Mutex::new(Some(Zeroizing::new(token.to_owned()))),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                stored: Mutex::new(None),
+                fail: true,
+            }
+        }
+        fn stored(&self) -> Option<String> {
+            self.stored
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|token| token.as_str().to_owned())
+        }
+    }
+
+    impl RefreshTokenStore for FakeRefreshStore {
+        fn store(
+            &self,
+            _account: &AccountId,
+            token: &Zeroizing<String>,
+        ) -> Result<(), RefreshTokenError> {
+            if self.fail {
+                return Err(RefreshTokenError::OperationFailed);
+            }
+            *self.stored.lock().unwrap() = Some(token.clone());
+            Ok(())
+        }
+        fn load(
+            &self,
+            _account: &AccountId,
+        ) -> Result<Option<Zeroizing<String>>, RefreshTokenError> {
+            if self.fail {
+                return Err(RefreshTokenError::OperationFailed);
+            }
+            Ok(self.stored.lock().unwrap().clone())
+        }
+        fn delete(&self, _account: &AccountId) -> Result<(), RefreshTokenError> {
+            *self.stored.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn connect_persists_the_refresh_token_and_returns_the_subject() {
+        let store = FakeRefreshStore::empty();
+        let connected = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &FakeTransport::success(Some("granted-refresh")),
+            &store,
+            &TestClock::at(0),
+        ))
+        .unwrap();
+        assert_eq!(connected.subject().as_str(), TEST_SUBJECT);
+        assert_eq!(store.stored().as_deref(), Some("granted-refresh"));
+    }
+
+    #[test]
+    fn connect_without_a_refresh_token_fails() {
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &FakeTransport::success(None),
+            &FakeRefreshStore::empty(),
+            &TestClock::at(0),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::MissingRefreshToken));
+    }
+
+    #[test]
+    fn connect_propagates_a_missing_identity_without_deleting_the_credential() {
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &FakeTransport::without_id_token(),
+            &FakeRefreshStore::empty(),
+            &TestClock::at(0),
+        ))
+        .unwrap_err();
+        // IdentityUnverified is non-destructive — never ConsentRevoked.
+        assert!(matches!(
+            error,
+            TokenLifecycleError::Token(TokenError::IdentityUnverified)
+        ));
+    }
+
+    #[test]
+    fn refresh_loads_refreshes_and_persists_a_rotated_token() {
+        let store = FakeRefreshStore::with_token("old-refresh");
+        let connected = drive(refresh_account(
+            &account(),
+            &config(),
+            &FakeTransport::success(Some("rotated-refresh")),
+            &store,
+            &TestClock::at(0),
+        ))
+        .unwrap();
+        assert_eq!(connected.subject().as_str(), TEST_SUBJECT);
+        assert_eq!(store.stored().as_deref(), Some("rotated-refresh"));
+    }
+
+    #[test]
+    fn refresh_keeps_the_stored_token_when_not_rotated() {
+        let store = FakeRefreshStore::with_token("kept-refresh");
+        drive(refresh_account(
+            &account(),
+            &config(),
+            &FakeTransport::success(None),
+            &store,
+            &TestClock::at(0),
+        ))
+        .unwrap();
+        assert_eq!(store.stored().as_deref(), Some("kept-refresh"));
+    }
+
+    #[test]
+    fn refresh_without_a_stored_token_fails() {
+        let error = drive(refresh_account(
+            &account(),
+            &config(),
+            &FakeTransport::success(Some("refresh")),
+            &FakeRefreshStore::empty(),
+            &TestClock::at(0),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::NoStoredToken));
+    }
+
+    #[test]
+    fn refresh_surfaces_a_store_failure() {
+        let error = drive(refresh_account(
+            &account(),
+            &config(),
+            &FakeTransport::success(Some("refresh")),
+            &FakeRefreshStore::failing(),
+            &TestClock::at(0),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Store(_)));
+    }
+
+    #[test]
+    fn refresh_if_due_skips_a_fresh_token_and_refreshes_a_stale_one() {
+        let clock = TestClock::at(0);
+        let store = FakeRefreshStore::empty();
+        // Connect at t=0: the access token expires at t=3600.
+        let connected = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &FakeTransport::success(Some("granted-refresh")),
+            &store,
+            &clock,
+        ))
+        .unwrap();
+        let (access_token, _subject) = connected.into_parts();
+
+        // Still fresh at t=0 with a 60s skew: no refresh runs.
+        let outcome = drive(refresh_if_due(
+            &account(),
+            &access_token,
+            Duration::from_secs(60),
+            &config(),
+            &FakeTransport::success(Some("rotated")),
+            &store,
+            &clock,
+        ))
+        .unwrap();
+        assert!(outcome.is_none());
+
+        // Within the skew of expiry at t=3560: a refresh runs and rotates.
+        clock.set(3_560);
+        let outcome = drive(refresh_if_due(
+            &account(),
+            &access_token,
+            Duration::from_secs(60),
+            &config(),
+            &FakeTransport::success(Some("rotated")),
+            &store,
+            &clock,
+        ))
+        .unwrap();
+        assert!(outcome.is_some());
+        assert_eq!(store.stored().as_deref(), Some("rotated"));
     }
 }

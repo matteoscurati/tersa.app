@@ -7600,6 +7600,7 @@ dependencies = [
  "tersa-keychain-macos",
  "tersa-store-sqlcipher-macos",
  "tokio",
+ "url",
  "zeroize",
 ]
 
@@ -9579,6 +9580,7 @@ dependencies = [
  "cargo_metadata",
  "plist",
  "serde",
+ "serde_json",
  "yaml_serde",
 ]
 

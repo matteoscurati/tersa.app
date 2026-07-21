@@ -15,5 +15,8 @@ plist.workspace = true
 serde = { version = "=1.0.228", default-features = false, features = ["std"] }
 yaml_serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -158,11 +158,48 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
   reused) before the 3f live run; this is a **merge-blocking gate on 3f**, not a
   Phase-1 mechanism change. The gate mechanism is identifier-agnostic — it hashes an
   opaque string and stores only the salted hash — so the swap is confined to adding
-  the `openid` scope, reading `sub` from the token-exchange `id_token`, and having the
+  the `openid` scope, reading `sub` from **every** token response's `id_token`
+  (exchange **and** refresh — a periodic refresh-driven sync after a restart holds no
+  in-memory `sub`, so it must be re-derived from the refresh response), and having the
   connected session implement the profile port from its held `sub`; the salted-hash
   store, the decision logic, and the fail-closed/atomic-clear guarantees are
   unchanged. (Source: the 3d-2a independent review — a confirmed critical — and the
   Fable judgement verdict.)
+  - **`id_token` decode is signature-unverified, by design (3d-2b).** The `id_token`
+    is only ever read from the token-endpoint response body, received over the token
+    transport's hardened TLS client directly from the token endpoint — never from a
+    front channel. The TLS origin authenticates the issuer, so its signature is not
+    verified (OIDC Core 3.1.3.7). This TLS-back-channel precondition is load-bearing:
+    the decode helper is private to the token transport, and the `aud == client_id`
+    check (with `iss` restricted to the Google issuers and a non-empty bounded `sub`)
+    is what makes the decode-only posture sound. The day an `id_token` is accepted
+    from any non-back-channel source, signature verification becomes mandatory.
+  - **What 3d-2b landed:** the `openid` scope, the transport-confined `id_token`
+    decode, semantic `aud`/`iss`/`sub` validation surfacing a validated subject on
+    the token response, and the generic token-lifecycle composition (connect / refresh
+    / proactive-refresh). A subject-less token response fails as a **non-destructive**
+    `IdentityUnverified` (the stored refresh token is retained for retry), never the
+    destructive consent-revoked terminal. 3d-2b makes the `sub` available; wiring it
+    to the gate (the port rename, retiring the `emailAddress` GET, and the HKDF
+    domain-label/version bump) lands with the concrete session in 3d-3.
+  - **`exp`/`iat` validation — a 3d-3-blocking gate (amended 2026-07-21).** 3d-2b
+    deliberately does NOT validate the `id_token`'s `exp`/`iat`: the token is always
+    freshly minted over the confined TLS back channel (so `exp` is always in the
+    future) AND the `sub` reaches no consumer in this slice, so the check would be
+    inert twice over, and validating a Unix-time claim needs a wall clock the pure
+    token layer deliberately excludes (it keeps `MonotonicClock` only). 3d-3 MUST,
+    as a merge-blocking acceptance criterion, validate the claims **in the concrete
+    session, before the subject feeds the identity gate, on EVERY token response
+    (exchange and refresh)** using a **wall clock (Unix time) owned by the
+    session/composition** — no wall-clock port is threaded into the pure token
+    layer. Required checks: `exp` present and `now < exp + skew`; `iat` present and
+    `iat <= now + skew` (reject a future-minted token); one fixed skew constant
+    ≤ 5 minutes. Failure is the existing **non-destructive** `IdentityUnverified`
+    (refresh token retained), never consent-revoked. TRIPWIRE (restated): the moment
+    any non-back-channel `id_token` source is introduced, **signature verification
+    AND `exp`/`iat`/`nonce` validation become mandatory at the acceptance point** —
+    no deferral. (Source: the 3d-2b independent review — a Sol confirmed finding —
+    and the Fable judgement verdict.)
 
 ### Read-only enforcement
 
