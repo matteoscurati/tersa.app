@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use tersa_domain::mailbox::AccountId;
 
+use crate::identity::IdentityHash;
 #[cfg(test)]
 use crate::mailbox::MailboxReader;
 use crate::mailbox::{
@@ -115,6 +116,11 @@ pub enum SyncFailureSource {
     Protocol(SyncProtocolError),
     /// Another sync is already active for this account.
     SingleFlight,
+    /// The in-transaction identity fence aborted a write: the recorded account
+    /// identity changed (or vanished) between the gate and this write, so a stale
+    /// cycle's envelopes or bodies were rolled back rather than persisted under a
+    /// different account.
+    IdentityFenced,
 }
 
 /// Names a content-free bounded-sync protocol violation.
@@ -238,10 +244,11 @@ where
         &'a self,
         account: &'a AccountId,
         policy: SyncPolicy,
+        fence: &'a IdentityHash,
     ) -> BoxFuture<'a, Result<SyncReport, SyncFailure>> {
         Box::pin(async move {
             let flight = self.acquire(account)?;
-            let result = self.sync_with_flight(account, policy).await;
+            let result = self.sync_with_flight(account, policy, fence).await;
             drop(flight);
             result
         })
@@ -268,6 +275,7 @@ where
         &self,
         account: &AccountId,
         policy: SyncPolicy,
+        fence: &IdentityHash,
     ) -> Result<SyncReport, SyncFailure> {
         let mut progress = SyncProgress::default();
         let capacity = usize::from(policy.keep_limit.get());
@@ -336,9 +344,9 @@ where
 
         let survivors = self
             .store
-            .reconcile_recent_envelopes(account, &envelopes, policy.keep_limit)
+            .reconcile_recent_envelopes(account, &envelopes, policy.keep_limit, fence)
             .await
-            .map_err(|error| failure(SyncFailureSource::Store(error), progress))?;
+            .map_err(|error| failure(store_failure_source(error), progress))?;
         let body_limit = usize::from(policy.full_body_limit.get());
         for id in survivors.into_iter().take(body_limit) {
             progress.body_requests += 1;
@@ -354,9 +362,9 @@ where
                     }
                     if self
                         .store
-                        .cache_message_if_present(account, &message)
+                        .cache_message_if_present(account, &message, fence)
                         .await
-                        .map_err(|error| failure(SyncFailureSource::Store(error), progress))?
+                        .map_err(|error| failure(store_failure_source(error), progress))?
                     {
                         progress.bodies_cached += 1;
                     } else {
@@ -373,6 +381,15 @@ where
 
 fn failure(source: SyncFailureSource, progress: SyncProgress) -> SyncFailure {
     SyncFailure { source, progress }
+}
+
+/// Maps a store error to a sync-failure source, surfacing the in-transaction
+/// identity fence as its own category rather than a generic store failure.
+fn store_failure_source(error: MailboxStoreError) -> SyncFailureSource {
+    match error {
+        MailboxStoreError::IdentityChanged => SyncFailureSource::IdentityFenced,
+        other => SyncFailureSource::Store(other),
+    }
 }
 
 struct SyncFlight<'a, R, S> {
@@ -451,6 +468,7 @@ mod tests {
     struct TestStore {
         reconciles: Mutex<u16>,
         survivors: Mutex<Option<Vec<MessageId>>>,
+        reconcile_error: Mutex<Option<MailboxStoreError>>,
         cache_results: Mutex<Vec<Result<bool, MailboxStoreError>>>,
         cached_ids: Mutex<Vec<MessageId>>,
         put_calls: Mutex<u16>,
@@ -476,8 +494,12 @@ mod tests {
             _: &'a AccountId,
             values: &'a [MessageEnvelope],
             _: StoreLimit,
+            _: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
             *self.reconciles.lock().unwrap() += 1;
+            if let Some(error) = self.reconcile_error.lock().unwrap().take() {
+                return Box::pin(ready(Err(error)));
+            }
             let configured = self.survivors.lock().unwrap().clone();
             Box::pin(ready(Ok(configured.unwrap_or_else(|| {
                 values
@@ -490,6 +512,7 @@ mod tests {
             &'a self,
             _: &'a AccountId,
             message: &'a Message,
+            _: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
             self.cached_ids
                 .lock()
@@ -556,6 +579,9 @@ mod tests {
         )
         .unwrap()
     }
+    fn fence() -> IdentityHash {
+        IdentityHash::from_bytes([0; 32])
+    }
     fn run<T>(future: impl Future<Output = T>) -> T {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -576,7 +602,7 @@ mod tests {
             ]),
             TestStore::default(),
         );
-        let report = run(coordinator.sync_recent(&account(), policy())).unwrap();
+        let report = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap();
         assert_eq!(report.progress().pages, 2);
         assert_eq!(report.progress().envelopes, 1);
         assert_eq!(*coordinator.store.reconciles.lock().unwrap(), 1);
@@ -592,7 +618,7 @@ mod tests {
             ]),
             TestStore::default(),
         );
-        let error = run(coordinator.sync_recent(&account(), policy())).unwrap_err();
+        let error = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap_err();
         assert_eq!(
             error.category(),
             SyncFailureSource::Protocol(SyncProtocolError::RepeatedContinuation)
@@ -623,7 +649,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = run(coordinator.sync_recent(&account(), two_pages)).unwrap();
+        let report = run(coordinator.sync_recent(&account(), two_pages, &fence())).unwrap();
 
         assert_eq!(report.progress().pages, 2);
         assert!(report.progress().snapshot_truncated);
@@ -639,7 +665,7 @@ mod tests {
             ))]),
             TestStore::default(),
         );
-        let error = run(coordinator.sync_recent(&account(), policy())).unwrap_err();
+        let error = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap_err();
         assert_eq!(
             error.category(),
             SyncFailureSource::Protocol(SyncProtocolError::ConflictingDuplicate)
@@ -664,7 +690,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = run(coordinator.sync_recent(&account(), keep_one)).unwrap_err();
+        let error = run(coordinator.sync_recent(&account(), keep_one, &fence())).unwrap_err();
 
         assert_eq!(
             error.category(),
@@ -691,7 +717,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = run(coordinator.sync_recent(&account(), keep_one)).unwrap_err();
+        let error = run(coordinator.sync_recent(&account(), keep_one, &fence())).unwrap_err();
 
         assert_eq!(
             error.category(),
@@ -747,7 +773,7 @@ mod tests {
             StoreLimit::new(1).unwrap(),
         )
         .unwrap();
-        let error = run(coordinator.sync_recent(&account(), one_item_pages)).unwrap_err();
+        let error = run(coordinator.sync_recent(&account(), one_item_pages, &fence())).unwrap_err();
         assert_eq!(
             error.category(),
             SyncFailureSource::Protocol(SyncProtocolError::OversizedPage)
@@ -772,7 +798,7 @@ mod tests {
             StoreLimit::new(1).unwrap(),
         )
         .unwrap();
-        let report = run(coordinator.sync_recent(&account(), three_item_pages)).unwrap();
+        let report = run(coordinator.sync_recent(&account(), three_item_pages, &fence())).unwrap();
         assert_eq!(report.progress().envelopes, 2);
         assert_eq!(*coordinator.store.reconciles.lock().unwrap(), 1);
     }
@@ -790,7 +816,7 @@ mod tests {
         *store.cache_results.lock().unwrap() = vec![Ok(false)];
         let coordinator = SyncCoordinator::new(remote, store);
 
-        let report = run(coordinator.sync_recent(&account(), policy())).unwrap();
+        let report = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap();
 
         assert_eq!(report.progress().body_requests, 1);
         assert_eq!(report.progress().bodies_cached, 0);
@@ -807,6 +833,42 @@ mod tests {
             ["retained"]
         );
         assert_eq!(*coordinator.store.put_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_fenced_reconcile_surfaces_as_identity_fenced_not_a_generic_store_failure() {
+        // The in-transaction identity fence aborts a stale cycle's envelope write
+        // with `IdentityChanged`; the coordinator must map it to its own
+        // `IdentityFenced` category so a caller can tell "the account changed
+        // underneath me" apart from an ordinary storage fault.
+        let remote = TestRemote::new(vec![Ok(Page::new(vec![envelope("one", 1)], None))]);
+        let store = TestStore::default();
+        *store.reconcile_error.lock().unwrap() = Some(MailboxStoreError::IdentityChanged);
+        let coordinator = SyncCoordinator::new(remote, store);
+
+        let error = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap_err();
+
+        assert_eq!(error.category(), SyncFailureSource::IdentityFenced);
+        // The abort happens at the reconcile write, before any body fetch.
+        assert_eq!(error.progress().body_requests, 0);
+    }
+
+    #[test]
+    fn a_fenced_body_cache_surfaces_as_identity_fenced_not_a_generic_store_failure() {
+        // The body write is fenced too (message IDs are not distinct across
+        // accounts), so a fence abort there must also map to `IdentityFenced`.
+        let retained = message("retained", 20);
+        let remote = TestRemote::new(vec![Ok(Page::new(vec![retained.envelope().clone()], None))])
+            .with_fetch_results(vec![Ok(retained)]);
+        let store = TestStore::default();
+        *store.survivors.lock().unwrap() = Some(vec![MessageId::new("retained").unwrap()]);
+        *store.cache_results.lock().unwrap() = vec![Err(MailboxStoreError::IdentityChanged)];
+        let coordinator = SyncCoordinator::new(remote, store);
+
+        let error = run(coordinator.sync_recent(&account(), policy(), &fence())).unwrap_err();
+
+        assert_eq!(error.category(), SyncFailureSource::IdentityFenced);
+        assert_eq!(error.progress().body_requests, 1);
     }
 
     #[test]
@@ -834,7 +896,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = run(coordinator.sync_recent(&account(), two_bodies)).unwrap();
+        let report = run(coordinator.sync_recent(&account(), two_bodies, &fence())).unwrap();
 
         assert_eq!(report.progress().body_requests, 2);
         assert_eq!(report.progress().bodies_cached, 1);
@@ -903,22 +965,24 @@ mod tests {
         let coordinator = SyncCoordinator::new(PendingRemote::default(), TestStore::default());
         let first_account = account();
         let second_account = AccountId::new("other-account").unwrap();
+        let held_fence = fence();
 
-        let unpolled = coordinator.sync_recent(&first_account, policy());
+        let unpolled = coordinator.sync_recent(&first_account, policy(), &held_fence);
         assert!(coordinator.active_accounts.lock().unwrap().is_empty());
         assert!(coordinator.remote.list_calls.lock().unwrap().is_empty());
         drop(unpolled);
 
-        let mut first = Box::pin(coordinator.sync_recent(&first_account, policy()));
+        let mut first = Box::pin(coordinator.sync_recent(&first_account, policy(), &held_fence));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
         assert_eq!(coordinator.active_accounts.lock().unwrap().len(), 1);
 
-        let duplicate = run(coordinator.sync_recent(&first_account, policy())).unwrap_err();
+        let duplicate =
+            run(coordinator.sync_recent(&first_account, policy(), &held_fence)).unwrap_err();
         assert_eq!(duplicate.category(), SyncFailureSource::SingleFlight);
 
-        let mut other = Box::pin(coordinator.sync_recent(&second_account, policy()));
+        let mut other = Box::pin(coordinator.sync_recent(&second_account, policy(), &held_fence));
         assert!(matches!(other.as_mut().poll(&mut context), Poll::Pending));
         assert_eq!(coordinator.active_accounts.lock().unwrap().len(), 2);
         drop(other);
@@ -937,7 +1001,9 @@ mod tests {
             TestStore::default(),
         );
         let local_account = account();
-        let mut operation = Box::pin(coordinator.sync_recent(&local_account, policy()));
+        let held_fence = fence();
+        let mut operation =
+            Box::pin(coordinator.sync_recent(&local_account, policy(), &held_fence));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
 

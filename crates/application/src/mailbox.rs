@@ -14,6 +14,8 @@
 use std::fmt;
 use std::pin::Pin;
 
+use crate::identity::IdentityHash;
+
 #[doc(inline)]
 pub use tersa_domain::mailbox::{
     AccountId, HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
@@ -220,12 +222,17 @@ pub enum MailboxStoreError {
     Storage,
     /// Stored mailbox data failed an integrity or format check.
     Corrupted,
+    /// The recorded account identity changed (or vanished) between the gate's
+    /// decision and this write — the in-transaction identity fence aborted the
+    /// write so a stale cycle can never persist under a different account.
+    IdentityChanged,
 }
 impl fmt::Display for MailboxStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "local mailbox storage failed",
             Self::Corrupted => "local mailbox storage is corrupted",
+            Self::IdentityChanged => "the account identity changed during the write",
         })
     }
 }
@@ -301,12 +308,21 @@ pub trait MailboxReader: Send + Sync {
 /// deferred.
 pub trait MailboxStore: MailboxReader {
     /// Inserts or replaces mailbox envelopes for an account.
+    ///
+    /// Unlike [`Self::reconcile_recent_envelopes`], this write is **not** identity-
+    /// fenced: it must not be wired into the bounded-sync write path, which carries
+    /// a `fence` so a stale cycle can never persist under a changed account. Reserve
+    /// it for gate/bootstrap contexts where the caller already holds the identity
+    /// invariant; the sync coordinator only ever calls the two fenced writers.
     fn upsert_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
         envelopes: &'a [MessageEnvelope],
     ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
     /// Inserts or replaces one complete message for an account.
+    ///
+    /// Not identity-fenced — same caveat as [`Self::upsert_envelopes`]. The fenced
+    /// body write on the sync path is [`Self::cache_message_if_present`].
     fn put_message<'a>(
         &'a self,
         account: &'a AccountId,
@@ -320,20 +336,31 @@ pub trait MailboxStore: MailboxReader {
     /// duplicate-free subsequence of input encounter order and name only input
     /// rows that survived that deterministic pruning.
     /// Implementations reject an input longer than [`StoreLimit::MAX`].
+    ///
+    /// `fence` is the account-identity hash the sync cycle computed at its gate.
+    /// The write commits only if the store's recorded identity for `account` still
+    /// equals `fence` inside the same transaction; a changed or missing identity
+    /// aborts with [`MailboxStoreError::IdentityChanged`], so a stale cycle can
+    /// never persist envelopes under a different account.
     fn reconcile_recent_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
         envelopes: &'a [MessageEnvelope],
         keep_limit: StoreLimit,
+        fence: &'a IdentityHash,
     ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>>;
     /// Caches a complete message only if its envelope row is still present.
     ///
     /// This is one atomic conditional mutation. It never inserts a missing row
-    /// and reports whether the existing row was updated.
+    /// and reports whether the existing row was updated. It is fenced by the
+    /// account-identity hash exactly as [`Self::reconcile_recent_envelopes`] is:
+    /// a stale body-fetch cannot land a cache write under a different account,
+    /// even on a colliding message identifier.
     fn cache_message_if_present<'a>(
         &'a self,
         account: &'a AccountId,
         message: &'a Message,
+        fence: &'a IdentityHash,
     ) -> BoxFuture<'a, Result<bool, MailboxStoreError>>;
     /// Retrieves an optional complete message.
     fn message<'a>(
@@ -534,6 +561,7 @@ mod tests {
             account: &'a AccountId,
             values: &'a [MessageEnvelope],
             keep_limit: StoreLimit,
+            _fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
             if values.len() > usize::from(StoreLimit::MAX) {
                 return Box::pin(ready(Err(MailboxStoreError::Storage)));
@@ -585,6 +613,7 @@ mod tests {
             &'a self,
             account: &'a AccountId,
             value: &'a Message,
+            _fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
             let exists = self
                 .envelopes
