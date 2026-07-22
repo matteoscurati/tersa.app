@@ -82,6 +82,32 @@ impl fmt::Display for ReadOnlyMailboxOpenError {
 
 impl std::error::Error for ReadOnlyMailboxOpenError {}
 
+/// Closed, redacted failure returned by the trusted writable-store composition
+/// that the sync worker drives.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum MailboxStoreOpenError {
+    /// The existing Keychain root could not be retrieved or validated.
+    KeyAccess,
+    /// The fixed profile location or its storage is unavailable.
+    ProfileUnavailable,
+    /// The encrypted mailbox failed strict validation.
+    MailboxCorrupted,
+}
+
+impl fmt::Debug for MailboxStoreOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MailboxStoreOpenError([REDACTED])")
+    }
+}
+
+impl fmt::Display for MailboxStoreOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("writable mailbox opening failed")
+    }
+}
+
+impl std::error::Error for MailboxStoreOpenError {}
+
 // Rust guideline compliant 1.0.
 
 #[cfg(any(target_os = "macos", test))]
@@ -479,6 +505,67 @@ fn open_read_only_mailbox(
         tersa_store_sqlcipher_macos::ReadOnlyMailboxOpenFailure::Corrupted => {
             ReadOnlyMailboxOpenError::MailboxCorrupted
         }
+    })
+}
+
+/// Opens the writable encrypted mailbox store for `account` on the fixed product
+/// profile, deriving its per-account `SQLCipher` key from the installation root key.
+///
+/// This is the writable counterpart of [`open_default_read_only_mailbox`]: the
+/// sync worker's whole-cycle composition writes through the returned store, whose
+/// identity-fenced and compare-and-set guarantees keep one account's mail from ever
+/// persisting under another. The key derivation and profile path are identical to
+/// the read-only path, so the two views address the same encrypted database.
+///
+/// # Errors
+///
+/// Returns a closed [`MailboxStoreOpenError`]: [`MailboxStoreOpenError::KeyAccess`]
+/// when the root key is unavailable, [`MailboxStoreOpenError::ProfileUnavailable`]
+/// when the profile location or storage is unavailable, and
+/// [`MailboxStoreOpenError::MailboxCorrupted`] when the encrypted database fails
+/// strict validation.
+#[cfg(target_os = "macos")]
+pub fn open_default_mailbox_store(
+    account: &AccountId,
+) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxStore, MailboxStoreOpenError> {
+    let backend = ProductionBackend::new().map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
+    let locator = ProductionContainerLocator::new()
+        .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
+    open_mailbox_store(&backend, &locator, account)
+}
+
+#[cfg(target_os = "macos")]
+fn open_mailbox_store(
+    retriever: &impl RootKeyRetriever,
+    locator: &impl ContainerLocator,
+    account: &AccountId,
+) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxStore, MailboxStoreOpenError> {
+    let root = retriever
+        .copy()
+        .map_err(|_error| MailboxStoreOpenError::KeyAccess)?
+        .ok_or(MailboxStoreOpenError::KeyAccess)?;
+    let key = derive_account_key(
+        &root,
+        account,
+        AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+    )
+    .map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
+    drop(root);
+    let path = account_database_path(locator, account)
+        .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
+    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        account.clone(),
+        path,
+        key.into_database_key(),
+    )
+    .map_err(|failure| match failure {
+        tersa_application::mailbox::MailboxStoreError::Corrupted => {
+            MailboxStoreOpenError::MailboxCorrupted
+        }
+        // Storage faults and any future non-exhaustive variant map to the closed
+        // "profile unavailable" — a store open never legitimately yields an
+        // identity-write error, so those collapse here too rather than leak.
+        _ => MailboxStoreOpenError::ProfileUnavailable,
     })
 }
 
@@ -4347,6 +4434,84 @@ mod tests {
         assert!(matches!(
             open_read_only_mailbox(&wrong, &profile.locator(), &account),
             Err(ReadOnlyMailboxOpenError::MailboxCorrupted)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writable_composition_opens_the_persistent_store_under_the_same_root() {
+        let root = [7; 32];
+        let account = account_id();
+        let profile = TestProfile::new("writable-success");
+        // Establish the encrypted database (and its profile directories) under the
+        // true root, then confirm the composition reopens the SAME database.
+        let derived = derive_account_key(
+            &SecretKey::new(root),
+            &account,
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+            account.clone(),
+            profile.database_path(&account),
+            derived.into_database_key(),
+        )
+        .unwrap();
+        drop(store);
+        let retriever = RetrievalOnlyFake {
+            result: Ok(Some(root)),
+            copies: AtomicUsize::new(0),
+        };
+
+        let reopened = open_mailbox_store(&retriever, &profile.locator(), &account);
+        assert!(reopened.is_ok());
+        assert_eq!(retriever.copies.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writable_composition_maps_missing_root_to_key_access() {
+        let retriever = RetrievalOnlyFake {
+            result: Ok(None),
+            copies: AtomicUsize::new(0),
+        };
+        let profile = TestProfile::new("writable-missing-root");
+
+        assert!(matches!(
+            open_mailbox_store(&retriever, &profile.locator(), &account_id()),
+            Err(MailboxStoreOpenError::KeyAccess)
+        ));
+        assert_eq!(retriever.copies.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writable_composition_maps_a_wrong_root_to_corruption() {
+        let account = account_id();
+        let profile = TestProfile::new("writable-wrong-root");
+        // Create the database under the true root.
+        let derived = derive_account_key(
+            &SecretKey::new([7; 32]),
+            &account,
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+            account.clone(),
+            profile.database_path(&account),
+            derived.into_database_key(),
+        )
+        .unwrap();
+        drop(store);
+        // A different root derives a different key: the encrypted database fails
+        // strict validation rather than silently opening a fresh one.
+        let wrong = RetrievalOnlyFake {
+            result: Ok(Some([8; 32])),
+            copies: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            open_mailbox_store(&wrong, &profile.locator(), &account),
+            Err(MailboxStoreOpenError::MailboxCorrupted)
         ));
     }
     #[test]
