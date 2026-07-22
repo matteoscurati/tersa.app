@@ -332,6 +332,24 @@ verdict that the fence alone was the guarantee.)
     / iOS finish) is 3d-3c-3. A blocking-acquire permit variant for disconnect is
     deferred to 3d-3d, where its caller lands.
 
+  - **3d-3c-3a/3b landed the connect→sync composition (amended 2026-07-22).** 3d-3c-3a
+    added `open_default_mailbox_store` (keychain-macos), the writable counterpart of
+    `open_default_read_only_mailbox` the worker writes through. 3d-3c-3b added
+    `begin_default_account_sync(account, config)`: it refreshes the account's stored
+    token, builds the session/store/hasher, and drives the worker — and the whole-cycle
+    permit now covers the **token refresh** as well, not just the gate-to-write. This
+    matters because `refresh_account` can rotate and persist the refresh token, so two
+    concurrent begins for one slot refreshing in parallel could race the
+    `RefreshTokenStore` write and lose a rotation; acquiring the permit before the
+    refresh (and building every Keychain/network object inside the permitted worker
+    thread, so a busy slot builds nothing) closes that. The worker core was generalized
+    to an error-agnostic `Future<Output = i32>` op so it drives both a bare
+    `gated_sync` and this refresh-then-sync cycle; a missing stored token maps to a
+    distinct `STATUS_NEEDS_RECONNECT` (re-consent, not retry), while setup/refresh/
+    session failures collapse to the opaque sync-failed code (no oracle). Isolating the
+    network stack out of the minimal bootstrap bridge, the `extern "C"` sync-begin/poll
+    FFI will live in a **separate crate** (not `apple/rust-bridge`), a later slice.
+
   - **3d-3b landed part (2), the fence (amended 2026-07-21).** `run_identity_gate`
     now returns the identity hash it committed (on `Match`, the hash it just
     verified) as the cycle's fence; `gated_sync` threads it into `sync_recent`, and
