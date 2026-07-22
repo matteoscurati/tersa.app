@@ -6131,7 +6131,7 @@ fn check_mime_dependency(
 ) {
     const MIME_SPIKE: &str = "tersa-mime-spike";
     let expected = match dependency.name.as_str() {
-        "ammonia" => Some("=4.1.3"),
+        "ammonia" => Some("=4.1.4"),
         "mail-parser" => Some("=0.11.5"),
         _ => None,
     };
