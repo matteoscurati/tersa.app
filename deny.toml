@@ -16,6 +16,8 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Slint 1.16.1 pins paste through its image stack; revalidate before 2026-08-15 and before closing the production UI gate" },
     { id = "RUSTSEC-2026-0192", reason = "Slint 1.16.1 pins ttf-parser through its text stack; revalidate before 2026-08-15 and before closing the production UI gate" },
     { id = "RUSTSEC-2026-0206", reason = "Slint 1.16.1 pins rustybuzz through its SVG stack; revalidate before 2026-08-15 and before closing the production UI gate" },
+    { id = "RUSTSEC-2026-0194", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (wayland-scanner requires ^0.39, so unbumpable without a Slint release using >=0.41; Slint 1.17 needs Rust 1.92 and still resolves 0.39.4); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
+    { id = "RUSTSEC-2026-0195", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (see RUSTSEC-2026-0194); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
 ]
 
 [bans]
