@@ -5173,10 +5173,10 @@ fn tokio_manifest_dependency_violations(
         ));
     }
     let features: BTreeSet<&str> = features.iter().map(String::as_str).collect();
-    let expected: BTreeSet<&str> = ["net", "rt", "time"].into_iter().collect();
+    let expected: BTreeSet<&str> = ["net", "rt", "sync", "time"].into_iter().collect();
     if features != expected {
         violations.push(format!(
-            "{package_name} -> tokio must enable exactly the current-thread runtime features net, rt, time"
+            "{package_name} -> tokio must enable exactly the current-thread runtime features net, rt, sync, time"
         ));
     }
     violations

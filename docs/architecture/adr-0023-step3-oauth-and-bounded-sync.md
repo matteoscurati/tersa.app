@@ -309,6 +309,29 @@ verdict that the fence alone was the guarantee.)
     the sole-caller worker's per-slot whole-cycle permit — remains a 3d-3c-2
     criterion (defense-in-depth in-process; the CAS is the cross-process guarantee).
 
+  - **3d-3c-2 landed part (1a)'s permit + worker (amended 2026-07-22).** A
+    process-global, per-`AccountId`, grow-only registry of permits lives in
+    `tersa-oauth-sync-macos` (`permit.rs`, macOS-only). Each permit is a per-slot
+    `tokio::sync::Mutex<()>` and the guard is an `OwnedMutexGuard<()>` — a
+    **deliberate deviation** from the Fable ruling's literal "per-slot blocking
+    `Mutex<()>`": a `std` guard is `!Send` and could not be moved onto the worker
+    thread after the pre-spawn acquire, whereas `OwnedMutexGuard` is `Send` and
+    non-poisoning; the semantics the ruling fixed (one atomic claim, `try` == busy,
+    a blocking variant reserved for disconnect) are preserved. The Rust-owned worker
+    (`worker.rs`) claims the permit with `try_acquire` **before** spawning (a busy
+    slot returns `Busy` and never spawns — ruling #5), spawns one thread that
+    `block_on`s `gated_sync` on a private current-thread runtime holding the permit
+    for the whole cycle, and releases it **before** publishing the closed terminal
+    status int. Cancellation is a `tokio::time::timeout` poll of the cancel
+    `AtomicBool` every 50 ms that drops the in-flight sync future (drop-safe). Status
+    ints collapse all gate sub-reasons and all sync sub-reasons (incl. an
+    `IdentityFenced` trip) to one code each — no identity/presence oracle. This
+    required tokio's `sync` feature (`{net, rt, sync, time}`; xtask allowlist
+    updated). The worker is a pure-Rust API here; wiring it as the **sole production
+    caller** (FFI `begin`/`poll` symbols + the grant-forward from `complete_callback`
+    / iOS finish) is 3d-3c-3. A blocking-acquire permit variant for disconnect is
+    deferred to 3d-3d, where its caller lands.
+
   - **3d-3b landed part (2), the fence (amended 2026-07-21).** `run_identity_gate`
     now returns the identity hash it committed (on `Match`, the hash it just
     verified) as the cycle's fence; `gated_sync` threads it into `sync_recent`, and

@@ -49,6 +49,13 @@ use tersa_gmail_rest_macos::GmailMailbox;
 #[cfg(target_os = "macos")]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 
+// The per-slot whole-cycle permit and the Rust-owned worker that holds it are
+// macOS-only: they depend on the platform's tokio runtime and the Gmail session.
+#[cfg(target_os = "macos")]
+mod permit;
+#[cfg(target_os = "macos")]
+pub mod worker;
+
 /// Reports why a gated sync stopped before or during the bounded sync.
 #[derive(Debug)]
 #[non_exhaustive]

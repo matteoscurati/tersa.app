@@ -54,7 +54,7 @@ tantivy = { version = "=0.26.1", default-features = false }
 tersa-application = { path = "crates/application", version = "=0.0.0" }
 tersa-domain = { path = "crates/domain", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt", "net", "time"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt", "net", "sync", "time"] }
 url = "2.5.8"
 zeroize = "1.9.0"
 yaml_serde = { version = "=0.10.4", default-features = false }
