@@ -7583,6 +7583,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-mailbox-sync-ffi-macos"
+version = "0.0.0"
+dependencies = [
+ "tersa-application",
+ "tersa-oauth-sync-macos",
+ "url",
+]
+
+[[package]]
 name = "tersa-mime-spike"
 version = "0.0.0"
 dependencies = [

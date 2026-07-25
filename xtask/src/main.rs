@@ -31,7 +31,7 @@ struct ResolvedDependencyIdentity {
     package_id: PackageId,
 }
 
-const SQLCIPHER_OWNERS: [&str; 6] = [
+const SQLCIPHER_OWNERS: [&str; 7] = [
     "tersa-search-spike",
     "tersa-sqlcipher-spike",
     "tersa-store-sqlcipher-macos",
@@ -39,13 +39,19 @@ const SQLCIPHER_OWNERS: [&str; 6] = [
     "tersa-cli-macos",
     // 3d: the trusted composition reconciles sync into the encrypted store.
     "tersa-oauth-sync-macos",
+    // 3d: the mailbox-sync FFI reaches the store only through the composition; its
+    // closed direct-dependency set forbids declaring rusqlite directly.
+    "tersa-mailbox-sync-ffi-macos",
 ];
 const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const HMAC_OWNERS: [&str; 3] = [
+const HMAC_OWNERS: [&str; 4] = [
     "tersa-blob-spike",
     "tersa-keychain-macos",
     // 3d: reaches HMAC transitively through the Keychain HKDF key derivation.
     "tersa-oauth-sync-macos",
+    // 3d: the mailbox-sync FFI reaches HMAC only through the composition's Keychain
+    // HKDF; its closed direct-dependency set forbids declaring hmac directly.
+    "tersa-mailbox-sync-ffi-macos",
 ];
 const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 0] = [];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
@@ -319,6 +325,19 @@ fn protected_package_shape_violations(package: &Package, metadata: &Metadata) ->
         ));
         violations.extend(custom_build_target_violations(package));
     }
+    if package_name == "tersa-mailbox-sync-ffi-macos" {
+        violations.extend(mailbox_sync_ffi_direct_dependency_set_violations(
+            &direct_dependencies,
+        ));
+        violations.extend(mailbox_sync_ffi_package_violations(
+            package,
+            metadata
+                .workspace_root
+                .join("adapters/mailbox-sync-ffi-macos/src/lib.rs")
+                .as_str(),
+        ));
+        violations.extend(custom_build_target_violations(package));
+    }
     violations
 }
 
@@ -352,6 +371,48 @@ fn oauth_sync_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) ->
         ));
     }
     violations
+}
+
+/// The mailbox-sync FFI's direct dependency set is closed: it forwards two public
+/// strings to the trusted composition and builds a token-client configuration from
+/// the portable application types — and NOTHING else. Because it is (necessarily) in
+/// the `SQLCipher` and `HMAC` reachability owner-sets, this closed set is what stops
+/// it from DIRECTLY declaring `rusqlite`, `hmac`, or any other capability crate and
+/// bypassing the composition it exists only to expose.
+fn mailbox_sync_ffi_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
+    const REQUIRED: [&str; 3] = ["tersa-application", "tersa-oauth-sync-macos", "url"];
+    let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for dependency in dependencies.difference(&required) {
+        violations.push(format!(
+            "tersa-mailbox-sync-ffi-macos -> {dependency} (dependency is outside the closed FFI set)"
+        ));
+    }
+    for dependency in required.difference(dependencies) {
+        violations.push(format!(
+            "tersa-mailbox-sync-ffi-macos is missing required direct dependency {dependency}"
+        ));
+    }
+    violations
+}
+
+/// The mailbox-sync FFI must expose exactly one reviewed library target, an
+/// `rlib`+`staticlib` from the canonical `src/lib.rs`, and nothing else — no example,
+/// binary, or custom-build target that could smuggle an unreviewed exported symbol.
+fn mailbox_sync_ffi_package_violations(package: &Package, canonical_library: &str) -> Vec<String> {
+    let has_exact_library = package.targets.iter().any(|target| {
+        target.name == "tersa_mailbox_sync_ffi_macos"
+            && target.src_path.as_str() == canonical_library
+            && target.kind == [TargetKind::RLib, TargetKind::StaticLib]
+            && target.crate_types == [CrateType::RLib, CrateType::StaticLib]
+    });
+    if package.targets.len() != 1 || !has_exact_library {
+        return vec![
+            "tersa-mailbox-sync-ffi-macos must expose only the reviewed rlib/staticlib library target from its canonical source"
+                .to_owned(),
+        ];
+    }
+    Vec::new()
 }
 
 fn authority_package_target_violations(package: &Package, metadata: &Metadata) -> Vec<String> {
@@ -551,7 +612,26 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         &bridge_package_sources,
         &bridge_paths,
     ));
-    violations.extend(rust_exported_c_abi_violations(&bridge_package_sources));
+    violations.extend(rust_exported_c_abi_violations(
+        &bridge_package_sources,
+        &expected_apple_c_abi_exports(),
+        APPLE_BRIDGE_C_ABI_COUNT_MESSAGE,
+    ));
+
+    // The mailbox-sync FFI is a sibling static library with its own two-symbol C ABI;
+    // pin its reviewed sources and export inventory exactly as the bridge's, so a new
+    // source file or exported symbol cannot land without review.
+    let ffi_package_sources =
+        tracked_source_documents(repository_root, "adapters/mailbox-sync-ffi-macos")?;
+    violations.extend(mailbox_sync_ffi_source_surface_violations(
+        &ffi_package_sources,
+    ));
+    violations.extend(rust_exported_c_abi_violations(
+        &ffi_package_sources,
+        &expected_mailbox_sync_ffi_c_abi_exports(),
+        MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
+    ));
+
     for (path, document) in tracked_source_documents(repository_root, "adapters/keychain-macos")? {
         if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
             violations.extend(rust_authority_source_surface_violations(&path, &document));
@@ -1016,20 +1096,20 @@ fn rust_authority_source_surface_violations(path: &Path, document: &str) -> Vec<
     violations
 }
 
-fn rust_authority_dynamic_alias_violations(path: &Path, document: &str) -> Vec<String> {
-    const FORBIDDEN_SYMBOLS: [&str; 4] = [
-        "SecItemUpdate",
-        "SecItemDelete",
-        "SecKeychain",
-        "set_generic_password",
-    ];
-    const FORBIDDEN_MECHANISMS: [&str; 8] = [
+/// Scans one production Rust document for dynamic or link-time mechanisms that
+/// alias or export a symbol outside the reviewed `no_mangle` inventory — an
+/// `export_name`/`link_name`/`link_section` attribute or inline assembly adds a
+/// linkable symbol the export scanner never counts. Comments, string literals,
+/// and test modules stay inert.
+fn forbidden_export_mechanism_violations(path: &Path, document: &str) -> Vec<String> {
+    const FORBIDDEN_MECHANISMS: [&str; 9] = [
         "asm",
         "dlopen",
         "dlsym",
         "export_name",
         "global_asm",
         "link_name",
+        "link_section",
         "llvm_asm",
         "naked_asm",
     ];
@@ -1045,6 +1125,19 @@ fn rust_authority_dynamic_alias_violations(path: &Path, document: &str) -> Vec<S
             ));
         }
     }
+    violations
+}
+
+fn rust_authority_dynamic_alias_violations(path: &Path, document: &str) -> Vec<String> {
+    const FORBIDDEN_SYMBOLS: [&str; 4] = [
+        "SecItemUpdate",
+        "SecItemDelete",
+        "SecKeychain",
+        "set_generic_password",
+    ];
+    let comments_masked = strip_rust_comments(document);
+    let production_document = strip_rust_test_modules(&comments_masked);
+    let mut violations = forbidden_export_mechanism_violations(path, document);
     for symbol in FORBIDDEN_SYMBOLS {
         if rust_literal_contains(&production_document, symbol) {
             violations.push(format!(
@@ -1114,6 +1207,7 @@ fn bridge_package_source_surface_violations(
             continue;
         }
         violations.extend(rust_external_source_expansion_violations(path, document));
+        violations.extend(forbidden_export_mechanism_violations(path, document));
         if path != Path::new("apple/rust-bridge/src/lib.rs")
             && path != Path::new("apple/rust-bridge/src/mailbox.rs")
         {
@@ -1129,8 +1223,21 @@ fn bridge_package_source_surface_violations(
     violations
 }
 
-fn rust_exported_c_abi_violations(package_documents: &[(PathBuf, String)]) -> Vec<String> {
-    let expected = expected_apple_c_abi_exports();
+/// The exact count message for the Apple bridge's reviewed C ABI symbol set.
+const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe";
+/// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol set.
+const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match the two reviewed begin and poll symbols";
+
+/// Pins a static-library package's exported C ABI to an exact reviewed set: every
+/// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
+/// whitespace-normalized signature, and the total count must match `expected` — so
+/// adding, removing, or reshaping an exported symbol cannot pass review silently.
+/// `count_message` names the reviewed set in the mismatch diagnostic.
+fn rust_exported_c_abi_violations(
+    package_documents: &[(PathBuf, String)],
+    expected: &BTreeMap<&str, &str>,
+    count_message: &str,
+) -> Vec<String> {
     let mut actual = BTreeMap::<String, Vec<String>>::new();
     let mut no_mangle_attributes = 0_usize;
     let mut violations = Vec::new();
@@ -1177,22 +1284,92 @@ fn rust_exported_c_abi_violations(package_documents: &[(PathBuf, String)]) -> Ve
         }
     }
     if no_mangle_attributes != expected.len() || actual.len() != expected.len() {
-        violations.push(
-            "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe"
-                .to_owned(),
-        );
+        violations.push(count_message.to_owned());
     }
     for (name, expected_signature) in expected {
         if actual
-            .get(name)
-            .is_none_or(|signatures| signatures != &[expected_signature])
+            .get(*name)
+            .is_none_or(|signatures| signatures != &[*expected_signature])
         {
             violations.push(format!(
-                "Apple bridge export `{name}` must retain its exact reviewed Rust C ABI signature"
+                "exported C ABI symbol `{name}` must retain its exact reviewed Rust signature"
             ));
         }
     }
     violations
+}
+
+/// Pins the mailbox-sync FFI's tracked sources to exactly the reviewed manifest and
+/// single library module, and forbids a Cargo build script — so no unreviewed source
+/// file (which could add an exported symbol or bypass the closed dependency set) can
+/// enter the crate without review. Each tracked Rust source is also scanned for
+/// source-graph expansion (`include!`, `#[path]`) and for non-`no_mangle` export
+/// mechanisms, either of which could smuggle a linkable symbol past the
+/// `.rs`-only export inventory.
+fn mailbox_sync_ffi_source_surface_violations(
+    package_documents: &[(PathBuf, String)],
+) -> Vec<String> {
+    let manifest_path = Path::new("adapters/mailbox-sync-ffi-macos/Cargo.toml");
+    let build_script_path = Path::new("adapters/mailbox-sync-ffi-macos/build.rs");
+    let mut violations = Vec::new();
+    let Some((_path, manifest)) = package_documents
+        .iter()
+        .find(|(path, _document)| path == manifest_path)
+    else {
+        return vec!["the mailbox-sync FFI Cargo.toml must be tracked".to_owned()];
+    };
+    if toml_table_has_key(manifest, "package", "build") {
+        violations
+            .push("the mailbox-sync FFI package must not declare a Cargo build script".to_owned());
+    }
+    if toml_table_has_key(manifest, "lib", "path") {
+        violations.push(
+            "the mailbox-sync FFI library must use the canonical inventoried src/lib.rs entry"
+                .to_owned(),
+        );
+    }
+    if package_documents
+        .iter()
+        .any(|(path, _document)| path == build_script_path)
+    {
+        violations.push("the mailbox-sync FFI must not track a conventional build.rs".to_owned());
+    }
+    let reviewed_rust_sources =
+        BTreeSet::from([PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs")]);
+    let tracked_rust_sources = package_documents
+        .iter()
+        .filter(|(path, _document)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        })
+        .map(|(path, _document)| path.clone())
+        .collect::<BTreeSet<_>>();
+    if tracked_rust_sources != reviewed_rust_sources {
+        violations.push(
+            "the mailbox-sync FFI tracked Rust source inventory must be exactly the reviewed src/lib.rs"
+                .to_owned(),
+        );
+    }
+    for (path, document) in package_documents {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        violations.extend(rust_external_source_expansion_violations(path, document));
+        violations.extend(forbidden_export_mechanism_violations(path, document));
+    }
+    violations
+}
+
+fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "tersa_mailbox_macos_sync_begin",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_sync_begin(client_id:*constu8,client_id_len:usize,account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_sync_poll",
+            "pubextern\"C\"fntersa_mailbox_macos_sync_poll(session_id:u64)->i32",
+        ),
+    ])
 }
 
 fn expected_apple_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
@@ -5402,11 +5579,16 @@ fn gmail_dependency_graph_violations(
     reqwest_packages: &BTreeSet<String>,
     target: &str,
 ) -> Vec<String> {
-    // reqwest (network) may be REACHED only by the Gmail adapter that owns it
-    // and the one trusted composition that drives it. tersa-keychain-macos and
-    // the retrieval-only tersa-cli-macos are deliberately absent: the check must
-    // still fire if either ever reaches reqwest.
-    const OWNERS: [&str; 2] = ["tersa-gmail-rest-macos", "tersa-oauth-sync-macos"];
+    // reqwest (network) may be REACHED only by the Gmail adapter that owns it, the
+    // one trusted composition that drives it, and the mailbox-sync FFI that exposes
+    // that composition to Swift. tersa-keychain-macos and the retrieval-only
+    // tersa-cli-macos are deliberately absent: the check must still fire if either
+    // ever reaches reqwest.
+    const OWNERS: [&str; 3] = [
+        "tersa-gmail-rest-macos",
+        "tersa-oauth-sync-macos",
+        "tersa-mailbox-sync-ffi-macos",
+    ];
     let mut violations = Vec::new();
     for member_id in workspace_members {
         let Some(name) = package_names.get(member_id) else {
@@ -6384,6 +6566,14 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "tersa-store-sqlcipher-macos",
             ]),
         ),
+        (
+            // 3d: the macOS C ABI that exposes the trusted composition's bounded-sync
+            // worker to Swift, in a sibling static library so the network stack stays
+            // out of the minimal bootstrap bridge. It composes nothing itself — it
+            // only forwards two public strings to the composition.
+            "tersa-mailbox-sync-ffi-macos",
+            BTreeSet::from(["tersa-application", "tersa-oauth-sync-macos"]),
+        ),
         ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
@@ -6480,19 +6670,22 @@ mod tests {
     use cargo_metadata::PackageId;
 
     use super::{
-        CANONICAL_TERSA_RUST_BRIDGE_HEADER, ResolvedDependencyIdentity,
+        APPLE_BRIDGE_C_ABI_COUNT_MESSAGE, CANONICAL_TERSA_RUST_BRIDGE_HEADER,
+        MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE, ResolvedDependencyIdentity,
         apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
         bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
         check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
         cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
+        expected_apple_c_abi_exports, expected_mailbox_sync_ffi_c_abi_exports,
         future_macos_store_dependency_violation, gmail_dependency_graph_violations,
         gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
         is_dioxus_runtime_dependency, is_slint_runtime_dependency,
         keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        non_owner_entitlement_violations, oauth_sync_direct_dependency_set_violations,
-        parse_identity, parse_plist_string_array, parse_project_targets,
-        project_generation_surface_violations, project_generation_wrapper,
+        mailbox_sync_ffi_direct_dependency_set_violations,
+        mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
+        oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
+        parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
         protected_keychain_dependency_rename_violations, reserved_future_policy_violations,
         resolved_workspace_dependency_names, retrieval_tokio_denial_violations,
         rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
@@ -7152,6 +7345,14 @@ fn boundary() {
         assert!(rust_authority_source_surface_violations(path, inert).is_empty());
     }
 
+    fn bridge_export_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+        rust_exported_c_abi_violations(
+            sources,
+            &expected_apple_c_abi_exports(),
+            APPLE_BRIDGE_C_ABI_COUNT_MESSAGE,
+        )
+    }
+
     fn reviewed_apple_bridge_export_sources() -> (&'static str, &'static str, &'static str) {
         let lib = r#"
 #[unsafe(no_mangle)]
@@ -7249,7 +7450,7 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
         let (lib, mailbox, oauth) = reviewed_apple_bridge_export_sources();
         let reviewed =
             reviewed_apple_bridge_documents(lib.to_owned(), mailbox.to_owned(), oauth.to_owned());
-        assert!(rust_exported_c_abi_violations(&reviewed).is_empty());
+        assert!(bridge_export_violations(&reviewed).is_empty());
 
         for mutation in [
             lib.replace("account_id_len: usize", "account_id_len: u32"),
@@ -7262,7 +7463,7 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
             let contaminated =
                 reviewed_apple_bridge_documents(mutation, mailbox.to_owned(), oauth.to_owned());
             assert!(
-                !rust_exported_c_abi_violations(&contaminated).is_empty(),
+                !bridge_export_violations(&contaminated).is_empty(),
                 "export name, set, and parameter widths must remain exact"
             );
         }
@@ -7277,7 +7478,7 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
             let contaminated =
                 reviewed_apple_bridge_documents(lib.to_owned(), mutation, oauth.to_owned());
             assert!(
-                !rust_exported_c_abi_violations(&contaminated).is_empty(),
+                !bridge_export_violations(&contaminated).is_empty(),
                 "read export name, set, and parameter widths must remain exact"
             );
         }
@@ -7289,7 +7490,7 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
             mailbox.to_owned(),
             oauth.to_owned(),
         );
-        let violations = rust_exported_c_abi_violations(&twelfth_symbol);
+        let violations = bridge_export_violations(&twelfth_symbol);
         assert!(
             violations
                 .iter()
@@ -7311,7 +7512,7 @@ mod compatibility {{
             ),
         );
         assert!(
-            !rust_exported_c_abi_violations(&comment_mask_bypass).is_empty(),
+            !bridge_export_violations(&comment_mask_bypass).is_empty(),
             "a comment containing a pseudo cfg(test) module must not hide a production export"
         );
 
@@ -7329,9 +7530,179 @@ mod compatibility {{
             ),
         );
         assert!(
-            !rust_exported_c_abi_violations(&literal_mask_bypass).is_empty(),
+            !bridge_export_violations(&literal_mask_bypass).is_empty(),
             "a literal containing a pseudo cfg(test) module must not hide a production export"
         );
+    }
+
+    fn reviewed_mailbox_sync_ffi_export_source() -> &'static str {
+        r#"
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_sync_begin(
+    client_id: *const u8,
+    client_id_len: usize,
+    account_id: *const u8,
+    account_id_len: usize,
+    output_session_id: *mut u64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
+"#
+    }
+
+    fn reviewed_mailbox_sync_ffi_documents(lib: String) -> Vec<(PathBuf, String)> {
+        vec![(
+            PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs"),
+            lib,
+        )]
+    }
+
+    fn ffi_export_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+        rust_exported_c_abi_violations(
+            sources,
+            &expected_mailbox_sync_ffi_c_abi_exports(),
+            MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
+        )
+    }
+
+    #[test]
+    fn mailbox_sync_ffi_export_inventory_pins_every_reviewed_signature() {
+        let lib = reviewed_mailbox_sync_ffi_export_source();
+        assert!(
+            ffi_export_violations(&reviewed_mailbox_sync_ffi_documents(lib.to_owned())).is_empty()
+        );
+
+        // Widening a parameter, changing the ABI, or renaming a symbol must trip.
+        for mutation in [
+            lib.replace("client_id_len: usize", "client_id_len: u32"),
+            lib.replacen("extern \"C\"", "extern \"system\"", 1),
+            lib.replace(
+                "tersa_mailbox_macos_sync_poll",
+                "tersa_mailbox_macos_sync_poll_all",
+            ),
+        ] {
+            assert!(
+                !ffi_export_violations(&reviewed_mailbox_sync_ffi_documents(mutation)).is_empty(),
+                "FFI export name, set, and parameter widths must remain exact"
+            );
+        }
+
+        // A third exported symbol must trip the reviewed-count message.
+        let third_symbol = reviewed_mailbox_sync_ffi_documents(format!(
+            "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn tersa_mailbox_macos_sync_extra() -> i32 {{}}"
+        ));
+        let violations = ffi_export_violations(&third_symbol);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("two reviewed begin and poll symbols")),
+            "a third symbol must trip the reviewed-count message: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mailbox_sync_ffi_source_inventory_and_closed_dependency_set_pin() {
+        let manifest = "[package]\nname = \"tersa-mailbox-sync-ffi-macos\"\n";
+        let clean = vec![
+            (
+                PathBuf::from("adapters/mailbox-sync-ffi-macos/Cargo.toml"),
+                manifest.to_owned(),
+            ),
+            (
+                PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs"),
+                String::new(),
+            ),
+        ];
+        assert!(mailbox_sync_ffi_source_surface_violations(&clean).is_empty());
+
+        // An unreviewed extra source or a declared build script fails closed.
+        let mut with_extra = clean.clone();
+        with_extra.push((
+            PathBuf::from("adapters/mailbox-sync-ffi-macos/src/extra.rs"),
+            String::new(),
+        ));
+        assert!(
+            !mailbox_sync_ffi_source_surface_violations(&with_extra).is_empty(),
+            "an unreviewed extra source must fail closed"
+        );
+        let with_build = vec![
+            (
+                PathBuf::from("adapters/mailbox-sync-ffi-macos/Cargo.toml"),
+                format!("{manifest}build = \"build.rs\"\n"),
+            ),
+            (
+                PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs"),
+                String::new(),
+            ),
+        ];
+        assert!(
+            !mailbox_sync_ffi_source_surface_violations(&with_build).is_empty(),
+            "a declared build script must fail closed"
+        );
+
+        // The closed direct-dependency set: exactly the three pass; a capability crate
+        // or a missing required dependency fails.
+        let exact = BTreeSet::from(["tersa-application", "tersa-oauth-sync-macos", "url"]);
+        assert!(mailbox_sync_ffi_direct_dependency_set_violations(&exact).is_empty());
+        let mut hostile = exact.clone();
+        hostile.insert("rusqlite");
+        assert!(!mailbox_sync_ffi_direct_dependency_set_violations(&hostile).is_empty());
+        let missing = BTreeSet::from(["tersa-application", "url"]);
+        assert!(!mailbox_sync_ffi_direct_dependency_set_violations(&missing).is_empty());
+    }
+
+    #[test]
+    fn mailbox_sync_ffi_source_surface_rejects_alternate_export_mechanisms() {
+        let manifest = "[package]\nname = \"tersa-mailbox-sync-ffi-macos\"\n";
+        // An export added through any mechanism other than a reviewed direct
+        // `no_mangle` attribute must fail closed even though the `.rs` inventory
+        // and the no_mangle count are both untouched.
+        for source in [
+            "#[unsafe(export_name = \"tersa_mailbox_macos_backdoor\")] pub extern \"C\" fn hidden() -> i32 { 0 }",
+            "#[unsafe(link_name = \"tersa_mailbox_macos_backdoor\")] pub extern \"C\" fn hidden() -> i32 { 0 }",
+            "#[unsafe(link_section = \"__TEXT,__text\")] pub extern \"C\" fn hidden() -> i32 { 0 }",
+        ] {
+            let documents = vec![
+                (
+                    PathBuf::from("adapters/mailbox-sync-ffi-macos/Cargo.toml"),
+                    manifest.to_owned(),
+                ),
+                (
+                    PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs"),
+                    source.to_owned(),
+                ),
+            ];
+            assert!(
+                !mailbox_sync_ffi_source_surface_violations(&documents).is_empty(),
+                "an alternate export mechanism must fail closed: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_sync_ffi_source_surface_rejects_production_source_expansion() {
+        let manifest = "[package]\nname = \"tersa-mailbox-sync-ffi-macos\"\n";
+        // `include!` and `#[path]` expand a non-`.rs` file whose exported symbols
+        // the `.rs`-only export inventory never scans.
+        for source in [
+            "include!(\"payload.inc\");",
+            "#[path = \"payload.inc\"] mod payload;",
+        ] {
+            let documents = vec![
+                (
+                    PathBuf::from("adapters/mailbox-sync-ffi-macos/Cargo.toml"),
+                    manifest.to_owned(),
+                ),
+                (
+                    PathBuf::from("adapters/mailbox-sync-ffi-macos/src/lib.rs"),
+                    source.to_owned(),
+                ),
+            ];
+            assert!(
+                !mailbox_sync_ffi_source_surface_violations(&documents).is_empty(),
+                "production source expansion must fail closed: {source}"
+            );
+        }
     }
 
     #[test]
@@ -7348,7 +7719,7 @@ mod compatibility {{
             let contaminated =
                 reviewed_apple_bridge_documents(mutation, mailbox.to_owned(), oauth.to_owned());
             assert!(
-                !rust_exported_c_abi_violations(&contaminated).is_empty(),
+                !bridge_export_violations(&contaminated).is_empty(),
                 "production cfg_attr no_mangle exports must not evade the direct-attribute inventory"
             );
         }
@@ -7361,7 +7732,7 @@ const NOTE: &str = "#[cfg_attr(unix, unsafe(no_mangle))]";
         );
         let sources = reviewed_apple_bridge_documents(inert, mailbox.to_owned(), oauth.to_owned());
         assert!(
-            rust_exported_c_abi_violations(&sources).is_empty(),
+            bridge_export_violations(&sources).is_empty(),
             "comments, strings, and Rust test modules must remain inert to the production no_mangle inventory"
         );
     }
@@ -10225,7 +10596,7 @@ targets:
                 "aarch64-apple-darwin",
             ),
             vec![
-                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\"] for aarch64-apple-darwin"
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\"] for aarch64-apple-darwin"
             ]
         );
         assert_eq!(
@@ -10237,7 +10608,7 @@ targets:
                 "aarch64-apple-ios",
             ),
             vec![
-                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\"] for aarch64-apple-ios",
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\"] for aarch64-apple-ios",
                 "tersa-gmail-rest-macos reaches reqwest on non-macOS target aarch64-apple-ios",
             ]
         );
