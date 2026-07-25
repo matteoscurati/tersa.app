@@ -1536,6 +1536,15 @@ fn toml_bare_or_quoted_key(key: &str) -> Option<&str> {
     .then_some(key)
 }
 
+/// Rejects the textual ways a tracked production source can expand its own source
+/// graph — `#[path]` (directly, via `cfg_attr`, or as a raw-identifier attribute)
+/// and `include!` (directly or renamed by a `use` alias) — so a non-`.rs` file
+/// cannot smuggle unreviewed items past the tracked-`.rs` inventory and the C-ABI
+/// export scanner. This is a textual lint, not a Rust parser: expansion reached only
+/// through a `macro_rules!` metavariable (`#[$attr]`, `$m!(...)`) or a proc-macro
+/// attribute is OUT OF SCOPE here and is instead backstopped by human review of the
+/// visible source plus, for a proc-macro, its required `Cargo.toml`/notices diff.
+/// See the deferred AST-aware guard follow-up.
 fn rust_external_source_expansion_violations(path: &Path, document: &str) -> Vec<String> {
     let code = strip_rust_non_code(document);
     let policy_code = strip_rust_test_modules(&code);
@@ -1548,7 +1557,7 @@ fn rust_external_source_expansion_violations(path: &Path, document: &str) -> Vec
     }
     if rust_has_path_attribute(&policy_code) {
         violations.push(format!(
-            "{} must not expand the production Rust source graph with #[path]",
+            "{} must not expand the production Rust source graph with #[path] (including via cfg_attr or a raw-identifier attribute)",
             path.display()
         ));
     }
@@ -1557,6 +1566,14 @@ fn rust_external_source_expansion_violations(path: &Path, document: &str) -> Vec
             "{} must not expand the production Rust source graph with include!",
             path.display()
         ));
+    }
+    for name in ["include", "include_str", "include_bytes"] {
+        if rust_has_aliased_include_macro(&policy_code, name) {
+            violations.push(format!(
+                "{} must not alias the include macro `{name}`",
+                path.display()
+            ));
+        }
     }
     violations
 }
@@ -1583,12 +1600,30 @@ fn rust_has_path_attribute(document: &str) -> bool {
             .bytes()
             .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
             .count();
-        if &name[..name_length] == "path" {
+        if &name[..name_length] == "path" || rust_attribute_body_applies_path(inner) {
             return true;
         }
         index = opening + attribute.len();
     }
     false
+}
+
+/// Flags a `path` attribute reached inside an attribute body that the leading-
+/// identifier check misses: a `path` nested at any `cfg_attr` depth, or a direct
+/// `#[r#path = ...]` whose raw `r#` prefix defeats the leading-identifier scan.
+/// A boundary-checked `path` (so `is_identifier_at` treats the `r#`/`,`/`(`
+/// neighbour as a boundary) directly applied with `=` or `(` anywhere in the body
+/// trips it. The tiny inventoried sources never apply `path` conditionally, so
+/// failing closed on a predicate-shaped `path` is intentional.
+fn rust_attribute_body_applies_path(body: &str) -> bool {
+    body.match_indices("path").any(|(index, _)| {
+        is_identifier_at(body, index, "path")
+            && matches!(
+                body.as_bytes()
+                    .get(skip_ascii_whitespace(body, index + "path".len())),
+                Some(b'=' | b'(')
+            )
+    })
 }
 
 fn rust_has_macro_invocation(document: &str, name: &str) -> bool {
@@ -1598,6 +1633,48 @@ fn rust_has_macro_invocation(document: &str, name: &str) -> bool {
                 .as_bytes()
                 .get(skip_ascii_whitespace(document, index + name.len()))
                 == Some(&b'!')
+    })
+}
+
+/// An include macro renamed by a production `use` declaration
+/// (`use ... <name> as <alias>;`) hides its invocations from the direct
+/// `include!` scan, and aliasing one is never legitimate in the tiny
+/// inventoried sources, so the alias itself fails closed.
+fn rust_has_aliased_include_macro(document: &str, name: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(relative) = document[search_from..].find("use") {
+        let use_start = search_from + relative;
+        if !is_identifier_at(document, use_start, "use") {
+            search_from = use_start + "use".len();
+            continue;
+        }
+        let declaration_end = document[use_start..]
+            .find(';')
+            .map_or(document.len(), |relative| use_start + relative);
+        if rust_use_declaration_aliases(&document[use_start..declaration_end], name) {
+            return true;
+        }
+        search_from = declaration_end;
+    }
+    false
+}
+
+fn rust_use_declaration_aliases(declaration: &str, name: &str) -> bool {
+    declaration.match_indices(name).any(|(index, _)| {
+        if !is_identifier_at(declaration, index, name) {
+            return false;
+        }
+        let alias_keyword = skip_ascii_whitespace(declaration, index + name.len());
+        if !declaration[alias_keyword..].starts_with("as")
+            || !is_identifier_at(declaration, alias_keyword, "as")
+        {
+            return false;
+        }
+        let alias = skip_ascii_whitespace(declaration, alias_keyword + "as".len());
+        declaration
+            .as_bytes()
+            .get(alias)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
     })
 }
 
@@ -7353,6 +7430,46 @@ fn boundary() {
         )
     }
 
+    #[test]
+    fn authority_sources_reject_cfg_attr_path_and_aliased_include_macros() {
+        let path = Path::new("apps/cli-macos/out-of-tree.rs");
+        for source in [
+            "#[cfg_attr(target_os = \"macos\", path = \"payload.inc\")] mod payload;",
+            "#[cfg_attr(all(unix), cfg_attr(target_os = \"macos\", path = \"x.inc\"))] mod y;",
+            "#[cfg_attr(unix, path(\"payload.inc\"))] mod payload;",
+            "#[r#path = \"payload.inc\"] mod payload;",
+            "#[r#cfg_attr(unix, path = \"payload.inc\")] mod payload;",
+            "use std::include as inject;\ninject!(\"payload.inc\");",
+            "use std::include_str as inject_str;\nconst PAYLOAD: &str = inject_str!(\"payload.inc\");",
+            "use std::include_bytes as ib;",
+            "pub use std::{include as inject};",
+            "fn authority() { use std::include as inject; inject!(\"payload.inc\"); }",
+        ] {
+            assert!(
+                !rust_authority_source_surface_violations(path, source).is_empty(),
+                "governed out-of-tree authority source must fail closed: {source:?}"
+            );
+        }
+        let violations =
+            rust_authority_source_surface_violations(path, "use std::include as inject;");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("must not alias the include macro `include`")),
+            "the include-macro alias violation must name the mechanism: {violations:?}"
+        );
+        for benign in [
+            "#[cfg_attr(unix, inline)]\nfn authority() -> u32 { 1 }\n",
+            "#[cfg_attr(all(not(target_os = \"macos\"), not(test)), expect(dead_code, reason = \"inert\"))]\nfn authority() {}\n",
+            "#[cfg(test)] mod tests { use std::include as inject; #[cfg_attr(unix, path = \"x.inc\")] mod x; }",
+        ] {
+            assert!(
+                rust_authority_source_surface_violations(path, benign).is_empty(),
+                "benign production source must not trip the source-expansion guard: {benign:?}"
+            );
+        }
+    }
+
     fn reviewed_apple_bridge_export_sources() -> (&'static str, &'static str, &'static str) {
         let lib = r#"
 #[unsafe(no_mangle)]
@@ -7888,6 +8005,8 @@ mod tests {
             "include ! (concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
             "#[path = \"../external.rs\"] mod external;",
             "# [ path = \"../external.rs\" ] mod external;",
+            "#[cfg_attr(target_os = \"macos\", path = \"../external.rs\")] mod external;",
+            "use std::include as inject;\ninject!(\"../external.rs\");",
         ] {
             let documents = vec![
                 (
