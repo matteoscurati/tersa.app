@@ -10,6 +10,7 @@ members = [
     "apple/rust-bridge",
     "adapters/gmail-rest-macos",
     "adapters/keychain-macos",
+    "adapters/mailbox-sync-ffi-macos",
     "adapters/oauth-sync-macos",
     "adapters/store-sqlcipher-macos",
     "apps/cli-macos",

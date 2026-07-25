@@ -1,0 +1,37 @@
+# This Source Code Form is subject to the terms of the Mozilla Public License,
+# v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain
+# one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-mailbox-sync-ffi-macos"
+description = "macOS-only C ABI for the Rust-owned bounded Gmail sync worker, linked as a sibling static library to the Apple bootstrap bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+# Every dependency is macOS-only: on other targets the crate compiles to an empty
+# library that exports no symbols. The Google token and revoke endpoints are pinned
+# downstream in the Gmail transport; this crate depends on neither the network nor
+# the Keychain directly — it reaches them only through the trusted composition.
+[target.'cfg(target_os = "macos")'.dependencies]
+tersa-application = { path = "../../crates/application", version = "=0.0.0" }
+tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0" }
+url = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# `test-util` exposes WorkerHandles' test constructor so the session-registry tests
+# can drive poll against fabricated terminal/running handles without spawning a
+# real worker (no Keychain, no network); never enabled by a production dependency.
+tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0", features = [
+    "test-util",
+] }
+
+[lints]
+workspace = true

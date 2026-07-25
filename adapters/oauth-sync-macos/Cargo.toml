@@ -13,6 +13,12 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# Exposes WorkerHandles' test-only constructor to tests in OTHER workspace crates
+# (the mailbox-sync FFI's session-registry tests). Never enabled by a production
+# dependency; the Apple static-library build does not pass `--all-features`.
+test-util = []
+
 [dependencies]
 tersa-application = { path = "../../crates/application", version = "=0.0.0" }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }

@@ -91,6 +91,18 @@ impl WorkerHandles {
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
+
+    /// Builds handles wrapping a fixed status and an inert, unset cancel flag, for
+    /// tests in other crates that drive a session registry (the mailbox-sync FFI)
+    /// without spawning a real worker thread. No worker observes the cancel flag.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn from_status_for_test(status: i32) -> Self {
+        Self {
+            status: Arc::new(AtomicI32::new(status)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// The result of asking to begin a cycle for an account slot.
@@ -168,10 +180,30 @@ impl Drop for StatusOnDrop {
     }
 }
 
+/// Builds handles for a cycle that could not start: the status Arc is already
+/// terminal at [`STATUS_INTERNAL`] and the cancel flag is inert (unset), so a
+/// session registered with these handles polls terminal immediately and reaps.
+fn terminal_internal_handles() -> WorkerHandles {
+    WorkerHandles {
+        status: Arc::new(AtomicI32::new(STATUS_INTERNAL)),
+        cancel: Arc::new(AtomicBool::new(false)),
+    }
+}
+
 /// Spawns a worker thread that holds `permit` for the whole cycle, drives `op` on a
 /// private current-thread runtime, then releases the permit BEFORE publishing the
 /// terminal status. `op` is the only value crossing the thread boundary, so its
 /// future need not be `Send` — it is built and awaited entirely on the worker thread.
+///
+/// # Failure mapping
+///
+/// Thread creation is fallible, so this goes through [`std::thread::Builder`] and
+/// its `io::Result` rather than the panicking `std::thread::spawn` — a panic here,
+/// on the FFI caller thread, would abort the whole process under the release
+/// profile's `panic = "abort"`. If the OS refuses the thread, the un-spawned
+/// closure drops with `permit` inside it (releasing the slot) and the returned
+/// handles are already terminal at [`STATUS_INTERNAL`]: the caller registers a
+/// session the first poll reaps, which is exactly the ABI's internal-anomaly code.
 fn spawn_cycle<F, Fut>(permit: WholeCyclePermit, op: F) -> WorkerHandles
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -181,23 +213,31 @@ where
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_status = Arc::clone(&status);
     let worker_cancel = Arc::clone(&cancel);
-    std::thread::spawn(move || {
-        // `terminal` is declared BEFORE `permit` so that, on a panic unwind, locals
-        // drop in reverse order — `permit` releasing the slot first, then `terminal`
-        // publishing STATUS_INTERNAL — preserving release-before-publish even when the
-        // cycle panics.
-        let mut terminal = StatusOnDrop::new(worker_status);
-        let permit = permit;
-        let outcome = match build_sync_runtime() {
-            Ok(runtime) => runtime.block_on(run_cycle(op, &worker_cancel)),
-            Err(_error) => STATUS_INTERNAL,
-        };
-        // Release the slot BEFORE publishing terminal status, so a poll that sees a
-        // terminal code can immediately re-claim the slot without a spurious busy.
-        drop(permit);
-        terminal.publish(outcome);
-    });
-    WorkerHandles { status, cancel }
+    let spawned = std::thread::Builder::new()
+        .name("tersa-sync".to_owned())
+        .spawn(move || {
+            // `terminal` is declared BEFORE `permit` so that, on a panic unwind, locals
+            // drop in reverse order — `permit` releasing the slot first, then `terminal`
+            // publishing STATUS_INTERNAL — preserving release-before-publish even when the
+            // cycle panics.
+            let mut terminal = StatusOnDrop::new(worker_status);
+            let permit = permit;
+            let outcome = match build_sync_runtime() {
+                Ok(runtime) => runtime.block_on(run_cycle(op, &worker_cancel)),
+                Err(_error) => STATUS_INTERNAL,
+            };
+            // Release the slot BEFORE publishing terminal status, so a poll that sees a
+            // terminal code can immediately re-claim the slot without a spurious busy.
+            drop(permit);
+            terminal.publish(outcome);
+        });
+    match spawned {
+        // Dropping the join handle detaches the worker, as before.
+        Ok(_worker) => WorkerHandles { status, cancel },
+        // The un-spawned closure (owning `permit`) was dropped with the error, so
+        // the slot is already released; surface the internal-anomaly terminal code.
+        Err(_error) => terminal_internal_handles(),
+    }
 }
 
 /// Claims the account slot and, only if free, spawns a worker for `op`. A busy slot
