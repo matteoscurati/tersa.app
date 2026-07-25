@@ -20,8 +20,50 @@ env:
   EVIDENCE_COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  changes:
+    name: Detect change scope
+    runs-on: ubuntu-24.04
+    outputs:
+      run_evidence: ${{ steps.scope.outputs.run_evidence }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Determine change scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Only pull requests take the fast path; push and merge_group run full evidence.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Diff from the merge base so a branch that is behind main reports only
+          # its own changes, never files that merely advanced on the base branch.
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          files="$(git diff --name-only "$merge_base" "$HEAD_SHA")"
+          printf 'changed files:\n%s\n' "$files"
+          if [ -z "$files" ]; then
+            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The evidence jobs never build xtask, workflows, or docs, so skip them only
+          # when EVERY changed path is one of those; any other path runs full evidence.
+          if printf '%s\n' "$files" | grep -qvE '^(xtask/|\.github/|.*\.md$)'; then
+            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_evidence=false" >> "$GITHUB_OUTPUT"
+          fi
+
   apple-bootstrap:
     name: Apple bootstrap
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
@@ -142,6 +184,8 @@ jobs:
 
   dioxus-apple-evidence:
     name: Dioxus Apple evidence
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -240,6 +284,8 @@ jobs:
 
   sqlcipher-apple-evidence:
     name: SQLCipher Apple evidence
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     timeout-minutes: 20
     env:
@@ -283,6 +329,8 @@ jobs:
 
   search-apple-evidence:
     name: Search Apple evidence
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -327,6 +375,8 @@ jobs:
 
   mime-apple-evidence:
     name: MIME and HTML Apple evidence
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -402,6 +452,8 @@ jobs:
 
   mime-parser-fuzz:
     name: Deterministic MIME parser fuzz regression
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -461,6 +513,8 @@ jobs:
 
   blob-apple-evidence:
     name: Crash-safe AEAD blob Apple evidence
+    needs: changes
+    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
