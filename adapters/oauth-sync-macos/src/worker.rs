@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use tersa_application::identity::{AccountIdentityHasher, AccountIdentityStore};
 use tersa_application::mailbox::{AccountId, MailboxStore, PageSize, StoreLimit};
-use tersa_application::oauth::{SystemMonotonicClock, SystemWallClock};
+use tersa_application::oauth::{AuthorizationGrant, SystemMonotonicClock, SystemWallClock};
 use tersa_application::sync::{SyncPolicy, SyncReport};
 use tersa_application::token::{TokenClientConfig, TokenError};
 use tersa_gmail_rest_macos::GmailTokenTransport;
@@ -34,8 +34,8 @@ use tersa_keychain_macos::{DataProtectionAccountIdentityHasher, open_default_mai
 
 use crate::permit::{self, WholeCyclePermit};
 use crate::{
-    GatedSyncError, GmailSession, TokenLifecycleError, build_sync_runtime, gated_sync,
-    refresh_account,
+    GatedSyncError, GmailSession, TokenLifecycleError, build_sync_runtime, connect_account,
+    gated_sync, refresh_account,
 };
 
 /// The worker thread is live and its cycle is in flight.
@@ -279,13 +279,19 @@ where
     })
 }
 
-/// A failure at some stage of the default-account cycle. Kept internal:
-/// [`status_for_cycle`] collapses it to a closed status code so no stage or
-/// identity detail leaves the worker.
+/// A failure at some stage of the default-account or connect-account cycle. Kept
+/// internal: [`status_for_cycle`] collapses it to a closed status code so no stage
+/// or identity detail leaves the worker.
 enum CycleError {
     /// A Keychain-backed or policy setup step failed (hasher, store, transport,
     /// refresh store, or the sync policy could not be built).
     Setup,
+    /// The OAuth grant could not be claimed: the session is unknown, expired, or
+    /// already claimed — the login window elapsed before the worker started.
+    ClaimMissing,
+    /// The initial grant exchange or the refresh-token store failed (the
+    /// newly-connected account path).
+    Connect(TokenLifecycleError),
     /// The stored refresh token could not be exchanged for an access token.
     Refresh(TokenLifecycleError),
     /// The refreshed credential failed session-freshness validation. Its specific
@@ -295,27 +301,37 @@ enum CycleError {
     Gated(GatedSyncError),
 }
 
-/// Maps a finished default-account cycle to its closed status code, leaking no stage
-/// or identity detail. Generic over the success payload, which is discarded.
+/// Maps a finished default-account or connect-account cycle to its closed status
+/// code, leaking no stage or identity detail. Generic over the success payload,
+/// which is discarded.
 fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
     match result {
         Ok(_) => STATUS_SUCCEEDED,
-        // The two reconnect-recoverable outcomes, kept distinct so the caller
+        // The reconnect-recoverable outcomes, kept distinct so the caller
         // re-consents instead of retrying forever: no token is stored, OR the stored
         // token's consent was revoked / it expired. The latter is the COMMON trigger
         // (the owner revoked access in their account settings, long inactivity, a
         // password change) — mapping it to the retry code would silently never-sync.
-        Err(CycleError::Refresh(
-            TokenLifecycleError::NoStoredToken
-            | TokenLifecycleError::Token(TokenError::ConsentRevoked),
-        )) => STATUS_NEEDS_RECONNECT,
+        // On the connect path the same code covers an unclaimable grant (the login
+        // window elapsed) and an `invalid_grant` at the initial exchange, which the
+        // token layer surfaces as `ConsentRevoked`.
+        Err(
+            CycleError::ClaimMissing
+            | CycleError::Connect(TokenLifecycleError::Token(TokenError::ConsentRevoked))
+            | CycleError::Refresh(
+                TokenLifecycleError::NoStoredToken
+                | TokenLifecycleError::Token(TokenError::ConsentRevoked),
+            ),
+        ) => STATUS_NEEDS_RECONNECT,
         // The bounded sync's own identity-gate fail-closed keeps its distinct code.
         Err(CycleError::Gated(GatedSyncError::Gate(_))) => STATUS_GATE_BLOCKED,
-        // Setup, other (retryable, non-destructive) refresh failures, session-
-        // freshness, and the bounded sync's own failures all collapse to the opaque
-        // "this cycle produced no sync" — none is an identity/presence block.
+        // Setup, other (retryable, non-destructive) exchange/refresh failures,
+        // session-freshness, and the bounded sync's own failures all collapse to
+        // the opaque "this cycle produced no sync" — none is an identity/presence
+        // block.
         Err(
             CycleError::Setup
+            | CycleError::Connect(_)
             | CycleError::Refresh(_)
             | CycleError::Session
             | CycleError::Gated(GatedSyncError::Sync(_)),
@@ -381,6 +397,81 @@ pub fn begin_default_account_sync(account: AccountId, config: TokenClientConfig)
     })
 }
 
+/// Builds the whole gate-to-write cycle for a newly-connected `account`: claim the
+/// just-finished OAuth grant together with its token-client config, exchange the
+/// grant for tokens (the initial exchange, not a refresh), persist the refresh
+/// token, validate freshness, then run the bounded sync. The claim runs FIRST,
+/// before any Keychain/network setup, so a claim-miss costs nothing and never
+/// touches the Keychain. As in the default-account cycle, every Keychain/network
+/// object is constructed HERE, on the worker thread, and the held permit covers
+/// the exchange, so the persisted refresh token cannot race a parallel cycle.
+///
+/// The config arrives WITH the claim — built by the claim's provider from the
+/// client id and the REAL redirect the grant was issued against (required for the
+/// `authorization_code` exchange) — because this composition's direct dependency set
+/// is closed and deliberately excludes `url`: the caller owns the redirect type,
+/// exactly as it supplies the config to [`begin_default_account_sync`].
+async fn run_connect_account_cycle<C>(
+    account: &AccountId,
+    claim: C,
+) -> Result<SyncReport, CycleError>
+where
+    C: FnOnce() -> Option<(AuthorizationGrant, TokenClientConfig)>,
+{
+    let (grant, config) = claim().ok_or(CycleError::ClaimMissing)?;
+    let hasher = DataProtectionAccountIdentityHasher::new().map_err(|_error| CycleError::Setup)?;
+    let store = open_default_mailbox_store(account).map_err(|_error| CycleError::Setup)?;
+    let refresh_store =
+        DataProtectionRefreshTokenStore::new().map_err(|_error| CycleError::Setup)?;
+    let transport = GmailTokenTransport::new().map_err(|_error| CycleError::Setup)?;
+    let monotonic = SystemMonotonicClock::new();
+    let wall_clock = SystemWallClock;
+    let policy = default_sync_policy().ok_or(CycleError::Setup)?;
+
+    // `connect_account` drops (wipes) the grant as soon as the exchange consumes
+    // it. A cancel observed mid-exchange drops this future before the refresh
+    // token is persisted; the next connect attempt simply re-claims and re-
+    // exchanges, and the sole canceller is disconnect (3d-3d), which deletes any
+    // stored token regardless.
+    let connected = connect_account(
+        account,
+        grant,
+        &config,
+        &transport,
+        &refresh_store,
+        &monotonic,
+    )
+    .await
+    .map_err(CycleError::Connect)?;
+    let session = GmailSession::new(account.clone(), connected, &wall_clock)
+        .map_err(|_error| CycleError::Session)?;
+    gated_sync(account, session, &hasher, store, policy)
+        .await
+        .map_err(CycleError::Gated)
+}
+
+/// Begins a bounded sync for a newly-connected `account` on a background worker,
+/// claiming the just-finished OAuth grant and exchanging it for tokens inside the
+/// whole-cycle permit. Returns [`BeginOutcome::Busy`] — WITHOUT calling `claim`,
+/// touching the Keychain, or spawning a worker — if a cycle is already in flight
+/// for the slot: the grant is not consumed and the caller may retry the same
+/// session. Only `account` and the `Send + 'static` claim closure cross the thread
+/// boundary; the grant and config are produced and consumed on the worker thread,
+/// so they never need to be `Send`. The claim is injected as a closure so this
+/// crate never depends on the bridge that owns the sessions, and it yields the
+/// token-client config alongside the grant because the closed dependency set keeps
+/// `url` (the redirect's type) with the caller, not this composition.
+#[must_use]
+pub fn begin_connect_account_sync<C>(account: AccountId, claim: C) -> BeginOutcome
+where
+    C: FnOnce() -> Option<(AuthorizationGrant, TokenClientConfig)> + Send + 'static,
+{
+    let slot = account.clone();
+    begin_with(&slot, move || async move {
+        status_for_cycle(&run_connect_account_cycle(&account, claim).await)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -401,8 +492,8 @@ mod tests {
     use super::{
         BeginOutcome, CycleError, GatedSyncError, STATUS_CANCELLED, STATUS_GATE_BLOCKED,
         STATUS_NEEDS_RECONNECT, STATUS_RUNNING, STATUS_SUCCEEDED, STATUS_SYNC_FAILED,
-        TokenLifecycleError, begin_default_account_sync, begin_with, run_cycle, status_for_cycle,
-        status_for_result,
+        TokenLifecycleError, begin_connect_account_sync, begin_default_account_sync, begin_with,
+        run_cycle, status_for_cycle, status_for_result,
     };
 
     fn account(id: &str) -> AccountId {
@@ -485,6 +576,33 @@ mod tests {
         assert_eq!(
             status_for_cycle(&Err::<(), _>(CycleError::Refresh(
                 TokenLifecycleError::Token(TokenError::IdentityUnverified)
+            ))),
+            STATUS_SYNC_FAILED
+        );
+        // The connect path's two reconnect-recoverable outcomes: an unclaimable
+        // grant (the login window elapsed), and an `invalid_grant` at the initial
+        // exchange, which the token layer surfaces as ConsentRevoked.
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::ClaimMissing)),
+            STATUS_NEEDS_RECONNECT
+        );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::ConsentRevoked)
+            ))),
+            STATUS_NEEDS_RECONNECT
+        );
+        // Other exchange/store failures are opaque, non-reconnect, non-identity:
+        // they collapse to the same retry code as every other non-gate failure.
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::MissingRefreshToken
+            ))),
+            STATUS_SYNC_FAILED
+        );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::Transport)
             ))),
             STATUS_SYNC_FAILED
         );
@@ -718,6 +836,55 @@ mod tests {
             BeginOutcome::Busy => {}
             BeginOutcome::Started(_) => panic!("a busy slot must not start a default-account sync"),
         }
+        go.store(true, Ordering::Release);
+        assert_eq!(poll_until_terminal(&holder), STATUS_SUCCEEDED);
+    }
+
+    #[test]
+    fn begin_connect_account_sync_with_a_claim_miss_needs_reconnect_without_keychain() {
+        let slot = account("connect-claim-miss");
+        let BeginOutcome::Started(handles) = begin_connect_account_sync(slot, || None) else {
+            panic!("a free slot must start a connect-account sync");
+        };
+        // The claim runs BEFORE any Keychain/network object is constructed, so on
+        // this CI host (no provisioned Keychain) the cycle still reaches a terminal
+        // status: a claim-miss maps to NEEDS_RECONNECT (re-consent), never to a
+        // setup failure. This drives the real spawn/permit path end to end.
+        assert_eq!(poll_until_terminal(&handles), STATUS_NEEDS_RECONNECT);
+    }
+
+    #[test]
+    fn begin_connect_account_sync_on_a_busy_slot_is_busy_and_never_claims() {
+        use std::sync::Arc;
+        let slot = account("connect-sync-busy");
+        let go = Arc::new(AtomicBool::new(false));
+        // Hold the slot with a fake op so the real entry finds it busy.
+        let release = Arc::clone(&go);
+        let BeginOutcome::Started(holder) = begin_with(&slot, move || async move {
+            while !release.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            STATUS_SUCCEEDED
+        }) else {
+            panic!("the holder must start");
+        };
+        let claimed = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&claimed);
+        // The Busy outcome proves no worker spawned; the flag proves the claim
+        // closure was never called, so the grant is not consumed and the caller
+        // may retry the same session. Both are structural: `begin_with` provably
+        // never runs the op on a busy slot.
+        match begin_connect_account_sync(slot.clone(), move || {
+            probe.store(true, Ordering::Release);
+            None
+        }) {
+            BeginOutcome::Busy => {}
+            BeginOutcome::Started(_) => panic!("a busy slot must not start a connect-account sync"),
+        }
+        assert!(
+            !claimed.load(Ordering::Acquire),
+            "a busy slot must not consume the grant: the claim closure must not run"
+        );
         go.store(true, Ordering::Release);
         assert_eq!(poll_until_terminal(&holder), STATUS_SUCCEEDED);
     }
