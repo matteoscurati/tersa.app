@@ -200,6 +200,12 @@ impl<C> fmt::Debug for AuthorizationSession<C> {
 }
 
 impl<C: MonotonicClock> AuthorizationSession<C> {
+    /// Returns the exact registered redirect URI.
+    #[must_use]
+    pub fn redirect_uri(&self) -> &Url {
+        &self.redirect_uri
+    }
+
     /// Validates and consumes the one permitted redirect.
     ///
     /// The session is consumed before validation, so every callback attempt is
