@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use tersa_application::oauth::{
-    AuthorizationConfig, AuthorizationSession, OAuthError, SystemMonotonicClock,
-    prepare_authorization,
+    AuthorizationConfig, AuthorizationGrant, AuthorizationSession, OAuthError,
+    SystemMonotonicClock, prepare_authorization,
 };
 use url::Url;
 use zeroize::Zeroizing;
@@ -25,6 +25,11 @@ use zeroize::Zeroizing;
 
 const IOS_CALLBACK_PATH: &str = "/oauth/callback";
 const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(120);
+/// How long a finished-but-unclaimed grant may sit in the registry before the
+/// reaper wipes it. Distinct from [`AUTHORIZATION_LIFETIME`] (which bounds the
+/// pre-callback window) so tightening one does not silently move the other; the
+/// begin→claim window is therefore up to the sum of the two.
+const PENDING_GRANT_LIFETIME: Duration = AUTHORIZATION_LIFETIME;
 const MAX_AUTHORIZATION_URL_BYTES: usize = 4_096;
 
 const STATUS_OK: i32 = 0;
@@ -39,12 +44,31 @@ const STATUS_INTERNAL: i32 = -7;
 
 type PendingSession = AuthorizationSession<SystemMonotonicClock>;
 
+/// One finished authorization awaiting a single-use token-exchange claim,
+/// kept with the redirect URI the exchange must present. Dropping an entry
+/// zeroizes the grant's code and verifier.
+struct PendingGrant {
+    grant: AuthorizationGrant,
+    redirect_uri: Url,
+    created_at: Instant,
+}
+
+const MAX_PENDING_GRANTS: usize = 4;
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static IOS_SESSIONS: OnceLock<Mutex<BTreeMap<u64, PendingSession>>> = OnceLock::new();
-static IOS_REAPER: OnceLock<()> = OnceLock::new();
+static PENDING_GRANTS: OnceLock<Mutex<BTreeMap<u64, PendingGrant>>> = OnceLock::new();
+static REAPER: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+static PENDING_GRANT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn ios_sessions() -> &'static Mutex<BTreeMap<u64, PendingSession>> {
     IOS_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn pending_grants() -> &'static Mutex<BTreeMap<u64, PendingGrant>> {
+    PENDING_GRANTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Starts an iOS authorization session without launching a browser.
@@ -98,7 +122,7 @@ pub unsafe extern "C" fn tersa_oauth_ios_begin(
             .lock()
             .map_err(|_error| STATUS_INTERNAL)?
             .insert(session_id, session);
-        ensure_ios_reaper();
+        ensure_reaper();
         Ok(())
     })();
     result.map_or_else(|status| status, |()| STATUS_OK)
@@ -139,7 +163,7 @@ pub unsafe extern "C" fn tersa_oauth_ios_finish(
     let _callback_bytes = Zeroizing::new(String::from(callback_url));
     match outcome {
         Ok(grant) => {
-            drop(grant);
+            store_grant(session_id, grant, session.redirect_uri().clone());
             STATUS_SUCCEEDED
         }
         Err(error) => status_for_error(error),
@@ -153,6 +177,15 @@ pub unsafe extern "C" fn tersa_oauth_ios_finish(
 )]
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_oauth_cancel(session_id: u64) -> i32 {
+    // Best-effort eviction: dropping any stored grant zeroizes its code and
+    // verifier. A callback completing concurrently on the worker thread can still
+    // store a grant after this point; that cancel-versus-callback race is closed
+    // under a single lock in 3c-3c-3, where the grant first becomes claimable.
+    pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&session_id);
+
     if let Ok(mut sessions) = ios_sessions().lock()
         && let Some(mut session) = sessions.remove(&session_id)
     {
@@ -177,6 +210,16 @@ struct BegunSession {
     authorization_url: Url,
 }
 
+/// Allocates the next never-reused session id, failing closed with
+/// [`STATUS_INTERNAL`] once the counter reaches `u64::MAX` instead of wrapping
+/// onto an id a live session could still hold. `u64::MAX` itself is never
+/// handed out: the counter stalls there and every later allocation fails.
+fn allocate_session_id() -> Result<u64, i32> {
+    NEXT_SESSION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_error| STATUS_INTERNAL)
+}
+
 fn begin_session(client_id: &str, redirect_uri: Url) -> Result<(u64, BegunSession), i32> {
     if client_id.trim().is_empty() || client_id.to_ascii_uppercase().contains("UNCONFIGURED") {
         return Err(STATUS_CONFIGURATION_MISSING);
@@ -189,7 +232,7 @@ fn begin_session(client_id: &str, redirect_uri: Url) -> Result<(u64, BegunSessio
     if authorization_url.as_str().len() > MAX_AUTHORIZATION_URL_BYTES {
         return Err(STATUS_INVALID_INPUT);
     }
-    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let session_id = allocate_session_id()?;
     Ok((
         session_id,
         BegunSession {
@@ -223,12 +266,83 @@ fn status_for_error(error: OAuthError) -> i32 {
     }
 }
 
-fn ensure_ios_reaper() {
-    IOS_REAPER.get_or_init(|| {
+/// Stores a finished grant under its OAuth `session_id` for a later
+/// single-use claim by the token-exchange step.
+fn store_grant(session_id: u64, grant: AuthorizationGrant, redirect_uri: Url) {
+    store_grant_at(session_id, grant, redirect_uri, Instant::now());
+}
+
+fn store_grant_at(
+    session_id: u64,
+    grant: AuthorizationGrant,
+    redirect_uri: Url,
+    created_at: Instant,
+) {
+    // Recover a poisoned lock rather than abandon it: dropping the guard on
+    // poison would strand every already-resident code+verifier un-zeroized for
+    // the process lifetime, inverting the TTL bound. The map holds no invariant a
+    // panic could break.
+    let mut grants = pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if grants.len() >= MAX_PENDING_GRANTS && !grants.contains_key(&session_id) {
+        evict_oldest_pending_grant(&mut grants);
+    }
+    grants.insert(
+        session_id,
+        PendingGrant {
+            grant,
+            redirect_uri,
+            created_at,
+        },
+    );
+    drop(grants);
+    ensure_reaper();
+}
+
+fn evict_oldest_pending_grant(grants: &mut BTreeMap<u64, PendingGrant>) {
+    let oldest = grants
+        .iter()
+        .min_by_key(|(_session_id, entry)| entry.created_at)
+        .map(|(session_id, _entry)| *session_id);
+    if let Some(session_id) = oldest {
+        grants.remove(&session_id);
+    }
+}
+
+/// Claims the grant stored under an OAuth `session_id` for token exchange.
+///
+/// Returns the grant and its redirect URI exactly once: a missing, expired,
+/// or already-claimed id yields `None`.
+///
+/// # Invariant
+///
+/// The `session_id` is a lookup key, NOT a capability: it is a sequential,
+/// Swift-visible counter, so a caller that can supply an arbitrary `session_id`
+/// could retrieve another flow's code and verifier. This function is a plain
+/// in-process Rust seam with no C ABI; the `session_id` must only ever be one the
+/// caller legitimately holds from its own begin/finish, never accepted from an
+/// untrusted source.
+#[must_use]
+pub fn claim_grant(session_id: u64) -> Option<(AuthorizationGrant, Url)> {
+    let mut grants = pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let entry = grants.remove(&session_id)?;
+    if entry.created_at.elapsed() >= PENDING_GRANT_LIFETIME {
+        // The abandoned grant drops here, wiping its code and verifier.
+        return None;
+    }
+    Some((entry.grant, entry.redirect_uri))
+}
+
+fn ensure_reaper() {
+    REAPER.get_or_init(|| {
         drop(std::thread::spawn(|| {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 reap_expired_ios_sessions();
+                reap_expired_pending_grants(Instant::now());
             }
         }));
     });
@@ -242,6 +356,16 @@ fn reap_expired_ios_sessions() {
             Err(_terminal_error) => false,
         });
     }
+}
+
+/// Evicts every grant older than the authorization lifetime as of `now`, so
+/// an abandoned code and verifier are wiped within one reaper tick.
+fn reap_expired_pending_grants(now: Instant) {
+    let mut grants = pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    grants
+        .retain(|_session_id, entry| now.duration_since(entry.created_at) < PENDING_GRANT_LIFETIME);
 }
 
 #[expect(
@@ -298,7 +422,7 @@ mod macos {
     use super::{
         AUTHORIZATION_LIFETIME, AuthorizationConfig, PendingSession, STATUS_CANCELLED,
         STATUS_EXPIRED, STATUS_INTERNAL, STATUS_OK, STATUS_REJECTED, STATUS_SUCCEEDED,
-        SystemMonotonicClock, Url, Zeroizing, prepare_authorization, status_for_error,
+        SystemMonotonicClock, Url, Zeroizing, prepare_authorization, status_for_error, store_grant,
     };
 
     const MAX_REQUEST_BYTES: usize = 8_192;
@@ -444,10 +568,14 @@ mod macos {
         let _ = stream.write_all(response);
     }
 
-    fn complete_callback(mut accepted: AcceptedCallback, session: &mut PendingSession) -> i32 {
+    fn complete_callback(
+        session_id: u64,
+        mut accepted: AcceptedCallback,
+        session: &mut PendingSession,
+    ) -> i32 {
         let outcome = session.finish(&accepted.callback);
         let status = outcome.map_or_else(status_for_error, |grant| {
-            drop(grant);
+            store_grant(session_id, grant, session.redirect_uri().clone());
             STATUS_SUCCEEDED
         });
         let response = if status == STATUS_SUCCEEDED {
@@ -516,6 +644,7 @@ mod macos {
     }
 
     pub(super) fn spawn(
+        session_id: u64,
         mut receiver: LoopbackReceiver,
         mut session: PendingSession,
     ) -> MacSessionEntry {
@@ -538,8 +667,10 @@ mod macos {
                 }
                 match receiver.try_accept(deadline) {
                     Ok(Some(accepted)) => {
-                        worker_status
-                            .store(complete_callback(accepted, &mut session), Ordering::Release);
+                        worker_status.store(
+                            complete_callback(session_id, accepted, &mut session),
+                            Ordering::Release,
+                        );
                         return;
                     }
                     Ok(None) => thread::sleep(Duration::from_millis(10)),
@@ -596,6 +727,7 @@ mod macos {
         use std::thread;
         use std::time::{Duration, Instant};
 
+        use super::super::{PENDING_GRANT_TEST_LOCK, allocate_session_id, claim_grant};
         use super::{
             AcceptedCallback, CALLBACK_PATH, HTTP_ERROR_RESPONSE, HTTP_SUCCESS_RESPONSE,
             LoopbackError, LoopbackReceiver, MAX_REQUEST_BYTES, STATUS_REJECTED, STATUS_SUCCEEDED,
@@ -735,7 +867,12 @@ mod macos {
                 response
             });
             let accepted = wait_for_callback(&mut receiver);
-            assert_eq!(complete_callback(accepted, &mut session), STATUS_SUCCEEDED);
+            let session_id = allocate_session_id().unwrap();
+            let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+            assert_eq!(
+                complete_callback(session_id, accepted, &mut session),
+                STATUS_SUCCEEDED
+            );
             let response = browser.join().unwrap();
             assert_eq!(response, HTTP_SUCCESS_RESPONSE);
             assert!(!response.windows(6).any(|window| window == b"secret"));
@@ -744,6 +881,12 @@ mod macos {
                 Err(LoopbackError::AlreadyConsumed)
             ));
             assert!(TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err());
+
+            let (grant, redirect_uri) = claim_grant(session_id).unwrap();
+            assert_eq!(grant.code(), "secret-code");
+            assert_eq!(grant.verifier().len(), 43);
+            assert_eq!(&redirect_uri, receiver.redirect_uri());
+            assert!(claim_grant(session_id).is_none());
         }
 
         #[test]
@@ -761,7 +904,11 @@ mod macos {
                 response
             });
             let accepted = wait_for_callback(&mut receiver);
-            assert_eq!(complete_callback(accepted, &mut session), STATUS_REJECTED);
+            let session_id = allocate_session_id().unwrap();
+            assert_eq!(
+                complete_callback(session_id, accepted, &mut session),
+                STATUS_REJECTED
+            );
             let response = browser.join().unwrap();
             assert_eq!(response, HTTP_ERROR_RESPONSE);
             assert!(!response.windows(6).any(|window| window == b"secret"));
@@ -836,7 +983,7 @@ pub unsafe extern "C" fn tersa_oauth_macos_begin(
         }
         let (authorization_url, session, receiver) = begin_macos(&client_id)?;
         let authorization_url = Zeroizing::new(String::from(authorization_url));
-        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let session_id = allocate_session_id()?;
         // SAFETY: The function contract requires writable output buffers.
         unsafe {
             write_begin_output(
@@ -851,7 +998,7 @@ pub unsafe extern "C" fn tersa_oauth_macos_begin(
         macos_sessions()
             .lock()
             .map_err(|_error| STATUS_INTERNAL)?
-            .insert(session_id, spawn_macos(receiver, session));
+            .insert(session_id, spawn_macos(session_id, receiver, session));
         Ok(())
     })();
     result.map_or_else(|status| status, |()| STATUS_OK)
@@ -896,12 +1043,37 @@ mod tests {
         reason = "redirect tests use compile-time constant schemes"
     )]
 
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        AuthorizationConfig, STATUS_CONFIGURATION_MISSING, SystemMonotonicClock, Url,
-        ios_redirect_uri, ios_sessions, prepare_authorization, reap_expired_ios_sessions,
+        AUTHORIZATION_LIFETIME, AuthorizationConfig, AuthorizationGrant, MAX_PENDING_GRANTS,
+        PENDING_GRANT_TEST_LOCK, STATUS_CONFIGURATION_MISSING, STATUS_REJECTED,
+        SystemMonotonicClock, Url, allocate_session_id, claim_grant, ios_redirect_uri,
+        ios_sessions, pending_grants, prepare_authorization, reap_expired_ios_sessions,
+        reap_expired_pending_grants, store_grant_at, tersa_oauth_cancel,
     };
+
+    fn make_grant(code: &str) -> (AuthorizationGrant, Url) {
+        let redirect = Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap();
+        let config =
+            AuthorizationConfig::new("public-test-client", redirect, Duration::from_secs(60))
+                .unwrap();
+        let prepared = prepare_authorization(config, SystemMonotonicClock::new()).unwrap();
+        let state = prepared
+            .authorization_url()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let mut callback = Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("state", &state)
+            .append_pair("code", code);
+        let (_authorization_url, mut session) = prepared.into_parts();
+        let redirect_uri = session.redirect_uri().clone();
+        let grant = session.finish(&callback).unwrap();
+        (grant, redirect_uri)
+    }
 
     #[test]
     fn ios_redirect_scheme_fails_closed() {
@@ -933,5 +1105,102 @@ mod tests {
         reap_expired_ios_sessions();
 
         assert!(!ios_sessions().lock().unwrap().contains_key(&session_id));
+    }
+
+    #[test]
+    fn a_stored_grant_is_claimed_exactly_once() {
+        let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("claim-once-code");
+        store_grant_at(session_id, grant, redirect_uri.clone(), Instant::now());
+
+        let (claimed, claimed_redirect) = claim_grant(session_id).unwrap();
+        assert_eq!(claimed.code(), "claim-once-code");
+        assert_eq!(claimed.verifier().len(), 43);
+        assert!(
+            claimed
+                .verifier()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+        assert_eq!(claimed_redirect, redirect_uri);
+        assert!(claim_grant(session_id).is_none());
+    }
+
+    #[test]
+    fn an_expired_stored_grant_is_not_claimable() {
+        let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("expired-code");
+        let stale = Instant::now()
+            .checked_sub(AUTHORIZATION_LIFETIME + Duration::from_secs(1))
+            .unwrap();
+        store_grant_at(session_id, grant, redirect_uri, stale);
+
+        assert!(claim_grant(session_id).is_none());
+        assert!(!pending_grants().lock().unwrap().contains_key(&session_id));
+    }
+
+    #[test]
+    fn a_full_registry_evicts_the_oldest_pending_grant() {
+        let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+        let base = Instant::now();
+        let mut session_ids = Vec::new();
+        for index in 0..MAX_PENDING_GRANTS {
+            let session_id = allocate_session_id().unwrap();
+            let (grant, redirect_uri) = make_grant("capped-code");
+            store_grant_at(
+                session_id,
+                grant,
+                redirect_uri,
+                base + Duration::from_secs(index as u64),
+            );
+            session_ids.push(session_id);
+        }
+        let newest_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("newest-code");
+        store_grant_at(
+            newest_id,
+            grant,
+            redirect_uri,
+            base + Duration::from_secs(1_000),
+        );
+
+        assert!(claim_grant(session_ids[0]).is_none());
+        for session_id in &session_ids[1..] {
+            assert!(claim_grant(*session_id).is_some());
+        }
+        assert!(claim_grant(newest_id).is_some());
+    }
+
+    #[test]
+    fn the_reaper_evicts_only_grants_older_than_the_authorization_lifetime() {
+        let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+        let base = Instant::now();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("reaped-code");
+        store_grant_at(
+            session_id,
+            grant,
+            redirect_uri,
+            base + Duration::from_secs(1),
+        );
+
+        reap_expired_pending_grants(base + AUTHORIZATION_LIFETIME);
+        assert!(pending_grants().lock().unwrap().contains_key(&session_id));
+        reap_expired_pending_grants(base + AUTHORIZATION_LIFETIME + Duration::from_secs(1));
+        assert!(!pending_grants().lock().unwrap().contains_key(&session_id));
+        assert!(claim_grant(session_id).is_none());
+    }
+
+    #[test]
+    fn cancel_evicts_a_pending_grant_without_a_live_session() {
+        let _registry_guard = PENDING_GRANT_TEST_LOCK.lock().unwrap();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("cancelled-code");
+        store_grant_at(session_id, grant, redirect_uri, Instant::now());
+
+        assert_eq!(tersa_oauth_cancel(session_id), STATUS_REJECTED);
+        assert!(claim_grant(session_id).is_none());
     }
 }

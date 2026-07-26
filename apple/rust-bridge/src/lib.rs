@@ -48,7 +48,7 @@ pub unsafe extern "C" fn tersa_macos_bootstrap_default_account(
 }
 
 #[doc(inline)]
-pub use oauth::{tersa_oauth_cancel, tersa_oauth_ios_begin, tersa_oauth_ios_finish};
+pub use oauth::{claim_grant, tersa_oauth_cancel, tersa_oauth_ios_begin, tersa_oauth_ios_finish};
 
 #[cfg(target_os = "macos")]
 #[doc(inline)]
