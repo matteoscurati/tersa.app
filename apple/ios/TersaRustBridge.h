@@ -24,6 +24,8 @@ int32_t tersa_oauth_ios_finish(
     const uint8_t *callback_url,
     size_t callback_url_len
 );
+// Invariant (see `tersa_oauth_cancel` in oauth.rs): session_id is a lookup
+// key, NOT a capability; callers must only pass an id from their own begin.
 int32_t tersa_oauth_cancel(uint64_t session_id);
 
 #endif
