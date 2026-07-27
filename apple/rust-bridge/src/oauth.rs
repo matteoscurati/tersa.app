@@ -7,7 +7,7 @@
 //! The adapter keeps sensitive state in Rust. Swift supplies only public build
 //! configuration and transports the authorization URL or callback URL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,6 +43,14 @@ const PENDING_GRANT_LIFETIME: Duration = AUTHORIZATION_LIFETIME;
 /// deliberately tied to [`AUTHORIZATION_LIFETIME`], NOT to the tunable
 /// [`PENDING_GRANT_LIFETIME`]: shortening the grant TTL must never shorten
 /// tombstone protection.
+///
+/// LEASE INVARIANT: a CLAIMED session's tombstone is unreapable. The TTL
+/// cannot bound the claim→fence window — it spans the ~30s token-exchange
+/// network request — so a claimed session's tombstone is pinned by the
+/// in-flight lease ([`GrantRegistry::in_flight`]) until the connect worker
+/// acknowledges completion via [`complete_session`]. The TTL bounds only
+/// unclaimed and completed sessions: a completed session's tombstone is
+/// re-stamped at release, and normal TTL reaping resumes from the release.
 const CANCEL_TOMBSTONE_LIFETIME: Duration = AUTHORIZATION_LIFETIME;
 const MAX_AUTHORIZATION_URL_BYTES: usize = 4_096;
 
@@ -67,9 +75,9 @@ struct PendingGrant {
     created_at: Instant,
 }
 
-/// The pending-authorization registry: one mutex over two maps with separate
-/// lifecycles, so every state transition (store, cancel, claim, reap) has a
-/// single linearization point.
+/// The pending-authorization registry: one mutex over two maps and the lease
+/// set with separate lifecycles, so every state transition (store, cancel,
+/// claim, complete, reap) has a single linearization point.
 struct GrantRegistry {
     /// Finished grants awaiting a single-use claim. Secret-bearing, so this
     /// map is count-capped at [`MAX_PENDING_GRANTS`] (bounding secret
@@ -78,8 +86,16 @@ struct GrantRegistry {
     /// Tombstones for cancelled sessions, stamped at cancel time. They hold NO
     /// secret, so they are NOT count-capped; they are TTL'd at
     /// [`CANCEL_TOMBSTONE_LIFETIME`] (at least the session store window) so a
-    /// live tombstone is never removed while a finisher may still store.
+    /// live tombstone is never removed while a finisher may still store. A
+    /// tombstone whose id is in `in_flight` is exempt from TTL reaping.
     cancelled: BTreeMap<u64, Instant>,
+    /// Sessions whose grant was successfully claimed but whose connect worker
+    /// has not yet acknowledged completion via [`complete_session`]. A cancel
+    /// tombstone for an id in this set is UNREAPABLE: the claim→fence window
+    /// spans the token-exchange network request, which the tombstone TTL
+    /// cannot bound. Entries are removed ONLY by `complete_session`, never
+    /// TTL-reaped.
+    in_flight: BTreeSet<u64>,
 }
 
 impl GrantRegistry {
@@ -87,6 +103,7 @@ impl GrantRegistry {
         Self {
             grants: BTreeMap::new(),
             cancelled: BTreeMap::new(),
+            in_flight: BTreeSet::new(),
         }
     }
 }
@@ -115,7 +132,8 @@ static PENDING_GRANT_TEST_LOCK: Mutex<()> = Mutex::new(());
 // Serializes registry-mutating tests AND resets the process-global registry on
 // entry, so tests are order-independent; recovers a poisoned lock so one
 // failing test does not cascade into the rest. NEXT_SESSION_ID is monotonic
-// and shared, so only the two registry maps are reset, never the counter.
+// and shared, so only the registry maps and the lease set are reset, never
+// the counter.
 fn registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
     let guard = PENDING_GRANT_TEST_LOCK
         .lock()
@@ -125,6 +143,7 @@ fn registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(PoisonError::into_inner);
     registry.grants.clear();
     registry.cancelled.clear();
+    registry.in_flight.clear();
     drop(registry);
     guard
 }
@@ -249,6 +268,28 @@ pub unsafe extern "C" fn tersa_oauth_ios_finish(
 /// - `STATUS_REJECTED` — admission failure only: the id is implausible
 ///   (zero, or at or beyond the allocation cursor, so it was never handed
 ///   out by this process). Nothing is stamped and nothing is displaced.
+///
+/// # Connectedness contract (for 3e)
+///
+/// This return value is authoritative ONLY over "the session can no longer
+/// produce a grant". It is NOT the source of truth for whether an account is
+/// connected: the CONNECT WORKER's terminal status is the sole source of that.
+/// A cancel that loses the post-store race — the worker stored the refresh
+/// token and passed its final cancel fence before the tombstone landed —
+/// returns `STATUS_CANCELLED` here while the worker returns `STATUS_SUCCEEDED`
+/// and a sync ran. UI connectedness must therefore key off the worker status
+/// plus disconnect, never off this return value.
+///
+/// Symmetrically, a `STATUS_CANCELLED` FROM THE CONNECT WORKER means only
+/// "this connect created no new connection"; it does NOT imply the account is
+/// disconnected. A cancelled RE-connect restores the prior credential and
+/// leaves the pre-existing connection intact, so 3e must not render the
+/// worker's CANCELLED as "disconnected" — connectedness keys off the worker
+/// status plus disconnect, as above. (Deferred 3e input, deliberately NOT
+/// implemented in this slice: a distinct outcome — e.g.
+/// `CancelledPriorPreserved` — would let the UI distinguish "re-connect
+/// cancelled, existing connection unchanged" from "connect cancelled, nothing
+/// connected". No new status int is added here.)
 ///
 /// # Invariant
 ///
@@ -520,6 +561,12 @@ fn evict_oldest_pending_grant(grants: &mut BTreeMap<u64, PendingGrant>) {
 /// Returns the grant and its redirect URI exactly once: a missing, expired,
 /// cancelled, or already-claimed id yields `None`.
 ///
+/// A SUCCESSFUL claim also takes the session's in-flight lease in the SAME
+/// critical section (`GrantRegistry::in_flight`): a cancel tombstone stamped
+/// afterwards is pinned against TTL reaping until the connect worker
+/// acknowledges completion via [`complete_session`]. A claim that returns
+/// `None` takes no lease.
+///
 /// # Invariant
 ///
 /// The `session_id` is a lookup key, NOT a capability: it is a sequential,
@@ -546,10 +593,72 @@ pub fn claim_grant(session_id: u64) -> Option<(AuthorizationGrant, Url)> {
     }
     let entry = registry.grants.remove(&session_id)?;
     if entry.created_at.elapsed() >= PENDING_GRANT_LIFETIME {
-        // The abandoned grant drops here, wiping its code and verifier.
+        // The abandoned grant drops here, wiping its code and verifier. NO
+        // lease is taken: the claim yielded nothing.
         None
     } else {
+        // The successful claim takes the in-flight lease in the same critical
+        // section as the grant removal, so a cancel racing the claim either
+        // lands BEFORE it (the tombstone refuses the claim above) or AFTER it
+        // (the lease is resident and pins the tombstone).
+        registry.in_flight.insert(session_id);
         Some((entry.grant, entry.redirect_uri))
+    }
+}
+
+/// Queries whether an OAuth `session_id` was cancelled, WITHOUT consuming the
+/// tombstone.
+///
+/// This is the connect flow's cancel-fence query: the token-exchange
+/// composition checks it after the provider exchange mints tokens but before
+/// the refresh token is stored, so a user who cancelled while the exchange was
+/// in flight revokes the minted token and aborts instead of ending up
+/// connected. The query is non-consuming — a `true` answer leaves the
+/// tombstone protective against a still-running finisher; only the reaper
+/// retires tombstones, once the session can no longer produce a grant — and
+/// for a CLAIMED session the in-flight lease pins the tombstone until the
+/// connect worker calls [`complete_session`].
+///
+/// # Invariant
+///
+/// The `session_id` is a lookup key, NOT a capability (the same note
+/// [`claim_grant`] carries): it is a sequential, Swift-visible counter, so an
+/// in-process caller walking `1..NEXT_SESSION_ID` could probe which flows were
+/// cancelled. That discloses only cancel state, never secrets, but the
+/// `session_id` must only ever be one the caller legitimately holds from its
+/// own begin, never accepted from an untrusted source.
+#[must_use]
+pub fn is_session_cancelled(session_id: u64) -> bool {
+    // Recover a poisoned lock rather than abandon the query, matching every
+    // other registry access: the maps hold no invariant a panic could break.
+    pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .cancelled
+        .contains_key(&session_id)
+}
+
+/// Releases a claimed session's in-flight lease: the connect worker's
+/// acknowledgement that its cycle finished, on success and on every error.
+///
+/// Removes `session_id` from `GrantRegistry::in_flight`; if a cancel
+/// tombstone is resident for the session its stamp is moved to now, so normal
+/// TTL reaping resumes FROM THE RELEASE rather than retroactively from the
+/// original cancel time. Idempotent and infallible: completing an unclaimed or
+/// already-completed session changes nothing. Same poison recovery as every
+/// other registry access.
+///
+/// This is the ONLY lease-release site, and it is deliberately not driven by
+/// `Drop` on the caller side: a mid-connect drop must leave the tombstone
+/// pinned (fail-safe), never reopen the store-without-fence bypass the
+/// tombstone closes.
+pub fn complete_session(session_id: u64) {
+    let mut registry = pending_grants()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    registry.in_flight.remove(&session_id);
+    if let Some(stamped_at) = registry.cancelled.get_mut(&session_id) {
+        *stamped_at = Instant::now();
     }
 }
 
@@ -598,16 +707,26 @@ fn reap_expired_ios_sessions() {
 /// cancel tombstones older than [`CANCEL_TOMBSTONE_LIFETIME`] as of `now`, so
 /// an abandoned code and verifier are wiped within one reaper tick while a
 /// tombstone stays protective for the whole window in which its session could
-/// still produce a grant.
+/// still produce a grant. A tombstone whose session holds an in-flight lease
+/// is NEVER retired, and lease entries themselves are never TTL-reaped: the
+/// claim→fence window spans the token-exchange network request, so the lease
+/// — released only by [`complete_session`] — bounds it, not the TTL.
 fn reap_expired_pending_grants(now: Instant) {
     let mut registry = pending_grants()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    registry
-        .grants
+    // Destructure once so the tombstone sweep can read the lease set while the
+    // maps are borrowed for retention.
+    let GrantRegistry {
+        grants,
+        cancelled,
+        in_flight,
+    } = &mut *registry;
+    grants
         .retain(|_session_id, grant| now.duration_since(grant.created_at) < PENDING_GRANT_LIFETIME);
-    registry.cancelled.retain(|_session_id, stamped_at| {
-        now.duration_since(*stamped_at) < CANCEL_TOMBSTONE_LIFETIME
+    cancelled.retain(|session_id, stamped_at| {
+        in_flight.contains(session_id)
+            || now.duration_since(*stamped_at) < CANCEL_TOMBSTONE_LIFETIME
     });
 }
 
@@ -1352,9 +1471,10 @@ mod tests {
         MAX_PENDING_GRANTS, NEXT_SESSION_ID, Ordering, PENDING_GRANT_LIFETIME, PoisonError,
         STATUS_CANCELLED, STATUS_CONFIGURATION_MISSING, STATUS_EXPIRED, STATUS_REJECTED,
         StoreOutcome, SystemMonotonicClock, Url, allocate_session_id, claim_grant,
-        finish_and_store, ios_redirect_uri, ios_sessions, pending_grants, prepare_authorization,
-        reap_expired_ios_sessions, reap_expired_pending_grants, registry_test_guard, store_grant,
-        store_grant_at, tersa_oauth_cancel,
+        complete_session, finish_and_store, ios_redirect_uri, ios_sessions, is_session_cancelled,
+        pending_grants, prepare_authorization, reap_expired_ios_sessions,
+        reap_expired_pending_grants, registry_test_guard, store_grant, store_grant_at,
+        tersa_oauth_cancel,
     };
 
     /// Builds a live session with the given lifetime plus the well-formed
@@ -1593,6 +1713,33 @@ mod tests {
     }
 
     #[test]
+    fn is_session_cancelled_reports_the_tombstone_without_consuming_it() {
+        let _registry_guard = registry_test_guard();
+        let cancelled_id = allocate_session_id().unwrap();
+        let never_cancelled_id = allocate_session_id().unwrap();
+
+        // A plausible id with no tombstone reports not-cancelled.
+        assert!(!is_session_cancelled(never_cancelled_id));
+
+        // The cancel stamps the tombstone; the fence query then reports it...
+        assert_eq!(tersa_oauth_cancel(cancelled_id), STATUS_CANCELLED);
+        assert!(is_session_cancelled(cancelled_id));
+        // ...and the query is non-consuming: a second check still sees the
+        // tombstone, which only the reaper retires, so a fence re-check (or a
+        // late store) remains refused.
+        assert!(is_session_cancelled(cancelled_id));
+        assert!(
+            pending_grants()
+                .lock()
+                .unwrap()
+                .cancelled
+                .contains_key(&cancelled_id)
+        );
+        // The query touches only its own id: a sibling flow stays unaffected.
+        assert!(!is_session_cancelled(never_cancelled_id));
+    }
+
+    #[test]
     fn grant_cap_pressure_never_evicts_a_cancel_tombstone() {
         let _registry_guard = registry_test_guard();
         let cancelled_id = allocate_session_id().unwrap();
@@ -1686,6 +1833,138 @@ mod tests {
                 .contains_key(&cancelled_id)
         );
         assert!(claim_grant(cancelled_id).is_none());
+    }
+
+    #[test]
+    fn a_claimed_sessions_tombstone_is_pinned_by_the_lease_until_complete() {
+        let _registry_guard = registry_test_guard();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("leased-code");
+        assert_eq!(
+            store_grant(session_id, grant, redirect_uri),
+            StoreOutcome::Stored
+        );
+
+        // A successful claim takes the in-flight lease in the same critical
+        // section as the grant removal.
+        assert!(claim_grant(session_id).is_some());
+        assert!(
+            pending_grants()
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains(&session_id)
+        );
+
+        // The cancel lands mid-connect and stamps its tombstone; age the stamp
+        // past the TTL so that, without the lease, the very next reap would
+        // retire it.
+        assert_eq!(tersa_oauth_cancel(session_id), STATUS_CANCELLED);
+        let aged = Instant::now()
+            .checked_sub(CANCEL_TOMBSTONE_LIFETIME + Duration::from_secs(1))
+            .unwrap();
+        pending_grants()
+            .lock()
+            .unwrap()
+            .cancelled
+            .insert(session_id, aged);
+
+        // The tombstone SURVIVES a reap past its TTL: the lease pins it,
+        // because the claim→fence window spans the network exchange.
+        reap_expired_pending_grants(Instant::now());
+        assert!(
+            pending_grants()
+                .lock()
+                .unwrap()
+                .cancelled
+                .contains_key(&session_id)
+        );
+
+        // The worker acknowledges completion: the lease is released and the
+        // tombstone re-stamped at release, so it now survives a reap at now
+        // (the aged stamp would have been retired by it)...
+        complete_session(session_id);
+        {
+            let registry = pending_grants().lock().unwrap();
+            assert!(!registry.in_flight.contains(&session_id));
+            assert!(*registry.cancelled.get(&session_id).unwrap() > aged);
+        }
+        reap_expired_pending_grants(Instant::now());
+        assert!(
+            pending_grants()
+                .lock()
+                .unwrap()
+                .cancelled
+                .contains_key(&session_id)
+        );
+
+        // ...and normal TTL reaping resumes FROM THE RELEASE.
+        reap_expired_pending_grants(
+            Instant::now() + CANCEL_TOMBSTONE_LIFETIME + Duration::from_secs(1),
+        );
+        assert!(
+            !pending_grants()
+                .lock()
+                .unwrap()
+                .cancelled
+                .contains_key(&session_id)
+        );
+    }
+
+    #[test]
+    fn a_missed_claim_takes_no_lease() {
+        let _registry_guard = registry_test_guard();
+        let session_id = allocate_session_id().unwrap();
+        // An unknown id: the claim misses and takes no lease.
+        assert!(claim_grant(session_id).is_none());
+        assert!(pending_grants().lock().unwrap().in_flight.is_empty());
+        // A tombstoned id: the claim misses too and still takes no lease.
+        assert_eq!(tersa_oauth_cancel(session_id), STATUS_CANCELLED);
+        assert!(claim_grant(session_id).is_none());
+        assert!(pending_grants().lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn complete_session_is_idempotent_and_leaves_the_lease_released() {
+        let _registry_guard = registry_test_guard();
+        let session_id = allocate_session_id().unwrap();
+        let (grant, redirect_uri) = make_grant("leased-code");
+        assert_eq!(
+            store_grant(session_id, grant, redirect_uri),
+            StoreOutcome::Stored
+        );
+        assert!(claim_grant(session_id).is_some());
+        assert!(
+            pending_grants()
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains(&session_id)
+        );
+
+        // A second release changes nothing: no panic, the lease stays removed.
+        complete_session(session_id);
+        complete_session(session_id);
+        assert!(
+            !pending_grants()
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains(&session_id)
+        );
+    }
+
+    #[test]
+    fn complete_session_without_a_tombstone_is_a_noop() {
+        let _registry_guard = registry_test_guard();
+        // An allocated id with nothing resident — no grant, no tombstone, no
+        // lease: completing it changes nothing (and must not panic).
+        let session_id = allocate_session_id().unwrap();
+        complete_session(session_id);
+        let registry = pending_grants().lock().unwrap();
+        assert!(!registry.in_flight.contains(&session_id));
+        assert!(!registry.cancelled.contains_key(&session_id));
+        assert!(!registry.grants.contains_key(&session_id));
     }
 
     #[test]

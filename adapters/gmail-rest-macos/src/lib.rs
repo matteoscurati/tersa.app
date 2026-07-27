@@ -50,6 +50,12 @@ const RAW_FIELDS: &str = "id,threadId,raw";
 const MAX_ACCESS_TOKEN_LEN: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Bounds one token-endpoint request, so it is the largest term of the connect
+/// flow's claim→cancel-fence latency. That window is not bounded by the
+/// bridge's `CANCEL_TOMBSTONE_LIFETIME` (apple/rust-bridge): a claimed
+/// session's cancel tombstone is instead pinned by the bridge's in-flight
+/// lease until the connect worker calls `complete_session` — see the lease
+/// invariant documented on that constant.
 #[cfg(target_os = "macos")]
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 #[cfg(any(target_os = "macos", test))]
@@ -691,22 +697,37 @@ impl GmailTokenTransport {
         body.zeroize();
         result
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl TokenTransport for GmailTokenTransport {
+    fn exchange(
+        &self,
+        request: ExchangeRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+        Box::pin(async move { self.post_token(&request.parameters()).await })
+    }
+
+    fn refresh(
+        &self,
+        request: RefreshRequest,
+    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
+        Box::pin(async move { self.post_token(&request.parameters()).await })
+    }
 
     /// Revokes a token at Google's revoke endpoint, best-effort.
     ///
-    /// Revocation is an inherent method rather than part of the
-    /// [`TokenTransport`] port, which models only exchange and refresh. The
-    /// token is sent as the single form-encoded `token` parameter. HTTP 200 is
-    /// success; any other status, an unparsable error body, or a network
+    /// The token is sent as the single form-encoded `token` parameter. HTTP 200
+    /// is success; any other status, an unparsable error body, or a network
     /// failure resolves to a [`TokenTransportError`] without provider data.
-    /// The ADR-0023 disconnect composition treats revocation as best-effort
-    /// and still deletes the local token when this call fails.
-    ///
-    /// # Errors
-    ///
-    /// Resolves to a typed transport or protocol failure without provider data.
-    #[must_use]
-    pub fn revoke<'a>(
+    /// The ADR-0023 disconnect composition treats revocation as best-effort and
+    /// still deletes the local token when this call fails. The connect flow's
+    /// cancel fences are NOT equivalent to disconnect: they store nothing (or
+    /// delete the just-stored token first), so a permanently-failed revoke on
+    /// that path leaves a live token at Google with no in-app remedy — the
+    /// fences therefore retry once (see `revoke_best_effort` in
+    /// `tersa-oauth-sync-macos`) before giving up.
+    fn revoke<'a>(
         &'a self,
         token: &'a Zeroizing<String>,
     ) -> BoxFuture<'a, Result<(), TokenTransportError>> {
@@ -725,23 +746,6 @@ impl GmailTokenTransport {
             body.zeroize();
             result
         })
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl TokenTransport for GmailTokenTransport {
-    fn exchange(
-        &self,
-        request: ExchangeRequest,
-    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
-        Box::pin(async move { self.post_token(&request.parameters()).await })
-    }
-
-    fn refresh(
-        &self,
-        request: RefreshRequest,
-    ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
-        Box::pin(async move { self.post_token(&request.parameters()).await })
     }
 }
 
@@ -1226,6 +1230,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
             Box::pin(async { Err(TokenTransportError::Transport) })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            _token: &'a Zeroizing<String>,
+        ) -> BoxFuture<'a, Result<(), TokenTransportError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

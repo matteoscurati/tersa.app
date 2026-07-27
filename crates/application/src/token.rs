@@ -487,6 +487,25 @@ pub trait TokenTransport: fmt::Debug + Send + Sync {
         &self,
         request: RefreshRequest,
     ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>>;
+
+    /// Revokes a token at the provider's revocation endpoint, best-effort.
+    ///
+    /// Callers treat revocation as best-effort and never gate local state on it
+    /// succeeding, but the two call paths differ materially: the ADR-0023
+    /// disconnect composition still deletes the local token when this call
+    /// fails, while the connect flow's cancel fences store nothing (or delete
+    /// the just-stored token first), so a permanently-failed revoke THERE
+    /// leaves a live token at the provider with no in-app remedy — the fences
+    /// therefore retry once before giving up.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to a typed transport or protocol failure without provider data.
+    #[must_use]
+    fn revoke<'a>(
+        &'a self,
+        token: &'a Zeroizing<String>,
+    ) -> BoxFuture<'a, Result<(), TokenTransportError>>;
 }
 
 /// Describes a token transport or protocol failure without provider data.
@@ -1004,6 +1023,13 @@ mod tests {
                     .push(RecordedRequest::Refresh(request));
                 self.outcome()
             })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            _token: &'a Zeroizing<String>,
+        ) -> BoxFuture<'a, Result<(), TokenTransportError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
