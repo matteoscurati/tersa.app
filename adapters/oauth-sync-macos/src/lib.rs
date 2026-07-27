@@ -48,6 +48,8 @@ use tersa_application::token::{
 use tersa_gmail_rest_macos::GmailMailbox;
 #[cfg(target_os = "macos")]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
+#[cfg(target_os = "macos")]
+use zeroize::Zeroizing;
 
 // The per-slot whole-cycle permit and the Rust-owned worker that holds it are
 // macOS-only: they depend on the platform's tokio runtime and the Gmail session.
@@ -215,7 +217,7 @@ where
 
 /// A connected account's short-lived access token and validated OIDC subject.
 ///
-/// Produced by [`connect_account`] and [`refresh_account`] from a SINGLE token
+/// Produced by `connect_account` and [`refresh_account`] from a SINGLE token
 /// response, so the access token and the identity-gate `subject` always share an
 /// origin (the same principal). 3d-3 builds the sync session from both, feeding
 /// the subject to the gate and the access token to the mailbox surface.
@@ -271,6 +273,25 @@ pub enum TokenLifecycleError {
     NoStoredToken,
     /// The exchange returned no refresh token, so offline refresh is impossible.
     MissingRefreshToken,
+    /// The connect was cancelled, observed at one of the three cancel fences:
+    /// BEFORE the exchange (no token was ever minted), after the exchange but
+    /// BEFORE the refresh-token store (nothing was persisted), or AFTER it
+    /// (the cleanup restored the snapshotted prior credential, or deleted the
+    /// just-stored token when there was none). A minted token was revoked
+    /// best-effort ONLY when the pre-exchange snapshot definitively read
+    /// empty (`Ok(None)`) — with a prior credential the minted token is
+    /// same-grant and disconnect (3d-3d) revokes it later, and an unreadable
+    /// store never licenses a revoke. The local cleanup completed. No NEW
+    /// connection was created — but a cancelled RE-connect preserves the
+    /// prior credential, so the account may still be connected.
+    Cancelled,
+    /// The connect was cancelled and the cancellation was acknowledged, but
+    /// the post-store cleanup's delete/restore write failed persistently: a
+    /// usable token may still sit in the Keychain. NOT a clean cancel — the
+    /// worker maps it to `STATUS_INTERNAL` (never `STATUS_CANCELLED`) so 3e
+    /// can surface "cancelled — please disconnect to be sure"; disconnect
+    /// (3d-3d) deletes the stored token regardless.
+    CancelledCleanupIncomplete,
 }
 
 #[cfg(target_os = "macos")]
@@ -281,6 +302,12 @@ impl core::fmt::Display for TokenLifecycleError {
             Self::Store(_) => "the refresh-token store failed",
             Self::NoStoredToken => "no refresh token is stored; re-connect is required",
             Self::MissingRefreshToken => "the token exchange returned no refresh token",
+            Self::Cancelled => {
+                "the connect was cancelled; no new connection was created (any pre-existing credential is preserved)"
+            }
+            Self::CancelledCleanupIncomplete => {
+                "the connect was cancelled but a token may remain stored"
+            }
         };
         formatter.write_str(message)
     }
@@ -288,6 +315,56 @@ impl core::fmt::Display for TokenLifecycleError {
 
 #[cfg(target_os = "macos")]
 impl std::error::Error for TokenLifecycleError {}
+
+/// One connect-account flow's session: the SINGLE source for both claiming the
+/// finished grant and querying cancellation, so the claim and the cancel fences
+/// provably reference the same session.
+///
+/// This replaces what would otherwise be two separately-passed closures (a
+/// claim and an `is_cancelled` query) that could be silently wired to two
+/// DIFFERENT sessions. The bridge's implementation (3b-2) holds the OAuth
+/// `session_id` and answers [`ConnectSession::claim`] from `claim_grant(id)`
+/// and [`ConnectSession::is_cancelled`] from `is_session_cancelled(id)`, so the
+/// two share the id by construction.
+#[cfg(target_os = "macos")]
+pub trait ConnectSession {
+    /// Claims the finished grant and its pinned token-client config for this
+    /// session, exactly once: a missing, expired, cancelled, or already-claimed
+    /// session yields `None`.
+    fn claim(&self) -> Option<(AuthorizationGrant, TokenClientConfig)>;
+
+    /// Whether this session has been cancelled. Checked at the cancel fences:
+    /// before the exchange, after the exchange mints tokens, and again after
+    /// the refresh-token store.
+    fn is_cancelled(&self) -> bool;
+
+    /// Acknowledges that the connect cycle finished, releasing the claimed
+    /// session's in-flight lease so its cancel tombstone (if any) resumes
+    /// normal TTL reaping. Idempotent and infallible. The connect worker calls
+    /// this EXACTLY ONCE after the whole claimed cycle (setup, connect, and
+    /// sync) returns, on every outcome — and never from `Drop`: a mid-connect
+    /// future drop must NOT retire the tombstone (that would reopen the
+    /// store-without-fence bypass the tombstone closes). A claim-miss takes
+    /// no lease and must never be completed.
+    fn complete(&self);
+}
+
+/// Revokes a provider-minted token best-effort, retrying ONCE on failure.
+///
+/// Used by the connect flow's cancel fences and store-failure path. This is NOT
+/// the ADR-0023 disconnect composition's revoke: disconnect keeps working from
+/// a stored local token, while on this path nothing is stored (or the
+/// just-stored copy was deleted first), so a revoke that fails permanently here
+/// leaves a LIVE token at the provider with no in-app remedy — the user can
+/// only revoke it from their Google account settings. The single immediate
+/// retry shrinks that window to a persistent network or provider failure; it
+/// cannot close it.
+#[cfg(target_os = "macos")]
+async fn revoke_best_effort<T: TokenTransport>(transport: &T, token: &Zeroizing<String>) {
+    if transport.revoke(token).await.is_err() {
+        let _ = transport.revoke(token).await;
+    }
+}
 
 /// Exchanges a forwarded authorization grant and persists the refresh token.
 ///
@@ -297,40 +374,223 @@ impl std::error::Error for TokenLifecycleError {}
 /// the short-lived access token with that subject. The grant is dropped (wiped)
 /// as soon as the exchange consumes it.
 ///
+/// # Lease
+///
+/// This function neither claims nor releases the session's in-flight lease:
+/// the caller MUST hold a successful [`ConnectSession::claim`] and MUST run
+/// [`ConnectSession::complete`] EXACTLY ONCE after this returns, on every
+/// outcome. The connect worker does both around the whole claimed cycle.
+///
+/// # Snapshot-conditional revocation (fail-closed)
+///
+/// Google `/revoke` revokes the whole GRANT, not one token: revoking a token
+/// minted during a connect that ran OVER an existing stored credential would
+/// kill the user's working connection. So BEFORE the exchange, the connect
+/// snapshots the stored credential (one Keychain read per user-initiated
+/// connect, TOCTOU-free because the per-slot whole-cycle permit serializes the
+/// slot). Every revoke below fires ONLY when the snapshot DEFINITIVELY read
+/// empty (`Ok(None)`): a failed read is UNKNOWN, not "no credential", and an
+/// unknown snapshot never licenses a revoke — a grant-scoped /revoke would
+/// kill a credential an unreadable store merely hid. With a prior credential,
+/// the minted token is same-grant and disconnect (3d-3d) revokes it later —
+/// so the connect never revokes, and a cancel restores the prior state
+/// instead.
+///
+/// `session` is the connect flow's cancel-fence query, checked THREE times:
+///
+/// - PRE-EXCHANGE, before the exchange runs: a cancel observed here means the
+///   user cancelled right after the callback, so the connect aborts with
+///   [`TokenLifecycleError::Cancelled`] before any token is minted — nothing
+///   to revoke or orphan, nothing stored.
+/// - PRE-STORE, right after the exchange mints tokens and BEFORE the refresh
+///   token is even extracted (so the fence sits above the
+///   [`TokenLifecycleError::MissingRefreshToken`] check): a cancel observed
+///   here revokes whichever token the exchange minted IFF the snapshot
+///   definitively read empty — revoking either the refresh or the access
+///   token revokes the grant at Google — and aborts with
+///   [`TokenLifecycleError::Cancelled`], storing nothing. With a prior
+///   credential or an unknown snapshot, nothing is revoked and any stored
+///   token is left intact.
+/// - POST-STORE, right after the refresh token is persisted: a cancel that
+///   landed in the check→store window runs the cleanup
+///   (`finish_cancelled_cleanup`): WITH a snapshotted prior credential it
+///   RESTORES the prior bytes and revokes nothing (the stored token is the
+///   live handle); WITHOUT one it deletes the just-stored token and revokes
+///   it, so no usable credential survives anywhere. The restore-vs-delete
+///   choice keys off `prior`, NOT `revocable`: on an unknown (`Err`) read
+///   `prior` is None, so the cleanup deletes the just-stored token, which is
+///   safe — the token it deletes is the one THIS connect stored. The
+///   delete/restore write is retried once (symmetric with
+///   `revoke_best_effort`); a persistent failure returns
+///   [`TokenLifecycleError::CancelledCleanupIncomplete`] — NOT
+///   [`TokenLifecycleError::Cancelled`] — because a usable token may remain in
+///   the Keychain. The per-slot whole-cycle permit guarantees no concurrent
+///   connect for this account, so the restore/delete cannot clobber another
+///   connect; disconnect (3d-3d) remains the backstop for a cancel landing
+///   after THIS check.
+///
+/// The [`TokenLifecycleError::MissingRefreshToken`] path is NOT gated on
+/// cancel: with a definitively-empty snapshot the handle-less grant's access
+/// token is revoked best-effort (closing the strand AND letting Google mint a
+/// refresh on retry); with a prior credential or an unknown snapshot, nothing
+/// is revoked — the stored token (if any) is the live handle.
+///
+/// Revocation is best-effort with one retry (see `revoke_best_effort`): consent
+/// withdrawal never gates on the network succeeding. Separately, a FAILED store
+/// revokes the minted token best-effort IFF the snapshot definitively read
+/// empty, before returning [`TokenLifecycleError::Store`], so a failed first
+/// store never strands a live grant at the provider with no local record.
+///
+/// # Concurrency
+///
+/// Connect cancellation flows through the tombstone/lease ONLY;
+/// `WorkerHandles::request_cancel` must never fire mid-connect; disconnect
+/// (3d-3d) serializes on the whole-cycle permit and deletes regardless. The
+/// bridge lease (`complete_session`) makes an accidental mid-connect drop
+/// fail-safe (the tombstone stays pinned) but does not un-store a token.
+///
 /// # Errors
 ///
 /// Returns [`TokenLifecycleError::Token`] when the exchange fails (including a
 /// missing/invalid identity), [`TokenLifecycleError::MissingRefreshToken`] when
-/// the exchange returns no refresh token, and [`TokenLifecycleError::Store`] when
-/// the Keychain rejects the write.
+/// the exchange returns no refresh token, [`TokenLifecycleError::Cancelled`]
+/// when any fence observes a cancellation and the local cleanup completes,
+/// [`TokenLifecycleError::CancelledCleanupIncomplete`] when the post-store
+/// cleanup's delete/restore write fails persistently, and
+/// [`TokenLifecycleError::Store`] when the Keychain rejects the write (the
+/// minted token is revoked best-effort first IFF the snapshot definitively
+/// read empty).
 #[cfg(target_os = "macos")]
-pub async fn connect_account<T, S, C>(
+pub(crate) async fn connect_account<T, S, C, St>(
     account: &AccountId,
     grant: AuthorizationGrant,
     config: &TokenClientConfig,
     transport: &T,
     refresh_store: &S,
     clock: &C,
+    session: &St,
 ) -> Result<ConnectedAccount, TokenLifecycleError>
 where
     T: TokenTransport,
     S: RefreshTokenStore,
     C: MonotonicClock,
+    St: ConnectSession + ?Sized,
 {
+    // PRE-EXCHANGE fence: the user cancelled right after the callback, before
+    // the exchange ran — abort now so no token is ever minted (nothing to
+    // revoke or orphan). This is downstream of the worker's claim, so the
+    // in-flight lease is held and is released by the worker's
+    // `ConnectSession::complete`.
+    if session.is_cancelled() {
+        return Err(TokenLifecycleError::Cancelled);
+    }
+    // Snapshot the stored credential BEFORE the exchange. Only a DEFINITIVE
+    // "nothing stored" (`Ok(None)`) licenses revoking a minted token below:
+    // a grant-scoped /revoke would kill a credential an unreadable store
+    // merely hid, so a FAILED read is UNKNOWN — never the revoking branch.
+    let loaded = refresh_store.load(account);
+    let revocable = matches!(loaded, Ok(None));
+    let prior = loaded.ok().flatten();
+
     let success = exchange_grant(&grant, config, transport, clock)
         .await
         .map_err(TokenLifecycleError::Token)?;
     drop(grant);
     let (access_token, rotated_refresh, subject, identity_expiry) = success.into_parts();
-    let refresh = rotated_refresh.ok_or(TokenLifecycleError::MissingRefreshToken)?;
-    refresh_store
-        .store(account, &refresh)
-        .map_err(TokenLifecycleError::Store)?;
+    // PRE-STORE fence: consent withdrawn mid-exchange — abort, storing nothing.
+    if session.is_cancelled() {
+        if revocable {
+            // Revoke whichever token the exchange minted (revoking either
+            // revokes the grant at Google). With a prior credential — or an
+            // UNREADABLE snapshot, behind which a live grant could be hiding —
+            // this must NOT fire: the minted token is same-grant, so the
+            // revoke would kill the user's working connection.
+            let token_to_revoke = rotated_refresh.as_ref().unwrap_or(access_token.secret());
+            revoke_best_effort(transport, token_to_revoke).await;
+        }
+        return Err(TokenLifecycleError::Cancelled);
+    }
+    // NOT gated on cancel: a refresh-less exchange strands the grant's only
+    // handle, so revoke the access token IFF the snapshot definitively read
+    // empty (an unknown read never revokes).
+    let Some(refresh) = rotated_refresh else {
+        if revocable {
+            revoke_best_effort(transport, access_token.secret()).await;
+        }
+        return Err(TokenLifecycleError::MissingRefreshToken);
+    };
+    if let Err(error) = refresh_store.store(account, &refresh) {
+        // A failed FIRST store leaves no local record of the minted token:
+        // revoke it best-effort rather than strand a live grant at the
+        // provider. With a prior credential the stored token is the record,
+        // and with an UNREADABLE snapshot a live grant could be hiding — so
+        // only a definitively-empty snapshot revokes here.
+        if revocable {
+            revoke_best_effort(transport, &refresh).await;
+        }
+        return Err(TokenLifecycleError::Store(error));
+    }
+    // POST-STORE fence: the cancel landed in the check→store window. The
+    // cleanup keys its restore-vs-delete choice off `prior`: restore iff a
+    // prior credential is present, delete otherwise — on an unknown (`Err`)
+    // read `prior` is None, so it deletes the just-stored token, which is
+    // safe: the token it deletes is the one THIS connect stored.
+    if session.is_cancelled() {
+        return finish_cancelled_cleanup(
+            refresh_store,
+            transport,
+            account,
+            &refresh,
+            prior.as_ref(),
+        )
+        .await;
+    }
     Ok(ConnectedAccount {
         access_token,
         subject,
         identity_expiry,
     })
+}
+
+/// Runs the post-store cancel cleanup for [`connect_account`].
+///
+/// WITH a snapshotted prior credential, RESTORES the prior bytes over the
+/// just-stored token and revokes NOTHING (the minted token is same-grant;
+/// disconnect (3d-3d) revokes it later). WITHOUT one, deletes the just-stored
+/// token and revokes it best-effort — the delete-vs-restore choice keys off
+/// `prior` alone, so an UNKNOWN (`Err`) snapshot read lands here too: `prior`
+/// is None and the cleanup deletes the just-stored token, which is safe
+/// because the token it deletes is the one THIS connect stored. The
+/// delete/restore WRITE is retried once, symmetric with `revoke_best_effort`.
+/// A persistent write failure returns
+/// [`TokenLifecycleError::CancelledCleanupIncomplete`] — NOT
+/// [`TokenLifecycleError::Cancelled`] — and revokes nothing: a usable token
+/// may still sit in the Keychain, and disconnect (3d-3d) is the remedy. On
+/// success the cancel is clean and [`TokenLifecycleError::Cancelled`] is
+/// returned.
+#[cfg(target_os = "macos")]
+async fn finish_cancelled_cleanup<S, T>(
+    refresh_store: &S,
+    transport: &T,
+    account: &AccountId,
+    refresh: &Zeroizing<String>,
+    prior: Option<&Zeroizing<String>>,
+) -> Result<ConnectedAccount, TokenLifecycleError>
+where
+    S: RefreshTokenStore,
+    T: TokenTransport,
+{
+    let cleanup_write = || match prior {
+        Some(prior_bytes) => refresh_store.store(account, prior_bytes),
+        None => refresh_store.delete(account),
+    };
+    if cleanup_write().is_err() && cleanup_write().is_err() {
+        return Err(TokenLifecycleError::CancelledCleanupIncomplete);
+    }
+    if prior.is_none() {
+        revoke_best_effort(transport, refresh).await;
+    }
+    Err(TokenLifecycleError::Cancelled)
 }
 
 /// Refreshes the access token from the stored refresh token.
@@ -1066,7 +1326,7 @@ mod token_lifecycle_tests {
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -1084,8 +1344,8 @@ mod token_lifecycle_tests {
     use zeroize::Zeroizing;
 
     use super::{
-        GmailSession, GmailSessionError, TokenLifecycleError, connect_account, refresh_account,
-        refresh_if_due,
+        ConnectSession, GmailSession, GmailSessionError, TokenLifecycleError, connect_account,
+        refresh_account, refresh_if_due,
     };
 
     #[derive(Debug)]
@@ -1106,6 +1366,7 @@ mod token_lifecycle_tests {
             &FakeTransport::success(Some("granted-refresh")),
             &store,
             &TestClock::at(0),
+            &FakeSession::never(),
         ))
         .unwrap()
     }
@@ -1213,6 +1474,9 @@ mod token_lifecycle_tests {
     struct FakeTransport {
         rotated_refresh_token: Option<Zeroizing<String>>,
         claims: Option<IdTokenClaims>,
+        revoke_result: Result<(), TokenTransportError>,
+        revoked: Mutex<Vec<Zeroizing<String>>>,
+        exchanges: AtomicUsize,
     }
 
     impl FakeTransport {
@@ -1220,13 +1484,25 @@ mod token_lifecycle_tests {
             Self {
                 rotated_refresh_token: rotated.map(|token| Zeroizing::new(token.to_owned())),
                 claims: Some(valid_claims()),
+                revoke_result: Ok(()),
+                revoked: Mutex::new(Vec::new()),
+                exchanges: AtomicUsize::new(0),
             }
         }
         fn without_id_token() -> Self {
             Self {
                 rotated_refresh_token: Some(Zeroizing::new("refresh".to_owned())),
                 claims: None,
+                revoke_result: Ok(()),
+                revoked: Mutex::new(Vec::new()),
+                exchanges: AtomicUsize::new(0),
             }
+        }
+        /// A transport whose revoke fails, so a test can prove the fences still
+        /// abort (and retry once) when revocation itself fails.
+        fn with_failing_revoke(mut self) -> Self {
+            self.revoke_result = Err(TokenTransportError::Transport);
+            self
         }
         fn response(&self) -> TokenResponse {
             TokenResponse::new(
@@ -1236,6 +1512,19 @@ mod token_lifecycle_tests {
                 self.claims.clone(),
             )
         }
+        fn revoked(&self) -> Vec<String> {
+            self.revoked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|token| token.as_str().to_owned())
+                .collect()
+        }
+        /// How many exchanges were actually polled, so a test can prove a
+        /// pre-exchange cancel minted no token at all.
+        fn exchange_calls(&self) -> usize {
+            self.exchanges.load(Ordering::SeqCst)
+        }
     }
 
     impl TokenTransport for FakeTransport {
@@ -1244,7 +1533,13 @@ mod token_lifecycle_tests {
             _request: ExchangeRequest,
         ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
             let response = self.response();
-            Box::pin(async move { Ok(response) })
+            // Record INSIDE the awaited future (the same discipline as the
+            // revoke log): an exchange that was never polled — a pre-exchange
+            // fence that aborted first — leaves no trace.
+            Box::pin(async move {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response)
+            })
         }
         fn refresh(
             &self,
@@ -1253,31 +1548,67 @@ mod token_lifecycle_tests {
             let response = self.response();
             Box::pin(async move { Ok(response) })
         }
+        fn revoke<'a>(
+            &'a self,
+            token: &'a Zeroizing<String>,
+        ) -> BoxFuture<'a, Result<(), TokenTransportError>> {
+            // Record INSIDE the awaited future: a revoke that was constructed but
+            // never polled (a fence that forgot to await it) leaves no trace, so
+            // the assertions on `revoked()` fail rather than pass vacuously.
+            Box::pin(async move {
+                self.revoked.lock().unwrap().push(token.clone());
+                self.revoke_result
+            })
+        }
     }
 
     struct FakeRefreshStore {
         stored: Mutex<Option<Zeroizing<String>>>,
-        fail: bool,
+        fail_load: bool,
+        /// Store calls whose 0-based index is >= this one fail, so a test can
+        /// let the initial store succeed and fail only the cleanup's restore
+        /// write.
+        fail_stores_from: Option<usize>,
+        fail_delete: bool,
+        store_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
     }
 
     impl FakeRefreshStore {
         fn empty() -> Self {
             Self {
                 stored: Mutex::new(None),
-                fail: false,
+                fail_load: false,
+                fail_stores_from: None,
+                fail_delete: false,
+                store_calls: AtomicUsize::new(0),
+                delete_calls: AtomicUsize::new(0),
             }
         }
         fn with_token(token: &str) -> Self {
             Self {
                 stored: Mutex::new(Some(Zeroizing::new(token.to_owned()))),
-                fail: false,
+                ..Self::empty()
             }
         }
+        /// Every load and store fails — the Keychain is down for the whole
+        /// connect, so the snapshot read is UNKNOWN (`Err`), never revocable.
         fn failing() -> Self {
             Self {
-                stored: Mutex::new(None),
-                fail: true,
+                fail_load: true,
+                fail_stores_from: Some(0),
+                ..Self::empty()
             }
+        }
+        /// Store calls from `from` (0-based) onward fail.
+        fn failing_stores_from(mut self, from: usize) -> Self {
+            self.fail_stores_from = Some(from);
+            self
+        }
+        /// Every delete fails.
+        fn failing_deletes(mut self) -> Self {
+            self.fail_delete = true;
+            self
         }
         fn stored(&self) -> Option<String> {
             self.stored
@@ -1294,7 +1625,8 @@ mod token_lifecycle_tests {
             _account: &AccountId,
             token: &Zeroizing<String>,
         ) -> Result<(), RefreshTokenError> {
-            if self.fail {
+            let call = self.store_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stores_from.is_some_and(|from| call >= from) {
                 return Err(RefreshTokenError::OperationFailed);
             }
             *self.stored.lock().unwrap() = Some(token.clone());
@@ -1304,14 +1636,75 @@ mod token_lifecycle_tests {
             &self,
             _account: &AccountId,
         ) -> Result<Option<Zeroizing<String>>, RefreshTokenError> {
-            if self.fail {
+            if self.fail_load {
                 return Err(RefreshTokenError::OperationFailed);
             }
             Ok(self.stored.lock().unwrap().clone())
         }
         fn delete(&self, _account: &AccountId) -> Result<(), RefreshTokenError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_delete {
+                return Err(RefreshTokenError::OperationFailed);
+            }
             *self.stored.lock().unwrap() = None;
             Ok(())
+        }
+    }
+
+    /// A fake [`ConnectSession`] for the `connect_account` tests. The claim is
+    /// never exercised here (only the worker claims), and `is_cancelled`
+    /// answers `false` for the first `cancel_from` fence checks and `true`
+    /// from then on, so a test can place the cancel exactly at the
+    /// pre-exchange, pre-store, or post-store fence.
+    struct FakeSession {
+        cancel_from: usize,
+        checks: AtomicUsize,
+    }
+
+    impl FakeSession {
+        /// Never cancelled: every fence passes.
+        fn never() -> Self {
+            Self {
+                cancel_from: usize::MAX,
+                checks: AtomicUsize::new(0),
+            }
+        }
+        /// Cancelled right after the callback: the FIRST (pre-exchange) fence
+        /// observes it, so the exchange never runs.
+        fn cancelled_before_the_exchange() -> Self {
+            Self {
+                cancel_from: 0,
+                ..Self::never()
+            }
+        }
+        /// Cancelled while the exchange is in flight: the pre-exchange fence
+        /// passes and the PRE-STORE fence observes it.
+        fn cancelled_during_the_exchange() -> Self {
+            Self {
+                cancel_from: 1,
+                ..Self::never()
+            }
+        }
+        /// Cancelled in the check→store window: both earlier fences pass and
+        /// the POST-STORE fence observes the cancel.
+        fn cancelled_in_the_store_window() -> Self {
+            Self {
+                cancel_from: 2,
+                ..Self::never()
+            }
+        }
+    }
+
+    impl ConnectSession for FakeSession {
+        fn claim(&self) -> Option<(AuthorizationGrant, TokenClientConfig)> {
+            None
+        }
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) >= self.cancel_from
+        }
+        fn complete(&self) {
+            // The exactly-once lease release is owned by the worker's
+            // `complete_after`, which these crate-root tests never drive.
         }
     }
 
@@ -1325,24 +1718,428 @@ mod token_lifecycle_tests {
             &FakeTransport::success(Some("granted-refresh")),
             &store,
             &TestClock::at(0),
+            &FakeSession::never(),
         ))
         .unwrap();
         assert_eq!(connected.subject().as_str(), TEST_SUBJECT);
         assert_eq!(store.stored().as_deref(), Some("granted-refresh"));
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn connect_without_a_refresh_token_fails() {
+    fn connect_cancelled_at_the_fence_revokes_the_minted_token_and_stores_nothing() {
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        // The cancel lands while the exchange is in flight, so the pre-store
+        // fence — after the exchange, before the store — observes it.
         let error = drive(connect_account(
             &account(),
             make_grant(),
             &config(),
-            &FakeTransport::success(None),
-            &FakeRefreshStore::empty(),
+            &transport,
+            &store,
             &TestClock::at(0),
+            &FakeSession::cancelled_during_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // The just-minted refresh token was revoked best-effort (recording inside
+        // the future proves the revoke was actually polled)...
+        assert_eq!(transport.revoked(), vec!["granted-refresh".to_owned()]);
+        // ...and nothing was persisted: no connected account is left behind.
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn connect_cancelled_with_a_failing_revoke_still_aborts_and_stores_nothing() {
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(Some("granted-refresh")).with_failing_revoke();
+        // Revocation fails, but consent withdrawal never gates on the network:
+        // the connect still aborts with Cancelled.
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_during_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // The failed revoke was retried exactly once: two polled attempts.
+        assert_eq!(
+            transport.revoked(),
+            vec!["granted-refresh".to_owned(), "granted-refresh".to_owned()]
+        );
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn a_cancelled_reconnect_leaves_the_existing_token_intact() {
+        // A RE-connect while a working token is stored: the cancel must not
+        // clobber the existing credential, and must NOT revoke the minted
+        // token — it is same-grant, so a revoke would kill the user's working
+        // connection. The pre-store fence aborts before any store or delete
+        // touches the slot.
+        let store = FakeRefreshStore::with_token("existing-refresh");
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_during_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // NO revoke (same-grant), no store, no delete: the already-stored
+        // credential survives untouched.
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored().as_deref(), Some("existing-refresh"));
+    }
+
+    #[test]
+    fn connect_cancelled_without_a_refresh_token_revokes_the_access_token() {
+        // The fence sits ABOVE the MissingRefreshToken check: when the exchange
+        // minted only an access token, that access token is what gets revoked
+        // (revoking either token revokes the grant at Google).
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(None);
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_during_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        assert_eq!(transport.revoked(), vec!["fake-access-token".to_owned()]);
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn connect_cancelled_after_the_store_deletes_the_token_and_revokes_it() {
+        // The cancel lands in the check→store window: the pre-store fence passes,
+        // the token is stored, and the POST-STORE fence observes the cancel.
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_in_the_store_window(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // The token WAS stored, then deleted again, and revoked: no connected
+        // account survives the post-store fence.
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.stored(), None);
+        assert_eq!(transport.revoked(), vec!["granted-refresh".to_owned()]);
+    }
+
+    #[test]
+    fn connect_revokes_the_minted_token_when_the_store_fails() {
+        // A failed store leaves no local record of the minted token, so the
+        // token is revoked best-effort rather than stranding a live grant.
+        // The revoke is licensed by a DEFINITIVELY-empty snapshot: the load
+        // reads `Ok(None)` and only the write fails.
+        let store = FakeRefreshStore::empty().failing_stores_from(0);
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Store(_)));
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.revoked(), vec!["granted-refresh".to_owned()]);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn a_failed_snapshot_read_is_unknown_and_revokes_nothing() {
+        // A load that returns `Err` is UNKNOWN, not "no credential": a live
+        // grant could be hiding behind the unreadable store, so NONE of the
+        // three revoke-gated paths may fire a grant-scoped revoke.
+
+        // 1. The pre-store cancel fence.
+        let store = FakeRefreshStore::failing();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_during_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+
+        // 2. The missing-refresh path (not gated on cancel).
+        let store = FakeRefreshStore::failing();
+        let transport = FakeTransport::success(None);
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
         ))
         .unwrap_err();
         assert!(matches!(error, TokenLifecycleError::MissingRefreshToken));
+        assert!(transport.revoked().is_empty());
+
+        // 3. The store-failure path.
+        let store = FakeRefreshStore::failing();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Store(_)));
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 1);
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn connect_with_a_prior_credential_never_revokes_when_the_store_fails() {
+        // A failed store on a RE-connect: the stored token is the live handle
+        // and the local record, so the minted token is NOT revoked
+        // (same-grant) — only the store error surfaces.
+        let store = FakeRefreshStore::with_token("existing-refresh").failing_stores_from(0);
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Store(_)));
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 1);
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.stored().as_deref(), Some("existing-refresh"));
+    }
+
+    #[test]
+    fn connect_cancelled_after_the_store_restores_the_prior_credential() {
+        // A RE-connect cancelled in the check→store window: the minted token
+        // WAS stored over the existing credential, so the cleanup RESTORES the
+        // prior bytes — a second store — and revokes NOTHING (the minted token
+        // is same-grant; disconnect (3d-3d) revokes it later).
+        let store = FakeRefreshStore::with_token("existing-refresh");
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_in_the_store_window(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // The minted token was stored, then the prior credential was stored
+        // back over it: two stores, no delete, and the stored value equals
+        // the prior.
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored().as_deref(), Some("existing-refresh"));
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn connect_cancelled_after_the_store_with_a_failing_delete_reports_incomplete_cleanup() {
+        // The cleanup's delete fails persistently (one retry, symmetric with
+        // the revoke retry): the cancel is acknowledged, but a usable token
+        // may still sit in the Keychain, so the residual variant — NOT
+        // Cancelled — is returned and nothing is revoked.
+        let store = FakeRefreshStore::empty().failing_deletes();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_in_the_store_window(),
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            TokenLifecycleError::CancelledCleanupIncomplete
+        ));
+        // The delete was attempted, then retried exactly once...
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 2);
+        // ...the minted token REMAINS stored (usable)...
+        assert_eq!(store.stored().as_deref(), Some("granted-refresh"));
+        // ...and nothing was revoked: disconnect (3d-3d) is the remedy.
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn connect_cancelled_after_the_store_with_a_failing_restore_reports_incomplete_cleanup() {
+        // WITH a prior credential, the cleanup restores the prior bytes; when
+        // that restore store fails persistently (the initial store succeeded,
+        // then the restore attempt plus one retry fail), the residual variant
+        // is returned and the minted token — which displaced the prior —
+        // remains stored.
+        let store = FakeRefreshStore::with_token("existing-refresh").failing_stores_from(1);
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_in_the_store_window(),
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            TokenLifecycleError::CancelledCleanupIncomplete
+        ));
+        // The initial store succeeded, then the restore was attempted and
+        // retried exactly once: three store calls in total.
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored().as_deref(), Some("granted-refresh"));
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn connect_cancelled_before_the_exchange_mints_nothing() {
+        // The user cancels right after the callback: the PRE-EXCHANGE fence
+        // observes it, so the exchange never runs — no token is minted, hence
+        // nothing to revoke, store, or orphan. The lease is unaffected: it is
+        // held by the worker's claim and released by its `complete()`.
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::cancelled_before_the_exchange(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::Cancelled));
+        // The exchange was never polled: no token exists anywhere.
+        assert_eq!(transport.exchange_calls(), 0);
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn connect_not_cancelled_at_the_fence_stores_without_revoking() {
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(Some("granted-refresh"));
+        let connected = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap();
+        assert_eq!(connected.subject().as_str(), TEST_SUBJECT);
+        assert_eq!(store.stored().as_deref(), Some("granted-refresh"));
+        // No cancellation observed: neither fence touches the revoke endpoint,
+        // and the post-store fence deletes nothing.
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn connect_without_a_refresh_token_fails() {
+        let store = FakeRefreshStore::empty();
+        let transport = FakeTransport::success(None);
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::MissingRefreshToken));
+        // Not a cancel, but NO prior credential exists: the handle-less
+        // grant's access token is revoked (closing the strand AND letting
+        // Google mint a refresh on retry), and nothing was stored.
+        assert_eq!(transport.revoked(), vec!["fake-access-token".to_owned()]);
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored(), None);
+    }
+
+    #[test]
+    fn connect_without_a_refresh_token_and_a_prior_credential_never_revokes() {
+        // The exchange minted no refresh token, but a working credential is
+        // stored: the minted access token is same-grant, so revoking it would
+        // kill the user's working connection. Never revoke — the stored token
+        // is the live handle.
+        let store = FakeRefreshStore::with_token("existing-refresh");
+        let transport = FakeTransport::success(None);
+        let error = drive(connect_account(
+            &account(),
+            make_grant(),
+            &config(),
+            &transport,
+            &store,
+            &TestClock::at(0),
+            &FakeSession::never(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, TokenLifecycleError::MissingRefreshToken));
+        assert!(transport.revoked().is_empty());
+        assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.stored().as_deref(), Some("existing-refresh"));
     }
 
     #[test]
@@ -1354,6 +2151,7 @@ mod token_lifecycle_tests {
             &FakeTransport::without_id_token(),
             &FakeRefreshStore::empty(),
             &TestClock::at(0),
+            &FakeSession::never(),
         ))
         .unwrap_err();
         // IdentityUnverified is non-destructive — never ConsentRevoked.
@@ -1430,6 +2228,7 @@ mod token_lifecycle_tests {
             &FakeTransport::success(Some("granted-refresh")),
             &store,
             &clock,
+            &FakeSession::never(),
         ))
         .unwrap();
         let (access_token, _subject, _expiry) = connected.into_parts();
