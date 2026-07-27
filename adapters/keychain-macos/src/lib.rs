@@ -569,6 +569,76 @@ fn open_mailbox_store(
     })
 }
 
+/// Opens the writable encrypted mailbox store for `account` ONLY if its
+/// database file already exists — the disconnect purge's open.
+///
+/// A never-connected account has no database file: [`open_default_mailbox_store`]
+/// would claim and create a fresh one, and a teardown must never create
+/// artifacts. This variant returns `Ok(None)` instead, so the purge is a no-op
+/// success. Key derivation and the profile path are identical to the default
+/// open, so a present database is the same encrypted store.
+///
+/// # Errors
+///
+/// Returns the same closed [`MailboxStoreOpenError`] as
+/// [`open_default_mailbox_store`].
+#[cfg(target_os = "macos")]
+pub fn open_default_mailbox_store_if_present(
+    account: &AccountId,
+) -> Result<Option<tersa_store_sqlcipher_macos::SqlCipherMailboxStore>, MailboxStoreOpenError> {
+    let backend = ProductionBackend::new().map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
+    let locator = ProductionContainerLocator::new()
+        .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
+    open_mailbox_store_if_present(&backend, &locator, account)
+}
+
+#[cfg(target_os = "macos")]
+fn open_mailbox_store_if_present(
+    retriever: &impl RootKeyRetriever,
+    locator: &impl ContainerLocator,
+    account: &AccountId,
+) -> Result<Option<tersa_store_sqlcipher_macos::SqlCipherMailboxStore>, MailboxStoreOpenError> {
+    // Presence-check the database path BEFORE touching the root key. Root-key
+    // access is required only to OPEN an existing database; a never-connected
+    // account has no database file, and disconnecting one must be a no-op
+    // success — NOT a `KeyAccess` failure that would fence the account merely
+    // because the (absent) account also has no key material available. A stat
+    // error is a genuine failure and is preserved (never masquerades as absent).
+    let path = account_database_path(locator, account)
+        .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
+    if !path
+        .try_exists()
+        .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?
+    {
+        return Ok(None);
+    }
+    let root = retriever
+        .copy()
+        .map_err(|_error| MailboxStoreOpenError::KeyAccess)?
+        .ok_or(MailboxStoreOpenError::KeyAccess)?;
+    let key = derive_account_key(
+        &root,
+        account,
+        AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+    )
+    .map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
+    drop(root);
+    // `open_existing` re-checks presence itself, so a file that vanishes
+    // between the stat above and here is still a clean `Ok(None)` (a purge
+    // no-op), never a spurious failure.
+    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open_existing(
+        account.clone(),
+        path,
+        key.into_database_key(),
+    )
+    .map_err(|failure| match failure {
+        tersa_application::mailbox::MailboxStoreError::Corrupted => {
+            MailboxStoreOpenError::MailboxCorrupted
+        }
+        _ => MailboxStoreOpenError::ProfileUnavailable,
+    })
+}
+
 /// Derives account-identity hashes for the sync-composition identity gate.
 ///
 /// Confines the root-key-derived HMAC key to this crate: the composition passes
@@ -4513,6 +4583,76 @@ mod tests {
             open_mailbox_store(&wrong, &profile.locator(), &account),
             Err(MailboxStoreOpenError::MailboxCorrupted)
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn purge_open_on_an_absent_database_is_none_and_creates_nothing() {
+        // The disconnect purge on a never-connected account: no database file
+        // exists, so the open is a no-op `None` and — critically — the open
+        // must not CREATE one (disconnect never creates artifacts).
+        //
+        // Sol P2: the presence check runs BEFORE the root key is touched, so an
+        // absent database is `Ok(None)` even when the root key is UNAVAILABLE —
+        // a never-connected account disconnects cleanly instead of failing with
+        // `KeyAccess`. The retriever here would ERROR if consulted; it must not
+        // be (`copies == 0`).
+        let account = account_id();
+        let profile = TestProfile::new("purge-absent");
+        let retriever = RetrievalOnlyFake {
+            result: Err(KeyStorageError::Unavailable),
+            copies: AtomicUsize::new(0),
+        };
+
+        let opened = open_mailbox_store_if_present(&retriever, &profile.locator(), &account);
+        assert!(
+            matches!(opened, Ok(None)),
+            "an absent database purges as a no-op success even with no root key"
+        );
+        let path = account_database_path(&profile.locator(), &account).unwrap();
+        assert!(
+            !path.exists(),
+            "the purge open must never create the database file"
+        );
+        assert_eq!(
+            retriever.copies.load(Ordering::SeqCst),
+            0,
+            "an absent database must not even consult the root key"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn purge_open_on_a_present_database_opens_it() {
+        // A connected account: the database exists, so the purge open returns
+        // it — the same encrypted store the default open addresses.
+        let root = [7; 32];
+        let account = account_id();
+        let profile = TestProfile::new("purge-present");
+        let derived = derive_account_key(
+            &SecretKey::new(root),
+            &account,
+            AccountKeyPurpose::SqlCipherAccountDatabaseV1,
+        )
+        .unwrap();
+        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+            account.clone(),
+            profile.database_path(&account),
+            derived.into_database_key(),
+        )
+        .unwrap();
+        drop(store);
+        let retriever = RetrievalOnlyFake {
+            result: Ok(Some(root)),
+            copies: AtomicUsize::new(0),
+        };
+
+        let opened = open_mailbox_store_if_present(&retriever, &profile.locator(), &account);
+        assert!(
+            matches!(opened, Ok(Some(_))),
+            "a present database opens for the purge"
+        );
+        assert_eq!(retriever.copies.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn existing_item_skips_rng_and_add() {

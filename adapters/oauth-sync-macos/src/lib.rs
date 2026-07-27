@@ -20,8 +20,11 @@
 //! inward ports ([`gated_sync`]) plus the token-lifecycle composition. 3d-3a adds
 //! the concrete `GmailSession` — one access token backing both the gate's
 //! subject and the mailbox surface — with `id_token` freshness validated against a
-//! wall clock at construction. The bridge entry points on the `tokio` runtime and
-//! the Rust-owned sync worker land in later 3d-3 slices.
+//! wall clock at construction. Later 3d-3 slices landed the Rust-owned sync
+//! worker, its FFI begins, and the cancel-fenced connect; 3d-3d adds the
+//! disconnect (consent-withdrawal) teardown: the permit slot's disconnecting
+//! coordination with its sync-only cancel registration, and the un-cancellable
+//! disconnect worker.
 
 #![forbid(unsafe_code)]
 
@@ -51,10 +54,14 @@ use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 #[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
 
-// The per-slot whole-cycle permit and the Rust-owned worker that holds it are
-// macOS-only: they depend on the platform's tokio runtime and the Gmail session.
+// The per-slot whole-cycle permit, the disconnect coordination on it, and the
+// Rust-owned worker that holds it are macOS-only: they depend on the platform's
+// tokio runtime and the Gmail session. `permit` is crate-internal: the
+// mailbox-sync FFI drives a disconnect through `worker::begin_disconnect`, which
+// claims the coordination lease + sets the fence itself, so the fence-clearing
+// capability never crosses the crate boundary.
 #[cfg(target_os = "macos")]
-mod permit;
+pub(crate) mod permit;
 #[cfg(target_os = "macos")]
 pub mod worker;
 
@@ -351,16 +358,20 @@ pub trait ConnectSession {
 
 /// Revokes a provider-minted token best-effort, retrying ONCE on failure.
 ///
-/// Used by the connect flow's cancel fences and store-failure path. This is NOT
-/// the ADR-0023 disconnect composition's revoke: disconnect keeps working from
-/// a stored local token, while on this path nothing is stored (or the
-/// just-stored copy was deleted first), so a revoke that fails permanently here
-/// leaves a LIVE token at the provider with no in-app remedy — the user can
-/// only revoke it from their Google account settings. The single immediate
-/// retry shrinks that window to a persistent network or provider failure; it
-/// cannot close it.
+/// Used by the connect flow's cancel fences and store-failure path, and by the
+/// disconnect (3d-3d) teardown for the ONE stored token it loads under the
+/// whole-cycle permit. Consent withdrawal never gates on the network: on every
+/// path the local teardown proceeds whether or not the revoke succeeds. On the
+/// connect fence paths nothing is stored (or the just-stored copy was deleted
+/// first), so a revoke that fails permanently there leaves a LIVE token at the
+/// provider with no in-app remedy — the user can only revoke it from their
+/// Google account settings. The single immediate retry shrinks that window to
+/// a persistent network or provider failure; it cannot close it.
 #[cfg(target_os = "macos")]
-async fn revoke_best_effort<T: TokenTransport>(transport: &T, token: &Zeroizing<String>) {
+pub(crate) async fn revoke_best_effort<T: TokenTransport>(
+    transport: &T,
+    token: &Zeroizing<String>,
+) {
     if transport.revoke(token).await.is_err() {
         let _ = transport.revoke(token).await;
     }

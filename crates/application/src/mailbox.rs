@@ -376,6 +376,43 @@ pub trait MailboxStore: MailboxReader {
     ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>>;
 }
 
+/// Purges one account's local data on disconnect (OAuth consent withdrawal).
+///
+/// PERMIT-HOLDER-ONLY, DESTRUCTIVE-ONLY: the caller MUST hold the account
+/// slot's whole-cycle permit, so no sync or connect cycle can be in flight or
+/// begin while the purge runs, and the purge carries no fence or identity hash
+/// — it cannot inject or compare state, only destroy it. One call is one
+/// atomic transaction: the mailbox rows and the account-identity row die
+/// together, so a retried disconnect after a mid-purge crash never finds a
+/// half-torn-down account. The store's account binding is NOT part of the
+/// purge: the file stays bound to its account for a clean re-connect.
+pub trait AccountPurgeStore: Send + Sync {
+    /// Clears the account's mailbox rows and deletes its account-identity row
+    /// in one transaction. An account with no recorded data purges as a no-op
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the transaction cannot be applied or
+    /// committed; a failed purge applies nothing.
+    fn purge_account<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
+}
+
+/// Reference forwarding: a shared reference to a purge store is itself a purge
+/// store, so a lazily-opened store can be passed by reference into a generic
+/// teardown without moving ownership.
+impl<T: AccountPurgeStore + ?Sized> AccountPurgeStore for &T {
+    fn purge_account<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).purge_account(account)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests assert valid fixtures")]

@@ -16,8 +16,11 @@
 //! session whose grant the worker claims: the grant, its registered redirect,
 //! and the client identifier all arrive with the claim from the bridge's
 //! session registry, never from Swift, so the exchange configuration cannot
-//! disagree with the session by construction. Both begins share the one poll
-//! entry point. Progress is a single closed status integer; no mailbox content,
+//! disagree with the session by construction. A disconnect begin supplies only
+//! the account identifier: it takes no grant and no configuration — the
+//! teardown (best-effort revoke, token delete, local purge) is built entirely
+//! inside the trusted composition. All three begins share the one poll entry
+//! point. Progress is a single closed status integer; no mailbox content,
 //! address, subject, or count ever crosses this boundary.
 //!
 //! # Single-archive link
@@ -25,7 +28,7 @@
 //! The application links ONLY this crate's static archive: depending on the
 //! bridge re-exports its `tersa_oauth_*` and `tersa_macos_*` C symbols from the
 //! same archive, so one `.a` carries both surfaces. Verified on the release
-//! build: the archive carries 14 `T _tersa_*` symbols (this crate's own 3 plus
+//! build: the archive carries 15 `T _tersa_*` symbols (this crate's own 4 plus
 //! the bridge's 11), and a C probe linking against this archive alone calls
 //! the bridge's exported functions. Linking the bridge archive as well fails
 //! loudly with duplicate symbols, so 3e wires exactly this one archive into
@@ -48,7 +51,7 @@ mod macos {
     use tersa_application::token::TokenClientConfig;
     use tersa_oauth_sync_macos::ConnectSession;
     use tersa_oauth_sync_macos::worker::{
-        BeginOutcome, STATUS_RUNNING, WorkerHandles, begin_connect_account_sync,
+        self, BeginOutcome, STATUS_RUNNING, WorkerHandles, begin_connect_account_sync,
         begin_default_account_sync,
     };
     use url::Url;
@@ -309,6 +312,105 @@ mod macos {
         result.map_or_else(|status| status, |()| STATUS_STARTED)
     }
 
+    /// Begins the disconnect (OAuth consent withdrawal + local teardown) for
+    /// `account_id` on a Rust-owned background worker, writing an opaque
+    /// session id the caller polls through the SAME
+    /// [`tersa_mailbox_macos_sync_poll`] as a sync or connect.
+    ///
+    /// The slot's `disconnecting` flag is set — and any in-flight sync's
+    /// registered cancel flag is signaled — on the CALLER thread BEFORE the
+    /// worker is spawned, so "`disconnect_begin` returned [`STATUS_STARTED`] ⇒
+    /// no new sync or connect begins for the slot" is a hard guarantee. The
+    /// worker then serializes BEHIND any in-flight cycle on the whole-cycle
+    /// gate, loads the stored refresh token under that gate, revokes it
+    /// best-effort (an offline withdrawal still tears down locally), deletes
+    /// it, and purges the account's local mailbox and identity in one
+    /// transaction. The flag is cleared only on full teardown success; on any
+    /// failure it stays set (fail-closed), the poll reports the internal code,
+    /// and a retried disconnect converges.
+    ///
+    /// Returns [`STATUS_STARTED`] with `output_session_id` written when a
+    /// worker was spawned, [`STATUS_SYNC_BUSY`] (nothing written) when a
+    /// disconnect worker is ALREADY active on the slot — a concurrent request
+    /// coalesces onto the running teardown rather than starting a second one;
+    /// this does NOT refuse withdrawal, the running worker owns it, and a RETRY
+    /// after a FAILED teardown is admitted, not busy — [`STATUS_INVALID_INPUT`]
+    /// for a rejected input, or [`STATUS_INTERNAL`] for a registry or
+    /// session-id allocation fault. `output_session_id` is written only on
+    /// [`STATUS_STARTED`]; the caller must not read it otherwise.
+    ///
+    /// ON `STATUS_SYNC_BUSY`, the caller MUST poll the disconnect it already
+    /// started to completion, NOT blindly re-issue: the running teardown owns
+    /// the request, and a retry-until-STARTED loop would, once that teardown
+    /// succeeds and the user reconnects, be admitted and tear down the NEW
+    /// connection.
+    ///
+    /// CALLER OBLIGATION (the `disconnecting` fence covers sync/connect BEGINS,
+    /// NOT the bridge's pending-authorization registry): the caller MUST cancel
+    /// every in-flight OAuth authorization session for this account BEFORE
+    /// calling disconnect. Disconnect does not — and, being bridge-free, cannot
+    /// — tombstone a pending grant, so a pending authorization whose callback
+    /// lands within `AUTHORIZATION_LIFETIME` after a successful disconnect would
+    /// silently re-connect the account. 3e must enforce this ordering; a
+    /// structural fix (a per-slot disconnect epoch stamped into the bridge
+    /// session, refused by `connect_begin` when stale) is a deferred follow-up.
+    ///
+    /// # Safety
+    ///
+    /// `account_id` must either be null or point to a readable buffer of the
+    /// stated length. `output_session_id`, when non-null, must be writable for
+    /// one `u64`. Every non-null pointer must remain valid for the duration of
+    /// this call and must not alias a mutable output.
+    #[expect(
+        unsafe_code,
+        reason = "the C ABI validates and copies caller-owned byte buffers"
+    )]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn tersa_mailbox_macos_disconnect_begin(
+        account_id: *const u8,
+        account_id_len: usize,
+        output_session_id: *mut u64,
+    ) -> i32 {
+        let result = (|| {
+            if output_session_id.is_null() {
+                return Err(STATUS_INVALID_INPUT);
+            }
+            // SAFETY: the function contract requires a readable account-id buffer.
+            let account_id = unsafe { read_utf8(account_id, account_id_len) }?;
+            let account = AccountId::new(account_id).map_err(|_error| STATUS_INVALID_INPUT)?;
+            // Lock the registry BEFORE spawning: a poisoned registry must fail
+            // without starting a worker no published session could ever track. The
+            // guard is held across the begin and insert, so registration always
+            // precedes publishing the id.
+            let mut sessions = sync_sessions().lock().map_err(|_error| STATUS_INTERNAL)?;
+            // Allocate before spawning: id exhaustion likewise fails closed without
+            // starting an untrackable worker, and the counter can never wrap onto a
+            // live id.
+            let session_id = allocate_session_id()?;
+            // `begin_disconnect` sets the disconnecting fence + claims the single-
+            // worker lease SYNCHRONOUSLY here, before it spawns, so once this
+            // returns STARTED no new sync or connect can begin for the slot.
+            // `Busy` ⇒ a disconnect worker is already active on the slot:
+            // coalesce onto it, writing no session id — withdrawal is not
+            // refused, the running worker owns the teardown.
+            match worker::begin_disconnect(account) {
+                BeginOutcome::Busy => return Err(STATUS_SYNC_BUSY),
+                BeginOutcome::Started(handles) => {
+                    // Register before publishing the id, so a caller can never
+                    // observe an id that is not yet pollable.
+                    sessions.insert(session_id, handles);
+                    // SAFETY: `output_session_id` was checked non-null above and
+                    // the contract requires it writable for one `u64`.
+                    unsafe {
+                        *output_session_id = session_id;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        result.map_or_else(|status| status, |()| STATUS_STARTED)
+    }
+
     /// Polls one bounded-sync session, returning the worker's closed status integer
     /// and reaping the session once it reaches a terminal status.
     ///
@@ -358,8 +460,8 @@ mod macos {
 
         use super::{
             BridgeConnectSession, MAX_INPUT_BYTES, STATUS_INVALID_INPUT, STATUS_UNKNOWN_SESSION,
-            read_utf8, tersa_mailbox_macos_connect_begin, tersa_mailbox_macos_sync_begin,
-            tersa_mailbox_macos_sync_poll,
+            read_utf8, tersa_mailbox_macos_connect_begin, tersa_mailbox_macos_disconnect_begin,
+            tersa_mailbox_macos_sync_begin, tersa_mailbox_macos_sync_poll,
         };
 
         fn insert_test_session(status: i32) -> u64 {
@@ -529,6 +631,57 @@ mod macos {
             );
         }
 
+        #[test]
+        fn disconnect_begin_rejects_a_null_output_pointer() {
+            let account = b"account-123";
+            // SAFETY: the input buffer is valid; the output pointer is null, which
+            // the function rejects before any dereference.
+            let status = unsafe {
+                tersa_mailbox_macos_disconnect_begin(
+                    account.as_ptr(),
+                    account.len(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+        }
+
+        #[test]
+        fn disconnect_begin_rejects_an_unreadable_account_buffer() {
+            let mut session_id = 0_u64;
+            // SAFETY: the account pointer is null (rejected before any read); the
+            // output pointer is valid.
+            let status = unsafe {
+                tersa_mailbox_macos_disconnect_begin(ptr::null(), 10, &raw mut session_id)
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+            assert_eq!(
+                session_id, 0,
+                "a rejected begin must not write a session id"
+            );
+        }
+
+        #[test]
+        fn disconnect_begin_rejects_an_invalid_account_identifier() {
+            // An email-shaped account identifier is rejected by `AccountId::new`,
+            // before the slot is marked disconnecting or any worker is spawned.
+            let account = b"user@example.com";
+            let mut session_id = 0_u64;
+            // SAFETY: the input buffer and the output pointer are valid.
+            let status = unsafe {
+                tersa_mailbox_macos_disconnect_begin(
+                    account.as_ptr(),
+                    account.len(),
+                    &raw mut session_id,
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+            assert_eq!(
+                session_id, 0,
+                "a rejected begin must not write a session id"
+            );
+        }
+
         /// Runs one real bridge iOS authorization begin for `client_id`,
         /// returning the bridge-issued OAuth session id and authorization URL.
         fn begin_bridge_oauth_session(client_id: &'static [u8]) -> (u64, Url) {
@@ -673,12 +826,15 @@ mod macos {
             super::sync_sessions().lock().unwrap().remove(&id);
         }
 
-        // The STATUS_STARTED and STATUS_SYNC_BUSY begin outcomes — sync and connect
-        // alike — are intentionally not exercised here: both require spawning a real
-        // worker, which builds the Keychain hasher and (on a provisioned host)
-        // performs network I/O. The busy mapping is proven deterministically by the
-        // worker crate's own `begin_default_account_sync_on_a_busy_slot_is_busy_and_builds_nothing`,
-        // and the started/registry/reap round-trip is covered above via fabricated
+        // The STATUS_STARTED and STATUS_SYNC_BUSY begin outcomes — sync, connect,
+        // and disconnect alike — are intentionally not exercised here: each
+        // requires spawning a real worker, which builds Keychain-backed objects
+        // and (on a provisioned host) performs network I/O. The busy mapping is
+        // proven deterministically by the worker crate's own
+        // `begin_default_account_sync_on_a_busy_slot_is_busy_and_builds_nothing`,
+        // the disconnect worker's spawn, blocking gate acquire, and fail-closed
+        // flag handling are covered by the worker crate's own tests, and the
+        // started/registry/reap round-trip is covered above via fabricated
         // handles; the live path is left to review and integration.
     }
 }
