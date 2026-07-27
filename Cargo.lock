@@ -7586,6 +7586,7 @@ dependencies = [
 name = "tersa-mailbox-sync-ffi-macos"
 version = "0.0.0"
 dependencies = [
+ "tersa-apple-bridge",
  "tersa-application",
  "tersa-oauth-sync-macos",
  "url",
