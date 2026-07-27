@@ -374,13 +374,22 @@ fn oauth_sync_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) ->
 }
 
 /// The mailbox-sync FFI's direct dependency set is closed: it forwards two public
-/// strings to the trusted composition and builds a token-client configuration from
-/// the portable application types — and NOTHING else. Because it is (necessarily) in
-/// the `SQLCipher` and `HMAC` reachability owner-sets, this closed set is what stops
-/// it from DIRECTLY declaring `rusqlite`, `hmac`, or any other capability crate and
-/// bypassing the composition it exists only to expose.
+/// strings to the trusted composition, claims finished grants through the Apple
+/// bridge's session registry seams, and builds a token-client configuration from
+/// the portable application types — and NOTHING else. Because it is (necessarily)
+/// in the `SQLCipher` and `HMAC` reachability owner-sets, this closed set is what
+/// stops it from DIRECTLY declaring `rusqlite`, `hmac`, or any other capability
+/// crate and bypassing the composition it exists only to expose. The bridge edge
+/// is a network-free tersa-* crate, not a capability crate: it adds no new
+/// network, `SQLCipher`, or `HMAC` reachability, and it is what lets the
+/// application link only the FFI archive while still seeing the bridge's symbols.
 fn mailbox_sync_ffi_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
-    const REQUIRED: [&str; 3] = ["tersa-application", "tersa-oauth-sync-macos", "url"];
+    const REQUIRED: [&str; 4] = [
+        "tersa-application",
+        "tersa-apple-bridge",
+        "tersa-oauth-sync-macos",
+        "url",
+    ];
     let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
     let mut violations = Vec::new();
     for dependency in dependencies.difference(&required) {
@@ -618,7 +627,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         APPLE_BRIDGE_C_ABI_COUNT_MESSAGE,
     ));
 
-    // The mailbox-sync FFI is a sibling static library with its own two-symbol C ABI;
+    // The mailbox-sync FFI is a sibling static library with its own three-symbol C ABI;
     // pin its reviewed sources and export inventory exactly as the bridge's, so a new
     // source file or exported symbol cannot land without review.
     let ffi_package_sources =
@@ -1225,8 +1234,11 @@ fn bridge_package_source_surface_violations(
 
 /// The exact count message for the Apple bridge's reviewed C ABI symbol set.
 const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe";
-/// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol set.
-const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match the two reviewed begin and poll symbols";
+/// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol
+/// set. It pins THIS crate's own three declared `#[no_mangle]` exports; the
+/// archive the application links carries those three plus the Apple bridge's
+/// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
+const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own three reviewed begin, connect, and poll no_mangle exports (the shipped archive surface is these three plus the Apple bridge's reviewed eleven)";
 
 /// Pins a static-library package's exported C ABI to an exact reviewed set: every
 /// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
@@ -1361,6 +1373,10 @@ fn mailbox_sync_ffi_source_surface_violations(
 
 fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        (
+            "tersa_mailbox_macos_connect_begin",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_connect_begin(account_id:*constu8,account_id_len:usize,oauth_session_id:u64,output_session_id:*mutu64,)->i32",
+        ),
         (
             "tersa_mailbox_macos_sync_begin",
             "pubunsafeextern\"C\"fntersa_mailbox_macos_sync_begin(client_id:*constu8,client_id_len:usize,account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
@@ -6578,6 +6594,13 @@ fn future_macos_store_dependency_violation(
             // macOS.
             "tersa-oauth-sync-macos",
             "tersa-gmail-rest-macos" | "tersa-keychain-macos" | "tersa-store-sqlcipher-macos"
+        ) | (
+            // The mailbox-sync FFI's bridge edge carries the grant-claim seam (and
+            // the single-archive link); like every other capability edge it must
+            // stay macOS-scoped, so a future un-scoping cannot pull the bridge into
+            // a non-macOS build of the FFI.
+            "tersa-mailbox-sync-ffi-macos",
+            "tersa-apple-bridge"
         )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
@@ -6647,9 +6670,15 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             // 3d: the macOS C ABI that exposes the trusted composition's bounded-sync
             // worker to Swift, in a sibling static library so the network stack stays
             // out of the minimal bootstrap bridge. It composes nothing itself — it
-            // only forwards two public strings to the composition.
+            // only forwards two public strings to the composition and claims finished
+            // grants through the bridge's session registry seams, the edge that lets
+            // the application link only this crate's archive.
             "tersa-mailbox-sync-ffi-macos",
-            BTreeSet::from(["tersa-application", "tersa-oauth-sync-macos"]),
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-apple-bridge",
+                "tersa-oauth-sync-macos",
+            ]),
         ),
         ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
@@ -7663,6 +7692,13 @@ pub unsafe extern "C" fn tersa_mailbox_macos_sync_begin(
     output_session_id: *mut u64,
 ) -> i32 {}
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_connect_begin(
+    account_id: *const u8,
+    account_id_len: usize,
+    oauth_session_id: u64,
+    output_session_id: *mut u64,
+) -> i32 {}
+#[unsafe(no_mangle)]
 pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
 "#
     }
@@ -7704,16 +7740,15 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
             );
         }
 
-        // A third exported symbol must trip the reviewed-count message.
-        let third_symbol = reviewed_mailbox_sync_ffi_documents(format!(
+        // A fourth exported symbol must trip the reviewed-count message.
+        let fourth_symbol = reviewed_mailbox_sync_ffi_documents(format!(
             "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn tersa_mailbox_macos_sync_extra() -> i32 {{}}"
         ));
-        let violations = ffi_export_violations(&third_symbol);
+        let violations = ffi_export_violations(&fourth_symbol);
         assert!(
-            violations
-                .iter()
-                .any(|violation| violation.contains("two reviewed begin and poll symbols")),
-            "a third symbol must trip the reviewed-count message: {violations:?}"
+            violations.iter().any(|violation| violation
+                .contains("three reviewed begin, connect, and poll no_mangle exports")),
+            "a fourth symbol must trip the reviewed-count message: {violations:?}"
         );
     }
 
@@ -7757,9 +7792,14 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
             "a declared build script must fail closed"
         );
 
-        // The closed direct-dependency set: exactly the three pass; a capability crate
+        // The closed direct-dependency set: exactly the four pass; a capability crate
         // or a missing required dependency fails.
-        let exact = BTreeSet::from(["tersa-application", "tersa-oauth-sync-macos", "url"]);
+        let exact = BTreeSet::from([
+            "tersa-application",
+            "tersa-apple-bridge",
+            "tersa-oauth-sync-macos",
+            "url",
+        ]);
         assert!(mailbox_sync_ffi_direct_dependency_set_violations(&exact).is_empty());
         let mut hostile = exact.clone();
         hostile.insert("rusqlite");
@@ -10496,6 +10536,9 @@ targets:
             ("tersa-oauth-sync-macos", "tersa-gmail-rest-macos"),
             ("tersa-oauth-sync-macos", "tersa-keychain-macos"),
             ("tersa-oauth-sync-macos", "tersa-store-sqlcipher-macos"),
+            // The FFI's bridge edge (the grant-claim seam and single-archive link)
+            // is pinned to macOS for the same reason.
+            ("tersa-mailbox-sync-ffi-macos", "tersa-apple-bridge"),
         ] {
             assert_eq!(
                 future_macos_store_dependency_violation(

@@ -20,8 +20,13 @@ crate-type = ["rlib", "staticlib"]
 # library that exports no symbols. The Google token and revoke endpoints are pinned
 # downstream in the Gmail transport; this crate depends on neither the network nor
 # the Keychain directly — it reaches them only through the trusted composition.
+# The bridge edge lets the application link ONLY this crate's static archive: the
+# archive then also carries the bridge's C symbols. It adds no network or store
+# reachability (the bridge is network-free; the Keychain was already reachable
+# through the composition), and the bridge's own dependency graph is unchanged.
 [target.'cfg(target_os = "macos")'.dependencies]
 tersa-application = { path = "../../crates/application", version = "=0.0.0" }
+tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0" }
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0" }
 url = { workspace = true }
 
