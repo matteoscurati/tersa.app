@@ -13,10 +13,20 @@
 //! immediately re-claimable.
 //!
 //! Progress is a single closed status integer (below) — never a count, address, or
-//! subject. A disconnect (a later slice) flips the cancel flag; the worker observes
-//! it within `CANCEL_POLL_INTERVAL` and drops the in-flight sync future, which is
-//! drop-cancellation-safe (each mailbox write is its own committed-or-rolled-back
-//! transaction, and the coordinator releases its inner single-flight on drop).
+//! subject. A disconnect (3d-3d) flips the cancel flag the SYNC begin registered
+//! in the permit slot (a connect begin registers none and is never signaled);
+//! the worker observes it within `CANCEL_POLL_INTERVAL` and drops the in-flight
+//! sync future, which is drop-cancellation-safe (each mailbox write is its own
+//! committed-or-rolled-back transaction, and the coordinator releases its inner
+//! single-flight on drop).
+//!
+//! The disconnect itself runs on a sibling worker ([`begin_disconnect`]) that
+//! INVERTS the begin order: the FFI marks the slot disconnecting up front, the
+//! worker spawns first and then blocking-acquires the gate on its plain thread —
+//! serializing BEHIND the now-cancelling cycle — and only then loads the stored
+//! refresh token, revokes it best-effort, deletes it, and purges the account's
+//! local data. That worker is un-cancellable and clears the disconnecting flag
+//! only on full teardown success.
 
 use std::pin::pin;
 use std::sync::Arc;
@@ -24,18 +34,23 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use tersa_application::identity::{AccountIdentityHasher, AccountIdentityStore};
-use tersa_application::mailbox::{AccountId, MailboxStore, PageSize, StoreLimit};
+use tersa_application::mailbox::{
+    AccountId, AccountPurgeStore, MailboxStore, PageSize, StoreLimit,
+};
 use tersa_application::oauth::{AuthorizationGrant, SystemMonotonicClock, SystemWallClock};
 use tersa_application::sync::{SyncPolicy, SyncReport};
-use tersa_application::token::{TokenClientConfig, TokenError};
+use tersa_application::token::{TokenClientConfig, TokenError, TokenTransport};
 use tersa_gmail_rest_macos::GmailTokenTransport;
-use tersa_keychain_macos::oauth_token::DataProtectionRefreshTokenStore;
-use tersa_keychain_macos::{DataProtectionAccountIdentityHasher, open_default_mailbox_store};
+use tersa_keychain_macos::oauth_token::{DataProtectionRefreshTokenStore, RefreshTokenStore};
+use tersa_keychain_macos::{
+    DataProtectionAccountIdentityHasher, open_default_mailbox_store,
+    open_default_mailbox_store_if_present,
+};
 
 use crate::permit::{self, WholeCyclePermit};
 use crate::{
     ConnectSession, GatedSyncError, GmailSession, TokenLifecycleError, build_sync_runtime,
-    connect_account, gated_sync, refresh_account,
+    connect_account, gated_sync, refresh_account, revoke_best_effort,
 };
 
 /// The worker thread is live and its cycle is in flight.
@@ -65,14 +80,28 @@ pub const STATUS_NEEDS_RECONNECT: i32 = -6;
 /// between cycles.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Live handles onto a spawned worker. The FFI layer (a later slice) reads the
-/// status on poll and requests cancellation on disconnect; neither carries mailbox
-/// content. The atomics are private so the terminal/reclaim and one-way
-/// cancellation protocols cannot be violated from outside — a caller can only read
-/// the status and request (never clear) a cancel.
+/// Live handles onto a spawned worker. The FFI layer reads the status on poll;
+/// disconnect signals cancellation through the SAME flag these handles carry,
+/// but reaches it via the permit slot's registration, never through this type.
+/// Neither carries mailbox content. The atomics are private so the
+/// terminal/reclaim and one-way cancellation protocols cannot be violated from
+/// outside — a caller can only read the status and request (never clear) a
+/// cancel.
 #[derive(Debug)]
 pub struct WorkerHandles {
     status: Arc<AtomicI32>,
+    // Read only by the test-only `request_cancel`: PRODUCTION cancels a sync via
+    // the permit slot's registration (a `Weak` to this same flag), never through
+    // the handle. Kept on the handle as the cancellation-authority the atomic
+    // protocol is defined over, but off the production API so no holder of a
+    // CONNECT worker's handles can drop-abort its exchange.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read only by the test-only `request_cancel`; production cancels via the permit registration, and the field is kept as the atomic cancel-authority off the production API"
+        )
+    )]
     cancel: Arc<AtomicBool>,
 }
 
@@ -91,11 +120,20 @@ impl WorkerHandles {
     ///
     /// DROP-CANCELLATION CONTRACT: connect cancellation flows through the OAuth
     /// tombstone/lease ONLY — this flag must NEVER be fired mid-connect.
-    /// Disconnect (3d-3d), the sole canceller, serializes on the whole-cycle
-    /// permit and deletes regardless, so it cannot overlap a connect holding
+    /// Disconnect (3d-3d), the sole canceller, signals the SYNC cycle's copy of
+    /// this flag through the permit slot's registration and serializes on the
+    /// whole-cycle permit, so it cannot overlap — or signal — a connect holding
     /// the slot. The bridge lease makes an accidental mid-connect drop
     /// fail-safe (the tombstone stays pinned) but does not un-store a token.
-    pub fn request_cancel(&self) {
+    ///
+    /// `#[cfg(test)]`: handle-based cancellation is a TEST affordance only. No
+    /// production caller exists — a disconnect cancels an in-flight SYNC through
+    /// the permit slot's registration (a `Weak` to a sync's cancel flag), never
+    /// through a handle. Keeping this off the production build makes the "connect
+    /// is never cancel-signaled" guarantee structural: no holder of a CONNECT
+    /// worker's handles can even name a method to drop-abort its exchange.
+    #[cfg(test)]
+    pub(crate) fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
 
@@ -201,6 +239,9 @@ fn terminal_internal_handles() -> WorkerHandles {
 /// private current-thread runtime, then releases the permit BEFORE publishing the
 /// terminal status. `op` is the only value crossing the thread boundary, so its
 /// future need not be `Send` — it is built and awaited entirely on the worker thread.
+/// `status` and `cancel` are the caller-built handle atomics: the SAME `cancel` a
+/// sync begin registered in the permit slot, so a disconnect signal reaches this
+/// worker's poll loop.
 ///
 /// # Failure mapping
 ///
@@ -208,16 +249,20 @@ fn terminal_internal_handles() -> WorkerHandles {
 /// its `io::Result` rather than the panicking `std::thread::spawn` — a panic here,
 /// on the FFI caller thread, would abort the whole process under the release
 /// profile's `panic = "abort"`. If the OS refuses the thread, the un-spawned
-/// closure drops with `permit` inside it (releasing the slot) and the returned
-/// handles are already terminal at [`STATUS_INTERNAL`]: the caller registers a
-/// session the first poll reaps, which is exactly the ABI's internal-anomaly code.
-fn spawn_cycle<F, Fut>(permit: WholeCyclePermit, op: F) -> WorkerHandles
+/// closure drops with `permit` inside it (releasing the slot, and deregistering
+/// any registered cancel flag) and the returned handles are already terminal at
+/// [`STATUS_INTERNAL`]: the caller registers a session the first poll reaps,
+/// which is exactly the ABI's internal-anomaly code.
+fn spawn_cycle<F, Fut>(
+    permit: WholeCyclePermit,
+    status: Arc<AtomicI32>,
+    cancel: Arc<AtomicBool>,
+    op: F,
+) -> WorkerHandles
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = i32>,
 {
-    let status = Arc::new(AtomicI32::new(STATUS_RUNNING));
-    let cancel = Arc::new(AtomicBool::new(false));
     let worker_status = Arc::clone(&status);
     let worker_cancel = Arc::clone(&cancel);
     let spawned = std::thread::Builder::new()
@@ -247,18 +292,52 @@ where
     }
 }
 
-/// Claims the account slot and, only if free, spawns a worker for `op`. A busy slot
-/// returns [`BeginOutcome::Busy`] without spawning. Generic over the operation so
-/// the concurrency machinery is testable with a fake cycle.
+/// Claims the account slot and, only if free, spawns a worker for `op`, building
+/// the handle atomics and registering the cancel flag in the permit slot iff
+/// `registers_cancel`. A busy OR disconnecting slot returns
+/// [`BeginOutcome::Busy`] without spawning — the two refusals are deliberately
+/// indistinguishable to the caller. Generic over the operation so the
+/// concurrency machinery is testable with a fake cycle.
+fn begin_inner<F, Fut>(account: &AccountId, registers_cancel: bool, op: F) -> BeginOutcome
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = i32>,
+{
+    let status = Arc::new(AtomicI32::new(STATUS_RUNNING));
+    let cancel = Arc::new(AtomicBool::new(false));
+    // The registration is STRUCTURAL: only a sync begin registers its cancel
+    // flag in the slot, so a disconnect can never signal a connect.
+    let registered = registers_cancel.then(|| Arc::clone(&cancel));
+    let Some(permit) = permit::try_acquire(account, registered) else {
+        return BeginOutcome::Busy;
+    };
+    BeginOutcome::Started(spawn_cycle(permit, status, cancel, op))
+}
+
+/// Begins a SYNC cycle for `op`: the worker's cancel flag is registered in the
+/// permit slot, so a disconnect prompt-cancels the in-flight sync and takes the
+/// gate without waiting out a whole bounded sync.
 fn begin_with<F, Fut>(account: &AccountId, op: F) -> BeginOutcome
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = i32>,
 {
-    let Some(permit) = permit::try_acquire(account) else {
-        return BeginOutcome::Busy;
-    };
-    BeginOutcome::Started(spawn_cycle(permit, op))
+    begin_inner(account, true, op)
+}
+
+/// Begins a CONNECT cycle for `op`: the worker's cancel flag is NEVER
+/// registered in the permit slot. The connect runs through the same
+/// [`CANCEL_POLL_INTERVAL`] cancel poll as a sync, so a disconnect that could
+/// signal it would drop-abort the token exchange mid-flight and orphan a
+/// minted token — connect cancellation flows through the OAuth tombstone/lease
+/// only, and the sync-only registration is what makes a signaled connect
+/// impossible.
+fn begin_connect_with<F, Fut>(account: &AccountId, op: F) -> BeginOutcome
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = i32>,
+{
+    begin_inner(account, false, op)
 }
 
 /// Begins a bounded sync for `account` on a background worker over an
@@ -552,10 +631,198 @@ pub fn begin_connect_account_sync<St>(account: AccountId, session: St) -> BeginO
 where
     St: ConnectSession + Send + 'static,
 {
+    // The CONNECT begin: it never registers its cancel flag in the permit slot,
+    // so a disconnect can never drop-abort the token exchange (see
+    // `begin_connect_with`).
     let slot = account.clone();
-    begin_with(&slot, move || async move {
+    begin_connect_with(&slot, move || async move {
         status_for_cycle(&run_connect_account_cycle(&account, &session).await)
     })
+}
+
+/// A failure at some stage of the disconnect teardown. Kept internal: the
+/// worker collapses every stage to [`STATUS_INTERNAL`] — which stage failed
+/// would leak teardown progress, and the disconnecting flag stays set
+/// regardless, so a retried disconnect converges.
+enum TeardownError {
+    /// A Keychain-backed setup step failed (the refresh-token store, the token
+    /// transport, or the presence-checked mailbox-store open).
+    Setup,
+    /// The stored refresh token could not be deleted.
+    TokenDelete,
+    /// The mailbox + identity purge transaction failed.
+    Purge,
+}
+
+/// The disconnect teardown's fault-injectable core: load the stored token,
+/// revoke it best-effort, delete it, then purge the local account data. Runs
+/// INSIDE the held disconnect gate, which is what serializes it behind any
+/// in-flight cycle. `store` is `None` when the account has no database file:
+/// the purge then no-ops without creating one.
+async fn run_teardown_with<S, T, P, F, E>(
+    account: &AccountId,
+    refresh_store: &S,
+    transport: Option<&T>,
+    open_store: F,
+) -> Result<(), TeardownError>
+where
+    S: RefreshTokenStore,
+    T: TokenTransport,
+    P: AccountPurgeStore,
+    F: FnOnce() -> Result<Option<P>, E>,
+{
+    // load-under-permit: an in-flight sync may rotate the token; only the
+    // permit serializes us behind it. Loading at BEGIN instead could revoke a
+    // rotated-out stale token and miss the live one.
+    let token = refresh_store.load(account);
+    // Ok(None) — nothing stored — and Err — the load failed, so the token's
+    // liveness is unknown — both SKIP the revoke: the idempotent delete and
+    // the purge still run, so the capability dies first and the local
+    // teardown is never gated on a Keychain read fault. A `None` transport
+    // (its constructor failed) likewise skips the revoke rather than aborting
+    // the mandatory local teardown.
+    if let (Ok(Some(token)), Some(transport)) = (&token, transport) {
+        // revoke targets the ONE stored token; a rotated refresh token
+        // abandoned unrevoked by the connect restore fence
+        // (`finish_cancelled_cleanup`, restore-prior branch) is only
+        // also-revoked here if Google /revoke is grant-scoped (the unverified
+        // 3f assumption) — 3f now gates disconnect COMPLETENESS, not just the
+        // connect fence. The revoke is BEST-EFFORT: the local delete/purge
+        // below never gates on the network, so an offline consent withdrawal
+        // still tears down.
+        revoke_best_effort(transport, token).await;
+    }
+    // The token capability dies BEFORE any local-store work: opening the
+    // mailbox store can FAIL (corrupt DB, unavailable root key), and a
+    // pre-delete open failure must never abort the mandatory token delete —
+    // that would leave a usable credential behind. So delete first, then open
+    // and purge, mapping an open failure to `Purge` (post-delete, retryable).
+    refresh_store
+        .delete(account)
+        .map_err(|_error| TeardownError::TokenDelete)?;
+    if let Some(store) = open_store().map_err(|_error| TeardownError::Purge)? {
+        store
+            .purge_account(account)
+            .await
+            .map_err(|_error| TeardownError::Purge)?;
+    }
+    Ok(())
+}
+
+/// The disconnect teardown's production composition: every Keychain/network
+/// object is constructed HERE, on the worker thread, so nothing but `account`
+/// crosses the thread boundary. The mailbox-store open is presence-checked: a
+/// never-connected account has no database file, and the purge must no-op
+/// WITHOUT creating one (disconnect never creates artifacts).
+async fn run_disconnect_teardown(account: &AccountId) -> Result<(), TeardownError> {
+    // The refresh store is the ONLY genuinely-fatal prerequisite: without it the
+    // mandatory token delete cannot run.
+    let refresh_store =
+        DataProtectionRefreshTokenStore::new().map_err(|_error| TeardownError::Setup)?;
+    // The transport is needed only for the BEST-EFFORT revoke: a construction
+    // failure (TLS/reqwest builder) becomes a SKIPPED revoke, exactly like a
+    // failed token load — it must never gate the mandatory local teardown.
+    let transport = GmailTokenTransport::new().ok();
+    // The mailbox store is opened LAZILY, AFTER the token delete inside
+    // `run_teardown_with`, so a store-open failure can never precede — and thus
+    // abort — the credential delete.
+    run_teardown_with(account, &refresh_store, transport.as_ref(), || {
+        open_default_mailbox_store_if_present(account)
+    })
+    .await
+}
+
+/// Spawns the disconnect worker for `account`: a plain thread that
+/// blocking-acquires the slot's gate — serializing BEHIND any in-flight sync
+/// or connect — then loads the stored refresh token, revokes it best-effort,
+/// deletes it, and purges the account's local mailbox and identity in one
+/// transaction.
+///
+/// Claims the slot's single-worker disconnect lease + sets the `disconnecting`
+/// fence SYNCHRONOUSLY on the caller thread (via `permit::begin_disconnect`)
+/// BEFORE spawning, so "`disconnect_begin` returned STARTED ⇒ no new sync can
+/// begin" holds. Returns [`BeginOutcome::Busy`] WITHOUT spawning when a
+/// disconnect worker is already active on the slot: a concurrent request
+/// coalesces onto the running teardown rather than starting a second one that
+/// could clear the fence early or tear down a freshly re-connected account.
+/// That is NOT refusing withdrawal — the running worker owns it. A RETRY after
+/// a FAILED teardown (fence still set, lease released) IS admitted and
+/// converges.
+///
+/// This worker clears the fence via `permit::clear_disconnecting` ONLY on
+/// full teardown success — on any failure it stays set (fail-closed) and the
+/// idempotent teardown converges on retry. The single-worker lease is released
+/// on EVERY outcome (success, failure, panic) as the `permit::DisconnectLease`
+/// drops, so a panicked worker never strands the slot un-retryable.
+///
+/// UN-CANCELLABLE: the worker is NOT routed through `run_cycle`'s
+/// `CANCEL_POLL_INTERVAL` poll, so the `cancel` flag in the returned handles
+/// is inert — registered nowhere, observed nowhere. The teardown is short,
+/// local, and must run to completion once started.
+#[must_use = "the returned outcome is the only way to poll or coalesce the disconnect"]
+pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
+    // Claim the single-worker lease + set the fence on THIS (caller) thread,
+    // before any worker spawns. `None` ⇒ a disconnect is already active on the
+    // slot ⇒ coalesce (do not spawn a second teardown).
+    let Some(lease) = permit::begin_disconnect(&account) else {
+        return BeginOutcome::Busy;
+    };
+    let status = Arc::new(AtomicI32::new(STATUS_RUNNING));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_status = Arc::clone(&status);
+    let spawned = std::thread::Builder::new()
+        .name("tersa-disconnect".to_owned())
+        .spawn(move || {
+            // Declaration order = REVERSE drop order on a panic unwind: `permit`
+            // releases the gate first, then `lease_guard` releases
+            // `disconnect_active` (so a retry is admitted), then `terminal`
+            // publishes STATUS_INTERNAL — preserving release-before-publish even
+            // on a panic. The `disconnecting` fence is NOT cleared on that path
+            // (fail-closed).
+            let mut terminal = StatusOnDrop::new(worker_status);
+            let lease_guard = lease;
+            // Blocking-acquire the gate OFF any tokio runtime thread (the
+            // runtime is built only below), bypassing the disconnecting check —
+            // disconnect set that flag itself, so a flag-checking acquire would
+            // self-deadlock.
+            let permit = permit::acquire_disconnect_gate(&account);
+            let outcome = match build_sync_runtime() {
+                Ok(runtime) => match runtime.block_on(run_disconnect_teardown(&account)) {
+                    Ok(()) => STATUS_SUCCEEDED,
+                    Err(_stage) => STATUS_INTERNAL,
+                },
+                Err(_error) => STATUS_INTERNAL,
+            };
+            // Release the gate BEFORE publishing the terminal status, mirroring
+            // `spawn_cycle`: a poll that sees terminal can immediately re-claim.
+            drop(permit);
+            // FORK E: clear the disconnecting FENCE ONLY on full teardown
+            // success. On ANY failure it STAYS set (fail-closed): the teardown
+            // is idempotent, so a retried disconnect converges; a process
+            // restart clears the in-memory flag.
+            if outcome == STATUS_SUCCEEDED {
+                permit::clear_disconnecting(&account);
+            }
+            // Release the single-worker lease (clearing `disconnect_active`)
+            // BEFORE publishing terminal, and AFTER clearing the fence: by the
+            // time a caller can observe the terminal status and re-issue a
+            // disconnect, `disconnect_active` is already clear, so it is admitted
+            // (never spuriously refused). Combined with a coalescing begin never
+            // touching the fence, no observable "fence cleared, lease held"
+            // window can orphan the fence. On a panic this runs during unwind
+            // (declaration order), keeping the fence set (fail-closed).
+            drop(lease_guard);
+            terminal.publish(outcome);
+        });
+    match spawned {
+        // Dropping the join handle detaches the worker, as before.
+        Ok(_worker) => BeginOutcome::Started(WorkerHandles { status, cancel }),
+        // The thread never spawned, so the moved `lease` dropped with the un-run
+        // closure — releasing `disconnect_active` so a retry is admitted — while
+        // the `disconnecting` fence stays set (fail-closed). The returned handles
+        // poll terminal immediately, like `spawn_cycle`'s refusal mapping.
+        Err(_error) => BeginOutcome::Started(terminal_internal_handles()),
+    }
 }
 
 #[cfg(test)]
@@ -582,8 +849,8 @@ mod tests {
         BeginOutcome, ConnectSession, CycleError, GatedSyncError, STATUS_CANCELLED,
         STATUS_GATE_BLOCKED, STATUS_INTERNAL, STATUS_NEEDS_RECONNECT, STATUS_RUNNING,
         STATUS_SUCCEEDED, STATUS_SYNC_FAILED, TokenLifecycleError, begin_connect_account_sync,
-        begin_default_account_sync, begin_with, complete_after, run_cycle, status_for_cycle,
-        status_for_result,
+        begin_connect_with, begin_default_account_sync, begin_disconnect, begin_with,
+        complete_after, permit, run_cycle, status_for_cycle, status_for_result,
     };
 
     /// A fake [`ConnectSession`]: `claim_missing` never produces a grant (the
@@ -1133,5 +1400,521 @@ mod tests {
         );
         go.store(true, Ordering::Release);
         assert_eq!(poll_until_terminal(&holder), STATUS_SUCCEEDED);
+    }
+
+    /// Records the cross-object order of teardown steps (revoke, token delete,
+    /// purge) so a test can assert the token capability dies before the cache
+    /// purge.
+    #[derive(Debug, Default)]
+    struct OrderLog(std::sync::Mutex<Vec<&'static str>>);
+
+    impl OrderLog {
+        fn record(&self, step: &'static str) {
+            self.0.lock().unwrap().push(step);
+        }
+        fn steps(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A refresh-token store fake: holds one optional token, can fail the load
+    /// or a leading run of deletes, and records every delete in the shared
+    /// order log. Its delete is idempotent exactly like the production store.
+    #[derive(Debug)]
+    struct FakeRefreshStore {
+        token: std::sync::Mutex<Option<zeroize::Zeroizing<String>>>,
+        fail_load: bool,
+        failing_deletes: AtomicUsize,
+        log: std::sync::Arc<OrderLog>,
+    }
+
+    impl FakeRefreshStore {
+        fn with_token(log: std::sync::Arc<OrderLog>) -> Self {
+            Self {
+                token: std::sync::Mutex::new(Some(zeroize::Zeroizing::new(
+                    "refresh-token".to_owned(),
+                ))),
+                fail_load: false,
+                failing_deletes: AtomicUsize::new(0),
+                log,
+            }
+        }
+        fn empty(log: std::sync::Arc<OrderLog>) -> Self {
+            Self {
+                token: std::sync::Mutex::new(None),
+                ..Self::with_token(log)
+            }
+        }
+        fn with_failing_load(log: std::sync::Arc<OrderLog>) -> Self {
+            Self {
+                fail_load: true,
+                ..Self::with_token(log)
+            }
+        }
+        fn fail_next_deletes(self, count: usize) -> Self {
+            self.failing_deletes.store(count, Ordering::SeqCst);
+            self
+        }
+        fn stored_token(&self) -> Option<String> {
+            self.token
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|token| token.as_str().to_owned())
+        }
+    }
+
+    impl tersa_keychain_macos::oauth_token::RefreshTokenStore for FakeRefreshStore {
+        fn store(
+            &self,
+            _account: &AccountId,
+            token: &zeroize::Zeroizing<String>,
+        ) -> Result<(), tersa_keychain_macos::oauth_token::RefreshTokenError> {
+            *self.token.lock().unwrap() = Some(token.clone());
+            Ok(())
+        }
+        fn load(
+            &self,
+            _account: &AccountId,
+        ) -> Result<
+            Option<zeroize::Zeroizing<String>>,
+            tersa_keychain_macos::oauth_token::RefreshTokenError,
+        > {
+            if self.fail_load {
+                return Err(tersa_keychain_macos::oauth_token::RefreshTokenError::OperationFailed);
+            }
+            Ok(self.token.lock().unwrap().clone())
+        }
+        fn delete(
+            &self,
+            _account: &AccountId,
+        ) -> Result<(), tersa_keychain_macos::oauth_token::RefreshTokenError> {
+            self.log.record("delete");
+            let remaining = self.failing_deletes.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.failing_deletes.store(remaining - 1, Ordering::SeqCst);
+                return Err(tersa_keychain_macos::oauth_token::RefreshTokenError::OperationFailed);
+            }
+            *self.token.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    /// A token transport that never exchanges or refreshes (the teardown only
+    /// revokes) and records every revoked token, in order, in the shared log.
+    #[derive(Debug)]
+    struct RecordingTransport {
+        revoked: std::sync::Mutex<Vec<String>>,
+        fail_revoke: bool,
+        log: std::sync::Arc<OrderLog>,
+    }
+
+    impl RecordingTransport {
+        fn new(log: std::sync::Arc<OrderLog>) -> Self {
+            Self {
+                revoked: std::sync::Mutex::new(Vec::new()),
+                fail_revoke: false,
+                log,
+            }
+        }
+        fn with_failing_revoke(self) -> Self {
+            Self {
+                fail_revoke: true,
+                ..self
+            }
+        }
+        fn revoked(&self) -> Vec<String> {
+            self.revoked.lock().unwrap().clone()
+        }
+    }
+
+    impl tersa_application::token::TokenTransport for RecordingTransport {
+        fn exchange(
+            &self,
+            _request: tersa_application::token::ExchangeRequest,
+        ) -> tersa_application::mailbox::BoxFuture<
+            '_,
+            Result<
+                tersa_application::token::TokenResponse,
+                tersa_application::token::TokenTransportError,
+            >,
+        > {
+            Box::pin(async { Err(tersa_application::token::TokenTransportError::Transport) })
+        }
+        fn refresh(
+            &self,
+            _request: tersa_application::token::RefreshRequest,
+        ) -> tersa_application::mailbox::BoxFuture<
+            '_,
+            Result<
+                tersa_application::token::TokenResponse,
+                tersa_application::token::TokenTransportError,
+            >,
+        > {
+            Box::pin(async { Err(tersa_application::token::TokenTransportError::Transport) })
+        }
+        fn revoke<'a>(
+            &'a self,
+            token: &'a zeroize::Zeroizing<String>,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::token::TokenTransportError>,
+        > {
+            // Record INSIDE the awaited future: a revoke that was constructed
+            // but never polled leaves no trace, so the assertions fail rather
+            // than pass vacuously.
+            Box::pin(async move {
+                self.log.record("revoke");
+                self.revoked.lock().unwrap().push(token.as_str().to_owned());
+                if self.fail_revoke {
+                    Err(tersa_application::token::TokenTransportError::Transport)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    /// A purge-store fake: fails a leading run of purges and records every
+    /// purge call in the shared order log.
+    #[derive(Debug)]
+    struct FakePurgeStore {
+        purges: AtomicUsize,
+        failing_purges: AtomicUsize,
+        log: std::sync::Arc<OrderLog>,
+    }
+
+    impl FakePurgeStore {
+        fn new(log: std::sync::Arc<OrderLog>) -> Self {
+            Self {
+                purges: AtomicUsize::new(0),
+                failing_purges: AtomicUsize::new(0),
+                log,
+            }
+        }
+        fn fail_next_purges(self, count: usize) -> Self {
+            self.failing_purges.store(count, Ordering::SeqCst);
+            self
+        }
+        fn purge_calls(&self) -> usize {
+            self.purges.load(Ordering::SeqCst)
+        }
+    }
+
+    impl tersa_application::mailbox::AccountPurgeStore for FakePurgeStore {
+        fn purge_account<'a>(
+            &'a self,
+            _account: &'a AccountId,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::mailbox::MailboxStoreError>,
+        > {
+            Box::pin(async move {
+                self.log.record("purge");
+                self.purges.fetch_add(1, Ordering::SeqCst);
+                let remaining = self.failing_purges.load(Ordering::SeqCst);
+                if remaining > 0 {
+                    self.failing_purges.store(remaining - 1, Ordering::SeqCst);
+                    return Err(tersa_application::mailbox::MailboxStoreError::Storage);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn drive_teardown<S, T, P>(
+        slot: &AccountId,
+        refresh_store: &S,
+        transport: &T,
+        store: Option<&P>,
+    ) -> Result<(), super::TeardownError>
+    where
+        S: tersa_keychain_macos::oauth_token::RefreshTokenStore,
+        T: tersa_application::token::TokenTransport,
+        P: tersa_application::mailbox::AccountPurgeStore,
+    {
+        // Mirror the production call shape: an OPTIONAL transport (a `None`
+        // skips the revoke) and a LAZY store opener invoked AFTER the delete.
+        // The already-built fake is handed back by reference through the closure.
+        test_runtime().block_on(super::run_teardown_with(
+            slot,
+            refresh_store,
+            Some(transport),
+            || Ok::<_, super::TeardownError>(store),
+        ))
+    }
+
+    #[test]
+    fn begin_disconnect_never_cancels_a_connect_holding_the_slot() {
+        use std::sync::Arc;
+        // FORK B (a): a connect holds the slot with NO registered cancel flag,
+        // so a disconnect begin has nothing to signal — the connect is never
+        // drop-aborted mid-token-exchange.
+        let slot = account("disconnect-connect-never-cancelled");
+        let go = Arc::new(AtomicBool::new(false));
+        let release = Arc::clone(&go);
+        let BeginOutcome::Started(handles) = begin_connect_with(&slot, move || async move {
+            while !release.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            STATUS_SUCCEEDED
+        }) else {
+            panic!("a free slot must start the connect");
+        };
+        let _lease = permit::begin_disconnect(&slot);
+        // Give any (wrongly) signaled cancel several poll intervals to land.
+        std::thread::sleep(Duration::from_millis(150));
+        go.store(true, Ordering::Release);
+        assert_eq!(
+            poll_until_terminal(&handles),
+            STATUS_SUCCEEDED,
+            "the connect must run to completion, never cancelled"
+        );
+        assert!(
+            !handles.cancel.load(Ordering::Acquire),
+            "a connect's cancel flag must stay unset"
+        );
+        // The slot IS marked disconnecting, though: new begins refuse.
+        assert!(matches!(
+            begin_with(&slot, || async { STATUS_SUCCEEDED }),
+            BeginOutcome::Busy
+        ));
+        permit::clear_disconnecting(&slot);
+    }
+
+    #[test]
+    fn begin_disconnect_prompt_cancels_a_sync_holding_the_slot() {
+        // FORK B (b): a sync registered its cancel flag, so the disconnect
+        // begin signals it; the sync observes it within its poll interval,
+        // drops the in-flight future, and releases the gate.
+        let slot = account("disconnect-sync-cancelled");
+        let BeginOutcome::Started(handles) = begin_with(&slot, pending::<i32>) else {
+            panic!("a free slot must start the sync");
+        };
+        let _lease = permit::begin_disconnect(&slot);
+        assert_eq!(poll_until_terminal(&handles), STATUS_CANCELLED);
+        // The slot still refuses new begins: disconnecting stays set until the
+        // teardown succeeds.
+        assert!(matches!(
+            begin_with(&slot, || async { STATUS_SUCCEEDED }),
+            BeginOutcome::Busy
+        ));
+        permit::clear_disconnecting(&slot);
+    }
+
+    #[test]
+    fn begins_refuse_while_disconnecting_and_the_grant_stays_unclaimed() {
+        let slot = account("disconnect-begin-refusal");
+        let _lease = permit::begin_disconnect(&slot);
+        // A sync begin refuses WITHOUT building any Keychain/network object:
+        // the refusal happens inside the permit check, before the op is ever
+        // built, exactly like the busy-slot tests prove for a held slot.
+        match begin_default_account_sync(slot.clone(), config()) {
+            BeginOutcome::Busy => {}
+            BeginOutcome::Started(_) => panic!("a disconnecting slot must refuse a sync begin"),
+        }
+        // A connect begin refuses WITHOUT claiming the grant: the caller may
+        // retry the same OAuth session after the teardown.
+        let session = FakeConnectSession::claim_missing(false);
+        let claim_calls = std::sync::Arc::clone(&session.claim_calls);
+        match begin_connect_account_sync(slot.clone(), session) {
+            BeginOutcome::Busy => {}
+            BeginOutcome::Started(_) => panic!("a disconnecting slot must refuse a connect begin"),
+        }
+        assert_eq!(
+            claim_calls.load(Ordering::Acquire),
+            0,
+            "a refused connect begin must not consume the grant"
+        );
+        permit::clear_disconnecting(&slot);
+    }
+
+    #[test]
+    fn a_failed_disconnect_worker_leaves_the_slot_disconnecting() {
+        // FORK E, setup-failure half, end to end: on this CI host (no
+        // provisioned Keychain for the unsigned test binary) the teardown's
+        // first Keychain-backed constructor fails, so the worker reports the
+        // internal code — and the disconnecting flag STAYS set.
+        let slot = account("disconnect-setup-failure");
+        // `begin_disconnect` now sets the fence + claims the lease itself.
+        let BeginOutcome::Started(handles) = begin_disconnect(slot.clone()) else {
+            panic!("a free slot must start the disconnect worker");
+        };
+        assert_eq!(poll_until_terminal(&handles), STATUS_INTERNAL);
+        assert!(matches!(
+            begin_with(&slot, || async { STATUS_SUCCEEDED }),
+            BeginOutcome::Busy
+        ));
+        // A retried disconnect converges on a healthy host; clear the flag as
+        // a successful teardown would so this slot is reusable.
+        permit::clear_disconnecting(&slot);
+    }
+
+    #[test]
+    fn teardown_revokes_then_deletes_then_purges() {
+        // The load-under-permit order: the ONE stored token is revoked
+        // best-effort, the capability dies (delete), and only then does the
+        // cache purge run.
+        let slot = account("disconnect-order");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(outcome.is_ok());
+        assert_eq!(log.steps(), vec!["revoke", "delete", "purge"]);
+        assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
+        assert_eq!(refresh_store.stored_token(), None);
+    }
+
+    #[test]
+    fn teardown_with_nothing_stored_skips_the_revoke_and_still_purges() {
+        // Ok(None): a never-connected (or already-torn-down) account revokes
+        // nothing but still deletes (idempotent) and purges.
+        let slot = account("disconnect-empty-token");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::empty(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(outcome.is_ok());
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn teardown_with_a_failed_load_skips_the_revoke_and_still_tears_down() {
+        // Err on load: whether a token lives at the provider is unknown, so
+        // nothing is revoked — but the idempotent delete and the purge still
+        // run, so the local teardown is never gated on a Keychain read fault.
+        let slot = account("disconnect-load-failure");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_failing_load(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(outcome.is_ok());
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
+        assert!(transport.revoked().is_empty());
+    }
+
+    #[test]
+    fn teardown_without_a_database_file_purges_nothing_and_succeeds() {
+        // A never-connected account has no database file: the store is None
+        // and the purge no-ops — the revoke and delete still run.
+        let slot = account("disconnect-absent-db");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, None::<&FakePurgeStore>);
+        assert!(outcome.is_ok());
+        assert_eq!(log.steps(), vec!["revoke", "delete"]);
+    }
+
+    #[test]
+    fn a_failed_revoke_does_not_gate_the_local_teardown() {
+        // Offline withdrawal: the revoke fails (and so does its one retry),
+        // but the delete and purge still run and the teardown SUCCEEDS.
+        let slot = account("disconnect-offline-revoke");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log)).with_failing_revoke();
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(outcome.is_ok());
+        // Best-effort with ONE retry: exactly two revoke attempts, then the
+        // local teardown proceeds.
+        assert_eq!(log.steps(), vec!["revoke", "revoke", "delete", "purge"]);
+        assert_eq!(transport.revoked().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_token_delete_aborts_before_the_purge() {
+        // The capability must die before the cache purge: a failed delete
+        // aborts the teardown and the purge NEVER runs while a usable token
+        // may remain.
+        let slot = account("disconnect-delete-failure");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store =
+            FakeRefreshStore::with_token(std::sync::Arc::clone(&log)).fail_next_deletes(1);
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(matches!(outcome, Err(super::TeardownError::TokenDelete)));
+        assert_eq!(purge_store.purge_calls(), 0);
+        assert_eq!(log.steps(), vec!["revoke", "delete"]);
+    }
+
+    #[test]
+    fn an_unopenable_store_still_revokes_and_deletes_then_fails_at_the_purge() {
+        // F1 (Opus/Sol): the mailbox-store OPEN can fail (corrupt DB, unavailable
+        // root key), and it is opened LAZILY inside the teardown — AFTER the
+        // token delete. So a store-open failure must NOT abort the mandatory
+        // token delete (which would leave a usable credential behind); the
+        // revoke and delete still run, and only then does the teardown fail at
+        // the (post-delete, retryable) purge stage.
+        let slot = account("disconnect-unopenable-store");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let outcome = test_runtime().block_on(super::run_teardown_with(
+            &slot,
+            &refresh_store,
+            Some(&transport),
+            // The lazy opener FAILS — as a corrupt DB or unavailable root key
+            // would — instead of yielding a store.
+            || Err::<Option<FakePurgeStore>, _>(super::TeardownError::Purge),
+        ));
+        assert!(matches!(outcome, Err(super::TeardownError::Purge)));
+        // The credential died FIRST, despite the store being unopenable.
+        assert_eq!(log.steps(), vec!["revoke", "delete"]);
+        assert_eq!(
+            refresh_store.stored_token(),
+            None,
+            "the token is deleted even when the store cannot be opened"
+        );
+    }
+
+    #[test]
+    fn a_failed_teardown_converges_on_retry_and_the_flag_follows_success() {
+        // FORK E, retry-convergence half: a teardown whose purge fails once
+        // leaves the capability destroyed (delete ran first) and the flag set;
+        // a retry with the fault cleared is idempotent and succeeds, and ONLY
+        // that success clears the flag.
+        let slot = account("disconnect-fork-e-retry");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log)).fail_next_purges(1);
+
+        // The FFI marks the slot disconnecting at BEGIN.
+        let _lease = permit::begin_disconnect(&slot);
+        let first = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(matches!(first, Err(super::TeardownError::Purge)));
+        assert_eq!(
+            refresh_store.stored_token(),
+            None,
+            "the token capability dies before the failed purge"
+        );
+        // The worker clears the flag ONLY on success, so it stays set here.
+        assert!(
+            permit::try_acquire(&slot, None).is_none(),
+            "a failed teardown leaves the slot disconnecting"
+        );
+        // Retry with the fault cleared: the load now finds nothing (the delete
+        // already ran), so no second revoke fires; delete is an idempotent
+        // no-op; the purge succeeds.
+        let second = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
+        assert!(second.is_ok());
+        permit::clear_disconnecting(&slot);
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "a successful teardown reopens the slot"
+        );
+        assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
+        assert_eq!(
+            log.steps(),
+            vec!["revoke", "delete", "purge", "delete", "purge"]
+        );
     }
 }

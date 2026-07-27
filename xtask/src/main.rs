@@ -1235,10 +1235,10 @@ fn bridge_package_source_surface_violations(
 /// The exact count message for the Apple bridge's reviewed C ABI symbol set.
 const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe";
 /// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol
-/// set. It pins THIS crate's own three declared `#[no_mangle]` exports; the
-/// archive the application links carries those three plus the Apple bridge's
+/// set. It pins THIS crate's own four declared `#[no_mangle]` exports; the
+/// archive the application links carries those four plus the Apple bridge's
 /// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
-const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own three reviewed begin, connect, and poll no_mangle exports (the shipped archive surface is these three plus the Apple bridge's reviewed eleven)";
+const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own four reviewed begin, connect, disconnect, and poll no_mangle exports (the shipped archive surface is these four plus the Apple bridge's reviewed eleven)";
 
 /// Pins a static-library package's exported C ABI to an exact reviewed set: every
 /// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
@@ -1376,6 +1376,10 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
         (
             "tersa_mailbox_macos_connect_begin",
             "pubunsafeextern\"C\"fntersa_mailbox_macos_connect_begin(account_id:*constu8,account_id_len:usize,oauth_session_id:u64,output_session_id:*mutu64,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_disconnect_begin",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_disconnect_begin(account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
         ),
         (
             "tersa_mailbox_macos_sync_begin",
@@ -7699,6 +7703,12 @@ pub unsafe extern "C" fn tersa_mailbox_macos_connect_begin(
     output_session_id: *mut u64,
 ) -> i32 {}
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_disconnect_begin(
+    account_id: *const u8,
+    account_id_len: usize,
+    output_session_id: *mut u64,
+) -> i32 {}
+#[unsafe(no_mangle)]
 pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
 "#
     }
@@ -7740,15 +7750,15 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
             );
         }
 
-        // A fourth exported symbol must trip the reviewed-count message.
-        let fourth_symbol = reviewed_mailbox_sync_ffi_documents(format!(
+        // A fifth exported symbol must trip the reviewed-count message.
+        let fifth_symbol = reviewed_mailbox_sync_ffi_documents(format!(
             "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn tersa_mailbox_macos_sync_extra() -> i32 {{}}"
         ));
-        let violations = ffi_export_violations(&fourth_symbol);
+        let violations = ffi_export_violations(&fifth_symbol);
         assert!(
             violations.iter().any(|violation| violation
-                .contains("three reviewed begin, connect, and poll no_mangle exports")),
-            "a fourth symbol must trip the reviewed-count message: {violations:?}"
+                .contains("four reviewed begin, connect, disconnect, and poll no_mangle exports")),
+            "a fifth symbol must trip the reviewed-count message: {violations:?}"
         );
     }
 

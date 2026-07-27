@@ -30,7 +30,7 @@ mod macos {
     use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags};
     use tersa_application::identity::{AccountIdentityStore, IdentityHash, IdentityReconcile};
     use tersa_application::mailbox::{
-        BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
+        AccountPurgeStore, BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
     };
     use tersa_domain::mailbox::{
         AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
@@ -255,6 +255,35 @@ mod macos {
             key: DatabaseKey,
         ) -> Result<Self, MailboxStoreError> {
             Self::open_inner_impl(account, path.as_ref(), key, &mut |_point, _path| Ok(()))
+        }
+
+        /// Opens the database for `account` at `path` ONLY if its file already
+        /// exists; an absent file is `Ok(None)` and is NEVER created.
+        ///
+        /// This is the disconnect purge's open: [`Self::open`] claims and
+        /// creates a fresh database for an absent path, and a teardown must
+        /// never create artifacts for a never-connected account. The presence
+        /// check runs before any open work; an I/O error checking it is
+        /// UNKNOWN, not absent, and fails closed as storage — disconnect must
+        /// not report a successful purge of data it could not even stat. The
+        /// check is inherently TOCTOU, but benignly: a file that appears
+        /// afterward is simply opened and purged, and nothing in this design
+        /// deletes a database file.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same errors as [`Self::open`] for a present file, and
+        /// [`MailboxStoreError::Storage`] when the presence check itself fails.
+        pub fn open_existing<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+        ) -> Result<Option<Self>, MailboxStoreError> {
+            match path.as_ref().try_exists() {
+                Ok(true) => Self::open(account, path, key).map(Some),
+                Ok(false) => Ok(None),
+                Err(_error) => Err(MailboxStoreError::Storage),
+            }
         }
 
         #[cfg(test)]
@@ -632,6 +661,47 @@ mod macos {
                     )
                     .map_err(store_error)?;
                 Ok(())
+            })
+        }
+
+        /// Destroys the account's local data in ONE transaction: every mailbox
+        /// row and the account-identity row die in the same commit, so a crash
+        /// mid-purge never leaves a half-torn-down account.
+        ///
+        /// PERMIT-HOLDER-ONLY, DESTRUCTIVE-ONLY: the caller must hold the
+        /// slot's whole-cycle permit, and the purge takes no fence or identity
+        /// hash — it cannot inject stale state, only destroy. `messages` is
+        /// cleared WITHOUT an account clause (the database file is per-account,
+        /// exactly as the identity-clearing reconcile does), and the
+        /// `account_binding` singleton is deliberately left intact: the file
+        /// stays bound to its account, so a later re-connect passes the
+        /// open-time binding check instead of failing as an unknown owner.
+        fn purge(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
+            self.with_connection(|connection| {
+                // BEGIN IMMEDIATE takes the write lock up front, mirroring the
+                // reconcile clear+write transaction: both DELETE statements
+                // commit or roll back together.
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(store_error)?;
+                transaction
+                    .execute("DELETE FROM messages", [])
+                    .map_err(store_error)?;
+                #[cfg(test)]
+                if self.take_failpoint()? {
+                    return Err(MailboxStoreError::Storage);
+                }
+                transaction
+                    .execute(
+                        "DELETE FROM account_identity WHERE account_id = ?1",
+                        params![account.as_str()],
+                    )
+                    .map_err(store_error)?;
+                #[cfg(test)]
+                if self.take_failpoint()? {
+                    return Err(MailboxStoreError::Storage);
+                }
+                transaction.commit().map_err(store_error)
             })
         }
 
@@ -1915,6 +1985,18 @@ mod macos {
                     clear_mailbox,
                     expected.map(IdentityHash::as_bytes),
                 )
+            })
+        }
+    }
+
+    impl AccountPurgeStore for SqlCipherMailboxStore {
+        fn purge_account<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.purge(account)
             })
         }
     }
@@ -4946,6 +5028,109 @@ mod macos {
                 database.path(),
                 key(7),
             ));
+        }
+
+        /// Counts the rows of one table through the store's own connection, for
+        /// purge assertions.
+        fn row_count(store: &SqlCipherMailboxStore, table: &str) -> i64 {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        #[test]
+        fn purge_clears_the_mailbox_and_identity_and_keeps_the_binding() {
+            let (database, store) = open("purge");
+            record_fence(&store);
+            run(store.upsert_envelopes(
+                &account(),
+                &[envelope("m1", "t1", 100), envelope("m2", "t1", 200)],
+            ))
+            .unwrap();
+            assert_eq!(row_count(&store, "messages"), 2);
+            assert_eq!(row_count(&store, "account_identity"), 1);
+
+            run(store.purge_account(&account())).unwrap();
+
+            // The mailbox rows AND the identity row die in the one purge...
+            assert_eq!(row_count(&store, "messages"), 0);
+            assert_eq!(row_count(&store, "account_identity"), 0);
+            // ...but the account_binding singleton survives: the file stays
+            // bound to its account, so a re-connect passes the open-time
+            // binding check instead of reading as an unknown owner.
+            assert_eq!(row_count(&store, "account_binding"), 1);
+            // The teardown is idempotent: a second purge is a no-op success.
+            run(store.purge_account(&account())).unwrap();
+            drop(store);
+            // A clean re-connect: the store reopens under the same account and
+            // reads as a first connect (no identity recorded).
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert!(reopened.read_identity_hash(&account()).unwrap().is_none());
+        }
+
+        #[test]
+        fn purge_rolls_back_atomically_on_a_failpoint() {
+            let (_database, store) = open("purge-rollback");
+            record_fence(&store);
+            run(store.upsert_envelopes(&account(), &[envelope("m1", "t1", 100)])).unwrap();
+            store.fail_next_mutation();
+            assert_eq!(
+                run(store.purge_account(&account())),
+                Err(MailboxStoreError::Storage)
+            );
+            // Both DELETE statements roll back together: a mid-purge fault never leaves a
+            // half-torn-down account (mailbox cleared but identity kept, or the
+            // reverse).
+            assert_eq!(row_count(&store, "messages"), 1);
+            assert_eq!(row_count(&store, "account_identity"), 1);
+            assert_eq!(row_count(&store, "account_binding"), 1);
+        }
+
+        #[test]
+        fn purge_rejects_a_wrong_account_without_database_work() {
+            let (_database, store) = open("purge-mismatch");
+            record_fence(&store);
+            let foreign = AccountId::new("account-b").unwrap();
+            let changes_before = store.connection.lock().unwrap().total_changes();
+            assert_eq!(
+                run(store.purge_account(&foreign)),
+                Err(MailboxStoreError::Storage)
+            );
+            assert_eq!(
+                store.connection.lock().unwrap().total_changes(),
+                changes_before,
+                "a wrong-account purge must not mutate the database"
+            );
+        }
+
+        #[test]
+        fn open_existing_on_an_absent_database_is_none_and_creates_nothing() {
+            let database = TestDatabase::new("open-existing-absent");
+            let opened =
+                SqlCipherMailboxStore::open_existing(account(), database.path(), key(7)).unwrap();
+            assert!(
+                opened.is_none(),
+                "an absent database is a no-op success for the disconnect purge"
+            );
+            assert!(
+                database.files().is_empty(),
+                "disconnect must never create artifacts for a never-connected account"
+            );
+        }
+
+        #[test]
+        fn open_existing_on_a_present_database_opens_it() {
+            let database = TestDatabase::new("open-existing-present");
+            let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            drop(store);
+            let opened =
+                SqlCipherMailboxStore::open_existing(account(), database.path(), key(7)).unwrap();
+            assert!(opened.is_some(), "a present database opens for the purge");
         }
 
         #[test]
