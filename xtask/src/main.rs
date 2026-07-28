@@ -627,7 +627,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         APPLE_BRIDGE_C_ABI_COUNT_MESSAGE,
     ));
 
-    // The mailbox-sync FFI is a sibling static library with its own three-symbol C ABI;
+    // The mailbox-sync FFI is a sibling static library with its own four-symbol C ABI;
     // pin its reviewed sources and export inventory exactly as the bridge's, so a new
     // source file or exported symbol cannot land without review.
     let ffi_package_sources =
@@ -2712,6 +2712,25 @@ size_t *output_url_len
 );
 int32_t tersa_oauth_macos_poll(uint64_t session_id);
 int32_t tersa_oauth_cancel(uint64_t session_id);
+int32_t tersa_mailbox_macos_sync_begin(
+const uint8_t *client_id,
+size_t client_id_len,
+const uint8_t *account_id,
+size_t account_id_len,
+uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_connect_begin(
+const uint8_t *account_id,
+size_t account_id_len,
+uint64_t oauth_session_id,
+uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_disconnect_begin(
+const uint8_t *account_id,
+size_t account_id_len,
+uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
 #endif";
 
 const CANONICAL_TERSA_MAC_BRIDGING_HEADER: &str = "#include \"TersaRustBridge.h\"";
@@ -4437,6 +4456,22 @@ fn validate_project_options(options: Option<&StrictYamlValue>, violations: &mut 
     }
 }
 
+/// The macOS app must link EXACTLY the mailbox-sync FFI archive and nothing else
+/// Rust-side. That archive re-exports the bridge's C symbols, so linking
+/// `libtersa_apple_bridge.a` alongside it would duplicate the bridge crate —
+/// splitting its process-global grant/session statics (a grant stored via one
+/// copy is unclaimable via the other). The linker only rejects one archive
+/// ordering; this pin is the actual enforcement of the single-archive rule.
+fn tersa_mac_links_only_ffi_archive(settings: Option<&StrictYamlValue>) -> bool {
+    const TERSA_MAC_OTHER_LDFLAGS: &str =
+        "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a";
+    matches!(settings, Some(StrictYamlValue::Mapping(settings))
+        if matches!(settings.get("OTHER_LDFLAGS"),
+            Some(StrictYamlValue::Sequence(flags)) if flags.len() == 1
+                && matches!(&flags[0], StrictYamlValue::String(value) if value == TERSA_MAC_OTHER_LDFLAGS))
+            && !settings.keys().any(|key| key.starts_with("OTHER_LDFLAGS[")))
+}
+
 fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> {
     let mut violations = Vec::new();
     let Ok(target) = yaml_mapping(target, "TersaMac target") else {
@@ -4459,6 +4494,12 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
     if !valid_bundle_identifier {
         violations.push(
             "the TersaMac PRODUCT_BUNDLE_IDENTIFIER must be exactly app.tersa.mac without conditional overrides"
+                .to_owned(),
+        );
+    }
+    if !tersa_mac_links_only_ffi_archive(settings) {
+        violations.push(
+            "the TersaMac OTHER_LDFLAGS must link exactly the single mailbox-sync FFI archive (libtersa_mailbox_sync_ffi_macos.a) with no conditional overrides and no additional Rust archive — linking the bridge archive too would split the bridge's process-global grant/session state"
                 .to_owned(),
         );
     }
@@ -6848,6 +6889,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a"
     preBuildScripts:
       - name: Build Rust static library
         basedOnDependencyAnalysis: false
@@ -9386,6 +9429,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a"
     preBuildScripts:
       - name: Build Rust static library
         basedOnDependencyAnalysis: false
@@ -9603,6 +9648,10 @@ targets:
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive mutation table asserting every unsupported xcodegen bypass fails closed"
+    )]
     fn effective_signing_policy_rejects_every_unsupported_xcodegen_bypass() {
         assert!(
             signing_configuration_violations(VALID_ENTITLEMENTS, VALID_SIGNING_PROJECT).is_empty()
@@ -9655,6 +9704,21 @@ targets:
             "        TERSA_MACOS_APP_GROUP: \"$(TeamIdentifierPrefix)app.tersa.shared\"",
             "        TERSA_MACOS_APP_GROUP: \"$(TeamIdentifierPrefix)app.tersa.shared\"\n        TERSA_MACOS_APP_GROUP[sdk=macosx*]: forbidden",
         );
+        // The single-archive link rule: swapping in the bridge archive, adding a
+        // SECOND archive, or dropping the pin entirely must all fail closed — the
+        // linker only rejects one archive ordering, so this gate is the guard.
+        let bridge_archive = VALID_SIGNING_PROJECT.replace(
+            "libtersa_mailbox_sync_ffi_macos.a",
+            "libtersa_apple_bridge.a",
+        );
+        let both_archives = VALID_SIGNING_PROJECT.replace(
+            "          - \"$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a\"",
+            "          - \"$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a\"\n          - \"$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_apple_bridge.a\"",
+        );
+        let missing_ldflags = VALID_SIGNING_PROJECT.replace(
+            "        OTHER_LDFLAGS:\n          - \"$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a\"\n",
+            "",
+        );
 
         for (label, project, expected) in [
             (
@@ -9688,6 +9752,21 @@ targets:
                 "conditional setting",
                 conditional,
                 "TERSA_MACOS_APP_GROUP[sdk=macosx*]",
+            ),
+            (
+                "bridge archive substituted",
+                bridge_archive,
+                "OTHER_LDFLAGS must link exactly the single mailbox-sync FFI archive",
+            ),
+            (
+                "both archives linked",
+                both_archives,
+                "OTHER_LDFLAGS must link exactly the single mailbox-sync FFI archive",
+            ),
+            (
+                "missing OTHER_LDFLAGS",
+                missing_ldflags,
+                "OTHER_LDFLAGS must link exactly the single mailbox-sync FFI archive",
             ),
         ] {
             let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);

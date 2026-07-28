@@ -57,7 +57,7 @@ targets:
         # this exception scoped to the target that invokes the locked script.
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
         OTHER_LDFLAGS:
-          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_apple_bridge.a"
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a"
     preBuildScripts:
       - name: Build Rust static library
         basedOnDependencyAnalysis: false

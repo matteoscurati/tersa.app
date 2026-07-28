@@ -78,8 +78,13 @@ generate_notice THIRD_PARTY_NOTICES-dioxus-ios.txt \
   "iOS arm64 device and simulator targets" \
   apps/dioxus-spike/Cargo.toml - "$dioxus_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
+# The macOS app links libtersa_mailbox_sync_ffi_macos.a (which re-exports the
+# bridge and pulls the full sync-engine closure), so its bundled notices must be
+# generated from the FFI crate's manifest, not the bare bridge. The output
+# filename stays -bridge-macos.txt (pinned in project.yml + xtask). iOS still
+# links the bridge archive, so its notices below stay on the bridge manifest.
 generate_notice THIRD_PARTY_NOTICES-bridge-macos.txt "tersa.app macOS arm64" \
-  apple/rust-bridge/Cargo.toml "$sqlcipher_supplemental" "$bridge_config" \
+  adapters/mailbox-sync-ffi-macos/Cargo.toml "$sqlcipher_supplemental" "$bridge_config" \
   --target aarch64-apple-darwin
 generate_notice THIRD_PARTY_NOTICES-bridge-ios.txt \
   "tersa.app iOS arm64 device and simulator targets" \

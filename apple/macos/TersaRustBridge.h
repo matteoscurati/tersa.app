@@ -51,4 +51,26 @@ int32_t tersa_oauth_macos_poll(uint64_t session_id);
 // key, NOT a capability; callers must only pass an id from their own begin.
 int32_t tersa_oauth_cancel(uint64_t session_id);
 
+// Mailbox sync FFI (adapters/mailbox-sync-ffi-macos). The macOS app links only
+// that crate's archive, which also re-exports the bridge symbols above.
+int32_t tersa_mailbox_macos_sync_begin(
+    const uint8_t *client_id,
+    size_t client_id_len,
+    const uint8_t *account_id,
+    size_t account_id_len,
+    uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_connect_begin(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    uint64_t oauth_session_id,
+    uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_disconnect_begin(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    uint64_t *output_session_id
+);
+int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
+
 #endif
