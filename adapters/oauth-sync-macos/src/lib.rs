@@ -356,7 +356,26 @@ pub trait ConnectSession {
     fn complete(&self);
 }
 
-/// Revokes a provider-minted token best-effort, retrying ONCE on failure.
+/// Whether the provider confirmed a best-effort token revocation.
+///
+/// Only the disconnect (3d-3d) teardown consumes this: it maps the outcome
+/// onto the worker's closed status set, so a locally-successful teardown whose
+/// /revoke could not be confirmed is reported DISTINCTLY from a confirmed one.
+/// The connect flow's cancel fences discard it — there the revoke is
+/// fire-and-forget (nothing is stored, or the just-stored copy was deleted
+/// first), so the outcome changes no behavior on that path.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+#[must_use = "the disconnect teardown maps this to the revoke-unconfirmed status; dropping it silently loses the M2 signal"]
+pub(crate) enum RevokeOutcome {
+    /// The revoke HTTP call succeeded — on the first attempt OR the one retry.
+    Confirmed,
+    /// Both the first attempt and the one retry failed.
+    Failed,
+}
+
+/// Revokes a provider-minted token best-effort, retrying ONCE on failure, and
+/// reports whether the provider confirmed the revocation.
 ///
 /// Used by the connect flow's cancel fences and store-failure path, and by the
 /// disconnect (3d-3d) teardown for the ONE stored token it loads under the
@@ -371,10 +390,11 @@ pub trait ConnectSession {
 pub(crate) async fn revoke_best_effort<T: TokenTransport>(
     transport: &T,
     token: &Zeroizing<String>,
-) {
-    if transport.revoke(token).await.is_err() {
-        let _ = transport.revoke(token).await;
+) -> RevokeOutcome {
+    if transport.revoke(token).await.is_err() && transport.revoke(token).await.is_err() {
+        return RevokeOutcome::Failed;
     }
+    RevokeOutcome::Confirmed
 }
 
 /// Exchanges a forwarded authorization grant and persists the refresh token.
@@ -517,7 +537,9 @@ where
             // this must NOT fire: the minted token is same-grant, so the
             // revoke would kill the user's working connection.
             let token_to_revoke = rotated_refresh.as_ref().unwrap_or(access_token.secret());
-            revoke_best_effort(transport, token_to_revoke).await;
+            // The connect fences are fire-and-forget: nothing is stored (or the
+            // just-stored copy was deleted first), so the outcome is discarded.
+            let _ = revoke_best_effort(transport, token_to_revoke).await;
         }
         return Err(TokenLifecycleError::Cancelled);
     }
@@ -526,7 +548,7 @@ where
     // empty (an unknown read never revokes).
     let Some(refresh) = rotated_refresh else {
         if revocable {
-            revoke_best_effort(transport, access_token.secret()).await;
+            let _ = revoke_best_effort(transport, access_token.secret()).await;
         }
         return Err(TokenLifecycleError::MissingRefreshToken);
     };
@@ -537,7 +559,7 @@ where
         // and with an UNREADABLE snapshot a live grant could be hiding — so
         // only a definitively-empty snapshot revokes here.
         if revocable {
-            revoke_best_effort(transport, &refresh).await;
+            let _ = revoke_best_effort(transport, &refresh).await;
         }
         return Err(TokenLifecycleError::Store(error));
     }
@@ -599,7 +621,7 @@ where
         return Err(TokenLifecycleError::CancelledCleanupIncomplete);
     }
     if prior.is_none() {
-        revoke_best_effort(transport, refresh).await;
+        let _ = revoke_best_effort(transport, refresh).await;
     }
     Err(TokenLifecycleError::Cancelled)
 }

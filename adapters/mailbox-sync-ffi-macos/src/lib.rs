@@ -325,8 +325,13 @@ mod macos {
     /// gate, loads the stored refresh token under that gate, revokes it
     /// best-effort (an offline withdrawal still tears down locally), deletes
     /// it, and purges the account's local mailbox and identity in one
-    /// transaction. The flag is cleared only on full teardown success; on any
-    /// failure it stays set (fail-closed), the poll reports the internal code,
+    /// transaction. A locally-COMPLETE teardown reports the plain success code
+    /// (1) when the provider confirmed the /revoke — or nothing was stored —
+    /// and the DISTINCT success-revoke-unconfirmed code (3) when it could not
+    /// be confirmed: the account is disconnected either way, and 3e renders
+    /// the latter as "Disconnected — also revoke access in your Google Account
+    /// settings." The flag clears on BOTH success codes; on any teardown
+    /// FAILURE it stays set (fail-closed), the poll reports the internal code,
     /// and a retried disconnect converges.
     ///
     /// Returns [`STATUS_STARTED`] with `output_session_id` written when a
@@ -415,9 +420,16 @@ mod macos {
     /// and reaping the session once it reaches a terminal status.
     ///
     /// Returns [`STATUS_RUNNING`] while the cycle is in flight, the worker's terminal
-    /// code (success, cancelled, gate-blocked, sync-failed, internal, or
-    /// needs-reconnect) once, [`STATUS_UNKNOWN_SESSION`] for an unregistered or
-    /// already-reaped id, or [`STATUS_INTERNAL`] if the registry lock is poisoned.
+    /// code (success, success-revoke-unconfirmed, cancelled, gate-blocked,
+    /// sync-failed, internal, or needs-reconnect) once, [`STATUS_UNKNOWN_SESSION`]
+    /// for an unregistered or already-reaped id, or [`STATUS_INTERNAL`] if the
+    /// registry lock is poisoned.
+    ///
+    /// This one poll serves sync, connect, AND disconnect sessions. The terminal
+    /// codes are NOT all reachable from every session kind: only a DISCONNECT
+    /// session can report [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`] — a sync or a
+    /// connect poll NEVER does. A Swift caller must not surface the
+    /// revoke-in-Google-settings copy off a sync/connect poll.
     ///
     /// # Safety
     ///

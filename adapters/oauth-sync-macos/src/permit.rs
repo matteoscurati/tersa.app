@@ -74,9 +74,11 @@ struct AccountSlot {
 /// The disconnect coordination record for one slot.
 #[derive(Debug)]
 struct SlotCoord {
-    /// Set at disconnect BEGIN, cleared ONLY on full teardown success. While
-    /// set, every [`try_acquire`] refuses: no new sync or connect begins
-    /// mid-teardown. This is the FENCE — it persists across a FAILED teardown
+    /// Set at disconnect BEGIN, cleared only on the teardown SUCCESS FAMILY
+    /// (`STATUS_SUCCEEDED` or `STATUS_SUCCEEDED_REVOKE_UNCONFIRMED` — i.e. any
+    /// locally-complete teardown, revoke confirmed or not). While set, every
+    /// [`try_acquire`] refuses: no new sync or connect begins mid-teardown. This
+    /// is the FENCE — it persists across a FAILED teardown
     /// (fail-closed), so on its own it cannot tell "a worker is running" from
     /// "a prior teardown failed and the account is fenced pending retry"; that
     /// distinction is [`Self::disconnect_active`].
@@ -294,11 +296,13 @@ pub(crate) fn acquire_disconnect_gate(account: &AccountId) -> DisconnectPermit {
     DisconnectPermit { _guard: guard }
 }
 
-/// Clears the slot's `disconnecting` fence. Called by the disconnect worker
-/// ONLY on full teardown success — never on a failure, never from a drop
-/// guard, so a failed or panicked teardown leaves the slot refusing new begins
-/// (fail-closed) until a retried disconnect converges. (The single-worker lease
-/// is released separately, on EVERY outcome, by [`DisconnectLease`].)
+/// Clears the slot's `disconnecting` fence. Called by the disconnect worker on
+/// the teardown SUCCESS FAMILY (`STATUS_SUCCEEDED` or
+/// `STATUS_SUCCEEDED_REVOKE_UNCONFIRMED` — any locally-complete teardown) —
+/// never on a failure, never from a drop guard, so a failed or panicked teardown
+/// leaves the slot refusing new begins (fail-closed) until a retried disconnect
+/// converges. (The single-worker lease is released separately, on EVERY outcome,
+/// by [`DisconnectLease`].)
 pub(crate) fn clear_disconnecting(account: &AccountId) {
     let slot = slot(account);
     lock_coord(&slot).disconnecting = false;
