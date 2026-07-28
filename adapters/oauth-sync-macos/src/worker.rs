@@ -26,7 +26,10 @@
 //! serializing BEHIND the now-cancelling cycle — and only then loads the stored
 //! refresh token, revokes it best-effort, deletes it, and purges the account's
 //! local data. That worker is un-cancellable and clears the disconnecting flag
-//! only on full teardown success.
+//! on the whole teardown SUCCESS FAMILY — a locally-complete teardown, whether
+//! or not the provider /revoke could be confirmed ([`STATUS_SUCCEEDED`] or
+//! [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`]); only a teardown FAILURE leaves the
+//! flag set (fail-closed).
 
 use std::pin::pin;
 use std::sync::Arc;
@@ -49,14 +52,25 @@ use tersa_keychain_macos::{
 
 use crate::permit::{self, WholeCyclePermit};
 use crate::{
-    ConnectSession, GatedSyncError, GmailSession, TokenLifecycleError, build_sync_runtime,
-    connect_account, gated_sync, refresh_account, revoke_best_effort,
+    ConnectSession, GatedSyncError, GmailSession, RevokeOutcome, TokenLifecycleError,
+    build_sync_runtime, connect_account, gated_sync, refresh_account, revoke_best_effort,
 };
 
 /// The worker thread is live and its cycle is in flight.
 pub const STATUS_RUNNING: i32 = 0;
 /// The gate passed and the bounded sync completed.
 pub const STATUS_SUCCEEDED: i32 = 1;
+/// The disconnect teardown completed locally — the stored token was deleted and
+/// the account's mailbox and identity were purged — but the provider /revoke
+/// could NOT be confirmed: both revoke attempts failed (e.g. offline), the
+/// token load failed so a token's liveness is unknown, or the token transport
+/// could not be constructed so no revoke was attempted. The account IS
+/// disconnected; 3e renders "Disconnected — also revoke access in your Google
+/// Account settings." Positive, alongside [`STATUS_SUCCEEDED`]: the two form
+/// the disconnect SUCCESS FAMILY the `disconnecting` fence clears on, distinct
+/// from the FFI's positive begin-refusal code (`STATUS_SYNC_BUSY = 2`), which
+/// is never a poll terminal.
+pub const STATUS_SUCCEEDED_REVOKE_UNCONFIRMED: i32 = 3;
 /// A disconnect was observed and the in-flight sync future was dropped.
 pub const STATUS_CANCELLED: i32 = -2;
 /// The account-identity gate blocked the sync. All gate sub-reasons collapse to
@@ -654,17 +668,38 @@ enum TeardownError {
     Purge,
 }
 
+/// Whether the disconnect teardown could CONFIRM the provider /revoke of the
+/// stored token. Kept internal: the worker maps it onto the closed status set —
+/// [`STATUS_SUCCEEDED`] for `Confirmed`/`NotNeeded`,
+/// [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`] for `Unconfirmed` — so a
+/// locally-complete teardown whose revoke could not be confirmed is a DISTINCT
+/// outcome the UI renders as "Disconnected — also revoke access in your Google
+/// Account settings."
+enum RevokeDisposition {
+    /// A token was stored and the provider confirmed its revocation (on the
+    /// first revoke attempt or the one retry).
+    Confirmed,
+    /// Nothing was stored, so there was nothing to revoke.
+    NotNeeded,
+    /// The revoke could not be confirmed: both revoke attempts failed, the
+    /// token load failed (a token may be present but unreadable), or a token
+    /// was present but the transport could not be constructed, so no revoke
+    /// was attempted at all.
+    Unconfirmed,
+}
+
 /// The disconnect teardown's fault-injectable core: load the stored token,
-/// revoke it best-effort, delete it, then purge the local account data. Runs
-/// INSIDE the held disconnect gate, which is what serializes it behind any
-/// in-flight cycle. `store` is `None` when the account has no database file:
-/// the purge then no-ops without creating one.
+/// revoke it best-effort, delete it, then purge the local account data,
+/// returning the revoke disposition on success. Runs INSIDE the held
+/// disconnect gate, which is what serializes it behind any in-flight cycle.
+/// `store` is `None` when the account has no database file: the purge then
+/// no-ops without creating one.
 async fn run_teardown_with<S, T, P, F, E>(
     account: &AccountId,
     refresh_store: &S,
     transport: Option<&T>,
     open_store: F,
-) -> Result<(), TeardownError>
+) -> Result<RevokeDisposition, TeardownError>
 where
     S: RefreshTokenStore,
     T: TokenTransport,
@@ -675,23 +710,34 @@ where
     // permit serializes us behind it. Loading at BEGIN instead could revoke a
     // rotated-out stale token and miss the live one.
     let token = refresh_store.load(account);
-    // Ok(None) — nothing stored — and Err — the load failed, so the token's
-    // liveness is unknown — both SKIP the revoke: the idempotent delete and
-    // the purge still run, so the capability dies first and the local
-    // teardown is never gated on a Keychain read fault. A `None` transport
-    // (its constructor failed) likewise skips the revoke rather than aborting
-    // the mandatory local teardown.
-    if let (Ok(Some(token)), Some(transport)) = (&token, transport) {
-        // revoke targets the ONE stored token; a rotated refresh token
-        // abandoned unrevoked by the connect restore fence
-        // (`finish_cancelled_cleanup`, restore-prior branch) is only
-        // also-revoked here if Google /revoke is grant-scoped (the unverified
-        // 3f assumption) — 3f now gates disconnect COMPLETENESS, not just the
-        // connect fence. The revoke is BEST-EFFORT: the local delete/purge
-        // below never gates on the network, so an offline consent withdrawal
-        // still tears down.
-        revoke_best_effort(transport, token).await;
-    }
+    // The revoke disposition, computed BEFORE the mandatory local teardown so
+    // an unconfirmed revoke never aborts it. Ok(None) — nothing stored — has
+    // nothing to revoke (`NotNeeded`). The two `Unconfirmed` arms: Err — the
+    // load failed, so the token's liveness is UNKNOWN and the revoke cannot be
+    // confirmed — and a `None` transport (its constructor failed) with a token
+    // present, which cannot even attempt the revoke. On every arm the
+    // idempotent delete and the purge still run, so the capability dies first
+    // and the local teardown is never gated on a Keychain read fault or the
+    // network.
+    let disposition = match (&token, transport) {
+        (Ok(Some(token)), Some(transport)) => {
+            // revoke targets the ONE stored token; a rotated refresh token
+            // abandoned unrevoked by the connect restore fence
+            // (`finish_cancelled_cleanup`, restore-prior branch) is only
+            // also-revoked here if Google /revoke is grant-scoped (the unverified
+            // 3f assumption) — 3f now gates disconnect COMPLETENESS, not just the
+            // connect fence. The revoke is BEST-EFFORT: the local delete/purge
+            // below never gates on the network, so an offline consent withdrawal
+            // still tears down — but whether the provider CONFIRMED the revoke is
+            // now reported, not discarded.
+            match revoke_best_effort(transport, token).await {
+                RevokeOutcome::Confirmed => RevokeDisposition::Confirmed,
+                RevokeOutcome::Failed => RevokeDisposition::Unconfirmed,
+            }
+        }
+        (Ok(Some(_)), None) | (Err(_), _) => RevokeDisposition::Unconfirmed,
+        (Ok(None), _) => RevokeDisposition::NotNeeded,
+    };
     // The token capability dies BEFORE any local-store work: opening the
     // mailbox store can FAIL (corrupt DB, unavailable root key), and a
     // pre-delete open failure must never abort the mandatory token delete —
@@ -706,15 +752,17 @@ where
             .await
             .map_err(|_error| TeardownError::Purge)?;
     }
-    Ok(())
+    Ok(disposition)
 }
 
 /// The disconnect teardown's production composition: every Keychain/network
 /// object is constructed HERE, on the worker thread, so nothing but `account`
 /// crosses the thread boundary. The mailbox-store open is presence-checked: a
 /// never-connected account has no database file, and the purge must no-op
-/// WITHOUT creating one (disconnect never creates artifacts).
-async fn run_disconnect_teardown(account: &AccountId) -> Result<(), TeardownError> {
+/// WITHOUT creating one (disconnect never creates artifacts). On success the
+/// revoke disposition is returned so the worker can report an unconfirmed
+/// /revoke as its own closed status.
+async fn run_disconnect_teardown(account: &AccountId) -> Result<RevokeDisposition, TeardownError> {
     // The refresh store is the ONLY genuinely-fatal prerequisite: without it the
     // mandatory token delete cannot run.
     let refresh_store =
@@ -749,8 +797,11 @@ async fn run_disconnect_teardown(account: &AccountId) -> Result<(), TeardownErro
 /// a FAILED teardown (fence still set, lease released) IS admitted and
 /// converges.
 ///
-/// This worker clears the fence via `permit::clear_disconnecting` ONLY on
-/// full teardown success — on any failure it stays set (fail-closed) and the
+/// This worker clears the fence via `permit::clear_disconnecting` on the whole
+/// disconnect SUCCESS FAMILY — [`STATUS_SUCCEEDED`] (the revoke was confirmed,
+/// or nothing was stored) and [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`] (the
+/// local teardown completed but the provider /revoke could NOT be confirmed)
+/// alike; only a teardown FAILURE leaves it set (fail-closed), and the
 /// idempotent teardown converges on retry. The single-worker lease is released
 /// on EVERY outcome (success, failure, panic) as the `permit::DisconnectLease`
 /// drops, so a panicked worker never strands the slot un-retryable.
@@ -761,6 +812,28 @@ async fn run_disconnect_teardown(account: &AccountId) -> Result<(), TeardownErro
 /// local, and must run to completion once started.
 #[must_use = "the returned outcome is the only way to poll or coalesce the disconnect"]
 pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
+    begin_disconnect_with(account, |account| async move {
+        run_disconnect_teardown(&account).await
+    })
+}
+
+/// The disconnect worker's spawn-and-run machinery, generic over the teardown
+/// operation — exactly as `begin_with` is generic over the sync op — so the
+/// disposition→status mapping and the fence policy are testable with a fake
+/// teardown (the production [`run_disconnect_teardown`] builds Keychain- and
+/// network-backed objects a test host cannot drive to a successful revoke).
+///
+/// `op` is HANDED a clone of the FENCED `account` (it does not choose its own),
+/// so the slot that is fenced/cleared and the account that is torn down are the
+/// same value by construction — a mismatch that could fence one slot while
+/// purging another account is unrepresentable. The future is built and awaited
+/// entirely on the worker thread, inside the held gate.
+#[must_use = "the returned outcome is the only way to poll or coalesce the disconnect"]
+fn begin_disconnect_with<F, Fut>(account: AccountId, op: F) -> BeginOutcome
+where
+    F: FnOnce(AccountId) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<RevokeDisposition, TeardownError>>,
+{
     // Claim the single-worker lease + set the fence on THIS (caller) thread,
     // before any worker spawns. `None` ⇒ a disconnect is already active on the
     // slot ⇒ coalesce (do not spawn a second teardown).
@@ -770,6 +843,9 @@ pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
     let status = Arc::new(AtomicI32::new(STATUS_RUNNING));
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_status = Arc::clone(&status);
+    // The op tears down exactly the fenced account (a clone of it), never one of
+    // its own choosing — see the fn doc.
+    let op_account = account.clone();
     let spawned = std::thread::Builder::new()
         .name("tersa-disconnect".to_owned())
         .spawn(move || {
@@ -787,8 +863,16 @@ pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
             // self-deadlock.
             let permit = permit::acquire_disconnect_gate(&account);
             let outcome = match build_sync_runtime() {
-                Ok(runtime) => match runtime.block_on(run_disconnect_teardown(&account)) {
-                    Ok(()) => STATUS_SUCCEEDED,
+                Ok(runtime) => match runtime.block_on(op(op_account)) {
+                    // The local teardown COMPLETED: a confirmed revoke — or
+                    // nothing stored to revoke — is the plain success; an
+                    // unconfirmed revoke is the distinct "disconnected — also
+                    // revoke access in your Google Account settings" code.
+                    Ok(RevokeDisposition::Confirmed | RevokeDisposition::NotNeeded) => {
+                        STATUS_SUCCEEDED
+                    }
+                    Ok(RevokeDisposition::Unconfirmed) => STATUS_SUCCEEDED_REVOKE_UNCONFIRMED,
+                    // Anti-oracle preserved: which STAGE failed never leaks.
                     Err(_stage) => STATUS_INTERNAL,
                 },
                 Err(_error) => STATUS_INTERNAL,
@@ -796,11 +880,27 @@ pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
             // Release the gate BEFORE publishing the terminal status, mirroring
             // `spawn_cycle`: a poll that sees terminal can immediately re-claim.
             drop(permit);
-            // FORK E: clear the disconnecting FENCE ONLY on full teardown
-            // success. On ANY failure it STAYS set (fail-closed): the teardown
-            // is idempotent, so a retried disconnect converges; a process
-            // restart clears the in-memory flag.
-            if outcome == STATUS_SUCCEEDED {
+            // FORK E: clear the disconnecting FENCE on the whole disconnect
+            // SUCCESS FAMILY — SUCCEEDED and SUCCEEDED_REVOKE_UNCONFIRMED alike.
+            // An unconfirmed revoke still tore down LOCALLY (the token is
+            // deleted, the mailbox purged), so clearing only on plain SUCCEEDED
+            // would leave the slot fenced FOREVER (no sync, no connect) until a
+            // retried disconnect or a process restart. Only a teardown FAILURE
+            // keeps the fence set (fail-closed): the teardown is idempotent, so
+            // a retried disconnect converges; a restart clears the in-memory
+            // flag. KNOWN GAP (not neutral): a retry after a PARTIAL teardown —
+            // delete ok, purge failed, revoke unconfirmed — reports plain
+            // SUCCEEDED because the token is gone (Ok(None)) by the retry. Since
+            // 3e-2a, the ABSENCE of the revoke-unconfirmed signal is an
+            // affirmative "revocation was fine" claim, which is FALSE here (the
+            // grant may still be live at Google). The in-process fix is a sticky
+            // per-slot `revoke_unconfirmed` bit OR'd into a later retry's
+            // disposition (3e-2b); cross-restart durability is the deferred F6
+            // marker. Bounded: the user saw the first attempt fail.
+            if matches!(
+                outcome,
+                STATUS_SUCCEEDED | STATUS_SUCCEEDED_REVOKE_UNCONFIRMED
+            ) {
                 permit::clear_disconnecting(&account);
             }
             // Release the single-worker lease (clearing `disconnect_active`)
@@ -846,11 +946,12 @@ mod tests {
     use url::Url;
 
     use super::{
-        BeginOutcome, ConnectSession, CycleError, GatedSyncError, STATUS_CANCELLED,
-        STATUS_GATE_BLOCKED, STATUS_INTERNAL, STATUS_NEEDS_RECONNECT, STATUS_RUNNING,
-        STATUS_SUCCEEDED, STATUS_SYNC_FAILED, TokenLifecycleError, begin_connect_account_sync,
-        begin_connect_with, begin_default_account_sync, begin_disconnect, begin_with,
-        complete_after, permit, run_cycle, status_for_cycle, status_for_result,
+        BeginOutcome, ConnectSession, CycleError, GatedSyncError, RevokeDisposition, RevokeOutcome,
+        STATUS_CANCELLED, STATUS_GATE_BLOCKED, STATUS_INTERNAL, STATUS_NEEDS_RECONNECT,
+        STATUS_RUNNING, STATUS_SUCCEEDED, STATUS_SUCCEEDED_REVOKE_UNCONFIRMED, STATUS_SYNC_FAILED,
+        TokenLifecycleError, begin_connect_account_sync, begin_connect_with,
+        begin_default_account_sync, begin_disconnect, begin_disconnect_with, begin_with,
+        complete_after, permit, revoke_best_effort, run_cycle, status_for_cycle, status_for_result,
     };
 
     /// A fake [`ConnectSession`]: `claim_missing` never produces a grant (the
@@ -1506,6 +1607,7 @@ mod tests {
     struct RecordingTransport {
         revoked: std::sync::Mutex<Vec<String>>,
         fail_revoke: bool,
+        failing_revokes: AtomicUsize,
         log: std::sync::Arc<OrderLog>,
     }
 
@@ -1514,6 +1616,7 @@ mod tests {
             Self {
                 revoked: std::sync::Mutex::new(Vec::new()),
                 fail_revoke: false,
+                failing_revokes: AtomicUsize::new(0),
                 log,
             }
         }
@@ -1522,6 +1625,13 @@ mod tests {
                 fail_revoke: true,
                 ..self
             }
+        }
+        /// Fails the next `count` revoke attempts, then succeeds — exercises the
+        /// retry-once-then-confirm path (vs `with_failing_revoke`, which fails
+        /// every attempt).
+        fn fail_next_revokes(self, count: usize) -> Self {
+            self.failing_revokes.store(count, Ordering::SeqCst);
+            self
         }
         fn revoked(&self) -> Vec<String> {
             self.revoked.lock().unwrap().clone()
@@ -1567,10 +1677,21 @@ mod tests {
                 self.log.record("revoke");
                 self.revoked.lock().unwrap().push(token.as_str().to_owned());
                 if self.fail_revoke {
-                    Err(tersa_application::token::TokenTransportError::Transport)
-                } else {
-                    Ok(())
+                    return Err(tersa_application::token::TokenTransportError::Transport);
                 }
+                // Atomically consume one from the failure budget (no non-atomic
+                // read-modify-write): `checked_sub` yields `None` at 0, so
+                // `fetch_update` returns `Ok` only while a failure remains.
+                if self
+                    .failing_revokes
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(tersa_application::token::TokenTransportError::Transport);
+                }
+                Ok(())
             })
         }
     }
@@ -1627,7 +1748,7 @@ mod tests {
         refresh_store: &S,
         transport: &T,
         store: Option<&P>,
-    ) -> Result<(), super::TeardownError>
+    ) -> Result<RevokeDisposition, super::TeardownError>
     where
         S: tersa_keychain_macos::oauth_token::RefreshTokenStore,
         T: tersa_application::token::TokenTransport,
@@ -1761,7 +1882,7 @@ mod tests {
         let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
         let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
         let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        assert!(outcome.is_ok());
+        assert!(matches!(outcome, Ok(RevokeDisposition::Confirmed)));
         assert_eq!(log.steps(), vec!["revoke", "delete", "purge"]);
         assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
         assert_eq!(refresh_store.stored_token(), None);
@@ -1777,7 +1898,9 @@ mod tests {
         let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
         let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
         let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        assert!(outcome.is_ok());
+        // Nothing stored → nothing to revoke: NotNeeded (maps to plain
+        // SUCCEEDED at the worker, NOT the revoke-unconfirmed code).
+        assert!(matches!(outcome, Ok(RevokeDisposition::NotNeeded)));
         assert_eq!(log.steps(), vec!["delete", "purge"]);
         assert!(transport.revoked().is_empty());
     }
@@ -1793,7 +1916,8 @@ mod tests {
         let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
         let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
         let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        assert!(outcome.is_ok());
+        // An unreadable token can never be confirmed revoked: Unconfirmed.
+        assert!(matches!(outcome, Ok(RevokeDisposition::Unconfirmed)));
         assert_eq!(log.steps(), vec!["delete", "purge"]);
         assert!(transport.revoked().is_empty());
     }
@@ -1807,7 +1931,7 @@ mod tests {
         let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
         let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
         let outcome = drive_teardown(&slot, &refresh_store, &transport, None::<&FakePurgeStore>);
-        assert!(outcome.is_ok());
+        assert!(matches!(outcome, Ok(RevokeDisposition::Confirmed)));
         assert_eq!(log.steps(), vec!["revoke", "delete"]);
     }
 
@@ -1821,7 +1945,9 @@ mod tests {
         let transport = RecordingTransport::new(std::sync::Arc::clone(&log)).with_failing_revoke();
         let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
         let outcome = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        assert!(outcome.is_ok());
+        // Both revoke attempts failed, so the revoke is UNCONFIRMED — but the
+        // teardown still SUCCEEDS locally (Ok, not Err).
+        assert!(matches!(outcome, Ok(RevokeDisposition::Unconfirmed)));
         // Best-effort with ONE retry: exactly two revoke attempts, then the
         // local teardown proceeds.
         assert_eq!(log.steps(), vec!["revoke", "revoke", "delete", "purge"]);
@@ -1896,7 +2022,8 @@ mod tests {
             None,
             "the token capability dies before the failed purge"
         );
-        // The worker clears the flag ONLY on success, so it stays set here.
+        // The worker clears the flag ONLY on the success family, so a failed
+        // teardown leaves it set here.
         assert!(
             permit::try_acquire(&slot, None).is_none(),
             "a failed teardown leaves the slot disconnecting"
@@ -1905,7 +2032,12 @@ mod tests {
         // already ran), so no second revoke fires; delete is an idempotent
         // no-op; the purge succeeds.
         let second = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        assert!(second.is_ok());
+        // Nothing stored → NotNeeded: this is the accepted risk of the
+        // success-family fence clear — a retry after a PARTIAL teardown (delete
+        // ok, purge failed, revoke unconfirmed) reports the PLAIN success
+        // because the token is gone by the retry (durable revoke-memory is the
+        // deferred F6 marker, not this slice).
+        assert!(matches!(second, Ok(RevokeDisposition::NotNeeded)));
         permit::clear_disconnecting(&slot);
         assert!(
             permit::try_acquire(&slot, None).is_some(),
@@ -1916,5 +2048,195 @@ mod tests {
             log.steps(),
             vec!["revoke", "delete", "purge", "delete", "purge"]
         );
+    }
+
+    #[test]
+    fn revoke_best_effort_confirms_a_first_try_success() {
+        let log = std::sync::Arc::new(OrderLog::default());
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let token = zeroize::Zeroizing::new("refresh-token".to_owned());
+        let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
+        assert!(matches!(outcome, RevokeOutcome::Confirmed));
+        assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
+    }
+
+    #[test]
+    fn revoke_best_effort_confirms_when_the_one_retry_succeeds() {
+        // The first attempt fails, the retry succeeds: Confirmed — and exactly
+        // two attempts were made (the retry is fired ONCE, never more).
+        let log = std::sync::Arc::new(OrderLog::default());
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log)).fail_next_revokes(1);
+        let token = zeroize::Zeroizing::new("refresh-token".to_owned());
+        let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
+        assert!(matches!(outcome, RevokeOutcome::Confirmed));
+        assert_eq!(transport.revoked().len(), 2);
+    }
+
+    #[test]
+    fn revoke_best_effort_fails_only_when_both_attempts_fail() {
+        let log = std::sync::Arc::new(OrderLog::default());
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log)).with_failing_revoke();
+        let token = zeroize::Zeroizing::new("refresh-token".to_owned());
+        let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
+        assert!(matches!(outcome, RevokeOutcome::Failed));
+        assert_eq!(transport.revoked().len(), 2);
+    }
+
+    #[test]
+    fn teardown_without_a_transport_and_a_token_present_is_unconfirmed() {
+        // The transport constructor failed: a token exists but no revoke can be
+        // attempted — Unconfirmed — while the delete and purge still run.
+        let slot = account("disconnect-no-transport-disposition");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh_store = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let purge_store = FakePurgeStore::new(std::sync::Arc::clone(&log));
+        let outcome = test_runtime().block_on(super::run_teardown_with(
+            &slot,
+            &refresh_store,
+            None::<&RecordingTransport>,
+            || Ok::<_, super::TeardownError>(Some(&purge_store)),
+        ));
+        assert!(matches!(outcome, Ok(RevokeDisposition::Unconfirmed)));
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
+        assert_eq!(refresh_store.stored_token(), None);
+    }
+
+    /// Drives the REAL disconnect-worker machinery — the lease, fence, gate,
+    /// disposition→status mapping, fence-clear policy, and terminal publish —
+    /// over a fake teardown, exactly as the `begin_with` tests drive the sync
+    /// machinery with a fake op. The fakes move into the worker op; their
+    /// shared order log stays readable after the terminal status is published.
+    fn begin_fake_disconnect(
+        slot: &AccountId,
+        refresh_store: FakeRefreshStore,
+        transport: Option<RecordingTransport>,
+        purge_store: FakePurgeStore,
+    ) -> super::WorkerHandles {
+        let BeginOutcome::Started(handles) =
+            begin_disconnect_with(slot.clone(), move |account| async move {
+                super::run_teardown_with(&account, &refresh_store, transport.as_ref(), || {
+                    Ok::<_, super::TeardownError>(Some(&purge_store))
+                })
+                .await
+            })
+        else {
+            panic!("a free slot must start the disconnect worker");
+        };
+        handles
+    }
+
+    #[test]
+    fn a_successful_disconnect_with_a_confirmed_revoke_reports_succeeded_and_clears_the_fence() {
+        // The confirmed-revoke happy path: plain SUCCEEDED, fence cleared.
+        let slot = account("disconnect-worker-confirmed");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let handles = begin_fake_disconnect(
+            &slot,
+            FakeRefreshStore::with_token(std::sync::Arc::clone(&log)),
+            Some(RecordingTransport::new(std::sync::Arc::clone(&log))),
+            FakePurgeStore::new(std::sync::Arc::clone(&log)),
+        );
+        assert_eq!(poll_until_terminal(&handles), STATUS_SUCCEEDED);
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "the fence clears on the confirmed success"
+        );
+        assert_eq!(log.steps(), vec!["revoke", "delete", "purge"]);
+    }
+
+    #[test]
+    fn a_successful_disconnect_with_nothing_stored_reports_succeeded_not_unconfirmed() {
+        // Ok(None) → NotNeeded → plain SUCCEEDED, NOT the revoke-unconfirmed
+        // code: a never-connected account must not be told to revoke in its
+        // Google settings.
+        let slot = account("disconnect-worker-not-needed");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let handles = begin_fake_disconnect(
+            &slot,
+            FakeRefreshStore::empty(std::sync::Arc::clone(&log)),
+            Some(RecordingTransport::new(std::sync::Arc::clone(&log))),
+            FakePurgeStore::new(std::sync::Arc::clone(&log)),
+        );
+        assert_eq!(poll_until_terminal(&handles), STATUS_SUCCEEDED);
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "the fence clears on the nothing-to-revoke success"
+        );
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
+    }
+
+    #[test]
+    fn a_successful_disconnect_with_an_unconfirmed_revoke_reports_3_and_clears_the_fence() {
+        // ★ REQUIRED regression (Fable): teardown SUCCESS + revoke FAILED
+        // (present token, both revoke attempts fail) must publish
+        // STATUS_SUCCEEDED_REVOKE_UNCONFIRMED AND clear the disconnecting
+        // fence. A success-only fence clear would leave the slot fenced
+        // FOREVER (no sync, no connect) until a retried disconnect or a
+        // restart — this is the test that would have caught that bug.
+        let slot = account("disconnect-worker-revoke-unconfirmed");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let handles = begin_fake_disconnect(
+            &slot,
+            FakeRefreshStore::with_token(std::sync::Arc::clone(&log)),
+            Some(RecordingTransport::new(std::sync::Arc::clone(&log)).with_failing_revoke()),
+            FakePurgeStore::new(std::sync::Arc::clone(&log)),
+        );
+        assert_eq!(
+            poll_until_terminal(&handles),
+            STATUS_SUCCEEDED_REVOKE_UNCONFIRMED
+        );
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "the fence must clear on the unconfirmed-revoke success, or the slot stays fenced forever"
+        );
+        // Both revoke attempts fired before the local teardown proceeded.
+        assert_eq!(log.steps(), vec!["revoke", "revoke", "delete", "purge"]);
+    }
+
+    #[test]
+    fn a_disconnect_with_no_transport_reports_3_and_clears_the_fence() {
+        // The transport constructor failed with a token present: no revoke
+        // could be attempted → Unconfirmed → the distinct code, fence cleared.
+        let slot = account("disconnect-worker-no-transport");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let handles = begin_fake_disconnect(
+            &slot,
+            FakeRefreshStore::with_token(std::sync::Arc::clone(&log)),
+            None,
+            FakePurgeStore::new(std::sync::Arc::clone(&log)),
+        );
+        assert_eq!(
+            poll_until_terminal(&handles),
+            STATUS_SUCCEEDED_REVOKE_UNCONFIRMED
+        );
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "the fence must clear on the unconfirmed (no-transport) success"
+        );
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
+    }
+
+    #[test]
+    fn a_disconnect_with_an_unreadable_token_reports_3_and_clears_the_fence() {
+        // Err on the token load: a token may be present but unreadable, so the
+        // revoke can never be confirmed → Unconfirmed → the distinct code,
+        // fence cleared.
+        let slot = account("disconnect-worker-load-err");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let handles = begin_fake_disconnect(
+            &slot,
+            FakeRefreshStore::with_failing_load(std::sync::Arc::clone(&log)),
+            Some(RecordingTransport::new(std::sync::Arc::clone(&log))),
+            FakePurgeStore::new(std::sync::Arc::clone(&log)),
+        );
+        assert_eq!(
+            poll_until_terminal(&handles),
+            STATUS_SUCCEEDED_REVOKE_UNCONFIRMED
+        );
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "the fence must clear on the unconfirmed (unreadable-token) success"
+        );
+        assert_eq!(log.steps(), vec!["delete", "purge"]);
     }
 }
