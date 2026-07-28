@@ -4,6 +4,15 @@
 
 import AppKit
 
+/// The terminal outcome of one OAuth authorization session. A success
+/// carries the bridge-issued OAuth session id the connect flow claims the
+/// grant with.
+enum OAuthOutcome {
+    case succeeded(OAuthSessionID)
+    case cancelled
+    case failed
+}
+
 @MainActor
 final class OAuthAuthorizationSession {
     private static let pendingStatus: Int32 = 0
@@ -11,8 +20,20 @@ final class OAuthAuthorizationSession {
 
     private var sessionID: UInt64?
     private var pollTimer: Timer?
+    private var onOutcome: (@MainActor (OAuthOutcome) -> Void)?
 
-    func start() -> Bool {
+    /// Begins one authorization session and reports its terminal outcome
+    /// exactly once. Returns `false` when the pre-flight fails —
+    /// `TersaOAuthClientID` missing, empty, or UNCONFIGURED, a session
+    /// already in flight, a begin failure, or an authorization URL the
+    /// workspace would not open; 3e-2c renders that `false` as the failed
+    /// state, so `onOutcome` fires only for a session that actually started.
+    ///
+    /// The client id this begin reads is the SAME `TersaOAuthClientID`
+    /// Info.plist key the caller passes downstream to
+    /// `tersa_mailbox_macos_sync_begin`, so the client_id↔grant pairing
+    /// holds by construction — no extra plumbing.
+    func start(onOutcome: @escaping @MainActor (OAuthOutcome) -> Void) -> Bool {
         guard sessionID == nil,
               let clientID = Bundle.main.object(forInfoDictionaryKey: "TersaOAuthClientID") as? String,
               !clientID.isEmpty,
@@ -56,6 +77,7 @@ final class OAuthAuthorizationSession {
         }
 
         sessionID = newSessionID
+        self.onOutcome = onOutcome
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.poll()
@@ -69,7 +91,12 @@ final class OAuthAuthorizationSession {
             return
         }
         _ = tersa_oauth_cancel(sessionID)
+        // Capture the callback, clear all state, THEN deliver — so a callback
+        // that reentrantly calls cancel()/start() sees no live session and the
+        // outcome is delivered exactly once.
+        let callback = onOutcome
         finishLocally()
+        callback?(.cancelled)
     }
 
     private func poll() {
@@ -78,8 +105,18 @@ final class OAuthAuthorizationSession {
         }
         let status = tersa_oauth_macos_poll(sessionID)
         if status != Self.pendingStatus {
-            _ = status == Self.succeededStatus
+            // Capture the outcome (with the session id, before it is cleared)
+            // AND the callback, clear all state, THEN deliver: the callback runs
+            // against cleared state, so a reentrant cancel()/start() sees no live
+            // session and the terminal outcome is delivered exactly once. A
+            // success still hands the connect flow the OAuth session id it
+            // claims the grant with.
+            let outcome: OAuthOutcome = status == Self.succeededStatus
+                ? .succeeded(OAuthSessionID(rawValue: sessionID))
+                : .failed
+            let callback = onOutcome
             finishLocally()
+            callback?(outcome)
         }
     }
 
@@ -87,5 +124,6 @@ final class OAuthAuthorizationSession {
         pollTimer?.invalidate()
         pollTimer = nil
         sessionID = nil
+        onOutcome = nil
     }
 }

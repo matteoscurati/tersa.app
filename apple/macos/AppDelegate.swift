@@ -27,7 +27,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startOAuthAuthorization() -> Bool {
-        oauthAuthorizationSession.start()
+        // TODO(3e-2c): surface the outcome in the account connection flow.
+        // This entry stays dead until then; the no-op only keeps it compiling
+        // against the new `start(onOutcome:)` signature.
+        oauthAuthorizationSession.start { _ in }
     }
 
     private func presentMainWindow() {
