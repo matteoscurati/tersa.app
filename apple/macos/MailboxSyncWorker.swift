@@ -157,9 +157,9 @@ final class MailboxSyncWorker: @unchecked Sendable {
     private var running = false
     private var pending: (() -> Void)?
 
-    /// Queues one connect for a finished OAuth session. A second queued
+    /// Queues one connect-begin for a finished OAuth session. A second queued
     /// request is rejected immediately.
-    func connect(
+    func beginConnect(
         accountIdentifier: Data,
         oauthSession: OAuthSessionID,
         completion: @escaping @MainActor (MailboxPollStatus) -> Void
@@ -167,18 +167,18 @@ final class MailboxSyncWorker: @unchecked Sendable {
         enqueueBegin(.connect(accountIdentifier, oauthSession), completion: completion)
     }
 
-    /// Queues one disconnect (consent withdrawal + local teardown). A second
-    /// queued request is rejected immediately.
-    func disconnect(
+    /// Queues one disconnect-begin (consent withdrawal + local teardown). A
+    /// second queued request is rejected immediately.
+    func beginDisconnect(
         accountIdentifier: Data,
         completion: @escaping @MainActor (MailboxPollStatus) -> Void
     ) {
         enqueueBegin(.disconnect(accountIdentifier), completion: completion)
     }
 
-    /// Queues one bounded sync. A second queued request is rejected
+    /// Queues one bounded sync-begin. A second queued request is rejected
     /// immediately.
-    func sync(
+    func beginSync(
         clientID: String,
         accountIdentifier: Data,
         completion: @escaping @MainActor (MailboxPollStatus) -> Void

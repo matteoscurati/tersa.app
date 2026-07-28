@@ -15,7 +15,10 @@ struct RootView: View {
         Group {
             if viewModel.state == .connected {
                 if let accountIdentifier = viewModel.connectedAccountIdentifier {
-                    InboxView(accountIdentifier: accountIdentifier)
+                    InboxView(
+                        accountIdentifier: accountIdentifier,
+                        onDisconnect: viewModel.disconnect
+                    )
                 } else {
                     InboxEmptyStateView()
                 }
@@ -24,7 +27,15 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 480, minHeight: 360)
-        .onChange(of: viewModel.state) { _, newState in
+        .onChange(of: viewModel.state) { oldState, newState in
+            // A disconnect resolving to not-connected is announced by the
+            // disconnect banner (the security-relevant "revoke unconfirmed" or
+            // the clean confirmation), so suppress the generic "Not connected"
+            // here — two consecutive VoiceOver announcements interrupt each
+            // other, and the banner's must win.
+            if oldState == .disconnecting, newState == .notConnected {
+                return
+            }
             announceConnectionState(newState)
         }
     }

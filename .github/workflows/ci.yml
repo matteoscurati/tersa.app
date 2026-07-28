@@ -172,6 +172,43 @@ jobs:
               exit 1
             }
           done
+      - name: Link and execute the mailbox-sync FFI C probe
+        run: |
+          set -euo pipefail
+          # A real Swift call site now pulls these symbols into the linked app
+          # binary; this probe proves the mailbox-sync FFI archive LINKS as a
+          # single archive (its own symbols AND the re-exported bridge ones
+          # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
+          # return their expected status. NOTE: static C↔Rust linking resolves by
+          # symbol NAME only, so this does NOT verify argument/return ABI — a
+          # widened return or an added parameter is invisible here (and poll(0)
+          # short-circuits to -8 before reading any argument). ABI shape is
+          # pinned per-side (the canonical header + the Rust export inventory);
+          # this step is the single-archive link-and-run proof. The
+          # pointer-taking begins are exercised through the app itself; their
+          # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
+          # defined behavior, never a violable contract.
+          archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+          test -f "$archive"
+          cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'
+          #include <stdint.h>
+          uint32_t tersa_apple_bridge_version(void);
+          int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
+          int main(void) {
+              if (tersa_apple_bridge_version() == 0) {
+                  return 1;
+              }
+              /* Session 0 is never registered: the poll must report unknown-session (-8). */
+              if (tersa_mailbox_macos_sync_poll(0) != -8) {
+                  return 2;
+              }
+              return 0;
+          }
+          C
+          cc "$RUNNER_TEMP/ffi_probe.c" "$archive" \
+            -framework Security -framework Foundation \
+            -o "$RUNNER_TEMP/ffi_probe"
+          "$RUNNER_TEMP/ffi_probe"
       - name: Verify OAuth PKCE and sandbox feasibility
         run: sh apple/scripts/verify-oauth-feasibility.sh
       - name: Bind OAuth feasibility evidence to the source commit

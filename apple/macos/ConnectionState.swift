@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// A non-ready product bootstrap outcome, phrased for the person using the
+/// A non-ready account-connection outcome, phrased for the person using the
 /// app. Carries no internal identifiers and no secrets.
 enum ConnectionFailure: Equatable {
     case invalidAccountIdentifier
@@ -10,6 +10,19 @@ enum ConnectionFailure: Equatable {
     case busyOrUnavailable
     case rootMissingWithExistingProfile
     case unavailable
+    /// The stored grant could not be claimed even right after a successful
+    /// re-consent: the sign-in itself lapsed.
+    case signInExpired
+    /// The browser sign-in flow started but did not complete.
+    case signInFailed
+    /// A PRE-FLIGHT refusal: the sign-in page never opened (missing/
+    /// unconfigured client id, a session already running, or no browser). NOT
+    /// a browser sign-in failure — a different remedy applies.
+    case signInUnavailable
+    /// The disconnect teardown did not converge; the Rust slot stays fenced
+    /// against sync and connect until a disconnect does. Its retry re-issues
+    /// the disconnect, never the connect ladder.
+    case disconnectIncomplete
 
     var message: String {
         switch self {
@@ -23,7 +36,21 @@ enum ConnectionFailure: Equatable {
             return "The existing profile cannot be unlocked on this Mac. Reinstall the app only after contacting support."
         case .unavailable:
             return "The account service is unavailable. Try again later."
+        case .signInExpired:
+            return "Your sign-in expired. Sign in again."
+        case .signInFailed:
+            return "The sign-in didn't complete. Sign in again."
+        case .signInUnavailable:
+            return "Tersa couldn't open the sign-in page in your browser. Check that a default browser is set, then try again."
+        case .disconnectIncomplete:
+            return "Tersa couldn't finish disconnecting. This account stays unavailable until it does. Try again — or remove Tersa from your Google Account to revoke its access now."
         }
+    }
+
+    /// The failure's operation-aware headline, shared by the failure view and
+    /// its VoiceOver value so the two never drift.
+    var title: String {
+        self == .disconnectIncomplete ? "Disconnect failed" : "Connection failed"
     }
 }
 
@@ -31,7 +58,10 @@ enum ConnectionFailure: Equatable {
 enum ConnectionState: Equatable {
     case notConnected
     case connecting
+    /// The OAuth consent page is open in the browser; the user can cancel it.
+    case authorizing
     case connected
+    case disconnecting
     case failed(ConnectionFailure)
 
     init(status: ProductBootstrapStatus) {
@@ -58,10 +88,14 @@ enum ConnectionState: Equatable {
             return "Not connected"
         case .connecting:
             return "Connecting"
+        case .authorizing:
+            return "Waiting for sign-in"
         case .connected:
             return "Connected"
-        case .failed:
-            return "Connection failed"
+        case .disconnecting:
+            return "Disconnecting"
+        case .failed(let failure):
+            return failure.title
         }
     }
 
@@ -72,8 +106,12 @@ enum ConnectionState: Equatable {
             return "Not connected"
         case .connecting:
             return "Connecting account"
+        case .authorizing:
+            return "Sign-in opened in the browser"
         case .connected:
             return "Account connected"
+        case .disconnecting:
+            return "Disconnecting account"
         case .failed(let failure):
             return failure.message
         }

@@ -8,7 +8,9 @@ import SwiftUI
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let oauthAuthorizationSession = OAuthAuthorizationSession()
+    /// The app-held OAuth authorization session the reviewed view-model
+    /// drives (start, and the unconditional cancel before a disconnect).
+    let oauthAuthorizationSession = OAuthAuthorizationSession()
     private let bootstrapWorker = BootstrapWorker()
     private var mainWindow: NSWindow?
 
@@ -18,19 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         presentMainWindow()
     }
 
-    /// Receives opaque bytes only from the future owning product flow.
+    /// Receives opaque bytes only from the reviewed view-model intent entry.
     func establishOwnedAccountProfile(
         accountIdentifier: Data,
         completion: @escaping @MainActor (ProductBootstrapStatus) -> Void
     ) {
         bootstrapWorker.submit(accountIdentifier: accountIdentifier, completion: completion)
-    }
-
-    func startOAuthAuthorization() -> Bool {
-        // TODO(3e-2c): surface the outcome in the account connection flow.
-        // This entry stays dead until then; the no-op only keeps it compiling
-        // against the new `start(onOutcome:)` signature.
-        oauthAuthorizationSession.start { _ in }
     }
 
     private func presentMainWindow() {
