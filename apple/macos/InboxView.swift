@@ -7,15 +7,18 @@ import SwiftUI
 /// Live inbox over the 2b read C ABI. The store is empty until Step 3 sync,
 /// so a real read currently returns zero rows and renders the empty state;
 /// the list and thread navigation render once data exists. The toolbar opens
-/// the submit-only search screen and the read-only composer entry.
+/// the submit-only search screen and the read-only composer entry, and holds
+/// the confirmation-gated disconnect control.
 @MainActor
 struct InboxView: View {
     let accountIdentifier: Data
+    let onDisconnect: () -> Void
 
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
     @State private var showingSearch = false
     @State private var showingComposer = false
+    @State private var showingDisconnectConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -40,7 +43,28 @@ struct InboxView: View {
                             .keyboardShortcut("n", modifiers: .command)
                             .accessibilityLabel("New message")
                     }
+                    // A rare, destructive account action belongs off the
+                    // primary row: an overflow menu, one step from the
+                    // high-frequency controls, behind its confirmation.
+                    ToolbarItem(placement: .automatic) {
+                        Menu {
+                            Button("Disconnect Account…", action: handleDisconnectTapped)
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("Account actions")
+                    }
                 }
+        }
+        .confirmationDialog(
+            "Disconnect this account?",
+            isPresented: $showingDisconnectConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect", role: .destructive, action: onDisconnect)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Tersa will stop having access to your Google Account, and mail stored on this Mac will be deleted. Your mail in Gmail is not affected.")
         }
         .sheet(isPresented: $showingComposer) {
             ComposerView()
@@ -119,6 +143,10 @@ struct InboxView: View {
 
     private func handleSearchTapped() {
         showingSearch = true
+    }
+
+    private func handleDisconnectTapped() {
+        showingDisconnectConfirmation = true
     }
 
     private func handleComposeTapped() {
