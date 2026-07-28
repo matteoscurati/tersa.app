@@ -2875,14 +2875,13 @@ fn swift_bootstrap_launch_entry_violations(
 ) -> Vec<String> {
     let mut violations = Vec::new();
     let intent_entries = swift_bootstrap_intent_entries(sources, &mut violations);
-    let target_code = sources
+    let stripped = sources
         .iter()
         .filter(|(path, _document)| {
             path.extension().and_then(|extension| extension.to_str()) == Some("swift")
         })
-        .map(|(_path, document)| strip_swift_non_code(document))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|(path, document)| (path.clone(), strip_swift_non_code(document)))
+        .collect::<Vec<_>>();
     // Two reachability closures over the same call graph:
     // - `terminal_reachable` stops propagation at the reviewed intent entry, so
     //   only functions reaching bootstrap through a NON-intent path appear here;
@@ -2892,22 +2891,18 @@ fn swift_bootstrap_launch_entry_violations(
         owner_entries,
         intent_entries: &intent_entries,
         terminal_reachable: &swift_bootstrap_reachable_entries(
-            &target_code,
+            &stripped,
             owner_entries,
             &intent_entries,
         ),
         strict_reachable: &swift_bootstrap_reachable_entries(
-            &target_code,
+            &stripped,
             owner_entries,
             &BTreeSet::new(),
         ),
     };
-    for (path, document) in sources {
-        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
-            continue;
-        }
-        let code = strip_swift_non_code(document);
-        for (name, body, is_initializer) in swift_function_declarations_with_kind(&code) {
+    for (path, code) in &stripped {
+        for (name, body, is_initializer) in swift_function_declarations_with_kind(code) {
             if swift_function_enters_bootstrap_unreviewed(
                 path,
                 &name,
@@ -2921,14 +2916,14 @@ fn swift_bootstrap_launch_entry_violations(
                 ));
             }
         }
-        for (property, bodies) in swift_named_property_bodies(&code) {
+        for (property, bodies) in swift_named_property_bodies(code) {
             if bodies.iter().any(|body| {
                 swift_member_call_count(body, "submit") != 0
                     || swift_unqualified_call_count(body, "submit") != 0
                     || reachability
                         .terminal_reachable
                         .iter()
-                        .any(|entry| contains_identifier(body, entry))
+                        .any(|(_node_path, node_name)| contains_identifier(body, node_name))
             }) {
                 violations.push(format!(
                     "{} property `{property}` must not enter product bootstrap during initialization",
@@ -2945,8 +2940,16 @@ fn swift_bootstrap_launch_entry_violations(
 struct BootstrapReachability<'a> {
     owner_entries: &'a BTreeSet<String>,
     intent_entries: &'a BTreeSet<String>,
-    terminal_reachable: &'a BTreeSet<String>,
-    strict_reachable: &'a BTreeSet<String>,
+    terminal_reachable: &'a BTreeSet<BootstrapNode>,
+    strict_reachable: &'a BTreeSet<BootstrapNode>,
+}
+
+/// One call-graph node: a named declaration in ONE macOS source file.
+type BootstrapNode = (PathBuf, String);
+
+fn bootstrap_node_reachable(set: &BTreeSet<BootstrapNode>, path: &Path, name: &str) -> bool {
+    set.iter()
+        .any(|(node_path, node_name)| node_path == path && node_name == name)
 }
 
 /// Whether a function declaration reaches product bootstrap through an
@@ -2964,7 +2967,7 @@ fn swift_function_enters_bootstrap_unreviewed(
 ) -> bool {
     let calls_submit = swift_member_call_count(body, "submit") != 0
         || swift_unqualified_call_count(body, "submit") != 0;
-    if !calls_submit && !reachability.strict_reachable.contains(name) {
+    if !calls_submit && !bootstrap_node_reachable(reachability.strict_reachable, path, name) {
         return false;
     }
     let app_delegate_path = Path::new("apple/macos/AppDelegate.swift");
@@ -2981,34 +2984,48 @@ fn swift_function_enters_bootstrap_unreviewed(
         return false;
     }
     let reaches_only_through_intent =
-        !calls_submit && !reachability.terminal_reachable.contains(name);
+        !calls_submit && !bootstrap_node_reachable(reachability.terminal_reachable, path, name);
     let is_automatic_entry = is_initializer || path == app_delegate_path;
     !reaches_only_through_intent || is_automatic_entry
 }
 
 fn swift_bootstrap_reachable_entries(
-    document: &str,
+    stripped: &[(PathBuf, String)],
     owner_entries: &BTreeSet<String>,
     intent_entries: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let entries = swift_named_entry_bodies(document);
-    let mut reachable = owner_entries.clone();
+) -> BTreeSet<BootstrapNode> {
+    let entries = stripped
+        .iter()
+        .flat_map(|(path, code)| {
+            swift_named_entry_bodies(code)
+                .into_iter()
+                .map(move |(name, bodies)| ((path.clone(), name), bodies))
+        })
+        .collect::<Vec<_>>();
+    let mut reachable = entries
+        .iter()
+        .filter(|((_path, name), _bodies)| owner_entries.contains(name))
+        .map(|(node, _bodies)| node.clone())
+        .collect::<BTreeSet<_>>();
     loop {
+        // Reviewed intent entries are reachable sinks: they are validated on
+        // their own, but callers reaching only through them do not enter
+        // bootstrap, so they never seed further propagation.
+        let seeds = reachable
+            .iter()
+            .map(|(_path, name)| name.clone())
+            .filter(|name| !intent_entries.contains(name.as_str()))
+            .collect::<BTreeSet<_>>();
         let mut changed = false;
-        for (name, bodies) in &entries {
-            if reachable.contains(name) {
+        for (node, bodies) in &entries {
+            if reachable.contains(node) {
                 continue;
             }
-            // Reviewed intent entries are reachable sinks: they are validated on
-            // their own, but callers reaching only through them do not enter
-            // bootstrap, so they never seed further propagation.
-            if bodies.iter().any(|body| {
-                reachable
-                    .iter()
-                    .filter(|entry| !intent_entries.contains(entry.as_str()))
-                    .any(|entry| contains_identifier(body, entry))
-            }) {
-                reachable.insert(name.clone());
+            if bodies
+                .iter()
+                .any(|body| seeds.iter().any(|seed| contains_identifier(body, seed)))
+            {
+                reachable.insert(node.clone());
                 changed = true;
             }
         }
@@ -3035,10 +3052,20 @@ fn swift_named_function_bodies(document: &str) -> BTreeMap<String, Vec<&str>> {
 }
 
 fn swift_named_property_bodies(document: &str) -> BTreeMap<String, Vec<&str>> {
+    // A `let`/`var` nested inside a function body is a LOCAL binding, not a
+    // declaration another function could name: it is not a call-graph node, and
+    // its enclosing function body is already inventoried on its own.
+    let function_bodies = swift_function_declaration_sites(document)
+        .into_iter()
+        .map(|(_name, body, _is_initializer, offset)| offset..offset + body.len())
+        .collect::<Vec<_>>();
     let mut properties = BTreeMap::<String, Vec<&str>>::new();
     for declaration in ["let", "var"] {
         for (start, _) in document.match_indices(declaration) {
             if !is_identifier_at(document, start, declaration) {
+                continue;
+            }
+            if function_bodies.iter().any(|range| range.contains(&start)) {
                 continue;
             }
             let name_start = skip_ascii_whitespace(document, start + declaration.len());
@@ -3504,6 +3531,16 @@ fn swift_function_declarations(document: &str) -> Vec<(String, &str)> {
 /// is a constructor (`init`), so callers can forbid bootstrap during
 /// construction independently of ordinary methods.
 fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, bool)> {
+    swift_function_declaration_sites(document)
+        .into_iter()
+        .map(|(name, body, is_initializer, _offset)| (name, body, is_initializer))
+        .collect()
+}
+
+/// Every parsed `func`/`init` declaration with the byte offset of its body, so
+/// callers can tell a type-scope declaration from a binding nested inside a
+/// function body.
+fn swift_function_declaration_sites(document: &str) -> Vec<(String, &str, bool, usize)> {
     let mut declarations = Vec::new();
     for keyword in ["func", "init"] {
         let is_initializer = keyword == "init";
@@ -3558,7 +3595,7 @@ fn swift_function_declarations_with_kind(document: &str) -> Vec<(String, &str, b
             };
             let opening = index + opening_relative;
             if let Some(body) = balanced_brace_body(document, opening) {
-                declarations.push((name, body, is_initializer));
+                declarations.push((name, body, is_initializer, opening));
             }
         }
     }
@@ -9243,6 +9280,187 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
                 "alternate BootstrapWorker receiver or construction must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn swift_inventory_separates_the_mailbox_sync_worker_from_product_bootstrap() {
+        let worker = r"class BootstrapWorker {}
+tersa_macos_bootstrap_default_account(pointer, count)";
+        let delegate = r"
+private let bootstrapWorker = BootstrapWorker()
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        let view_model = r"
+func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }
+";
+        // The reviewed mailbox-sync surface: same bare names as the reviewed
+        // intent entry, but it reaches only the mailbox-sync C ABI.
+        let sync_worker = r"
+enum MailboxBeginStatus { init?(rawValue: Int32) { self = .started } }
+enum MailboxPollStatus { init?(rawValue: Int32) { self = .running } }
+final class MailboxSyncWorker {
+    func connect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.connect(accountIdentifier), completion: completion) }
+    func disconnect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.disconnect(accountIdentifier), completion: completion) }
+    func sync(clientID: String, accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.sync(clientID, accountIdentifier), completion: completion) }
+    private func performBegin(_ request: BeginRequest) -> (status: Int32, sessionID: UInt64) {
+        var sessionID: UInt64 = 0
+        let status: Int32
+        switch request {
+        case .connect(let accountIdentifier):
+            status = tersa_mailbox_macos_connect_begin(accountIdentifier, &sessionID)
+        case .disconnect(let accountIdentifier):
+            status = tersa_mailbox_macos_disconnect_begin(accountIdentifier, &sessionID)
+        case .sync(let clientID, let accountIdentifier):
+            status = tersa_mailbox_macos_sync_begin(clientID, accountIdentifier, &sessionID)
+        }
+        return (status, sessionID)
+    }
+}
+";
+        // A third-party state file whose `init` merely names a local of the same
+        // name the worker uses must not be dragged in by a namesake.
+        let connection_state = r"
+enum ConnectionState { init(status: ProductBootstrapStatus) { switch status { case .ready: self = .connected } } }
+";
+        let sources = |sync: &str| {
+            vec![
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    view_model.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/ConnectionState.swift"),
+                    connection_state.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/MailboxSyncWorker.swift"),
+                    sync.to_owned(),
+                ),
+            ]
+        };
+        assert!(
+            swift_bootstrap_inventory_violations(&sources(sync_worker)).is_empty(),
+            "the reviewed mailbox-sync worker must not be a bootstrap entry: {:?}",
+            swift_bootstrap_inventory_violations(&sources(sync_worker))
+        );
+        // The exemption is structural, never a file allowlist: a real product
+        // bootstrap entry added to the SAME file must still fail closed.
+        for real_entry in [
+            "func rogueBootstrap() { bootstrapWorker.submit(accountIdentifier: Data(), completion: receive) }",
+            "func rogueBootstrap() { submit(accountIdentifier: Data(), completion: receive) }",
+            "func rogueBootstrap() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+            "init() { connect(accountIdentifier: Data(), completion: receive) }",
+            "let autoStart: () -> Void = { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }",
+        ] {
+            let injected = format!("{sync_worker}\n{real_entry}");
+            assert!(
+                !swift_bootstrap_inventory_violations(&sources(&injected)).is_empty(),
+                "a real bootstrap entry in the mailbox-sync worker must fail closed: {real_entry}"
+            );
+        }
+        // Namesake isolation must not become a bypass: a function that shares the
+        // reviewed intent entry's bare name but submits itself still fails closed.
+        assert!(
+            !swift_bootstrap_inventory_violations(&[
+                (
+                    PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                    worker.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AppDelegate.swift"),
+                    delegate.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    view_model.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/Rogue.swift"),
+                    "func connect() { bootstrapWorker.submit(accountIdentifier: Data(), completion: receive) }".to_owned(),
+                ),
+            ])
+            .is_empty(),
+            "a namesake of the reviewed intent entry may not submit product bootstrap"
+        );
+    }
+
+    #[test]
+    fn swift_inventory_accepts_the_bootstrap_then_sync_intent_ladder() {
+        let worker = r"class BootstrapWorker {}
+tersa_macos_bootstrap_default_account(pointer, count)";
+        let delegate = r"
+private let bootstrapWorker = BootstrapWorker()
+func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+";
+        let sync_worker = r"
+final class MailboxSyncWorker {
+    func connect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.connect(accountIdentifier), completion: completion) }
+    func sync(clientID: String, accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.sync(clientID, accountIdentifier), completion: completion) }
+}
+";
+        // 3e-2c: the ONE reviewed intent entry drives product bootstrap AND the
+        // mailbox-sync worker (bootstrap -> sync -> needsReconnect -> OAuth ->
+        // connect). Touching the worker must not unreview the intent entry.
+        let ladder = r"
+func connect() {
+    (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: { status in
+        guard status == .ready else { return }
+        self.syncWorker.sync(clientID: self.clientID, accountIdentifier: Data()) { poll in
+            guard poll == .needsReconnect else { return }
+            self.startOAuth { session in
+                self.syncWorker.connect(accountIdentifier: Data(), completion: self.receive)
+            }
+        }
+    })
+}
+func startOAuth(_ handoff: @escaping (OAuthSessionID) -> Void) { session.start(onOutcome: handoff) }
+";
+        let sources = vec![
+            (
+                PathBuf::from("apple/macos/BootstrapWorker.swift"),
+                worker.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                delegate.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                ladder.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/MailboxSyncWorker.swift"),
+                sync_worker.to_owned(),
+            ),
+        ];
+        assert!(
+            swift_bootstrap_inventory_violations(&sources).is_empty(),
+            "the reviewed intent ladder may drive bootstrap and the sync worker: {:?}",
+            swift_bootstrap_inventory_violations(&sources)
+        );
+        // ... and the ladder must still never run automatically.
+        let mut automatic = sources.clone();
+        automatic[1].1 = format!(
+            "{delegate}\nfunc applicationDidFinishLaunching(_ notification: Notification) {{ model.connect() }}"
+        );
+        assert!(
+            !swift_bootstrap_inventory_violations(&automatic).is_empty(),
+            "a launch hook driving the ladder must still fail closed"
+        );
+        let mut constructed = sources.clone();
+        constructed[2].1 = format!("{ladder}\ninit() {{ connect() }}");
+        assert!(
+            !swift_bootstrap_inventory_violations(&constructed).is_empty(),
+            "an initializer driving the ladder must still fail closed"
+        );
     }
 
     #[test]
