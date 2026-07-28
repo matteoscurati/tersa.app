@@ -46,6 +46,12 @@ enum ConnectionFailure: Equatable {
             return "Tersa couldn't finish disconnecting. This account stays unavailable until it does. Try again — or remove Tersa from your Google Account to revoke its access now."
         }
     }
+
+    /// The failure's operation-aware headline, shared by the failure view and
+    /// its VoiceOver value so the two never drift.
+    var title: String {
+        self == .disconnectIncomplete ? "Disconnect failed" : "Connection failed"
+    }
 }
 
 /// The closed set of account-connection states the UI can render.
@@ -89,7 +95,7 @@ enum ConnectionState: Equatable {
         case .disconnecting:
             return "Disconnecting"
         case .failed(let failure):
-            return failure == .disconnectIncomplete ? "Disconnect failed" : "Connection failed"
+            return failure.title
         }
     }
 

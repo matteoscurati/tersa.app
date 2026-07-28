@@ -176,12 +176,18 @@ jobs:
         run: |
           set -euo pipefail
           # A real Swift call site now pulls these symbols into the linked app
-          # binary; this probe proves the reviewed C declarations also link AND
-          # execute against the Rust implementations, catching a coordinated
-          # C-decl-vs-Rust-signature wrong edit that the per-side source pins
-          # cannot. The pointer-taking begins are exercised through the app
-          # itself; their decls stay _Nonnull-free so the Rust null rejection
-          # (-7) remains a defined behavior, never a violable contract.
+          # binary; this probe proves the mailbox-sync FFI archive LINKS as a
+          # single archive (its own symbols AND the re-exported bridge ones
+          # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
+          # return their expected status. NOTE: static C↔Rust linking resolves by
+          # symbol NAME only, so this does NOT verify argument/return ABI — a
+          # widened return or an added parameter is invisible here (and poll(0)
+          # short-circuits to -8 before reading any argument). ABI shape is
+          # pinned per-side (the canonical header + the Rust export inventory);
+          # this step is the single-archive link-and-run proof. The
+          # pointer-taking begins are exercised through the app itself; their
+          # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
+          # defined behavior, never a violable contract.
           archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
           test -f "$archive"
           cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'

@@ -122,7 +122,7 @@ struct AccountConnectionView: View {
                 .font(.system(size: 48))
                 .foregroundStyle(.orange)
                 .accessibilityHidden(true)
-            Text(failure == .disconnectIncomplete ? "Disconnect failed" : "Connection failed")
+            Text(failure.title)
                 .font(.title2)
             Text(failure.message)
                 .font(.callout)

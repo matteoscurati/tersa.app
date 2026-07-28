@@ -46,10 +46,19 @@ final class AccountConnectionViewModel: ObservableObject {
 
     /// The OAuth client id handed to the sync and connect begins: the SAME
     /// `TersaOAuthClientID` Info.plist key `OAuthAuthorizationSession` reads,
-    /// so the client_id↔grant pairing holds by construction — no second,
-    /// unchecked path.
+    /// so the client_id↔grant pairing holds by construction. `connect()` applies
+    /// the SAME empty/`UNCONFIGURED` pre-flight `start()` does, so a bad id fails
+    /// fast with the configuration message rather than surfacing downstream as a
+    /// misleading "unavailable".
     private static var oauthClientID: String {
         Bundle.main.object(forInfoDictionaryKey: "TersaOAuthClientID") as? String ?? ""
+    }
+
+    /// Mirrors `OAuthAuthorizationSession.start()`'s pre-flight: an empty or
+    /// still-`UNCONFIGURED` client id cannot drive the sync/connect begins.
+    private static var oauthClientIDIsUsable: Bool {
+        let id = oauthClientID
+        return !id.isEmpty && id.range(of: "UNCONFIGURED", options: .caseInsensitive) == nil
     }
 
     var isConnectDisabled: Bool {
@@ -75,6 +84,13 @@ final class AccountConnectionViewModel: ObservableObject {
         // Google" advice would break the connection they are making now).
         disconnectNotice = nil
         disconnectConfirmation = nil
+        // Fail fast on a missing/unconfigured client id with the config-specific
+        // message, rather than letting a bad id reach the sync rung and surface
+        // as a misleading permanent "unavailable".
+        guard Self.oauthClientIDIsUsable else {
+            state = .failed(.signInUnavailable)
+            return
+        }
         state = .connecting
         let accountIdentifierData = Data(trimmedIdentifier.utf8)
         let completion: @MainActor (ProductBootstrapStatus) -> Void = { [weak self] status in
@@ -105,6 +121,13 @@ final class AccountConnectionViewModel: ObservableObject {
     /// connect until a disconnect converges, so re-running the connect ladder
     /// would dead-loop — while every other failure retries the ladder.
     func retryAfterFailure(_ failure: ConnectionFailure) {
+        // Only a genuine failure retries. `retry()`/`disconnect()` reset the
+        // state, so without this a double-tap before the failure view is
+        // dismissed would slip a SECOND concurrent ladder past their re-entry
+        // guards; the second tap now sees a non-failed state and no-ops.
+        guard case .failed = state else {
+            return
+        }
         if failure == .disconnectIncomplete {
             state = .notConnected
             disconnect()
@@ -145,9 +168,11 @@ final class AccountConnectionViewModel: ObservableObject {
                  .unknownSession, .unrecognized, .running:
                 // Fail closed: the fence stays set in Rust until a disconnect
                 // converges, so this failure's retry re-issues the DISCONNECT
-                // (see retryAfterFailure) rather than the connect ladder. The
-                // worker coalesces a busy disconnect-begin onto the running
-                // teardown; the UI never re-issues in a loop.
+                // (see retryAfterFailure) rather than the connect ladder. Only
+                // one disconnect is ever in flight: `disconnect()`'s
+                // `state != .disconnecting` guard and `retryAfterFailure`'s
+                // `case .failed` guard keep the UI single-issue, so the worker's
+                // second-slot behavior is never exercised from here.
                 self.state = .failed(.disconnectIncomplete)
             }
         }
@@ -185,13 +210,30 @@ final class AccountConnectionViewModel: ObservableObject {
             case .succeeded, .succeededRevokeUnconfirmed:
                 self.connectedAccountIdentifier = accountIdentifier
                 self.state = .connected
+            case .syncFailed:
+                // A returning user reaches their locally-synced inbox even when
+                // the network refresh can't complete (the offline case: the
+                // stored-credential refresh dies with a transport error ->
+                // SYNC_FAILED, never reaching the gate). Safe on THIS rung not
+                // because the gate passed — SYNC_FAILED means the gate did not
+                // BLOCK, which includes it never running — but because the
+                // mailbox store only ever holds the last-COMMITTED identity's
+                // data: writes happen solely through the post-gate SyncCoordinator,
+                // and a mismatched re-consent clears the store (ClearAndRecord).
+                // The pre-gate SYNC_FAILED sub-cases here (refresh transport,
+                // setup, session) mutate nothing, so they show last-verified
+                // data. No NEW identity can be introduced on this rung (it uses
+                // the STORED credential); the fresh-consent handoff lives on the
+                // connect rung, which deliberately does NOT land connected here.
+                self.connectedAccountIdentifier = accountIdentifier
+                self.state = .connected
             case .needsReconnect:
                 self.authorizeAndConnect(accountIdentifier: accountIdentifier)
             case .cancelled:
                 // A disconnect dropped the in-flight sync; land neutral —
                 // not a failure, and never rendered as "disconnected".
                 self.state = .notConnected
-            case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
+            case .gateBlocked, .internalError, .unknownSession, .unrecognized,
                  .running:
                 self.state = .failed(Self.terminalFailure(status))
             }
@@ -255,6 +297,15 @@ final class AccountConnectionViewModel: ObservableObject {
                 self.state = .notConnected
             case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
                  .running:
+                // On the CONNECT rung, .syncFailed must NOT land connected: after
+                // a fresh browser consent, SYNC_FAILED covers pre-gate failures
+                // (a bad exchange, an UNVERIFIED id_token, no token stored) where
+                // the gate never ran — landing connected would show the PREVIOUS
+                // identity's cached mailbox to the newly-consenting one, defeating
+                // the identity gate at the account-handoff moment. Recovery is
+                // one tap: retry() -> the stored-credential rung, which is where a
+                // genuinely-stored token gets the gate. (The offline regression is
+                // fully fixed on that rung; this rung is unreachable offline.)
                 self.state = .failed(Self.terminalFailure(status))
             }
         }
