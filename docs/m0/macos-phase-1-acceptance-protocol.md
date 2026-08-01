@@ -68,6 +68,13 @@ candidate, commit, manifest digest, and non-unique machine class.
    sync/index peak memory below 350 MiB. A threshold miss fails the gate unless
    a separately accepted ADR changes that budget.
 
+The installed application bundle must not exceed 16 MiB and the compressed DMG
+download must not exceed 8 MiB. Measure regular-file bytes inside `Tersa.app`
+and the final compressed DMG file bytes. A size-budget miss follows the same
+fail-closed rule as the performance thresholds. The collection mechanism and
+unsigned pre-measurement limits are documented in the
+[Step-4 performance harness](macos-performance-harness.md).
+
 ## `P1-MACOS-002`: macOS release acceptance
 
 Build the exact candidate with Hardened Runtime and the reviewed minimal

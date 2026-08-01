@@ -61,6 +61,8 @@ jobs:
           fetch-depth: 0
       - name: Test change-scope classifier
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_ci_change_scope.py
+      - name: Test macOS performance report contract
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py
       - name: Determine change scope
         id: scope
         env:

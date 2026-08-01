@@ -2575,6 +2575,7 @@ mod macos {
         use std::time::Instant;
 
         use super::*;
+        use tersa_application::mailbox_search::{MailboxSearchQuery, search_metadata};
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2665,6 +2666,78 @@ mod macos {
                 None,
             ))
             .unwrap();
+        }
+
+        fn performance_envelope(index: u16) -> MessageEnvelope {
+            let subject = if index.is_multiple_of(2) {
+                format!("Synthetic needle {index:03}")
+            } else {
+                format!("Synthetic control {index:03}")
+            };
+            MessageEnvelope::new(
+                MessageId::new(format!("message-{index:03}")).unwrap(),
+                ThreadId::new(format!("thread-{index:03}")).unwrap(),
+                HeaderText::new(format!("sender-{index:03}@example.invalid")).unwrap(),
+                HeaderText::new(subject).unwrap(),
+                HeaderText::new("Synthetic preview").unwrap(),
+                UnixTimestampMillis::new(i64::from(index)).unwrap(),
+                index.is_multiple_of(3),
+            )
+        }
+
+        /// Emits one privacy-safe Step-4 performance sample over the production
+        /// `SQLCipher` reader, metadata search, and fenced reconciliation paths.
+        /// The external harness runs this ignored test once as warm-up and five
+        /// more times as recorded samples; ordinary verification only compiles it.
+        #[test]
+        #[ignore = "run through apple/scripts/capture-macos-performance.sh"]
+        fn performance_harness_sample() {
+            let (database, store) = open("performance-harness");
+            record_fence(&store);
+            let envelopes = (0..100).map(performance_envelope).collect::<Vec<_>>();
+            run(store.reconcile_recent_envelopes(
+                &account(),
+                &envelopes,
+                StoreLimit::new(100).unwrap(),
+                &fence(),
+            ))
+            .unwrap();
+
+            let open_started = Instant::now();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let rows =
+                run(reader.list_envelopes(&account(), StoreLimit::new(50).unwrap())).unwrap();
+            let open_list_us = open_started.elapsed().as_micros();
+            assert_eq!(rows.len(), 50);
+
+            let query = MailboxSearchQuery::new("needle").unwrap();
+            let query_started = Instant::now();
+            let document = run(search_metadata(
+                &reader,
+                &account(),
+                &query,
+                StoreLimit::new(50).unwrap(),
+            ))
+            .unwrap();
+            let query_us = query_started.elapsed().as_micros();
+            assert_eq!(document.messages().len(), 50);
+
+            let updated = (100..200).map(performance_envelope).collect::<Vec<_>>();
+            let reconcile_started = Instant::now();
+            let survivors = run(store.reconcile_recent_envelopes(
+                &account(),
+                &updated,
+                StoreLimit::new(100).unwrap(),
+                &fence(),
+            ))
+            .unwrap();
+            let reconcile_us = reconcile_started.elapsed().as_micros();
+            assert_eq!(survivors.len(), 100);
+
+            println!(
+                "TERSA_PERF_SAMPLE open_list_us={open_list_us} query_us={query_us} reconcile_us={reconcile_us} rows=100"
+            );
         }
 
         fn crash_store_at(database: &TestDatabase, point: &str) {
