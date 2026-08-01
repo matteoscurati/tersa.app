@@ -2066,10 +2066,9 @@ mod macos_keychain {
             &security_string!(item::kSecClass),
             &security_string!(item::kSecClassGenericPassword),
         )?;
-        validate_optional_attribute(
+        validate_optional_false_attribute(
             dictionary,
             &security_string!(item::kSecAttrSynchronizable),
-            &CFBoolean::false_value().as_CFType(),
         )?;
         let data = dictionary
             .find(security_string!(item::kSecValueData).as_CFTypeRef())
@@ -2111,6 +2110,28 @@ mod macos_keychain {
             return Err(KeyStorageError::Invalid);
         }
         Ok(())
+    }
+
+    fn validate_optional_false_attribute(
+        dictionary: &CFDictionary,
+        key: &CFType,
+    ) -> Result<(), KeyStorageError> {
+        let Some(actual) = dictionary.find(key.as_CFTypeRef()) else {
+            return Ok(());
+        };
+        // Security.framework returns synchronizable=false as either a
+        // CFBoolean or an NSNumber zero, depending on the Keychain backend.
+        let accepted = [
+            CFBoolean::false_value().as_CFType(),
+            CFNumber::from(0).as_CFType(),
+        ];
+        if accepted.iter().any(|expected| {
+            // SAFETY: Both arguments are live Core Foundation objects.
+            (unsafe { CFEqual(*actual, expected.as_CFTypeRef()) }) != 0
+        }) {
+            return Ok(());
+        }
+        Err(KeyStorageError::Invalid)
     }
 
     #[cfg(test)]
@@ -2277,6 +2298,20 @@ mod macos_keychain {
                 [7; 32]
             );
 
+            let numeric_false = fixture_record(
+                group,
+                Some(&[7; 32]),
+                None,
+                Some(CFNumber::from(0).as_CFType()),
+            );
+            let numeric_false = CFArray::from_CFTypes(&[numeric_false.as_CFType()]);
+            assert_eq!(
+                *decode_copy_result(numeric_false.as_CFType(), group)
+                    .unwrap()
+                    .as_bytes(),
+                [7; 32]
+            );
+
             let wrong_class = fixture_record(
                 group,
                 Some(&[7; 32]),
@@ -2298,6 +2333,18 @@ mod macos_keychain {
             let wrong_sync = CFArray::from_CFTypes(&[wrong_sync.as_CFType()]);
             assert_eq!(
                 decode_copy_result(wrong_sync.as_CFType(), group),
+                Err(KeyStorageError::Invalid)
+            );
+
+            let numeric_true = fixture_record(
+                group,
+                Some(&[7; 32]),
+                None,
+                Some(CFNumber::from(1).as_CFType()),
+            );
+            let numeric_true = CFArray::from_CFTypes(&[numeric_true.as_CFType()]);
+            assert_eq!(
+                decode_copy_result(numeric_true.as_CFType(), group),
                 Err(KeyStorageError::Invalid)
             );
         }

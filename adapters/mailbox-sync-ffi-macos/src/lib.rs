@@ -16,12 +16,15 @@
 //! session whose grant the worker claims: the grant, its registered redirect,
 //! and the client identifier all arrive with the claim from the bridge's
 //! session registry, never from Swift, so the exchange configuration cannot
-//! disagree with the session by construction. A disconnect begin supplies only
-//! the account identifier: it takes no grant and no configuration — the
-//! teardown (best-effort revoke, token delete, local purge) is built entirely
-//! inside the trusted composition. All three begins share the one poll entry
-//! point. Progress is a single closed status integer; no mailbox content,
-//! address, subject, or count ever crosses this boundary.
+//! disagree with the session by construction. An optional Desktop-client secret
+//! may be supplied at Rust compile time; installed applications cannot keep that
+//! value confidential, so it is treated as client configuration rather than as a
+//! runtime credential. A disconnect begin supplies only the account identifier:
+//! it takes no grant and no configuration — the teardown (best-effort revoke,
+//! token delete, local purge) is built entirely inside the trusted composition.
+//! All three begins share the one poll entry point. Progress is a single closed
+//! status integer; no mailbox content, address, subject, or count ever crosses
+//! this boundary.
 //!
 //! # Single-archive link
 //!
@@ -123,13 +126,34 @@ mod macos {
             .map_err(|_error| STATUS_INVALID_INPUT)
     }
 
+    /// Reads the optional Desktop-client secret embedded by the local build.
+    ///
+    /// Google documents this value as optional for installed apps, but some
+    /// Desktop clients require it at the token endpoint. The value is compiled
+    /// into the application and therefore is not treated as confidential.
+    fn configured_client_secret() -> Option<&'static str> {
+        client_secret_from_build_setting(option_env!("TERSA_OAUTH_CLIENT_SECRET"))
+    }
+
+    fn client_secret_from_build_setting(value: Option<&str>) -> Option<&str> {
+        value.filter(|secret| {
+            !secret.trim().is_empty() && !secret.to_ascii_uppercase().contains("UNCONFIGURED")
+        })
+    }
+
     /// Builds the token-client configuration pinned to this application's public
     /// posture: the caller-supplied client id, the pinned placeholder redirect, and
-    /// no client secret. A blank client id is a caller error; the placeholder redirect
-    /// is a compile-time constant whose parse failure could only be an internal fault.
+    /// the optional build-time Desktop-client secret. A blank client id is a caller
+    /// error; the placeholder redirect is a compile-time constant whose parse
+    /// failure could only be an internal fault.
     fn pinned_configuration(client_id: String) -> Result<TokenClientConfig, i32> {
         let redirect = Url::parse(PLACEHOLDER_REDIRECT_URI).map_err(|_error| STATUS_INTERNAL)?;
-        TokenClientConfig::new(client_id, redirect, None).map_err(|_error| STATUS_INVALID_INPUT)
+        TokenClientConfig::new_with_optional_client_secret(
+            client_id,
+            redirect,
+            configured_client_secret(),
+        )
+        .map_err(|_error| STATUS_INVALID_INPUT)
     }
 
     /// The production [`ConnectSession`] backed by the Apple bridge's session
@@ -148,10 +172,14 @@ mod macos {
         fn claim(&self) -> Option<(AuthorizationGrant, TokenClientConfig)> {
             let (grant, redirect, client_id) =
                 tersa_apple_bridge::claim_grant(self.oauth_session_id)?;
-            // A public OAuth client carries no secret, exactly as
-            // `pinned_configuration` pins it; the Google token and revoke
-            // endpoints are pinned downstream in the Gmail transport.
-            match TokenClientConfig::new(client_id, redirect, None) {
+            // The optional build-time Desktop-client secret is paired with the
+            // same claimed client id and redirect. The Google token and revoke
+            // endpoints remain pinned downstream in the Gmail transport.
+            match TokenClientConfig::new_with_optional_client_secret(
+                client_id,
+                redirect,
+                configured_client_secret(),
+            ) {
                 Ok(config) => Some((grant, config)),
                 Err(_error) => {
                     // The lease WAS taken by `claim_grant`, and a claim-miss
@@ -472,8 +500,9 @@ mod macos {
 
         use super::{
             BridgeConnectSession, MAX_INPUT_BYTES, STATUS_INVALID_INPUT, STATUS_UNKNOWN_SESSION,
-            read_utf8, tersa_mailbox_macos_connect_begin, tersa_mailbox_macos_disconnect_begin,
-            tersa_mailbox_macos_sync_begin, tersa_mailbox_macos_sync_poll,
+            client_secret_from_build_setting, read_utf8, tersa_mailbox_macos_connect_begin,
+            tersa_mailbox_macos_disconnect_begin, tersa_mailbox_macos_sync_begin,
+            tersa_mailbox_macos_sync_poll,
         };
 
         fn insert_test_session(status: i32) -> u64 {
@@ -483,6 +512,16 @@ mod macos {
                 .unwrap()
                 .insert(id, WorkerHandles::from_status_for_test(status));
             id
+        }
+
+        #[test]
+        fn client_secret_build_setting_is_optional_and_rejects_placeholders() {
+            assert!(client_secret_from_build_setting(None).is_none());
+            assert!(client_secret_from_build_setting(Some("   ")).is_none());
+            assert!(client_secret_from_build_setting(Some("UNCONFIGURED")).is_none());
+
+            let secret = client_secret_from_build_setting(Some("desktop-test-secret")).unwrap();
+            assert_eq!(secret, "desktop-test-secret");
         }
 
         #[test]
