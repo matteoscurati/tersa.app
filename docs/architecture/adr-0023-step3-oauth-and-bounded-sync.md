@@ -8,8 +8,13 @@ one at https://mozilla.org/MPL/2.0/.
 
 - Status: Accepted
 - Date: 2026-07-20
+- Implemented: 2026-08-01
 
 ## Context
+
+This Context records the preimplementation baseline as of the adoption date,
+2026-07-20, and is deliberately historical. The current delivered state is
+recorded under "Implementation outcome" in the Decision section.
 
 Phase 1 is macOS-first. Step 2 (the macOS UI vertical slice,
 [ADR 0021](adr-0021-macos-ui-vertical-slice.md), PRs 2a–2f) shipped native
@@ -35,13 +40,14 @@ Much of the machinery exists and is reviewed:
 - the bounded sync coordinator ([ADR 0018](adr-0018-bounded-sync-and-cache.md),
   `crates/application/src/sync.rs`) and the store reconcile path.
 
-The one genuinely new and security-critical subsystem is the **token lifecycle**.
-Today the bridge validates the authorization callback and then `drop(grant)`s it
-(`apple/rust-bridge/src/oauth.rs`, `complete_callback`): no token exchange, no
-refresh, no persistence, no revocation exists anywhere, and
-`adapters/keychain-macos` has no token surface. This ADR plans Step 3; it
-implements nothing. It follows the ADR 0021 precedent of a plan-only ADR whose
-decisions are realized in later, independently reviewed pull requests.
+At adoption time, the one genuinely new and security-critical subsystem was the
+**token lifecycle**. The bridge then validated the authorization callback and
+`drop(grant)`ed it (`apple/rust-bridge/src/oauth.rs`, `complete_callback`): token
+exchange, refresh, persistence, revocation, and the Keychain token surface did
+not yet exist. This ADR was accepted as the Step-3 implementation plan, following
+the ADR 0021 precedent of a plan-only ADR whose decisions would be realized in
+later, independently reviewed pull requests. The implementation outcome below
+records the completed state and supersedes these adoption-time facts.
 
 The binding constraints (unchanged): each user connects **their own** Google
 account through the official API; the product application is the sole profile
@@ -62,19 +68,41 @@ runtime measurements enabled by a populated store are recorded on each PR's
 ADR 0022 checklist, but the dedicated performance harness and its thresholds
 remain **Step 4**; Step 3 does not build that harness or assert a threshold.
 
+### Implementation outcome — 2026-08-01
+
+Step 3 is complete in source and in the owner-driven macOS live flow. The Rust
+engine and disconnect fence landed through PRs #66–#71, the Swift connect/sync/
+disconnect ladder through PRs #72–#75, and the live-run fixes through
+[PR #76](https://github.com/matteoscurati/tersa.app/pull/76). A Release/arm64
+build signed with an Apple Development identity retained the full committed App
+Sandbox, network, App Group, and Keychain entitlements; no reduced-entitlement
+variant was used.
+
+The run completed browser consent, PKCE loopback callback, code exchange,
+refresh-token Keychain persistence, bounded `gmail.readonly` fetch into the
+encrypted store, visible inbox rendering, confirmed provider revoke, local
+token deletion, and mailbox purge. The original decomposition's separate
+post-revoke re-connect exercise was not part of the final owner-approved
+connect → sync → disconnect run and is not claimed as live evidence.
+
+This completion is delivery evidence, not an `M0-OAUTH-001` pass: the local run
+did not produce the immutable retained artifact and independent evidence
+attestation required by the gate register. It also does not exercise the
+deferred distinct token/root Keychain-group barrier, Developer ID signing,
+notarization, accessibility, or the Step-4 performance harness.
+
 ### Client-secret posture (amends an M0 invariant, empirically resolved)
 
 The evidenced macOS transport binds an ephemeral `http://127.0.0.1:{port}/`
 loopback; only Google's **Desktop app** client type accepts unregistered loopback
-redirects. Whether the token endpoint requires the Desktop client's `client_secret`
-under PKCE is contested — Google's native-app guidance has described it as optional,
-while Desktop clients have historically been issued a secret and rejected exchanges
-without it. This ADR does not settle it by reading docs: a one-off `curl` probe of
-the token endpoint with the real Desktop client (a 3f prerequisite, run **before**
-3a freezes its request shape) determines it empirically. Either result yields the
-same posture: if a secret is required it is the Desktop client's, which is **not
-confidential** for an installed app (RFC 8252 §8.5); if none is required, none is
-sent. This ADR therefore amends the
+redirects. The 3f run resolved the concrete client's behavior empirically:
+Google's token endpoint rejected the PKCE exchange until the Desktop client's
+issued `client_secret` was included. That value is **not confidential** for an
+installed app (RFC 8252 §8.5). It is build-injected alongside the client ID,
+stored in zeroizing runtime configuration, and sent only to the token endpoint;
+it is never treated as an authentication boundary, committed, or logged. A
+Desktop client that does not require it may leave the setting absent. This ADR
+therefore amends the
 [OAuth/PKCE feasibility](../m0/oauth-pkce-feasibility.md) deferred-work invariant
 "exchange the validated code **without a client secret**" to "without a
 **confidential** secret", so the plan holds under either outcome: any secret sent is
@@ -434,24 +462,25 @@ reusable `emailAddress`. `sub` is used only as gate input (hashed, never shown).
 ### Client configuration and injection
 
 The committed `apple/project.yml` OAuth placeholders stay `UNCONFIGURED`; the
-client ID and — only if the client-secret probe shows the token endpoint requires
-one — the non-confidential secret are injected locally at build time through a small
-reviewed override that leaves the pinned `project.yml` structure unchanged, and are
-never committed. The Google Cloud requirements are: a project with the Gmail API
-enabled; an OAuth consent screen (External, Testing, with the developer's own
-address as a test user); the `gmail.readonly` scope; and a **Desktop app** OAuth
-client (client ID, plus the client's non-confidential secret if the probe requires
-it; loopback needs no redirect registration).
+client ID and optional non-confidential client secret are injected locally at
+build time through a reviewed override that leaves the pinned `project.yml`
+structure unchanged, and are never committed. The 3f Desktop client required
+the secret; another client configuration may omit it if its token endpoint
+accepts that shape. The Google Cloud requirements are: a project with the Gmail
+API enabled; an OAuth consent screen (External, Testing, with the developer's
+own address as a test user); the `gmail.readonly` scope; and a **Desktop app**
+OAuth client. Loopback needs no redirect registration.
 
 ### Decomposition into bounded, independently reviewed PRs
 
-Everything except the final live run builds and is reviewed against the
-`UNCONFIGURED` placeholder, which fails closed at every layer. Only 3f **builds or
-runs** against the live client; the sole earlier touch of a live credential is the
-one-off out-of-band `curl` client-secret probe before 3a (manual evidence, no build
-artifact, the secret never committed or logged).
+The accepted decomposition kept every source slice buildable and reviewable
+against the `UNCONFIGURED` placeholder, which fails closed at every layer. Only
+3f built and ran against the live client. The planned earlier probe did not
+settle the concrete client's request shape; 3f exposed the missing-secret
+response and PR #76 added the optional configuration before the successful
+rerun. No credential or live authorization artifact was committed or logged.
 
-- **ADR 0023** (this document): the plan.
+- **ADR 0023** (this document): the adopted implementation plan.
 - **3a** — portable token exchange/refresh state machine and port; **replace**
   `GMAIL_MODIFY_SCOPE` with `gmail.readonly` so no `gmail.modify` code path remains.
   No I/O; deterministic tests. Its request shape is frozen only after the
@@ -479,11 +508,12 @@ artifact, the secret never committed or logged).
   re-connect / disconnect states; the new Swift OAuth/sync invocation-seam guard
   (security-adjacent: senior review; taste per ADR 0020). No change to the 2b read
   surface — the ADR 0021 invariance test.
-- **3f** — evidence: the live client on the developer's own account; the
-  client-secret probe result; real consent, bounded sync populating the store,
-  inbox/thread/search rendering real mail; disconnect and re-connect exercised; the
-  ADR 0022 measurements a populated store enables. Run by the lead with the user's
-  client.
+- **3f — completed 2026-08-01** — the owner drove the real consent flow; the
+  live client-secret requirement was resolved; bounded sync populated the
+  encrypted store and rendered real mail; disconnect confirmed revoke, token
+  deletion, and mailbox purge. The run recorded no mail content or credential
+  in the repository. A post-revoke re-connect and protocol-grade measurements
+  remain outside the live claim.
 
 3a and 3c may proceed in parallel; 3b after 3a; 3d after 3a–3c; 3e after 3d;
 3f last.
@@ -504,20 +534,20 @@ verification (CASA) is MVP-completion work.
 
 ## Consequences
 
-Step 3 is mostly integration over reviewed parts, concentrated on one new
+Step 3 was mostly integration over reviewed parts, concentrated on one new
 security-critical subsystem — the token lifecycle — which the senior/security lane
 owns end to end (3c, 3d, the guard extensions, and the 3e wiring review). This
 concentrates token exchange, network entry, and the sync write path in the one
 trusted `tersa-oauth-sync-macos` composition crate, which consumes the Keychain token
 store and the SQLCipher store rather than absorbing them. 3d realizes the
-dedicated-composition-crate refactor this section anticipated (Step 3 is the growth
-that warrants it); keeping the composition out of `tersa-keychain-macos` keeps the
+dedicated-composition-crate refactor this section anticipated (Step 3 was the growth
+that warranted it); keeping the composition out of `tersa-keychain-macos` keeps the
 token store and, critically, the retrieval-only CLI off the `reqwest` / `tokio`
 network graph — the machine-checked expression of the CLI's retrieval-only invariant. The read UI is
 unchanged and its 2b surface stays invariant. The store gains real data, so
 ADR 0022 runtime measurements become meaningful and are recorded per slice. The
-account-connection screen gains a real Google sign-in and a disconnect affordance;
-the developer configures a free Google Cloud Desktop client (about fifteen
-minutes) for 3f, and re-consents about weekly while the app stays in Testing. When
+account-connection screen now has a real Google sign-in and disconnect affordance;
+the developer configured a Google Cloud Desktop client for 3f and re-consents
+about weekly while the app stays in Testing. When
 the credential block clears, the deferred 2f runtime accessibility/sandbox walk and
 signed distribution proceed independently of this step.
