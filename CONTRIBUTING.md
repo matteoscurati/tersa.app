@@ -50,15 +50,16 @@ in the pull request and in
 
 Treat the remote default branch as the source of truth after a pull request is
 merged. Inventory linked worktrees before switching branches because another
-worktree may already own `main`. In the worktree that owns `main`, require a
-clean tracked state, fast-forward it, and prove that it exactly matches the
-remote branch:
+worktree may already own `main`. Identify that worktree first, then run every
+state-changing or state-validating command from it. Require a clean ordinary
+state, fast-forward it, and prove that it exactly matches the remote branch:
 
 ```sh
-git status --short --branch
 git fetch origin --prune
 git worktree list
-# Run the remaining commands in the worktree that owns main.
+# Replace this path with the worktree that owns main.
+cd /absolute/path/to/main-worktree
+git status --short --branch
 git pull --ff-only origin main
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 ```
