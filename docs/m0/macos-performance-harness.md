@@ -12,18 +12,22 @@ evidence, and an independent reviewer.
 Run the privacy-safe unsigned probe on an Apple Silicon Mac:
 
 ```sh
-sh apple/scripts/capture-macos-performance.sh > macos-performance.json
+sh apple/scripts/capture-macos-performance.sh > /tmp/tersa-macos-performance.json
 ```
 
-The script builds the real Release application unsigned, stages the intact
-`Tersa.app` bundle at the root of a compressed UDZO DMG, compiles the production
-SQLCipher adapter in Release mode, discards one warm-up sample, and records five
-samples. It rejects a dirty worktree before building so its exact commit cannot
-conceal staged, unstaged, or untracked source. Its fixture contains exactly 100
-synthetic envelopes under `example.invalid`; it never opens the product
-Keychain, account profile, Gmail cache, or network. The committed report tool
-emits aggregate values only and rejects an invalid commit, missing sample,
-malformed marker, or threshold breach.
+Write the report outside the repository: shell redirection creates the output
+before the runner begins, and the commit-binding guard intentionally rejects any
+untracked repository file. The script also requires a native arm64 process and
+rejects Rosetta before measuring. It builds the real Release application
+unsigned, stages the intact `Tersa.app` bundle at the root of a compressed UDZO
+DMG, compiles the production SQLCipher adapter in Release mode, discards one
+warm-up sample, and records five samples. It rejects a dirty worktree before
+building so its exact commit cannot conceal staged, unstaged, or untracked
+source. Its fixture contains exactly 100 synthetic envelopes under
+`example.invalid`; it never opens the product Keychain, account profile, Gmail
+cache, or network. The committed report tool emits aggregate values only and
+rejects an invalid commit, missing sample, malformed marker, or threshold
+breach.
 
 ## Automated pre-measurements
 

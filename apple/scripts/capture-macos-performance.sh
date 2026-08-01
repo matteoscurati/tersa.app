@@ -19,6 +19,15 @@ trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
 
 cd "$ROOT"
 
+[ "$(uname -m)" = arm64 ] || {
+  printf 'error: performance capture requires native arm64 macOS\n' >&2
+  exit 1
+}
+TRANSLATED="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
+[ "$TRANSLATED" = 0 ] || {
+  printf 'error: performance capture requires a non-Rosetta process\n' >&2
+  exit 1
+}
 [ -z "$(git status --porcelain --untracked-files=all)" ] || {
   printf 'error: commit-bound capture requires a clean worktree\n' >&2
   exit 1
