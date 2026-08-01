@@ -1,20 +1,40 @@
 # macOS UI development-signed accessibility and App Sandbox evidence
 
-## Current-state addendum — 2026-08-01
+## Current Apple Development capture — 2026-08-01
 
-The credential condition recorded below is historical. An Apple Development
-identity and matching development provisioning are now available. A
-Release/arm64 Tersa build signed by that team launched with all five committed
-production entitlements and completed the ADR-0023 Step-3f live OAuth, sync,
-and disconnect flow; [PR #76](https://github.com/matteoscurati/tersa.app/pull/76)
+The capture script built tracked Release/arm64 source at commit
+`8254d45c5296432445e0af73ee85b9a18c5022cc`. It selected the one available
+Apple Development identity and the one current matching Mac Development
+profile without printing either identifier. The resulting app used Hardened
+Runtime and the exact five committed production entitlements; no entitlement
+was weakened or rewritten in the repository.
+
+| Observation | Result |
+|---|---|
+| Native build and Apple Development signature | PASS — arm64, strict signature verification, Hardened Runtime |
+| Provisioning and entitlement binding | PASS — current embedded profile and the exact five-key set; team values redacted |
+| Product launch and App Sandbox container | PASS — the app remained running and `~/Library/Containers/app.tersa.mac` existed |
+| Sandbox denial and observation-path control | PASS — the same-signature bundled canary was denied an outside-container create; its unsandboxed control succeeded |
+| VoiceOver-only five-screen walk | PENDING — not executed; no spoken-output claim |
+| Full Keyboard Access-only five-screen walk | PENDING — not executed; no keyboard-navigation claim |
+
+The two accessibility walks remain pending because the local automation runtime
+was unavailable and the console session was locked during capture. Source-level
+semantics and a screenshot are not substituted for VoiceOver speech or physical
+keyboard evidence. The script leaves the exact interactive checklist visible
+after every successful automated capture.
+
+This is development-only, explicitly non-gate evidence. It is not Developer ID,
+notarization, retained distribution evidence, or independent accessibility
+approval. The earlier ADR-0023 Step-3f live OAuth, sync, and disconnect result
+remains separately recorded; [PR #76](https://github.com/matteoscurati/tersa.app/pull/76)
 contains the source fixes found by that run.
 
-That live run did not execute or attest the VoiceOver, Full Keyboard Access,
-sandbox-denial, or complete performance checklist in sections 3–6. Those
-observations therefore remain pending a new development-signed capture. The
-historical ad-hoc evidence below is retained unchanged as the exact record of
-its earlier source state; it is not a statement about current credential
-availability and it still passes no release gate.
+## Historical ad-hoc capture
+
+The remainder of this document preserves the earlier ad-hoc capture at its
+original source state. Its credential statements are historical and do not
+describe current Apple Development availability.
 
 ## Purpose and non-claim
 
