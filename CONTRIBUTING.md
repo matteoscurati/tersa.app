@@ -46,6 +46,31 @@ unparsable, do not rewrite shared history. Record a public signed attestation
 in the pull request and in
 [`docs/governance/dco-attestations.md`](docs/governance/dco-attestations.md).
 
+## Post-merge local hygiene
+
+Treat the remote default branch as the source of truth after a pull request is
+merged. Before starting the next slice, require a clean worktree, fast-forward
+the local default branch, and inventory linked worktrees:
+
+```sh
+git status --short --branch
+git fetch origin --prune
+git switch main
+git pull --ff-only origin main
+git worktree list
+```
+
+Remove a linked worktree only after `git status --short` is empty inside that
+worktree. Delete its local topic branch only after GitHub reports the pull
+request as merged. Because this repository uses squash merges, Git may not
+recognize the original topic commit as an ancestor of `main`; before using a
+forced local branch deletion, compare the topic tree with the immutable pull
+request merge commit and keep the remote branch until the result is verified.
+
+Never clean, reset, or delete an unrelated dirty worktree. Local OAuth build
+configuration and credentials remain ignored machine state and must not be
+staged as part of post-merge cleanup.
+
 ## Verification and review
 
 Run every check relevant to the change and record the commands and results in
