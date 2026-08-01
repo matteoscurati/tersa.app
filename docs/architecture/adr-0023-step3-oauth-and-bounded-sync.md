@@ -12,6 +12,10 @@ one at https://mozilla.org/MPL/2.0/.
 
 ## Context
 
+This Context records the preimplementation baseline as of the adoption date,
+2026-07-20, and is deliberately historical. The current delivered state is
+recorded under "Implementation outcome" in the Decision section.
+
 Phase 1 is macOS-first. Step 2 (the macOS UI vertical slice,
 [ADR 0021](adr-0021-macos-ui-vertical-slice.md), PRs 2a–2f) shipped native
 AppKit/SwiftUI account-connection, inbox, thread, search, and a composer-entry
