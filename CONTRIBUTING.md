@@ -46,6 +46,51 @@ unparsable, do not rewrite shared history. Record a public signed attestation
 in the pull request and in
 [`docs/governance/dco-attestations.md`](docs/governance/dco-attestations.md).
 
+## Post-merge local hygiene
+
+Treat the remote default branch as the source of truth after a pull request is
+merged. Inventory linked worktrees before switching branches because another
+worktree may already own `main`. Identify that worktree first, then run every
+state-changing or state-validating command from it. Require a clean ordinary
+state, fast-forward it, and prove that it exactly matches the remote branch:
+
+```sh
+git fetch origin --prune
+git worktree list
+# Replace this path with the worktree that owns main.
+cd /absolute/path/to/main-worktree
+git status --short --branch
+git pull --ff-only origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+```
+
+If `main` is not checked out anywhere, switch to it without overriding another
+worktree. If the final equality check fails, stop and preserve any unpublished
+local commits; never reset them merely to make the check pass.
+
+Before removing a linked worktree, inspect both ordinary and ignored state:
+
+```sh
+git -C <worktree> status --short
+git -C <worktree> ls-files --others --ignored --exclude-standard
+```
+
+An empty ordinary status alone is insufficient: worktree removal can delete
+ignored machine configuration. Preserve every needed ignored file outside the
+worktree and explicitly account for disposable build output before removal.
+
+Delete a local topic branch only after GitHub reports the pull request as
+merged. Because this repository uses squash merges, Git may not recognize the
+original topic commit as an ancestor of `main`. Before using a forced local
+branch deletion, verify the immutable pull request merge commit, its patch,
+and any topic-only commits; ancestry or a whole-tree comparison alone may be
+inconclusive after the base branch advances. Keep the remote branch until that
+verification is complete.
+
+Never clean, reset, or delete an unrelated dirty worktree. Local OAuth build
+configuration and credentials remain ignored machine state and must not be
+staged as part of post-merge cleanup.
+
 ## Verification and review
 
 Run every check relevant to the change and record the commands and results in
