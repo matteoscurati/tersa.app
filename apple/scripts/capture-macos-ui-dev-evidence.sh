@@ -17,6 +17,10 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-ui-evidence.XXXXXX")"
 SOURCE="$SCRATCH/source"
 RESOLVED_ENTITLEMENTS="$SCRATCH/resolved.entitlements.plist"
 EMBEDDED_ENTITLEMENTS="$SCRATCH/embedded.entitlements.plist"
+SANDBOX_CANARY_APP="$SCRATCH/Tersa Sandbox Canary.app"
+SANDBOX_CANARY="$SANDBOX_CANARY_APP/Contents/MacOS/tersa-sandbox-write-canary"
+UNSANDBOXED_CANARY="$SCRATCH/tersa-sandbox-write-canary-unsandboxed"
+CANARY_DESTINATION="$BUILD_DIR/outside-sandbox-write-canary"
 trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
 
 section() { printf '\n== %s ==\n' "$1"; }
@@ -161,6 +165,54 @@ printf 'launch=ok\n'
   || fail 'the App Sandbox container was not materialized'
 printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\n'
 
+section 'App Sandbox denial'
+cat >"$SCRATCH/sandbox-write-canary.c" <<'CANARY'
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 64;
+    int descriptor = open(argv[1], O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (descriptor < 0) {
+        return errno == EACCES || errno == EPERM ? 73 : 74;
+    }
+    if (write(descriptor, "sandbox-canary\n", 15) != 15) return 75;
+    return close(descriptor) == 0 ? 0 : 76;
+}
+CANARY
+cc "$SCRATCH/sandbox-write-canary.c" -o "$UNSANDBOXED_CANARY"
+mkdir -p "$SANDBOX_CANARY_APP/Contents/MacOS"
+cp "$UNSANDBOXED_CANARY" "$SANDBOX_CANARY"
+cp "$APP/Contents/Info.plist" "$SANDBOX_CANARY_APP/Contents/Info.plist"
+plutil -replace CFBundleExecutable -string tersa-sandbox-write-canary \
+  "$SANDBOX_CANARY_APP/Contents/Info.plist"
+plutil -replace CFBundleName -string 'Tersa Sandbox Canary' \
+  "$SANDBOX_CANARY_APP/Contents/Info.plist"
+cp "$PROFILE_MATCH" "$SANDBOX_CANARY_APP/Contents/embedded.provisionprofile"
+chmod 600 "$SANDBOX_CANARY_APP/Contents/embedded.provisionprofile"
+codesign -s "$IDENTITY_HASH" --entitlements "$RESOLVED_ENTITLEMENTS" \
+  --force --options runtime --timestamp=none "$SANDBOX_CANARY_APP" >/dev/null 2>&1
+codesign --verify --deep --strict "$SANDBOX_CANARY_APP" >/dev/null 2>&1 \
+  || fail 'sandbox write canary signature verification failed'
+
+rm -f -- "$CANARY_DESTINATION"
+set +e
+"$SANDBOX_CANARY" "$CANARY_DESTINATION"
+SANDBOX_STATUS=$?
+set -e
+[ "$SANDBOX_STATUS" -eq 73 ] \
+  || fail 'the sandboxed canary did not receive an outside-container write denial'
+[ ! -e "$CANARY_DESTINATION" ] \
+  || fail 'the sandboxed canary created its outside-container destination'
+"$UNSANDBOXED_CANARY" "$CANARY_DESTINATION" \
+  || fail 'the unsandboxed positive control could not create its destination'
+[ -f "$CANARY_DESTINATION" ] \
+  || fail 'the unsandboxed positive control did not create its destination'
+rm -f -- "$CANARY_DESTINATION"
+printf 'sandbox_denial=outside-container create denied\n'
+printf 'sandbox_positive_control=outside-container create succeeded\n'
+
 section 'Interactive development-only walk'
 cat <<'CHECKLIST'
 Record with no pointer fallback:
@@ -170,8 +222,8 @@ Record with no pointer fallback:
      Tab/Escape behavior; edited-mid-search result suppression stays silent.
   3. Full Keyboard Access: complete the same five-screen traversal with visible
      focus and no trap, using keyboard controls only.
-  4. App Sandbox: record a sender=="Sandbox" denial for an ungranted capability
-     and a positive control proving the observation path was active.
+  4. App Sandbox: the automated bundled canary above must be denied while its
+     unsandboxed positive control succeeds.
 
 This Apple Development result is non-gate. Developer ID, notarization, retained
 artifact binding, and independent distribution review remain mandatory.
