@@ -92,18 +92,18 @@ or application setting.
 
 ## Evidence contract
 
-The dedicated `mime-apple-evidence` CI job:
+The shared macOS notice gate first regenerates and compares target-specific
+third-party notices. The dedicated `mime-apple-evidence` CI job then:
 
-1. regenerates and compares target-specific third-party notices;
-2. cross-builds the locked portable diagnostic for macOS, iOS device, and iOS
+1. cross-builds the locked portable diagnostic for macOS, iOS device, and iOS
    simulator;
-3. archives the native macOS and iOS targets and builds the simulator target;
-4. exports current Rust sanitizer output into the macOS app resource;
-5. checks signed entitlements, the exact diagnostic-only ATS exception, in-app
+2. archives the native macOS and iOS targets and builds the simulator target;
+3. exports current Rust sanitizer output into the macOS app resource;
+4. checks signed entitlements, the exact diagnostic-only ATS exception, in-app
    transport-control behavior, listeners, native policy flags, action,
    response, and new-window denial, independently derived output hashes, and
    website data;
-6. uploads only aggregate text and JSON evidence.
+5. uploads only aggregate text and JSON evidence.
 
 The separate `mime-parser-fuzz` Linux job installs the exact nightly and fuzz
 driver, validates the independent fuzz lock against its isolated license,

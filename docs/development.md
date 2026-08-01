@@ -41,6 +41,35 @@ For physical-device or signed-distribution evidence, follow the
 [physical-device and distribution protocol](m0/physical-device-and-distribution-protocol.md),
 including its commit-bound locator and review-retention rules.
 
+### CI execution modes
+
+Pull requests use a fast required lane: change-scope classification, Linux and
+macOS Rust verification, supply-chain policy, and the real Apple product build
+when production Apple paths are affected. Diagnostic Slint, Dioxus, SQLCipher,
+search, MIME, fuzz, and blob evidence is not repeated for every intermediate PR
+commit. The complete evidence set runs for every `main` push that passes
+`CI gate`; its artifacts remain bound to the immutable integrated commit and
+retain their existing 90-day lifetime. Merge-queue runs use the same fast
+required gate, including a conservative product and notice check; the resulting
+`main` push owns the exact-commit evidence. Deep evidence jobs start only after
+`CI gate` succeeds, so they cannot consume the macOS runner pool ahead of a
+required fast lane.
+
+The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
+build paths fan out conservatively, while documentation, workflow, and xtask-only
+changes avoid Apple evidence. Its table-driven tests must change with every new
+scope rule. A single suite can be reproduced without running unrelated evidence:
+
+```sh
+gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus
+```
+
+The supported suite names are `all`, `product`, `slint`, `dioxus`, `sqlcipher`,
+`search`, `mime`, `mime-fuzz`, `blob`, and `notices`. A dedicated macOS lane owns
+the single target-specific notice regeneration whenever the selected scope
+requires it; diagnostic jobs still compare the committed notice resources in
+their packaged products.
+
 ## Dependency changes
 
 Use intentional dependency declarations in the workspace manifest. Do not use
@@ -330,8 +359,9 @@ python3 apple/scripts/verify-dioxus-runtime.py
 The Dioxus verifier pins the exact 0.7.9 graph, rejects Manganis and devtools,
 allows only the required `tokio_runtime` feature, and checks the private
 WebSocket's loopback bind and mutual-key invariants in the resolved source. The
-separate Apple evidence job also regenerates the Apple-target notices and
-checks live listeners with `lsof`. Notice comparison stays on macOS because
+shared macOS notice gate regenerates the Apple-target notices, while the
+separate Apple evidence job checks live listeners with `lsof`. Notice
+comparison stays on macOS because
 `cargo-about` 0.9.1 is not byte-stable for Apple target selection across host
 operating systems. This is diagnostic evidence, not a product backend or App
 Sandbox claim. See

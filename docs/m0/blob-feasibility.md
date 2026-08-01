@@ -80,10 +80,11 @@ IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
   --package tersa-blob-spike --target aarch64-apple-ios-sim
 ```
 
-The dedicated `blob-apple-evidence` job regenerates all target-specific
-notices, cross-builds the release diagnostic for macOS, iOS device, and iOS
-simulator, runs the macOS arm64 process-crash protocol, binds `result.txt` to
-the source commit, and retains the aggregate artifact for 90 days.
+The shared macOS notice gate regenerates all target-specific notices. The
+dedicated `blob-apple-evidence` job cross-builds the release diagnostic for
+macOS, iOS device, and iOS simulator, runs the macOS arm64 process-crash
+protocol, binds `result.txt` to the source commit, and retains the aggregate
+artifact for 90 days.
 
 ## Non-claims and remaining gates
 

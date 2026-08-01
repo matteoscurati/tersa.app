@@ -5,13 +5,33 @@ on:
   push:
     branches: [main]
   merge_group:
+  workflow_dispatch:
+    inputs:
+      evidence_suite:
+        description: Evidence suite to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - product
+          - slint
+          - dioxus
+          - sqlcipher
+          - search
+          - mime
+          - mime-fuzz
+          - blob
+          - notices
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Supersede stale commits only within one pull request. Main and manual runs
+  # use their unique run ID so every integrated commit retains full evidence.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,47 +44,91 @@ jobs:
     name: Detect change scope
     runs-on: ubuntu-24.04
     outputs:
-      run_evidence: ${{ steps.scope.outputs.run_evidence }}
+      product_apple: ${{ steps.scope.outputs.product_apple }}
+      slint: ${{ steps.scope.outputs.slint }}
+      dioxus: ${{ steps.scope.outputs.dioxus }}
+      sqlcipher: ${{ steps.scope.outputs.sqlcipher }}
+      search: ${{ steps.scope.outputs.search }}
+      mime: ${{ steps.scope.outputs.mime }}
+      mime_fuzz: ${{ steps.scope.outputs.mime_fuzz }}
+      blob: ${{ steps.scope.outputs.blob }}
+      notices: ${{ steps.scope.outputs.notices }}
+      run_full_evidence: ${{ steps.scope.outputs.run_full_evidence }}
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+      - name: Test change-scope classifier
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_ci_change_scope.py
       - name: Determine change scope
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVIDENCE_SUITE: ${{ inputs.evidence_suite }}
         run: |
           set -euo pipefail
-          # Only pull requests take the fast path; push and merge_group run full evidence.
-          if [ "$EVENT_NAME" != "pull_request" ]; then
-            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Diff from the merge base so a branch that is behind main reports only
-          # its own changes, never files that merely advanced on the base branch.
-          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-          files="$(git diff --name-only "$merge_base" "$HEAD_SHA")"
-          printf 'changed files:\n%s\n' "$files"
-          if [ -z "$files" ]; then
-            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # The evidence jobs never build xtask, workflows, or docs, so skip them only
-          # when EVERY changed path is one of those; any other path runs full evidence.
-          if printf '%s\n' "$files" | grep -qvE '^(xtask/|\.github/|.*\.md$)'; then
-            echo "run_evidence=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_evidence=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$EVENT_NAME" in
+            push)
+              python3 scripts/ci-change-scope.py --full >> "$GITHUB_OUTPUT"
+              echo "run_full_evidence=true" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              case "$EVIDENCE_SUITE" in
+                all)
+                  python3 scripts/ci-change-scope.py --full >> "$GITHUB_OUTPUT"
+                  echo "run_full_evidence=true" >> "$GITHUB_OUTPUT"
+                  ;;
+                product) scope_path='about-bridge.toml' ;;
+                slint) scope_path='about.toml' ;;
+                dioxus) scope_path='about-dioxus.toml' ;;
+                sqlcipher) scope_path='about-sqlcipher.toml' ;;
+                search) scope_path='about-search.toml' ;;
+                mime) scope_path='about-mime.toml' ;;
+                mime-fuzz) scope_path='fuzz/Cargo.lock' ;;
+                blob) scope_path='about-blob.toml' ;;
+                notices) scope_path='apple/licenses/rust-skia-notices.txt' ;;
+                *) echo "Unsupported evidence suite: $EVIDENCE_SUITE" >&2; exit 1 ;;
+              esac
+              if [ "$EVIDENCE_SUITE" != all ]; then
+                python3 scripts/ci-change-scope.py "$scope_path" >> "$GITHUB_OUTPUT"
+                echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            merge_group)
+              # The merge queue conservatively checks the product and notices
+              # for the combined state. Deep exact-commit evidence is produced
+              # by the subsequent main push.
+              python3 scripts/ci-change-scope.py --full >> "$GITHUB_OUTPUT"
+              echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request)
+              # Diff from the merge base so a branch that is behind main reports
+              # only its own changes, never files that advanced on the base branch.
+              merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+              # Disable rename detection so both the removed source and added
+              # destination are classified. A rename into docs must not hide a
+              # production path from the fail-closed product gate.
+              files="$(git diff --no-renames --name-only "$merge_base" "$HEAD_SHA")"
+              printf 'changed files:\n%s\n' "$files"
+              printf '%s\n' "$files" | python3 scripts/ci-change-scope.py \
+                >> "$GITHUB_OUTPUT"
+              echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported GitHub event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
 
-  apple-bootstrap:
-    name: Apple bootstrap
+  apple_product:
+    name: Apple product
     needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    if: ${{ needs.changes.outputs.product_apple == 'true' }}
     runs-on: macos-26
+    timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       TERSA_OAUTH_CLIENT_ID: public-ci-client.apps.googleusercontent.com
@@ -76,6 +140,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -212,16 +278,48 @@ jobs:
       - name: Verify OAuth PKCE and sandbox feasibility
         run: sh apple/scripts/verify-oauth-feasibility.sh
       - name: Bind OAuth feasibility evidence to the source commit
-        if: always()
+        if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         run: python3 scripts/write-evidence-manifest.py apple/build/oauth-evidence "$EVIDENCE_COMMIT_SHA"
       - name: Upload OAuth feasibility evidence
-        if: always()
+        if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
           name: oauth-pkce-feasibility-evidence
           path: apple/build/oauth-evidence
           if-no-files-found: error
           retention-days: 90
+  slint-apple-evidence:
+    name: Slint Apple evidence
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'slint' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Verify Xcode 26
+        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
+      - name: Install XcodeGen 2.45.4
+        env:
+          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
+        run: |
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
+          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
+      - name: Generate Apple project
+        run: sh apple/scripts/generate-project.sh
       - name: Build and archive unsigned macOS Slint spike
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
@@ -256,8 +354,8 @@ jobs:
 
   dioxus-apple-evidence:
     name: Dioxus Apple evidence
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'dioxus' }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -269,6 +367,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -282,14 +382,6 @@ jobs:
           unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Verify Dioxus runtime boundary
         run: python3 apple/scripts/verify-dioxus-runtime.py
       - name: Verify device evidence schema and redaction rejection
@@ -356,8 +448,8 @@ jobs:
 
   sqlcipher-apple-evidence:
     name: SQLCipher Apple evidence
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'sqlcipher' }}
     runs-on: macos-26
     timeout-minutes: 20
     env:
@@ -371,16 +463,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Build SQLCipher diagnostic for iOS targets
         run: |
           cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios
@@ -401,8 +487,8 @@ jobs:
 
   search-apple-evidence:
     name: Search Apple evidence
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'search' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -416,16 +502,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Cross-build encrypted search diagnostic
         run: |
           cargo build --locked --release --package tersa-search-spike --target aarch64-apple-darwin
@@ -447,8 +527,8 @@ jobs:
 
   mime-apple-evidence:
     name: MIME and HTML Apple evidence
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -462,6 +542,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -475,14 +557,6 @@ jobs:
           unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Cross-build portable MIME diagnostic
         run: |
           cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-darwin
@@ -524,8 +598,8 @@ jobs:
 
   mime-parser-fuzz:
     name: Deterministic MIME parser fuzz regression
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime-fuzz' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -536,6 +610,8 @@ jobs:
         with:
           toolchain: nightly-2026-07-14
           components: clippy,rust-src,rustfmt
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install exact fuzz and policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
@@ -585,8 +661,8 @@ jobs:
 
   blob-apple-evidence:
     name: Crash-safe AEAD blob Apple evidence
-    needs: changes
-    if: ${{ needs.changes.outputs.run_evidence == 'true' }}
+    needs: [changes, ci_gate]
+    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'blob' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -600,16 +676,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
       - name: Cross-build portable blob diagnostic for iOS
         run: |
           cargo build --locked --release --package tersa-blob-spike --target aarch64-apple-ios
@@ -628,8 +698,32 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  notices:
+    name: Third-party notices
+    needs: changes
+    if: ${{ needs.changes.outputs.notices == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install notice generator
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Check target-specific third-party notices
+        run: sh apple/scripts/generate-third-party-notices.sh --check
+
   rust:
     name: Rust (${{ matrix.os }})
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -640,6 +734,9 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Prepare verified rust-skia archive
         if: runner.os == 'macOS'
         run: |
@@ -658,6 +755,9 @@ jobs:
           fetch-depth: 0
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache-on-failure: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify M0 product gates
         run: |
           python3 scripts/verify-m0-gates.py --self-test
@@ -665,7 +765,7 @@ jobs:
       - name: Install policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
-          tool: cargo-about@0.9.1,cargo-audit@0.22.1,cargo-deny@0.20.2,cargo-hack@0.6.45,typos-cli@1.48.0
+          tool: cargo-audit@0.22.1,cargo-deny@0.20.2,cargo-hack@0.6.45,typos-cli@1.48.0
       - name: Fetch locked dependencies for offline policy checks
         run: cargo fetch --locked
       - name: Check dependency licenses and sources
@@ -720,3 +820,36 @@ jobs:
           cargo run --locked --package xtask -- dco
           "${{ github.event.before }}"
           "${{ github.sha }}"
+
+  ci_gate:
+    name: CI gate
+    needs: [changes, apple_product, notices, rust, policy]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the fast CI lane
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
+          NOTICES_RESULT: ${{ needs.notices.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "changes=$CHANGES_RESULT" \
+            "apple_product=$APPLE_PRODUCT_RESULT" \
+            "notices=$NOTICES_RESULT" \
+            "rust=$RUST_RESULT" \
+            "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$CHANGES_RESULT" = success
+          case "$APPLE_PRODUCT_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$NOTICES_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          test "$RUST_RESULT" = success
+          test "$POLICY_RESULT" = success

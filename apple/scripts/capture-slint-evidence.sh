@@ -10,6 +10,8 @@ apple_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${apple_dir}/build/slint-evidence"
 mac_app="${apple_dir}/build/TersaSlintMac.xcarchive/Products/Applications/Tersa Slint Spike.app"
 ios_app="${apple_dir}/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa Slint Spike.app"
+window_finder="${apple_dir}/build/slint-find-process-window"
+ocr_recognizer="${apple_dir}/build/slint-recognize-image-text"
 mkdir -p "$build_dir"
 
 mac_pid=''
@@ -61,49 +63,12 @@ now_ns() {
 
 recognize_text() {
   image_path="$1"
-  xcrun swift - "$image_path" <<'SWIFT'
-import AppKit
-import Vision
-
-let path = CommandLine.arguments[1]
-guard let image = NSImage(contentsOfFile: path) else {
-    fatalError("Cannot load screenshot at \(path)")
-}
-var proposedRect = NSRect(origin: .zero, size: image.size)
-guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
-    fatalError("Cannot create a CGImage for \(path)")
-}
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = false
-try VNImageRequestHandler(cgImage: cgImage).perform([request])
-for observation in request.results ?? [] {
-    if let candidate = observation.topCandidates(1).first {
-        print(candidate.string)
-    }
-}
-SWIFT
+  "$ocr_recognizer" "$image_path"
 }
 
 find_mac_window() {
   process_id="$1"
-  xcrun swift - "$process_id" <<'SWIFT'
-import CoreGraphics
-import Foundation
-
-let processIdentifier = Int32(CommandLine.arguments[1])!
-let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[CFString: Any]] ?? []
-for window in windows {
-    let owner = (window[kCGWindowOwnerPID] as? NSNumber)?.int32Value
-    let layer = (window[kCGWindowLayer] as? NSNumber)?.intValue
-    let number = (window[kCGWindowNumber] as? NSNumber)?.intValue
-    if owner == processIdentifier && layer == 0, let number {
-        print(number)
-        break
-    }
-}
-SWIFT
+  "$window_finder" "$process_id"
 }
 
 wait_for_mac_window() {
@@ -141,6 +106,9 @@ stop_mac() {
   wait "$mac_pid" 2>/dev/null || true
   mac_pid=''
 }
+
+xcrun swiftc "${apple_dir}/scripts/find-process-window.swift" -o "$window_finder"
+xcrun swiftc "${apple_dir}/scripts/recognize-image-text.swift" -o "$ocr_recognizer"
 
 mac_cold_start=$(now_ns)
 start_mac
