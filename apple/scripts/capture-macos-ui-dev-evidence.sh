@@ -32,14 +32,12 @@ TRANSLATED="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
 COMMIT="$(git rev-parse HEAD)"
 
 IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null \
-  | sed -nE 's/^[[:space:]]*[0-9]+\) ([0-9A-Fa-f]{40}) "Apple Development: .* \(([A-Z0-9]{10})\)"$/\1 \2/p')"
+  | sed -nE 's/^[[:space:]]*[0-9]+\) ([0-9A-Fa-f]{40}) "Apple Development: .+"$/\1/p')"
 IDENTITY_COUNT="$(printf '%s\n' "$IDENTITIES" | awk 'NF { count += 1 } END { print count + 0 }')"
 [ "$IDENTITY_COUNT" -eq 1 ] \
   || fail 'capture requires exactly one valid Apple Development identity'
 IDENTITY_HASH="$(printf '%s\n' "$IDENTITIES" | awk 'NF { print $1 }')"
-TEAM_ID="$(printf '%s\n' "$IDENTITIES" | awk 'NF { print $2 }')"
-[ -n "$IDENTITY_HASH" ] && [ -n "$TEAM_ID" ] \
-  || fail 'the Apple Development identity is incomplete'
+[ -n "$IDENTITY_HASH" ] || fail 'the Apple Development identity is incomplete'
 
 mkdir -p "$SOURCE" "$BUILD_DIR"
 git archive --format=tar --output="$SCRATCH/source.tar" "$COMMIT"
@@ -61,6 +59,15 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac -configuration Releas
   TERSA_OAUTH_REDIRECT_SCHEME="${TERSA_OAUTH_REDIRECT_SCHEME:-app.tersa.oauth.development-evidence}" \
   build >/dev/null
 printf 'unsigned_build=ok\n'
+
+# Derive the effective Team Identifier from a first, entitlement-free signature.
+# The human-readable certificate label is not authoritative and may contain a
+# different parenthesized account identifier on development certificates.
+codesign -s "$IDENTITY_HASH" --force --options runtime --timestamp=none \
+  "$APP" >/dev/null 2>&1
+TEAM_ID="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+printf '%s\n' "$TEAM_ID" | grep -qE '^[A-Z0-9]{10}$' \
+  || fail 'the effective Apple Development team identifier is unavailable'
 
 sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
   "$SOURCE/apple/macos/TersaMac.entitlements" >"$RESOLVED_ENTITLEMENTS"
