@@ -29,6 +29,12 @@ cache, or network. The committed report tool emits aggregate values only and
 rejects an invalid commit, missing sample, malformed marker, or threshold
 breach.
 
+After the worktree preflight, the runner exports the declared commit with
+`git archive` and performs every Cargo, Xcode, bundle, and DMG operation inside
+that temporary tracked-only source tree. Ignored local configuration,
+credentials, generated projects, and build outputs therefore cannot enter the
+candidate or affect its measured size. The temporary export is removed on exit.
+
 ## Automated pre-measurements
 
 The synthetic runner records:

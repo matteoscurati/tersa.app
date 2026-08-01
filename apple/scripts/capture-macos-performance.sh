@@ -11,6 +11,7 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-performance.XXXXXX")"
+SOURCE="$SCRATCH/source"
 DERIVED="$SCRATCH/DerivedData"
 APP="$DERIVED/Build/Products/Release/Tersa.app"
 DMG="$SCRATCH/Tersa.dmg"
@@ -32,6 +33,14 @@ TRANSLATED="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
   printf 'error: commit-bound capture requires a clean worktree\n' >&2
   exit 1
 }
+COMMIT="$(git rev-parse HEAD)"
+
+# Build only tracked bytes from the declared commit. Ignored credentials or
+# generated files under a recursive Xcode source root cannot enter the bundle.
+mkdir -p "$SOURCE"
+git archive --format=tar --output="$SCRATCH/source.tar" "$COMMIT"
+tar -xf "$SCRATCH/source.tar" -C "$SOURCE"
+cd "$SOURCE"
 
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py >/dev/null
 
@@ -72,4 +81,4 @@ python3 scripts/macos-performance-report.py capture \
   --executable "$TEST_EXECUTABLE" \
   --app "$APP" \
   --dmg "$DMG" \
-  --commit "$(git rev-parse HEAD)"
+  --commit "$COMMIT"
