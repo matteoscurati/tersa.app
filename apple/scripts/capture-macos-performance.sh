@@ -14,6 +14,7 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-performance.XXXXXX")"
 DERIVED="$SCRATCH/DerivedData"
 APP="$DERIVED/Build/Products/Release/Tersa.app"
 DMG="$SCRATCH/Tersa.dmg"
+DMG_ROOT="$SCRATCH/dmg-root"
 trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
 
 cd "$ROOT"
@@ -54,7 +55,9 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac -configuration Releas
   TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.performance-harness \
   build >/dev/null
 
-hdiutil create -quiet -fs HFS+ -format UDZO -srcfolder "$APP" -volname Tersa "$DMG"
+mkdir -p "$DMG_ROOT"
+ditto "$APP" "$DMG_ROOT/Tersa.app"
+hdiutil create -quiet -fs HFS+ -format UDZO -srcfolder "$DMG_ROOT" -volname Tersa "$DMG"
 
 python3 scripts/macos-performance-report.py capture \
   --executable "$TEST_EXECUTABLE" \
