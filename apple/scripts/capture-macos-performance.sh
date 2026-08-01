@@ -23,7 +23,7 @@ cd "$ROOT"
   exit 1
 }
 
-python3 -m unittest scripts/test_macos_performance_report.py >/dev/null
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py >/dev/null
 
 cargo test --locked --release -p tersa-store-sqlcipher-macos \
   performance_harness_sample --no-run --message-format=json \
