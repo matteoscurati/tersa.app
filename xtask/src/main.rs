@@ -2486,7 +2486,52 @@ fn swift_bootstrap_source_violations(worker: &str, app_delegate: &str) -> Vec<St
                 .to_owned(),
         );
     }
+    for required in [
+        "@main\n@MainActor\nprivate enum TersaApplication",
+        "private static let delegate = AppDelegate()",
+    ] {
+        if !app_delegate.contains(required) {
+            violations.push(format!(
+                "AppDelegate.swift is missing explicit application entrypoint source `{required}`"
+            ));
+        }
+    }
+    if app_delegate.matches("@main").count() != 1 {
+        violations.push(
+            "AppDelegate.swift must contain exactly one explicit application entrypoint".to_owned(),
+        );
+    }
+    if !swift_has_canonical_application_main(&app_delegate) {
+        violations.push(
+            "AppDelegate.swift must create NSApplication, install the retained delegate, and run the event loop exactly once in that order inside the sole main() body"
+                .to_owned(),
+        );
+    }
     violations
+}
+
+fn swift_has_canonical_application_main(document: &str) -> bool {
+    let bodies = swift_function_bodies(document, "main");
+    let [body] = bodies.as_slice() else {
+        return false;
+    };
+    let required = [
+        "let application = NSApplication.shared",
+        "application.delegate = delegate",
+        "application.run()",
+    ];
+    if required
+        .iter()
+        .any(|source| document.matches(source).count() != 1 || body.matches(source).count() != 1)
+    {
+        return false;
+    }
+    let compact = body
+        .bytes()
+        .filter(|byte| !is_rust_ascii_whitespace(*byte))
+        .collect::<Vec<_>>();
+    compact
+        == b"{letapplication=NSApplication.sharedapplication.delegate=delegateapplication.run()}"
 }
 
 fn swift_bootstrap_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
@@ -8532,8 +8577,21 @@ else if pending == nil {}
 tersa_macos_bootstrap_default_account(pointer, count)
 ";
         let app = r"
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
 func applicationDidFinishLaunching(_ notification: Notification) { _ = version() }
 func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActor (ProductBootstrapStatus) -> Void) { bootstrapWorker.submit(accountIdentifier: bytes, completion: completion) }
+}
+@main
+@MainActor
+private enum TersaApplication {
+    private static let delegate = AppDelegate()
+    static func main() {
+        let application = NSApplication.shared
+        application.delegate = delegate
+        application.run()
+    }
+}
 ";
         assert!(swift_bootstrap_source_violations(worker, app).is_empty());
         assert!(
@@ -8565,6 +8623,37 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
             )
             .is_empty()
         );
+        for drift in [
+            app.replace("application.delegate = delegate", ""),
+            app.replace("private static let delegate = AppDelegate()", ""),
+            app.replace("application.run()", ""),
+            app.replace("@main\n@MainActor\nprivate enum TersaApplication", ""),
+            app.replace(
+                "application.delegate = delegate\n        application.run()",
+                "application.run()\n        application.delegate = delegate",
+            ),
+            app.replace(
+                "application.delegate = delegate",
+                "installDelegate(application)\n    }\n    static func installDelegate(_ application: NSApplication) {\n        application.delegate = delegate",
+            ),
+            app.replace(
+                "application.delegate = delegate",
+                "if CommandLine.arguments.isEmpty {\n            application.delegate = delegate\n        }",
+            ),
+            app.replace(
+                "application.delegate = delegate",
+                "let delegate = AppDelegate()\n        application.delegate = delegate",
+            ),
+            app.replace(
+                "@MainActor\nfinal class AppDelegate",
+                "@main\n@MainActor\nfinal class AppDelegate",
+            ),
+        ] {
+            assert!(
+                !swift_bootstrap_source_violations(worker, &drift).is_empty(),
+                "an uninstalled or ambiguous AppKit entrypoint must fail closed"
+            );
+        }
     }
 
     #[test]

@@ -71,6 +71,27 @@ impl TokenClientConfig {
         })
     }
 
+    /// Creates a configuration from an optional borrowed Desktop-client secret.
+    ///
+    /// The borrowed value is copied directly into zeroizing storage. This keeps
+    /// callers that only hold build-time configuration strings from depending on
+    /// the concrete secret-storage wrapper.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::new`].
+    pub fn new_with_optional_client_secret<T: Into<String>>(
+        client_id: T,
+        redirect_uri: Url,
+        client_secret: Option<&str>,
+    ) -> Result<Self, TokenError> {
+        Self::new(
+            client_id,
+            redirect_uri,
+            client_secret.map(|secret| Zeroizing::new(secret.to_owned())),
+        )
+    }
+
     /// Returns the public OAuth client identifier.
     #[must_use]
     pub fn client_id(&self) -> &str {
@@ -1089,6 +1110,30 @@ mod tests {
             .unwrap_err(),
             TokenError::InvalidConfiguration
         );
+        assert_eq!(
+            TokenClientConfig::new_with_optional_client_secret(
+                "public-test-client",
+                test_redirect(),
+                Some("   "),
+            )
+            .unwrap_err(),
+            TokenError::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn borrowed_optional_client_secret_is_copied_into_redacted_storage() {
+        let config = TokenClientConfig::new_with_optional_client_secret(
+            "public-test-client",
+            test_redirect(),
+            Some("desktop-test-secret"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.client_secret().map(|secret| secret.as_str()),
+            Some("desktop-test-secret")
+        );
+        assert!(!format!("{config:?}").contains("desktop-test-secret"));
     }
 
     fn claims(subject: &str, audiences: &[&str], issuer: &str, azp: Option<&str>) -> IdTokenClaims {

@@ -5,7 +5,6 @@
 import AppKit
 import SwiftUI
 
-@main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The app-held OAuth authorization session the reviewed view-model
@@ -41,5 +40,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
         mainWindow = window
+    }
+}
+
+@main
+@MainActor
+private enum TersaApplication {
+    private static let delegate = AppDelegate()
+
+    static func main() {
+        let application = NSApplication.shared
+        application.delegate = delegate
+        application.run()
     }
 }
