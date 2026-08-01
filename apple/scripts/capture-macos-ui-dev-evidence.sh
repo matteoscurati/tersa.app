@@ -101,7 +101,7 @@ for key in \
   printf '%s\n' "$ENTITLEMENTS_OUT" | grep -qE "^  \"$key\" =>" \
     || fail "reviewed entitlement missing: $key"
 done
-APP_GROUP="$(plutil -extract com.apple.security.application-groups.0 raw "$EMBEDDED_ENTITLEMENTS")"
+APP_GROUP="$(plutil -extract 'com\.apple\.security\.application-groups.0' raw "$EMBEDDED_ENTITLEMENTS")"
 KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$EMBEDDED_ENTITLEMENTS")"
 [ "$APP_GROUP" = "$TEAM_ID.app.tersa.shared" ] \
   || fail 'the embedded application group is not team-prefixed app.tersa.shared'
