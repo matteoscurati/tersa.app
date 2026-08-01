@@ -382,6 +382,8 @@ jobs:
           unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
+      - name: Fetch locked dependencies for offline runtime verification
+        run: cargo fetch --locked
       - name: Verify Dioxus runtime boundary
         run: python3 apple/scripts/verify-dioxus-runtime.py
       - name: Verify device evidence schema and redaction rejection
