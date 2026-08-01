@@ -17,11 +17,13 @@ sh apple/scripts/capture-macos-performance.sh > macos-performance.json
 
 The script builds the real Release application unsigned, creates a compressed
 UDZO DMG, compiles the production SQLCipher adapter in Release mode, discards
-one warm-up sample, and records five samples. Its fixture contains exactly 100
-synthetic envelopes under `example.invalid`; it never opens the product
-Keychain, account profile, Gmail cache, or network. The committed report tool
-emits aggregate values only and rejects an invalid commit, missing sample,
-malformed marker, or threshold breach.
+one warm-up sample, and records five samples. It rejects a dirty worktree before
+building so its exact commit cannot conceal staged, unstaged, or untracked
+source. Its fixture contains exactly 100 synthetic envelopes under
+`example.invalid`; it never opens the product Keychain, account profile, Gmail
+cache, or network. The committed report tool emits aggregate values only and
+rejects an invalid commit, missing sample, malformed marker, or threshold
+breach.
 
 ## Automated pre-measurements
 

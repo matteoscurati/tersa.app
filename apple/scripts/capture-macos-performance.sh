@@ -18,6 +18,11 @@ trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
 
 cd "$ROOT"
 
+[ -z "$(git status --porcelain --untracked-files=all)" ] || {
+  printf 'error: commit-bound capture requires a clean worktree\n' >&2
+  exit 1
+}
+
 python3 -m unittest scripts/test_macos_performance_report.py >/dev/null
 
 cargo test --locked --release -p tersa-store-sqlcipher-macos \
