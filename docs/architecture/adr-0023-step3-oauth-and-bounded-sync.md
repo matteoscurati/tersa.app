@@ -36,13 +36,14 @@ Much of the machinery exists and is reviewed:
 - the bounded sync coordinator ([ADR 0018](adr-0018-bounded-sync-and-cache.md),
   `crates/application/src/sync.rs`) and the store reconcile path.
 
-The one genuinely new and security-critical subsystem is the **token lifecycle**.
-Today the bridge validates the authorization callback and then `drop(grant)`s it
-(`apple/rust-bridge/src/oauth.rs`, `complete_callback`): no token exchange, no
-refresh, no persistence, no revocation exists anywhere, and
-`adapters/keychain-macos` has no token surface. This ADR plans Step 3; it
-implements nothing. It follows the ADR 0021 precedent of a plan-only ADR whose
-decisions are realized in later, independently reviewed pull requests.
+At adoption time, the one genuinely new and security-critical subsystem was the
+**token lifecycle**. The bridge then validated the authorization callback and
+`drop(grant)`ed it (`apple/rust-bridge/src/oauth.rs`, `complete_callback`): token
+exchange, refresh, persistence, revocation, and the Keychain token surface did
+not yet exist. This ADR was accepted as the Step-3 implementation plan, following
+the ADR 0021 precedent of a plan-only ADR whose decisions would be realized in
+later, independently reviewed pull requests. The implementation outcome below
+records the completed state and supersedes these adoption-time facts.
 
 The binding constraints (unchanged): each user connects **their own** Google
 account through the official API; the product application is the sole profile
@@ -457,24 +458,25 @@ reusable `emailAddress`. `sub` is used only as gate input (hashed, never shown).
 ### Client configuration and injection
 
 The committed `apple/project.yml` OAuth placeholders stay `UNCONFIGURED`; the
-client ID and — only if the client-secret probe shows the token endpoint requires
-one — the non-confidential secret are injected locally at build time through a small
-reviewed override that leaves the pinned `project.yml` structure unchanged, and are
-never committed. The Google Cloud requirements are: a project with the Gmail API
-enabled; an OAuth consent screen (External, Testing, with the developer's own
-address as a test user); the `gmail.readonly` scope; and a **Desktop app** OAuth
-client (client ID, plus the client's non-confidential secret if the probe requires
-it; loopback needs no redirect registration).
+client ID and optional non-confidential client secret are injected locally at
+build time through a reviewed override that leaves the pinned `project.yml`
+structure unchanged, and are never committed. The 3f Desktop client required
+the secret; another client configuration may omit it if its token endpoint
+accepts that shape. The Google Cloud requirements are: a project with the Gmail
+API enabled; an OAuth consent screen (External, Testing, with the developer's
+own address as a test user); the `gmail.readonly` scope; and a **Desktop app**
+OAuth client. Loopback needs no redirect registration.
 
 ### Decomposition into bounded, independently reviewed PRs
 
-Everything except the final live run builds and is reviewed against the
-`UNCONFIGURED` placeholder, which fails closed at every layer. Only 3f **builds or
-runs** against the live client; the sole earlier touch of a live credential is the
-one-off out-of-band `curl` client-secret probe before 3a (manual evidence, no build
-artifact, the secret never committed or logged).
+The accepted decomposition kept every source slice buildable and reviewable
+against the `UNCONFIGURED` placeholder, which fails closed at every layer. Only
+3f built and ran against the live client. The planned earlier probe did not
+settle the concrete client's request shape; 3f exposed the missing-secret
+response and PR #76 added the optional configuration before the successful
+rerun. No credential or live authorization artifact was committed or logged.
 
-- **ADR 0023** (this document): the plan.
+- **ADR 0023** (this document): the adopted implementation plan.
 - **3a** — portable token exchange/refresh state machine and port; **replace**
   `GMAIL_MODIFY_SCOPE` with `gmail.readonly` so no `gmail.modify` code path remains.
   No I/O; deterministic tests. Its request shape is frozen only after the
