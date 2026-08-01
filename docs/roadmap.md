@@ -62,9 +62,13 @@ containment, accessibility, or a production renderer. `M0-MIME-001` therefore
 remains open at its device-signed evidence requirement.
 
 The portable PKCE state machine and Apple callback transports are implemented
-with deterministic evidence. Real consumer and Workspace authorization, code
-exchange, Keychain persistence, revocation, and Google verification remain M0
-work and are not implied by the transport feasibility result.
+with deterministic evidence. A development-signed macOS run also completed
+real consumer authorization, code exchange, group-scoped Keychain persistence,
+read-only Gmail sync, confirmed revoke, and local purge. `M0-OAUTH-001` remains
+open because that run was not captured as the immutable retained, independently
+attested device-signed evidence the register requires. Workspace authorization,
+physical-device browser lifecycle, and Google restricted-scope verification
+remain unproven.
 
 The Slint diagnostic packages successfully, but its production gate failed
 because the locked Winit accessibility adapter is a no-op on iOS. The planned
@@ -135,8 +139,9 @@ and Gmail through the official API.
 This phase does not pass, delete, or downgrade M0 gates. A macOS baseline never
 satisfies `M1-UI-001` and never changes the mobile-inclusive
 `ui_baseline_approved` flag. The current cache budgets remain constraints, not
-passes. Real Google authorization and verification also remain open until their
-own reviewed evidence exists.
+passes. The real Google consumer flow is implemented and has run successfully
+under an Apple Development signature. Its formal gate and Google verification
+remain open until qualifying reviewed evidence exists.
 
 The bootstrap-source implementation does not edit or pass the M0 gate register,
 add a new executable, Xcode, signing, entitlement, package, or distribution

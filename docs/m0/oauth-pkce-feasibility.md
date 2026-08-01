@@ -2,13 +2,17 @@
 
 ## Decision
 
-The M0 callback transport is feasible for both Apple targets, subject to real
-Google authorization and physical-device validation in a later gate.
+The M0 callback transport is feasible for both Apple targets. The macOS path
+has also completed a development-signed live run against the owner's Google
+account; the authoritative gate remains open because that run was not captured
+as the commit-bound, retained, independently attested evidence the gate
+requires.
 
 - Rust generates independent 256-bit verifier and state values from the OS
   CSPRNG and always derives an RFC 7636 S256 challenge.
-- The authorization request uses only `gmail.modify` and contains no client
-  secret.
+- The authorization request uses `gmail.readonly` for Gmail access and
+  `openid` only to obtain the immutable OIDC subject used by the account-
+  identity gate. It contains no client secret.
 - macOS binds `127.0.0.1` on an ephemeral port before returning the browser
   URL. Its HTTP receiver discards malformed or speculative connections, then
   consumes the first syntactically valid callback on the exact provider-
@@ -29,14 +33,26 @@ iOS simulator targets, verifies exported bridge symbols and Info.plist values,
 and executes an ad-hoc-signed macOS sandbox probe that needs both inbound and
 outbound loopback networking.
 
+On 2026-08-01, Step 3f exercised a Release/arm64 build signed with an Apple
+Development identity and the full committed production entitlements. The
+owner completed consent in the browser; Tersa exchanged the loopback code,
+stored the refresh token in the group-scoped Keychain, fetched read-only Gmail
+data into the encrypted mailbox, rendered messages, and then disconnected with
+a confirmed provider revoke, local token deletion, and mailbox purge. The
+concrete Google Desktop client required its issued `client_secret` at the token
+endpoint even with PKCE. [PR #76](https://github.com/matteoscurati/tersa.app/pull/76)
+landed optional build-time support for that non-confidential native-app
+configuration; the value stayed in ignored local configuration and was neither
+committed nor logged.
+
 This is not evidence of:
 
-- authorization against a real Google consumer or Workspace account;
-- token endpoint compatibility;
-- refresh-token persistence or Keychain behavior;
-- Gmail API access;
+- the `M0-OAUTH-001` device-signed gate, because no immutable retained evidence
+  artifact and independent evidence attestation were registered;
+- authorization against a Google Workspace account;
 - physical-device browser lifecycle behavior;
-- Google restricted-scope verification.
+- Google restricted-scope verification or CASA;
+- Developer ID, notarized, or distributable release behavior.
 
 ## Security invariants
 
@@ -51,9 +67,15 @@ the browser. Another local process can reach the port. Unpredictable state
 prevents callback injection, while PKCE prevents an intercepted code from being
 redeemed without its verifier.
 
-## Deferred work
+## Remaining work
 
-The next OAuth slice must exchange the validated code without a client secret,
-keep the access token in memory, store only the refresh token in a device-only
-Keychain item, serialize refresh per account, and exercise real Google test
-accounts. It must not weaken any invariant established here.
+The live implementation keeps access tokens in memory, persists only the
+refresh token in a device-only Keychain item, and serializes refresh per
+account. Remaining hardening is tracked separately: the
+[distinct token Keychain access group](https://github.com/matteoscurati/tersa.app/issues/51),
+[durable revoke-unconfirmed state](https://github.com/matteoscurati/tersa.app/issues/80),
+[client-side operation deadlines](https://github.com/matteoscurati/tersa.app/issues/81),
+[complete Swift FFI call inventory](https://github.com/matteoscurati/tersa.app/issues/82),
+and [offline freshness UI](https://github.com/matteoscurati/tersa.app/issues/83).
+None weakens the invariants above or reopens the completed Step 3 delivery
+slice; gate closure still requires the separately governed evidence tier.

@@ -1,8 +1,24 @@
 # macOS UI development-signed accessibility and App Sandbox evidence
 
+## Current-state addendum — 2026-08-01
+
+The credential condition recorded below is historical. An Apple Development
+identity and matching development provisioning are now available. A
+Release/arm64 Tersa build signed by that team launched with all five committed
+production entitlements and completed the ADR-0023 Step-3f live OAuth, sync,
+and disconnect flow; [PR #76](https://github.com/matteoscurati/tersa.app/pull/76)
+contains the source fixes found by that run.
+
+That live run did not execute or attest the VoiceOver, Full Keyboard Access,
+sandbox-denial, or complete performance checklist in sections 3–6. Those
+observations therefore remain pending a new development-signed capture. The
+historical ad-hoc evidence below is retained unchanged as the exact record of
+its earlier source state; it is not a statement about current credential
+availability and it still passes no release gate.
+
 ## Purpose and non-claim
 
-This document records **development-signed (ad-hoc)** accessibility and App
+This document records **local ad-hoc** accessibility and App
 Sandbox observations for the macOS UI vertical slice (ADR-0021 slices 2c–2e:
 account connection, inbox, thread, search, composer entry), captured at an exact
 commit by `apple/scripts/capture-macos-ui-dev-evidence.sh`.

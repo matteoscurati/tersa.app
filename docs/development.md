@@ -85,7 +85,11 @@ crate or changing an internal edge.
 The M0 adapter proves authorization request generation and native callback
 transport without real Google credentials. Official builds inject public OAuth
 client identifiers and the registered iOS callback scheme as Xcode build
-settings; they are not secrets. An unconfigured build fails closed.
+settings; they are not secrets. Some Google Desktop clients also require their
+issued client secret at the token endpoint even with PKCE. For an installed
+native app this is non-confidential client configuration, not an authentication
+boundary; inject it only through ignored local or release configuration and
+never commit or log it. An unconfigured build fails closed.
 
 ```sh
 xcodebuild ... \
