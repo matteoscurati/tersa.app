@@ -11,6 +11,7 @@ apple_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${apple_dir}/build/dioxus-evidence"
 mac_home="${build_dir}/macos-home"
 window_finder="${apple_dir}/build/find-process-window"
+ocr_recognizer="${apple_dir}/build/dioxus-recognize-image-text"
 mac_app="${apple_dir}/build/TersaDioxusMac.xcarchive/Products/Applications/Tersa Dioxus Spike.app"
 mac_sandbox_app="${build_dir}/Tersa Dioxus Spike Sandbox.app"
 ios_app="${apple_dir}/build/DerivedDataDioxus/Build/Products/Release-iphonesimulator/Tersa Dioxus Spike.app"
@@ -139,28 +140,7 @@ now_ns() {
 
 recognize_text() {
   image_path="$1"
-  xcrun swift - "$image_path" <<'SWIFT'
-import AppKit
-import Vision
-
-let path = CommandLine.arguments[1]
-guard let image = NSImage(contentsOfFile: path) else {
-    fatalError("Cannot load screenshot at \(path)")
-}
-var proposedRect = NSRect(origin: .zero, size: image.size)
-guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
-    fatalError("Cannot create a CGImage for \(path)")
-}
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = false
-try VNImageRequestHandler(cgImage: cgImage).perform([request])
-for observation in request.results ?? [] {
-    if let candidate = observation.topCandidates(1).first {
-        print(candidate.string)
-    }
-}
-SWIFT
+  "$ocr_recognizer" "$image_path"
 }
 
 capture_mac_until_text() {
@@ -186,6 +166,7 @@ capture_mac_until_text() {
 }
 
 xcrun swiftc "${apple_dir}/scripts/find-process-window.swift" -o "$window_finder"
+xcrun swiftc "${apple_dir}/scripts/recognize-image-text.swift" -o "$ocr_recognizer"
 
 verify_virtualization_ocr() {
   ocr_file="$1"
