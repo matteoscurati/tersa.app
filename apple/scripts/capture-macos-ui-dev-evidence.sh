@@ -69,6 +69,34 @@ TEAM_ID="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p'
 printf '%s\n' "$TEAM_ID" | grep -qE '^[A-Z0-9]{10}$' \
   || fail 'the effective Apple Development team identifier is unavailable'
 
+PROFILE_MATCH=''
+PROFILE_COUNT=0
+for profile_dir in \
+  "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+  "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+  [ -d "$profile_dir" ] || continue
+  for profile in "$profile_dir"/*; do
+    [ -f "$profile" ] || continue
+    security cms -D -i "$profile" >"$SCRATCH/profile.plist" 2>/dev/null || continue
+    profile_team="$(plutil -extract TeamIdentifier.0 raw "$SCRATCH/profile.plist" 2>/dev/null || true)"
+    profile_app_id="$(plutil -extract 'Entitlements.com\.apple\.application-identifier' raw "$SCRATCH/profile.plist" 2>/dev/null || true)"
+    profile_expiry="$(plutil -extract ExpirationDate raw "$SCRATCH/profile.plist" 2>/dev/null || true)"
+    [ "$profile_team" = "$TEAM_ID" ] || continue
+    case "$profile_app_id" in
+      "$TEAM_ID.*"|"$TEAM_ID.app.tersa.mac") ;;
+      *) continue ;;
+    esac
+    python3 -c 'from datetime import datetime, timezone; import sys; assert datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")) > datetime.now(timezone.utc)' \
+      "$profile_expiry" 2>/dev/null || continue
+    PROFILE_MATCH="$profile"
+    PROFILE_COUNT=$((PROFILE_COUNT + 1))
+  done
+done
+[ "$PROFILE_COUNT" -eq 1 ] \
+  || fail 'capture requires exactly one current matching Mac Development profile'
+cp "$PROFILE_MATCH" "$APP/Contents/embedded.provisionprofile"
+chmod 600 "$APP/Contents/embedded.provisionprofile"
+
 sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
   "$SOURCE/apple/macos/TersaMac.entitlements" >"$RESOLVED_ENTITLEMENTS"
 plutil -lint "$RESOLVED_ENTITLEMENTS" >/dev/null
@@ -87,6 +115,7 @@ printf '%s\n' "$SIGNATURE" | grep -qE '^CodeDirectory .*flags=.*runtime' \
   || fail 'the signed application is missing Hardened Runtime'
 printf 'signature=valid Apple Development (authority and team redacted)\n'
 printf 'hardened_runtime=present\n'
+printf 'embedded_profile=present current Mac Development (identifier redacted)\n'
 
 codesign -d --entitlements :- --xml "$APP" >"$EMBEDDED_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$EMBEDDED_ENTITLEMENTS" >/dev/null
