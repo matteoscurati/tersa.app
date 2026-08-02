@@ -535,6 +535,10 @@ pub trait TokenTransport: fmt::Debug + Send + Sync {
     /// # Errors
     ///
     /// Resolves to a typed transport or protocol failure without provider data.
+    /// A well-formed answer that the submitted token is unknown or already
+    /// invalid at the provider (Google's HTTP 400 `invalid_token`) resolves to
+    /// [`TokenTransportError::InvalidToken`], so a caller can confirm the
+    /// desired end state for an already-gone grant.
     #[must_use]
     fn revoke<'a>(
         &'a self,
@@ -553,6 +557,16 @@ pub enum TokenTransportError {
     Transport,
     /// The endpoint answered the well-formed `invalid_grant` error.
     InvalidGrant,
+    /// The endpoint answered the well-formed `invalid_token` error: the
+    /// submitted token is unknown or already invalid at the provider.
+    ///
+    /// Only a revocation endpoint emits this answer in practice (Google
+    /// answers HTTP 400 `invalid_token` when asked to revoke an unknown or
+    /// already-revoked token). The exchange and refresh state machines
+    /// therefore map it to the conservative [`TokenError::ProviderRejected`];
+    /// revoke callers may treat it as confirmation that the grant is already
+    /// gone.
+    InvalidToken,
     /// The endpoint answered any other well-formed error.
     ProviderRejected,
     /// The response did not parse into a complete token response.
@@ -564,6 +578,7 @@ impl fmt::Display for TokenTransportError {
         let message = match self {
             Self::Transport => "the token endpoint could not be reached",
             Self::InvalidGrant => "the token endpoint reported an invalid grant",
+            Self::InvalidToken => "the endpoint reported an unknown or invalid token",
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
         };
@@ -581,13 +596,33 @@ pub enum TokenError {
     InvalidConfiguration,
     /// The token endpoint could not be reached.
     Transport,
-    /// The provider rejected the request with an error other than `invalid_grant`.
+    /// The provider rejected the request with an error other than a
+    /// refresh-time `invalid_grant` (which is [`Self::ConsentRevoked`]) or an
+    /// exchange-time `invalid_grant` (which is
+    /// [`Self::AuthorizationCodeRejected`]).
     ProviderRejected,
+    /// The token endpoint answered the authorization-code EXCHANGE with
+    /// `invalid_grant`: the authorization code was stale, already redeemed,
+    /// or mismatched, so the sign-in itself lapsed and must be re-run.
+    ///
+    /// Only the EXCHANGE path produces this terminal. It is non-destructive —
+    /// no stored credential exists on that path, so it is never a deletion
+    /// license and never [`Self::ConsentRevoked`] — but it is also NOT an
+    /// ordinary retryable rejection: the connect composition routes it to the
+    /// re-connect ("sign in again") recovery, not to a bare retry.
+    AuthorizationCodeRejected,
     /// The endpoint response did not parse into a complete token response.
     MalformedResponse,
     /// The token endpoint explicitly returned a grant without Gmail read access.
     InsufficientScope,
-    /// The grant or refresh token lost validity and re-consent is required.
+    /// The stored refresh token lost validity at the provider — consent was
+    /// withdrawn or the token expired — and re-consent is required.
+    ///
+    /// Only the REFRESH path produces this terminal: a refresh-time
+    /// `invalid_grant` answers about a persisted credential, which the
+    /// composition deletes before reporting. An exchange-time `invalid_grant`
+    /// maps to [`Self::AuthorizationCodeRejected`] instead, because no stored
+    /// credential exists to delete for a stale authorization code.
     ConsentRevoked,
     /// The token op succeeded but its `id_token` was absent or failed identity
     /// validation (`aud`/`iss`/`sub`).
@@ -605,6 +640,7 @@ impl fmt::Display for TokenError {
             Self::InvalidConfiguration => "invalid token client configuration",
             Self::Transport => "the token endpoint could not be reached",
             Self::ProviderRejected => "the token endpoint rejected the request",
+            Self::AuthorizationCodeRejected => "the authorization code was rejected; sign in again",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
             Self::InsufficientScope => "the token grant omitted Gmail read access",
             Self::ConsentRevoked => "the granted consent was revoked and re-connect is required",
@@ -908,14 +944,20 @@ impl fmt::Debug for TokenSuccess {
 ///
 /// Builds the authorization-code request from the grant and client
 /// configuration, sends it through the transport, and interprets the outcome.
-/// An `invalid_grant` protocol answer maps to [`TokenError::ConsentRevoked`],
-/// the terminal the composition routes to the re-connect state.
+/// An `invalid_grant` protocol answer maps to
+/// [`TokenError::AuthorizationCodeRejected`]: on the exchange it means the
+/// authorization code was stale, already redeemed, or mismatched — the
+/// sign-in lapsed and must be re-run. No stored credential exists on this
+/// path, so the terminal is non-destructive and never the deletion-licensing
+/// [`TokenError::ConsentRevoked`], which is reserved for the refresh path
+/// (see [`refresh_access_token`]).
 ///
 /// # Errors
 ///
-/// Returns [`TokenError::ConsentRevoked`] when consent was withdrawn or the
-/// grant expired, [`TokenError::Transport`] when the endpoint is unreachable,
-/// [`TokenError::ProviderRejected`] for any other provider error, and
+/// Returns [`TokenError::AuthorizationCodeRejected`] when the provider
+/// answered the exchange with `invalid_grant` (a stale or used authorization
+/// code), [`TokenError::ProviderRejected`] for any other provider rejection,
+/// [`TokenError::Transport`] when the endpoint is unreachable, and
 /// [`TokenError::MalformedResponse`] for an unparsable response.
 pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
     grant: &AuthorizationGrant,
@@ -956,7 +998,7 @@ pub fn exchange_grant_with_scope_outcome<'a, T: TokenTransport, C: MonotonicCloc
         let response = transport
             .exchange(request)
             .await
-            .map_err(map_transport_error)?;
+            .map_err(map_exchange_transport_error)?;
         scope_outcome_from_response(response, clock.now(), config)
     })
 }
@@ -964,9 +1006,11 @@ pub fn exchange_grant_with_scope_outcome<'a, T: TokenTransport, C: MonotonicCloc
 /// Refreshes an access token using the stored refresh token.
 ///
 /// Builds the refresh-token request from the stored token and client
-/// configuration, sends it through the transport, and interprets the outcome
-/// exactly like [`exchange_grant`], including the [`TokenError::ConsentRevoked`]
-/// mapping.
+/// configuration, sends it through the transport, and interprets the outcome.
+/// Unlike the exchange path, a refresh-time `invalid_grant` answers about the
+/// STORED credential, so it maps to the destructive
+/// [`TokenError::ConsentRevoked`] terminal the composition routes to
+/// re-connect after deleting the dead credential.
 ///
 /// # Errors
 ///
@@ -1023,8 +1067,32 @@ fn map_transport_error(error: TokenTransportError) -> TokenError {
     match error {
         TokenTransportError::Transport => TokenError::Transport,
         TokenTransportError::InvalidGrant => TokenError::ConsentRevoked,
-        TokenTransportError::ProviderRejected => TokenError::ProviderRejected,
+        // `invalid_token` is a revocation-endpoint answer; if a transport ever
+        // surfaces it on exchange or refresh it is an ordinary provider
+        // rejection, never a license to delete a stored credential.
+        TokenTransportError::InvalidToken | TokenTransportError::ProviderRejected => {
+            TokenError::ProviderRejected
+        }
         TokenTransportError::MalformedResponse => TokenError::MalformedResponse,
+    }
+}
+
+/// Maps a transport failure in the authorization-code exchange context.
+///
+/// An `invalid_grant` answer here means the authorization code was stale,
+/// already redeemed, or mismatched — NOT that a stored refresh token lost
+/// consent — so it maps to [`TokenError::AuthorizationCodeRejected`]: the
+/// non-destructive sign-in-expired terminal the connect composition routes to
+/// the re-connect recovery. It is deliberately distinct both from
+/// [`TokenError::ConsentRevoked`], which the compositions treat as a license
+/// to delete a stored credential (none exists on this path), and from
+/// [`TokenError::ProviderRejected`], which is an ordinary retryable
+/// rejection. The refresh path keeps the `invalid_grant` →
+/// [`TokenError::ConsentRevoked`] mapping via [`map_transport_error`].
+fn map_exchange_transport_error(error: TokenTransportError) -> TokenError {
+    match error {
+        TokenTransportError::InvalidGrant => TokenError::AuthorizationCodeRejected,
+        other => map_transport_error(other),
     }
 }
 
@@ -1715,21 +1783,28 @@ mod tests {
     }
 
     #[test]
-    fn maps_invalid_grant_to_consent_revoked_on_both_flows() {
+    fn maps_invalid_grant_by_flow_exchange_rejected_refresh_consent_revoked() {
+        // Exchange: an invalid_grant answer is a stale, used, or mismatched
+        // authorization code — the sign-in lapsed. The terminal is the
+        // dedicated, non-destructive AuthorizationCodeRejected: never
+        // ConsentRevoked (no stored credential exists to delete) and never
+        // the ordinary retryable ProviderRejected.
         let grant = make_grant("exchange-code");
         let config = make_config(None);
         let transport = FakeTransport::failing(TokenTransportError::InvalidGrant);
-        assert_eq!(
-            now_ready(exchange_grant(
-                &grant,
-                &config,
-                &transport,
-                &TestClock::default()
-            ))
-            .unwrap_err(),
-            TokenError::ConsentRevoked
-        );
+        let exchange_error = now_ready(exchange_grant(
+            &grant,
+            &config,
+            &transport,
+            &TestClock::default(),
+        ))
+        .unwrap_err();
+        assert_eq!(exchange_error, TokenError::AuthorizationCodeRejected);
+        assert_ne!(exchange_error, TokenError::ConsentRevoked);
+        assert_ne!(exchange_error, TokenError::ProviderRejected);
 
+        // Refresh: the same answer is about the stored credential, so it stays
+        // the destructive ConsentRevoked terminal.
         let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
         let transport = FakeTransport::failing(TokenTransportError::InvalidGrant);
         assert_eq!(
@@ -1741,6 +1816,38 @@ mod tests {
             ))
             .unwrap_err(),
             TokenError::ConsentRevoked
+        );
+    }
+
+    #[test]
+    fn maps_invalid_token_to_provider_rejected_on_exchange_and_refresh() {
+        // `invalid_token` is a revocation-endpoint answer; on the token
+        // endpoint it must never become the destructive ConsentRevoked.
+        let grant = make_grant("exchange-code");
+        let config = make_config(None);
+        let transport = FakeTransport::failing(TokenTransportError::InvalidToken);
+        assert_eq!(
+            now_ready(exchange_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::ProviderRejected
+        );
+
+        let refresh_token = Zeroizing::new("stored-refresh-token".to_owned());
+        let transport = FakeTransport::failing(TokenTransportError::InvalidToken);
+        assert_eq!(
+            now_ready(refresh_access_token(
+                &refresh_token,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::ProviderRejected
         );
     }
 

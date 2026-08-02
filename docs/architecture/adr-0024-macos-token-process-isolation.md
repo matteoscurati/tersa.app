@@ -137,11 +137,117 @@ also changing the signed entitlement topology.
 The repository now includes the embedded `TersaMacTokenBroker` XPC packaging
 skeleton: an XcodeGen target, a closed version-1 NSXPC protocol surface, a
 fail-closed service entry point, disjoint broker entitlement declarations, and
-xtask inventory guards for those shapes. That skeleton does **not** activate
-runtime isolation. Token authority remains in-process in `TersaMac`. The
-dedicated token Keychain group is declared for the broker only and is not yet
-registered, provisioned, or used. Builds remain unsigned unless an operator
-configures signing locally. This ADR still implements no Keychain migration,
-OAuth/token move, client XPC wiring, signed runtime proof, notarization, or
-distribution evidence. Until those later items land, the source guard is
-defense in depth and final distribution remains blocked by issue #51.
+xtask inventory guards for those shapes.
+
+The portable token-broker lifecycle core now also exists as the
+`tersa-token-broker-core` workspace crate (`adapters/token-broker-core`). It
+implements the broker's process-agnostic OAuth/token logic over generic ports:
+authorization begin/complete with a bounded TTL'd PKCE session registry, code
+exchange, refresh, rotation, per-subject serialized token mutation, a
+refresh-token store port, revoke/delete separation, zeroizing public token
+results, and a closed error surface. It deliberately contains no
+Security.framework/Keychain code, no C ABI, and no IPC.
+
+Three operational properties of that core are recorded here for the later
+service integration. First, Google's revocation endpoint is grant-wide:
+revoking any one token of a grant revokes every token minted for the same
+Google user and OAuth client. The core therefore runs its stranded-grant
+cleanup revoke only against a definitively empty local store snapshot. That
+snapshot is per-install local state, not global grant knowledge: a second
+install or device holding credentials for the same user/client grant is
+invisible to it, so an empty-snapshot cleanup revoke can still invalidate
+that other install's grant. This residual risk is accepted for the
+best-effort cleanup; an unconditional revoke on every failed completion was
+rejected precisely because it would multiply such cross-install damage.
+Second, an explicitly under-scoped first-connect completion
+(`InsufficientScope`) is deliberately non-destructive: the broker persists
+nothing and revokes nothing, because the under-scoped outcome carries no
+validated identity and no subject-keyed snapshot exists to gate a
+grant-wide revoke. The accepted cost is that this path can leave a live
+under-scoped grant at Google, and the app CANNOT revoke it in-app — the
+minted tokens were dropped and there is no validated subject or stored
+credential to revoke against. The only remedies are the point-3 UI recovery
+below (retain-or-retry, or external manual revocation). Third, the core
+enforces a hard 1,024-byte bound on provider-minted refresh
+tokens, and Google documents no maximum length. A rotation exceeding the
+bound is rejected as `MalformedResponse` before any persistence or revoke
+input, so the failure mode is a visible terminal error, never a truncation
+or a partial write. Monitoring should read a sustained rise in refresh-path
+`MalformedResponse` terminals as a possible provider-side change outgrowing
+the bound — a signal to review the constant — not only as response
+corruption.
+
+A deliberate identity asymmetry behind these properties is recorded once so
+point 3 and reviewers do not normalize it away: a granted refresh
+re-validates the exact stored subject FIRST and refuses to persist anything
+— including a valid rotation — when the provider answer belongs to a
+different subject, while an explicitly under-scoped refresh CANNOT validate
+identity at all (the scope verdict is decided before claims validation) and
+persists a valid rotation solely as a local revocation handle for the grant
+before reporting the scope failure. The two paths intentionally treat a
+rotation differently.
+
+A fourth, forward-looking constraint is recorded for the point-3 service
+integration as a design and acceptance requirement, not as implemented
+behavior. Today's version-1 protocol surface is the point-1 skeleton:
+`TersaTokenBrokerStatusV1` is closed at exactly five bootstrap status codes
+(`success`, `notImplemented`, `notProvisioned`, `invalidRequest`,
+`rejectedClient`) and carries NO operational recovery case — no
+sign-in-expired, provider-rejected, insufficient-scope, or
+revoke-unconfirmed status exists on the wire yet. The broker core's public
+error vocabulary is likewise closed. Point 3 therefore EXTENDS
+`TersaTokenBrokerStatusV1` with a reviewed closed set of operational
+recovery cases and updates the exact protocol and xtask inventory guards to
+that reviewed set: adding reviewed closed enum cases is a revision inside
+the closed-surface discipline, not an open-ended error channel, and
+open-ended status strings, codes, or error payloads remain forbidden. The
+point-3 XPC operation-to-status mapping, and the main app's status-to-UI
+mapping behind it, must preserve four distinct recovery semantics end to
+end, and acceptance evidence must demonstrate each: an unconfirmed provider
+revocation (`RevokeUnconfirmed`) stays visibly distinct from a clean
+teardown so the app can direct the user to revoke the grant manually in
+their Google account settings; an explicitly under-scoped grant
+(`InsufficientScope`) keeps its own recovery naming the Gmail consent that
+must be allowed on retry, AND — because the broker deliberately persists
+and revokes nothing on that path and can leave a live under-scoped grant at
+Google that the app cannot revoke (see the second operational property
+above) — must also offer retain-or-retry recovery and direct the user to
+their Google account-permissions page for external manual revocation; a
+revoked consent and a missing refresh token (`ConsentRevoked`,
+`MissingRefreshToken`) route to re-connect after the destructive local
+deletion the former licenses; and an exchange-time authorization-code
+rejection — the token layer's `AuthorizationCodeRejected`, a stale,
+already redeemed, or mismatched code, which the broker core preserves as
+its own closed `BrokerError::AuthorizationCodeRejected` variant so the XPC
+mapping can route it without guessing — maps to a NEW closed v1
+operational status defined in point 3, which the app then maps to its
+EXISTING `ConnectionFailure.signInExpired` UI recovery with the "sign in
+again" remedy (today reached through the legacy `STATUS_NEEDS_RECONNECT`
+status). It must never surface as an opaque retryable failure, never be
+folded into the ordinary provider-rejected status — itself a distinct
+operational status point 3 defines, not an existing v1 case — and never
+claim that a stored credential was deleted (none exists on that path). The
+closed operational statuses must also preserve BY OPERATION the context the
+broker error vocabulary deliberately does not carry: `PersistenceFailed` is
+one variant across operations, so point 3 maps it by operation.
+`PersistenceFailed` returned while loading during `revoke_provider_grant`
+means the revocation is unconfirmed: local teardown should still be
+attempted and the outcome visibly reported. `PersistenceFailed` returned
+from `delete_stored_tokens` means local teardown is incomplete and must
+never be reported clean. The broker error vocabulary must not be widened
+merely to carry this call-site context; the operation the app invoked
+supplies it. Collapsing any of these recovery semantics into one opaque
+failure code, or widening the wire surface into an open-ended error channel
+to express them, fails acceptance.
+
+Neither piece activates runtime isolation. The portable core is not yet linked
+into the XPC target, which still links no Rust; there is no production
+Keychain adapter bound to its refresh-token store port, no client-side XPC
+wiring in `macos/`, and no entitlement activation. Token authority remains
+in-process in `TersaMac`. The dedicated token Keychain group is declared for
+the broker only and is not yet registered, provisioned, or used. Builds remain
+unsigned unless an operator configures signing locally. This ADR still
+implements no Keychain migration, OAuth/token move behind XPC, signed runtime
+proof, notarization, or distribution evidence. Until those later items land,
+the source guard is defense in depth and final distribution remains blocked by
+issue #51.

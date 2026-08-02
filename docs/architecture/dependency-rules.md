@@ -82,6 +82,20 @@ The Apple bridge may call application use cases directly when the operating
 system owns the transport. The M0 OAuth adapter uses this edge for the browser
 callback while keeping PKCE and callback validation in portable Rust.
 
+## Portable token-broker core
+
+`tersa-token-broker-core` (`adapters/token-broker-core`) is the portable
+lifecycle core the separately signed macOS token-broker process will host
+under ADR 0024. It may depend inward only on `tersa-application` and declares
+no Apple-framework, Keychain, storage-engine, transport, C ABI, or IPC
+dependency; refresh-token persistence and entropy enter only through its
+generic ports. It owns authorization begin/complete with a bounded TTL'd PKCE
+session registry, code exchange, refresh, rotation, per-subject serialized
+token mutation, revoke/delete separation, zeroizing public token results, and
+a closed error surface. It is not yet linked into the `TersaMacTokenBroker`
+XPC target and activates no runtime isolation; binding its ports to the macOS
+Keychain and the closed XPC protocol is later XPC-integration work.
+
 ## Bounded sync and cache orchestration
 
 `tersa-application::sync` is the sole shared owner of bounded recent-snapshot

@@ -13,6 +13,7 @@ members = [
     "adapters/mailbox-sync-ffi-macos",
     "adapters/oauth-sync-macos",
     "adapters/store-sqlcipher-macos",
+    "adapters/token-broker-core",
     "apps/cli-macos",
     "crates/application",
     "crates/domain",

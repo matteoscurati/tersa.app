@@ -45,7 +45,8 @@ use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncRepo
 #[cfg(target_os = "macos")]
 use tersa_application::token::{
     AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome,
-    TokenTransport, exchange_grant_with_scope_outcome, refresh_access_token_with_scope_outcome,
+    TokenTransport, TokenTransportError, exchange_grant_with_scope_outcome,
+    refresh_access_token_with_scope_outcome,
 };
 #[cfg(target_os = "macos")]
 use tersa_gmail_rest_macos::GmailMailbox;
@@ -368,14 +369,36 @@ pub trait ConnectSession {
 #[derive(Debug)]
 #[must_use = "the disconnect teardown maps this to the revoke-unconfirmed status; dropping it silently loses the M2 signal"]
 pub(crate) enum RevokeOutcome {
-    /// The revoke HTTP call succeeded — on the first attempt OR the one retry.
+    /// The revoke is confirmed: the revoke HTTP call succeeded — on the first
+    /// attempt OR the one retry — or the provider answered that the token or
+    /// grant is ALREADY GONE (`invalid_token` or `invalid_grant`), which
+    /// confirms the desired end state without a retry.
     Confirmed,
-    /// Both the first attempt and the one retry failed.
+    /// Both the first attempt and the one retry failed with errors other than
+    /// an already-gone answer.
     Failed,
 }
 
-/// Revokes a provider-minted token best-effort, retrying ONCE on failure, and
-/// reports whether the provider confirmed the revocation.
+/// Whether one revoke attempt confirmed the desired end state: it succeeded,
+/// or the provider answered that the token or grant is already gone. Google
+/// answers HTTP 400 `invalid_token` when asked to revoke an unknown or
+/// already-revoked token, and `invalid_grant` for an already-invalid grant —
+/// both CONFIRM the desired end state, so retrying them is pointless. This is
+/// the same already-gone semantics the ADR-0024 broker's
+/// `revoke_provider_grant` applies over this shared transport error enum.
+#[cfg(target_os = "macos")]
+fn revoke_confirmed(outcome: Result<(), TokenTransportError>) -> bool {
+    matches!(
+        outcome,
+        Ok(()) | Err(TokenTransportError::InvalidToken | TokenTransportError::InvalidGrant)
+    )
+}
+
+/// Revokes a provider-minted token best-effort and reports whether the
+/// provider confirmed the revocation.
+///
+/// An already-gone answer (`invalid_token` or `invalid_grant`) is confirmed
+/// IMMEDIATELY, with no pointless retry. Any other failure is retried ONCE.
 ///
 /// Used by the connect flow's cancel fences and store-failure path, and by the
 /// disconnect (3d-3d) teardown for the ONE stored token it loads under the
@@ -391,10 +414,13 @@ pub(crate) async fn revoke_best_effort<T: TokenTransport>(
     transport: &T,
     token: &Zeroizing<String>,
 ) -> RevokeOutcome {
-    if transport.revoke(token).await.is_err() && transport.revoke(token).await.is_err() {
-        return RevokeOutcome::Failed;
+    if revoke_confirmed(transport.revoke(token).await) {
+        return RevokeOutcome::Confirmed;
     }
-    RevokeOutcome::Confirmed
+    if revoke_confirmed(transport.revoke(token).await) {
+        return RevokeOutcome::Confirmed;
+    }
+    RevokeOutcome::Failed
 }
 
 /// Exchanges a forwarded authorization grant and persists the refresh token.

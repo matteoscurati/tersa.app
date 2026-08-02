@@ -7668,6 +7668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-token-broker-core"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "getrandom 0.3.4",
+ "tersa-application",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

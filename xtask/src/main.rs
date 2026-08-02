@@ -8382,6 +8382,13 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "tersa-presentation",
             BTreeSet::from(["tersa-application", "tersa-domain", "tersa-platform"]),
         ),
+        (
+            // Point 2: the portable token-broker lifecycle composition is
+            // platform-agnostic; its sole workspace edge is the application
+            // port layer it composes over.
+            "tersa-token-broker-core",
+            BTreeSet::from(["tersa-application"]),
+        ),
     ])
 }
 
@@ -8691,6 +8698,14 @@ targets:
                 "tersa-presentation",
                 "tersa-store-sqlcipher-macos",
             ])
+        );
+    }
+
+    #[test]
+    fn activates_the_token_broker_core_boundary() {
+        assert_eq!(
+            dependency_policy()["tersa-token-broker-core"],
+            BTreeSet::from(["tersa-application"])
         );
     }
 
