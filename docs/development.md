@@ -43,25 +43,48 @@ including its commit-bound locator and review-retention rules.
 
 ### CI execution modes
 
-Pull requests use a fast required lane: change-scope classification, Linux and
-macOS Rust verification, supply-chain policy, and the real Apple product build
-when production Apple paths are affected. Diagnostic Slint, Dioxus, SQLCipher,
-search, MIME, fuzz, and blob evidence is not repeated for every intermediate PR
-commit. The complete evidence set runs for every `main` push that passes
-`CI gate`; its artifacts remain bound to the immutable integrated commit and
-retain their existing 90-day lifetime. Merge-queue runs use the same fast
-required gate, including a conservative product and notice check; the resulting
-`main` push owns the exact-commit evidence. Deep evidence jobs start only after
-`CI gate` succeeds, so they cannot consume the macOS runner pool ahead of a
-required fast lane.
+Open implementation pull requests as drafts. Draft creation and synchronization
+schedule no CI runners; changing the pull request to ready-for-review triggers
+the one required fast lane. Subsequent ready pull-request commits supersede an
+older in-progress run through the per-PR concurrency group. The fast lane runs
+change-scope classification, Linux and macOS Rust verification, supply-chain
+policy, and the real Apple product build when production Apple paths are
+affected. The Apple PR gate builds macOS and the iOS simulator once. Device
+builds, archives, and OAuth feasibility capture belong to explicit evidence
+runs, not the required PR path.
+
+Merging does not repeat the already-required checks on a `main` push. Merge
+queue runs retain the conservative fast gate. Diagnostic Slint, Dioxus,
+SQLCipher, search, MIME, fuzz, blob, and OAuth evidence runs only through an
+explicit `workflow_dispatch` selection. Use `all` at release or at an
+architecture evidence checkpoint, and select one suite while investigating a
+specific diagnostic. These artifacts remain bound to the selected immutable
+commit and retain the existing 90-day protocol lifetime. Cache writes are also
+restricted to explicit evidence runs, preventing intermediate PR keys from
+growing the repository cache toward its storage limit. Manual runs publish
+`Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
+evidence selection cannot substitute for the real pull-request scope or DCO
+check.
+
+The repository is public and uses only standard GitHub-hosted runners, so runner
+execution has no billable minute charge. The policy above still minimizes queue
+time, redundant macOS capacity, cache churn, and artifact growth.
 
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
 build paths fan out conservatively, while documentation, workflow, and xtask-only
-changes avoid Apple evidence. Its table-driven tests must change with every new
-scope rule. A single suite can be reproduced without running unrelated evidence:
+changes avoid Apple evidence. The classifier and its own tests are an exact
+control-path allowlist exercised inside the scope job; every other unknown
+`scripts/` path still fans out. Its table-driven tests must change with every
+new scope rule. A single suite can be reproduced without running unrelated evidence:
 
 ```sh
 gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus
+```
+
+Run the full retained evidence set for a release candidate with:
+
+```sh
+gh workflow run CI --ref <immutable-commit> -f evidence_suite=all
 ```
 
 The supported suite names are `all`, `product`, `slint`, `dioxus`, `sqlcipher`,
