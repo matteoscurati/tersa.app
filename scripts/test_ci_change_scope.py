@@ -104,11 +104,12 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("github.event_name == 'push'", workflow)
         self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
         self.assertIn("cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}", workflow)
+        self.assertIn("\n    name: CI gate\n", workflow)
+        self.assertIn("\n    name: Manual evidence gate\n", workflow)
         self.assertIn(
-            "name: ${{ github.event_name == 'workflow_dispatch' && 'Manual evidence gate' || 'CI gate' }}",
+            "github.event_name != 'workflow_dispatch'",
             workflow,
         )
-        self.assertNotIn("\n    name: CI gate\n", workflow)
 
     def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

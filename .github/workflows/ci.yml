@@ -827,12 +827,43 @@ jobs:
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
   ci_gate:
-    # A manual evidence run must never publish the branch-protection context.
-    # Otherwise a narrowly selected suite could satisfy `CI gate` without the
-    # pull request's real scope or DCO check.
-    name: ${{ github.event_name == 'workflow_dispatch' && 'Manual evidence gate' || 'CI gate' }}
+    name: CI gate
     needs: [changes, apple_product, notices, rust, policy]
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the selected validation lane
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
+          NOTICES_RESULT: ${{ needs.notices.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "changes=$CHANGES_RESULT" \
+            "apple_product=$APPLE_PRODUCT_RESULT" \
+            "notices=$NOTICES_RESULT" \
+            "rust=$RUST_RESULT" \
+            "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$CHANGES_RESULT" = success
+          case "$APPLE_PRODUCT_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$NOTICES_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          test "$RUST_RESULT" = success
+          test "$POLICY_RESULT" = success
+  manual_evidence_gate:
+    # Keep manual evidence isolated from the branch-protection context. A
+    # narrowly selected suite must never satisfy the pull request's `CI gate`.
+    name: Manual evidence gate
+    needs: [changes, apple_product, notices, rust, policy]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require the selected validation lane
