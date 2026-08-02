@@ -3747,7 +3747,9 @@ fn is_exact_reviewed_token_broker_protocol_declaration(
         return false;
     }
     let attr_start = attr_end - attr.len();
-    &code[attr_start..attr_end] == attr
+    // Byte-offset pin: Swift source may be non-ASCII, so use a boundary-aware
+    // lookup instead of slicing (which panics on a mid-character offset).
+    code.get(attr_start..attr_end) == Some(attr)
 }
 
 /// True when exactly one `enum TersaMacTokenBrokerProtocolVersion { ... }`
@@ -13023,6 +13025,22 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 .any(|violation| violation.contains("must not declare `protocol`")),
             "protocol declaration outside TokenBrokerProtocol.swift must fail closed"
         );
+
+        // Negative: a multi-byte character that makes the @objc pin land mid-UTF-8
+        // sequence must not panic; fail closed with the protocol declaration
+        // violation. `é` is two bytes (C3 A9); replacing leading `@` with `é`
+        // keeps the preceding span attr.len() bytes long so attr_start is the
+        // continuation byte A9.
+        let multibyte_attr_boundary = reviewed.replace(
+            "@objc(TersaMacTokenBrokerProtocolV1)",
+            "éobjc(TersaMacTokenBrokerProtocolV1)",
+        );
+        assert!(
+            swift_source_lexical_violations(protocol_path, &multibyte_attr_boundary)
+                .iter()
+                .any(|violation| violation.contains("must not declare `protocol`")),
+            "multi-byte @objc pin boundary must fail closed without panicking"
+        );
     }
 
     #[test]
@@ -13103,7 +13121,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
     /// when `(` is missing after a real `func` keyword. The exact five reviewed
     /// methods still pass via the baseline surface checks.
     #[test]
-    fn token_broker_protocol_surface_rejects_unparseable_sixth_operations() {
+    fn token_broker_protocol_surface_rejects_unparsable_sixth_operations() {
         let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
         let reviewed =
             include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
