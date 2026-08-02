@@ -128,6 +128,13 @@ same-process Keychain-group follow-up for distribution: the refresh-token item
 moves behind a separately signed XPC broker, and the main app no longer carries
 that group.
 
+The macOS UI persists the user-supplied local `AccountId` alias in its sandbox
+preferences solely to restore content-free disconnect recovery after relaunch.
+`AccountId` rejects email-shaped values (including `@`), so this is neither the
+Google address nor a stable provider identifier; it remains cleartext local
+metadata and may be included in ordinary device backups. OAuth material, Gmail
+content, and the validated provider subject are never stored there.
+
 - **Rotation is an atomic in-place replace.** Google may return a new refresh token
   on refresh or re-consent. A refresh-token item has one fixed Keychain primary key
   (service + `AccountId` + access group), so a second `SecItemAdd` returns

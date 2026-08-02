@@ -65,7 +65,9 @@ impl AccountLifecycleMetadata {
 /// it remains on every local teardown failure. A successful, unconfirmed revoke
 /// replaces it with `RevokeUnconfirmed`; only confirmed/reconciled completion
 /// clears it. A sync timestamp is written only after the entire gated sync
-/// succeeds, and account purge clears that timestamp.
+/// succeeds, and account purge clears that timestamp. A later successful sync
+/// proves a newly consented credential after `RevokeUnconfirmed`, so its
+/// completion clears stale recovery advice before recording freshness.
 pub trait AccountLifecycleStore: Send + Sync {
     /// Reads the bounded lifecycle projection.
     fn lifecycle_metadata<'a>(

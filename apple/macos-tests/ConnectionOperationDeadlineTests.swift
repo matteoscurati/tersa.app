@@ -54,4 +54,35 @@ final class ConnectionOperationDeadlineTests: XCTestCase {
         XCTAssertFalse(deadlines.accepts(token))
         XCTAssertFalse(deadlines.disconnectIsActive)
     }
+
+    func testConnectTimeoutKeepsLateSuccessAuthoritativeAndBlocksRetryBegin() {
+        let clock = TestClock(now: 0)
+        let deadlines = ConnectionOperationDeadline(now: { clock.now })
+        let token = deadlines.start(kind: .connectAndSync, timeout: 1)
+
+        clock.now = 1_000_000_000
+        XCTAssertTrue(deadlines.timeOut(token, keepAlive: true))
+        XCTAssertTrue(deadlines.accepts(token))
+        XCTAssertTrue(deadlines.connectIsActive)
+        XCTAssertTrue(deadlines.hasActiveOperation)
+        XCTAssertTrue(deadlines.finish(token))
+        XCTAssertFalse(deadlines.connectIsActive)
+        XCTAssertFalse(deadlines.hasActiveOperation)
+    }
+
+    func testKeepWaitingRenewsTheSameGenerationAndCanTimeOutAgain() throws {
+        let clock = TestClock(now: 0)
+        let deadlines = ConnectionOperationDeadline(now: { clock.now })
+        let token = deadlines.start(kind: .disconnect, timeout: 1)
+        clock.now = 1_000_000_000
+        XCTAssertTrue(deadlines.timeOut(token, keepAlive: true))
+
+        let renewed = try XCTUnwrap(deadlines.renewTimedOut(kind: .disconnect, timeout: 2))
+        XCTAssertEqual(renewed, token)
+        clock.now = 2_999_999_999
+        XCTAssertFalse(deadlines.timeOut(token, keepAlive: true))
+        clock.now = 3_000_000_000
+        XCTAssertTrue(deadlines.timeOut(token, keepAlive: true))
+        XCTAssertTrue(deadlines.accepts(token))
+    }
 }

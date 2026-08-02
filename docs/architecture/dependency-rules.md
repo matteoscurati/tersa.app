@@ -197,6 +197,15 @@ call count. It strips comments and string literals before counting and rejects
 extra calls, moved calls, aliases, or missing reviewed calls. This is review
 drift detection, not an ABI or operating-system security boundary.
 
+Disconnect recovery uses two content-free persistence layers. The encrypted
+account lifecycle row records incomplete teardown, revoke-unconfirmed, and the
+last successful sync time. Before Swift issues the sole destructive disconnect
+begin, it synchronously writes and verifies an outer sandbox-preferences journal
+containing only the opaque local account alias. That outer journal survives a
+SQLCipher open or marker-write failure and takes precedence at relaunch; it is
+cleared only after a successful Rust disconnect terminal. Neither layer stores
+OAuth material, Gmail content, or a provider identifier.
+
 PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
 It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
 trusted database-opening composition and must feed the privately derived key

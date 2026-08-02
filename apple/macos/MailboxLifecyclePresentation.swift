@@ -26,6 +26,63 @@ struct MailboxLifecycleSnapshot: Equatable {
     }
 }
 
+/// Closed result of the privacy-safe lifecycle metadata query.
+enum MailboxLifecycleReadResult {
+    case success(MailboxLifecycleSnapshot)
+    case failure
+
+    var launchProjection: MailboxLifecycleLaunchProjection {
+        switch self {
+        case .success(let snapshot):
+            return .recovery(snapshot.recoveryPresentation)
+        case .failure:
+            return .unavailable
+        }
+    }
+}
+
+enum MailboxLifecycleLaunchProjection: Equatable {
+    case recovery(MailboxLifecycleRecoveryPresentation)
+    case unavailable
+}
+
+struct MailboxLifecycleRestoreToken: Equatable {
+    fileprivate let generation: UInt64
+    fileprivate let accountIdentifier: Data
+}
+
+/// Generation fence for the launch-only lifecycle read. User intent
+/// invalidates the pending token without borrowing the connection deadline.
+struct MailboxLifecycleRestoreFence {
+    private var generation: UInt64 = 0
+    private var active: MailboxLifecycleRestoreToken?
+
+    mutating func begin(accountIdentifier: Data) -> MailboxLifecycleRestoreToken {
+        generation &+= 1
+        let token = MailboxLifecycleRestoreToken(
+            generation: generation,
+            accountIdentifier: accountIdentifier
+        )
+        active = token
+        return token
+    }
+
+    mutating func invalidate() {
+        active = nil
+    }
+
+    mutating func finish(
+        _ token: MailboxLifecycleRestoreToken,
+        currentAccountIdentifier: Data
+    ) -> Bool {
+        guard active == token, token.accountIdentifier == currentAccountIdentifier else {
+            return false
+        }
+        active = nil
+        return true
+    }
+}
+
 /// Content-free launch presentation restored from the durable lifecycle row.
 enum MailboxLifecycleRecoveryPresentation: Equatable {
     case none
@@ -66,11 +123,11 @@ enum MailboxFreshnessState: Equatable {
         case .unknown:
             return ""
         case .fresh(.some(let date)):
-            return "Last updated \(formatDate(date))."
+            return "Last updated " + formatDate(date) + "."
         case .fresh(.none):
             return "Sync complete. Last-updated time is unavailable."
         case .offline(.some(let date)):
-            return "Offline. Showing cached mail last updated \(formatDate(date))."
+            return "Offline. Showing cached mail last updated " + formatDate(date) + "."
         case .offline(.none):
             return "Offline. Showing cached mail; no successful sync time is available."
         }

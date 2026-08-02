@@ -510,7 +510,7 @@ async fn run_default_account_cycle(
     let report = gated_sync(account, session, &hasher, &store, policy)
         .await
         .map_err(CycleError::Gated)?;
-    record_successful_sync(&store, account, &wall_clock).await?;
+    finalize_successful_sync(&store, account, &wall_clock).await?;
     Ok(report)
 }
 
@@ -635,26 +635,38 @@ async fn run_claimed_connect_cycle<St: ConnectSession>(
     let report = gated_sync(account, session, &hasher, &store, policy)
         .await
         .map_err(CycleError::Gated)?;
-    record_successful_sync(&store, account, &wall_clock).await?;
+    finalize_successful_sync(&store, account, &wall_clock).await?;
     Ok(report)
 }
 
 /// Records freshness only after the whole gated sync returns successfully. The
 /// injected wall clock keeps this transition deterministic in tests; conversion
 /// overflow fails closed rather than manufacturing a misleading timestamp.
-async fn record_successful_sync<S: AccountLifecycleStore>(
+async fn finalize_successful_sync<S: AccountLifecycleStore>(
     store: &S,
     account: &AccountId,
     clock: &impl tersa_application::oauth::WallClock,
 ) -> Result<(), CycleError> {
-    let millis = i64::try_from(clock.unix_time())
+    // A successful sync after RevokeUnconfirmed necessarily used a newly
+    // consented credential: disconnect deleted the prior local token before it
+    // reported that state. Clearing recovery is therefore required before the
+    // worker reports success, so stale revoke advice never targets the new
+    // connection.
+    store
+        .clear_disconnect_recovery(account)
+        .await
+        .map_err(|_error| CycleError::Setup)?;
+    let Some(millis) = i64::try_from(clock.unix_time())
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000))
-        .ok_or(CycleError::Setup)?;
-    store
-        .record_successful_sync(account, millis)
-        .await
-        .map_err(|_error| CycleError::Setup)
+    else {
+        return Ok(());
+    };
+    // Freshness is presentational aggregate metadata. Its failure must not
+    // turn an exchanged credential and fully committed mailbox sync into a
+    // false connection failure; Swift explicitly renders an unavailable time.
+    let _ = store.record_successful_sync(account, millis).await;
+    Ok(())
 }
 
 /// Begins a bounded sync for a newly-connected `account` on a background worker,
@@ -862,8 +874,7 @@ pub fn lifecycle_metadata(
     };
     // The SQLCipher adapter's lifecycle operation is lazy but synchronous by
     // construction; the worker is the only production caller and runs off the
-    // main thread. Build no runtime here: query callers receive a fast opaque
-    // storage failure if a future backend ever requires one.
+    // main thread. Runtime construction failure stays an opaque storage error.
     let runtime = build_sync_runtime().map_err(|_error| MailboxStoreError::Storage)?;
     runtime
         .block_on(store.lifecycle_metadata(account))
@@ -1803,6 +1814,8 @@ mod tests {
         failing_purges: AtomicUsize,
         lifecycle: std::sync::Mutex<AccountLifecycleMetadata>,
         fail_marker: AtomicBool,
+        fail_freshness: AtomicBool,
+        freshness_writes: AtomicUsize,
         log_lifecycle: AtomicBool,
         log: std::sync::Arc<OrderLog>,
     }
@@ -1814,6 +1827,8 @@ mod tests {
                 failing_purges: AtomicUsize::new(0),
                 lifecycle: std::sync::Mutex::new(AccountLifecycleMetadata::default()),
                 fail_marker: AtomicBool::new(false),
+                fail_freshness: AtomicBool::new(false),
+                freshness_writes: AtomicUsize::new(0),
                 log_lifecycle: AtomicBool::new(false),
                 log,
             }
@@ -1836,6 +1851,13 @@ mod tests {
         fn fail_marker(self) -> Self {
             self.fail_marker.store(true, Ordering::SeqCst);
             self
+        }
+        fn fail_freshness(self) -> Self {
+            self.fail_freshness.store(true, Ordering::SeqCst);
+            self
+        }
+        fn freshness_writes(&self) -> usize {
+            self.freshness_writes.load(Ordering::SeqCst)
         }
         fn with_lifecycle_log(self) -> Self {
             self.log_lifecycle.store(true, Ordering::SeqCst);
@@ -1944,7 +1966,22 @@ mod tests {
             'a,
             Result<(), tersa_application::mailbox::MailboxStoreError>,
         > {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.freshness_writes.fetch_add(1, Ordering::SeqCst);
+                if self.fail_freshness.load(Ordering::SeqCst) {
+                    return Err(tersa_application::mailbox::MailboxStoreError::Storage);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedWallClock(u64);
+
+    impl tersa_application::oauth::WallClock for FixedWallClock {
+        fn unix_time(&self) -> u64 {
+            self.0
         }
     }
 
@@ -2128,6 +2165,29 @@ mod tests {
             vec!["marker-start", "revoke", "delete", "purge", "marker-clear"]
         );
         assert_eq!(store.recovery(), None);
+    }
+
+    #[test]
+    fn successful_sync_clears_recovery_even_when_freshness_write_fails() {
+        let slot = account("lifecycle-sync-reconcile");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let store = FakePurgeStore::new(log)
+            .with_recovery(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed)
+            .fail_freshness();
+
+        assert!(
+            test_runtime()
+                .block_on(super::finalize_successful_sync(
+                    &store,
+                    &slot,
+                    &FixedWallClock(1_800_000_000),
+                ))
+                .is_ok(),
+            "freshness metadata must not fail a successful sync"
+        );
+
+        assert_eq!(store.recovery(), None);
+        assert_eq!(store.freshness_writes(), 1);
     }
 
     #[test]

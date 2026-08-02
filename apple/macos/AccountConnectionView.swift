@@ -55,7 +55,7 @@ struct AccountConnectionView: View {
                 .accessibilityHidden(true)
             Text("Connect your account")
                 .font(.title2)
-            Text("Enter an account identifier to connect this Mac.")
+            Text("Enter a local account name, such as primary-gmail, to connect this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -64,11 +64,11 @@ struct AccountConnectionView: View {
                     .accessibilityLabel("Connection progress")
                     .accessibilityValue("In progress")
             }
-            TextField("Account identifier", text: $viewModel.accountIdentifier)
+            TextField("Local account name", text: $viewModel.accountIdentifier)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 320)
                 .disabled(isConnecting)
-                .accessibilityLabel("Account identifier")
+                .accessibilityLabel("Local account name")
                 .onSubmit(handleConnectTapped)
             Button("Connect", action: handleConnectTapped)
                 .keyboardShortcut(.defaultAction)
@@ -145,6 +145,8 @@ struct AccountConnectionView: View {
         case .disconnectIncomplete:
             return "Disconnect again"
         case .disconnectTimedOut:
+            return "Keep waiting"
+        case .connectionTimedOut:
             return "Keep waiting"
         default:
             return "Try again"

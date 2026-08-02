@@ -1385,7 +1385,11 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
         ),
         (
             "tersa_mailbox_macos_lifecycle_get",
-            "pubunsafeextern\"C\"fntersa_mailbox_macos_lifecycle_get(account_id:*constu8,account_id_len:usize,output_recovery:*muti32,output_last_successful_sync_unix_millis:*muti64,)->i32",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_mailbox_macos_lifecycle_get(account_id:*constu8,account_id_len:usize,output_recovery:*mut",
+                "i32,output_last_successful_sync_unix_millis:*mut",
+                "i64,)->i32"
+            ),
         ),
         (
             "tersa_mailbox_macos_sync_begin",
@@ -4914,11 +4918,14 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
             if matches!(sources.as_slice(), [
                 StrictYamlValue::Mapping(test_sources),
                 StrictYamlValue::Mapping(coordinator_source),
+                StrictYamlValue::Mapping(disconnect_intent_source),
                 StrictYamlValue::Mapping(lifecycle_source),
             ] if test_sources.len() == 1
                 && matches!(test_sources.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-tests")
                 && coordinator_source.len() == 1
                 && matches!(coordinator_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionOperationDeadline.swift")
+                && disconnect_intent_source.len() == 1
+                && matches!(disconnect_intent_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/DisconnectIntentStore.swift")
                 && lifecycle_source.len() == 1
                 && matches!(lifecycle_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxLifecyclePresentation.swift"))
     );
@@ -7278,6 +7285,7 @@ targets:
     sources:
       - path: macos-tests
       - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/DisconnectIntentStore.swift
       - path: macos/MailboxLifecyclePresentation.swift
     settings:
       base:
@@ -10240,6 +10248,7 @@ targets:
     sources:
       - path: macos-tests
       - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/DisconnectIntentStore.swift
       - path: macos/MailboxLifecyclePresentation.swift
     settings:
       base:

@@ -80,4 +80,23 @@ final class MailboxLifecyclePresentationTests: XCTestCase {
             .fresh(lastSuccessfulSync: refreshedDate)
         )
     }
+
+    func testLifecycleReadFailureIsAnExplicitLaunchFailure() {
+        XCTAssertEqual(MailboxLifecycleReadResult.failure.launchProjection, .unavailable)
+    }
+
+    func testLaunchRestoreFenceRejectsUserIntentAndAccountChanges() {
+        var fence = MailboxLifecycleRestoreFence()
+        let primary = Data("primary-gmail".utf8)
+        let other = Data("other-gmail".utf8)
+        let first = fence.begin(accountIdentifier: primary)
+
+        XCTAssertFalse(fence.finish(first, currentAccountIdentifier: other))
+        fence.invalidate()
+        XCTAssertFalse(fence.finish(first, currentAccountIdentifier: primary))
+
+        let retry = fence.begin(accountIdentifier: primary)
+        XCTAssertTrue(fence.finish(retry, currentAccountIdentifier: primary))
+        XCTAssertFalse(fence.finish(retry, currentAccountIdentifier: primary))
+    }
 }

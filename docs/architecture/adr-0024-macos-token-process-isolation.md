@@ -42,10 +42,10 @@ untrusted principals.
 The release architecture will isolate refresh-token authority in a separately
 signed embedded XPC service. The process capabilities are disjoint:
 
-| Process | Keychain group | Other required capabilities |
-| --- | --- | --- |
-| `TersaMac` | installation root/store group only | App Sandbox, network client/server, App Group |
-| token broker XPC service | refresh-token group only | App Sandbox and network client |
+| Process | Keychain group | Other required capabilities | Required signing posture |
+| --- | --- | --- | --- |
+| `TersaMac` | installation root/store group only | App Sandbox, network client/server, App Group | Hardened Runtime; library validation enabled |
+| token broker XPC service | refresh-token group only | App Sandbox and network client | Hardened Runtime; library validation enabled |
 
 The main app will not carry the token access-group entitlement. The broker will
 not carry the installation root/store Keychain group or App Group entitlement.
@@ -56,17 +56,45 @@ exchange or refresh may return only the bounded short-lived access token and the
 already validated subject required by the account-identity gate. Gmail mailbox
 fetch and SQLCipher ownership remain in the main process.
 
-The broker must accept connections only from the embedded, same-team Tersa app,
-validate every bounded request again at the service boundary, serialize token
-mutation per account, reject unknown protocol versions and operations, and fail
-closed if the service is unavailable. There is no in-process Keychain fallback,
-environment/file credential channel, or generic Keychain-operation RPC.
+The main app owns the IPv4 loopback listener and passes its ephemeral redirect
+URI to the broker before authorization begins. The broker generates and retains
+the PKCE verifier and state, returns the authorization URL plus an opaque session
+handle, validates the forwarded callback for that session, and redeems the code.
+The verifier and refresh token never cross IPC. Seeing the callback code in the
+main process is insufficient to redeem it without the broker-held verifier. This
+choice keeps `network.server` out of the broker and pins it to `TersaMac`.
 
-The current app has not been distributed. Migration therefore deliberately
-discards the development refresh-token item and requires owner-driven
-re-consent. No migration build may temporarily give one executable both the new
-token group and the root/store group. The legacy development credential must be
-removed before release-candidate evidence is captured.
+Both release processes must omit `get-task-allow`,
+`com.apple.security.cs.debugger`,
+`com.apple.security.cs.disable-library-validation`, and
+`com.apple.security.cs.allow-dyld-environment-variables`. The target and
+entitlement inventories treat presence or enablement of any of those exceptions
+as a release-blocking violation. Without this posture, debugger attachment or
+library injection could collapse the process boundary while leaving the
+Keychain-group table apparently disjoint.
+
+The broker must accept connections only from the embedded Tersa app by applying
+`NSXPCConnection.setCodeSigningRequirement(_:)` with the reviewed team and
+designated requirement. PID-based identity checks are forbidden because PID
+reuse is not a signing identity. The broker validates every bounded request
+again at the service boundary, serializes token mutation per account, rejects
+unknown protocol versions and operations, and fails closed if the service is
+unavailable. There is no in-process Keychain fallback, environment/file
+credential channel, or generic Keychain-operation RPC.
+
+Disconnect retains the ordering `outer intent → SQLCipher marker → broker
+revoke → broker token delete → main-app purge → marker clear`. If the broker is
+unavailable, the app preserves `IncompleteTeardown` and reports an unconfirmed
+failure; it never reports a clean disconnect or purges away the recovery
+evidence. Short-lived access tokens returned to the main process remain
+memory-only, cycle-scoped, zeroized on drop, and are never persisted or logged.
+
+The current app has not been distributed. Before the entitlement split, a build
+that still carries only the legacy group must best-effort revoke and then delete
+the development refresh-token item. An explicit absence query must confirm the
+item is gone; absence is not assumed. The split build then introduces the new
+broker group and requires owner-driven re-consent. No migration build may give
+one executable both the new token group and the root/store group.
 
 ## Required implementation and evidence
 
@@ -77,17 +105,23 @@ Issue #51 remains open until all of the following are complete:
    exchange, refresh, persistence, rotation, deletion, and revoke behind it.
 3. Remove token-group authority and direct refresh-token Keychain reachability
    from `TersaMac`; keep root/store authority out of the broker.
-4. Extend dependency, source, target, and entitlement inventories so drift in
-   either process fails CI.
+4. Extend dependency, source, target, entitlement, Hardened Runtime, library
+   validation, and forbidden-debug-capability inventories so drift in either
+   process fails CI.
 5. In a development-signed build, prove normal token operations succeed, a
    broker root-targeted probe receives `errSecMissingEntitlement`, and a main-app
    token-targeted probe receives `errSecMissingEntitlement`.
 6. Repeat entitlement inspection and both negative controls on the exact
-   Developer ID signed and notarized release candidate.
+   Developer ID signed and notarized release candidate. Prove debugger attach
+   and `task_for_pid` from the main app to the broker fail under the exact
+   release signing posture.
 
-The probes must be fixed-purpose test entries and must not expose a generic
-Keychain mutation capability. Evidence must be redacted, commit-bound, and
-independently reviewed under the existing distribution protocol.
+The probes must be fixed-purpose test entries, set
+`kSecUseDataProtectionKeychain`, and must not expose a generic Keychain mutation
+capability. Only `errSecMissingEntitlement` passes a wrong-group negative
+control; `errSecItemNotFound` is a failed probe. Evidence must be redacted,
+commit-bound, and independently reviewed under the existing distribution
+protocol.
 
 ## Consequences
 

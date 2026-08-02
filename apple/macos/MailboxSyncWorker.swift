@@ -139,12 +139,6 @@ enum MailboxPollStatus {
     }
 }
 
-/// Closed result of the privacy-safe lifecycle metadata query.
-enum MailboxLifecycleReadResult {
-    case success(MailboxLifecycleSnapshot)
-    case failure
-}
-
 /// Serializes the mailbox connect, disconnect, and sync begins — and their
 /// ONE shared FFI poll loop — away from the AppKit main thread. One active
 /// session at a time: the UI cannot legally run two flows, and the Rust

@@ -73,6 +73,7 @@ targets:
       # Compile the coordinator directly so its deterministic tests do not
       # invoke the app target's AppKit/FFI bootstrap or live OAuth surface.
       - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/DisconnectIntentStore.swift
       - path: macos/MailboxLifecyclePresentation.swift
     settings:
       base:

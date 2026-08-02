@@ -38,6 +38,7 @@ final class AccountConnectionViewModel: ObservableObject {
 
     private let syncWorker = MailboxSyncWorker()
     private let operationDeadline = ConnectionOperationDeadline()
+    private let disconnectIntentStore = DisconnectIntentStore()
     private var operationTimer: Timer?
     private static let connectAndSyncTimeout: TimeInterval = 45
     private static let authorizationTimeout: TimeInterval = 5 * 60
@@ -52,6 +53,7 @@ final class AccountConnectionViewModel: ObservableObject {
     private var activationObserver: NSObjectProtocol?
     private var activationTimeout: Timer?
     private var didRestorePersistedLifecycle = false
+    private var launchLifecycleRestoreFence = MailboxLifecycleRestoreFence()
 
     /// The M2 warning copy for a disconnect that returned
     /// `.succeededRevokeUnconfirmed`: fact → what we can't confirm → the
@@ -71,13 +73,25 @@ final class AccountConnectionViewModel: ObservableObject {
             return
         }
         didRestorePersistedLifecycle = true
+        if let pendingIdentifier = disconnectIntentStore.pendingAccountIdentifier() {
+            let pendingAccount = Data(pendingIdentifier.utf8)
+            accountIdentifier = pendingIdentifier
+            connectedAccountIdentifier = pendingAccount
+            state = .failed(.disconnectIncomplete)
+            return
+        }
         guard let savedIdentifier = UserDefaults.standard.string(
             forKey: Self.lastAccountIdentifierKey
         ), !savedIdentifier.isEmpty else {
             return
         }
         accountIdentifier = savedIdentifier
-        restorePersistedLifecycle(accountIdentifier: Data(savedIdentifier.utf8))
+        let savedAccount = Data(savedIdentifier.utf8)
+        let restoreToken = launchLifecycleRestoreFence.begin(accountIdentifier: savedAccount)
+        restorePersistedLifecycle(
+            accountIdentifier: savedAccount,
+            restoreToken: restoreToken
+        )
     }
 
     /// The OAuth client id handed to the sync and connect begins: the SAME
@@ -127,13 +141,30 @@ final class AccountConnectionViewModel: ObservableObject {
         return true
     }
 
+    private func renewTimedOutOperation(
+        _ kind: ConnectionOperationKind,
+        timeout: TimeInterval,
+        state renewedState: ConnectionState
+    ) {
+        guard let token = operationDeadline.renewTimedOut(kind: kind, timeout: timeout) else {
+            return
+        }
+        operationTimer?.invalidate()
+        operationTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleOperationTimeout(token)
+            }
+        }
+        state = renewedState
+    }
+
     /// A normal timeout invalidates its callback generation. Disconnect is the
     /// exception: its Rust teardown has already begun, so the late terminal is
     /// still allowed to settle the UI and no connect may start in between.
     private func handleOperationTimeout(_ token: ConnectionOperationToken) {
         switch token.kind {
         case .connectAndSync:
-            guard operationDeadline.timeOut(token, keepAlive: false) else { return }
+            guard operationDeadline.timeOut(token, keepAlive: true) else { return }
             operationTimer = nil
             state = .failed(.connectionTimedOut)
         case .authorization:
@@ -158,10 +189,11 @@ final class AccountConnectionViewModel: ObservableObject {
               state != .connecting,
               state != .authorizing,
               state != .disconnecting,
-              !operationDeadline.disconnectIsActive
+              !operationDeadline.hasActiveOperation
         else {
             return
         }
+        launchLifecycleRestoreFence.invalidate()
         // A new connect supersedes only a clean-disconnect confirmation. A
         // durable revoke-unconfirmed warning remains visible until the next
         // disconnect converges or the user dismisses it explicitly.
@@ -210,7 +242,9 @@ final class AccountConnectionViewModel: ObservableObject {
     /// Routes a failure's retry. A failed DISCONNECT must re-issue the
     /// disconnect — the Rust account slot stays fenced against sync and
     /// connect until a disconnect converges, so re-running the connect ladder
-    /// would dead-loop — while every other failure retries the ladder.
+    /// would dead-loop. A timed-out non-cancellable operation only returns to
+    /// progress while its original terminal remains authoritative; other
+    /// failures retry the ladder.
     func retryAfterFailure(_ failure: ConnectionFailure) {
         // Only a genuine failure retries. `retry()`/`disconnect()` reset the
         // state, so without this a double-tap before the failure view is
@@ -222,10 +256,24 @@ final class AccountConnectionViewModel: ObservableObject {
         if failure == .disconnectIncomplete {
             state = .notConnected
             disconnect()
+        } else if failure == .connectionTimedOut, operationDeadline.connectIsActive {
+            // Token exchange, credential persistence, or bounded sync may
+            // already be in flight and cannot be abandoned safely. Re-enter
+            // progress without issuing a second begin; its terminal remains
+            // authoritative.
+            renewTimedOutOperation(
+                .connectAndSync,
+                timeout: Self.connectAndSyncTimeout,
+                state: .connecting
+            )
         } else if failure == .disconnectTimedOut, operationDeadline.disconnectIsActive {
             // The destructive worker is still live. Re-enter progress without
             // issuing a second begin; its late terminal remains authoritative.
-            state = .disconnecting
+            renewTimedOutOperation(
+                .disconnect,
+                timeout: Self.disconnectTimeout,
+                state: .disconnecting
+            )
         } else {
             retry()
         }
@@ -234,10 +282,18 @@ final class AccountConnectionViewModel: ObservableObject {
     /// Disconnects the connected account (consent withdrawal + local
     /// teardown). Any in-flight OAuth is cancelled FIRST and unconditionally:
     /// a pending grant landing within the bridge's authorization lifetime
-    /// after a successful disconnect would silently re-connect the account,
+    /// after a successful disconnect would silently re-connect the account.
+    /// The content-free outer intent journal is durably verified before the
+    /// destructive Rust begin and cleared only after a successful terminal.
     func disconnect() {
         (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
         guard let accountIdentifier = connectedAccountIdentifier, state != .disconnecting else {
+            return
+        }
+        guard let pendingIdentifier = String(data: accountIdentifier, encoding: .utf8),
+              disconnectIntentStore.markPending(accountIdentifier: pendingIdentifier)
+        else {
+            state = .failed(.disconnectIncomplete)
             return
         }
         // This disconnect earns its own banner: clear any prior one before we
@@ -256,12 +312,20 @@ final class AccountConnectionViewModel: ObservableObject {
             _ = self.finishOperation(token)
             switch status {
             case .succeeded:
+                guard self.disconnectIntentStore.clearPending() else {
+                    self.state = .failed(.disconnectIncomplete)
+                    return
+                }
                 self.state = .notConnected
                 self.disconnectConfirmation = Self.disconnectConfirmed
                 self.connectedAccountIdentifier = nil
                 self.mailboxFreshness = .unknown
                 UserDefaults.standard.removeObject(forKey: Self.lastAccountIdentifierKey)
             case .succeededRevokeUnconfirmed:
+                guard self.disconnectIntentStore.clearPending() else {
+                    self.state = .failed(.disconnectIncomplete)
+                    return
+                }
                 self.state = .notConnected
                 self.disconnectNotice = Self.revokeUnconfirmedNotice
                 self.connectedAccountIdentifier = nil
@@ -562,19 +626,33 @@ final class AccountConnectionViewModel: ObservableObject {
     /// Restores a durable disconnect warning as soon as the one remembered,
     /// opaque local account alias is available. This reads only the bounded
     /// lifecycle projection; it never starts OAuth or a mailbox sync at launch.
-    private func restorePersistedLifecycle(accountIdentifier: Data) {
+    private func restorePersistedLifecycle(
+        accountIdentifier: Data,
+        restoreToken: MailboxLifecycleRestoreToken
+    ) {
         syncWorker.readLifecycle(accountIdentifier: accountIdentifier) { [weak self] result in
-            guard let self, case .success(let snapshot) = result else {
+            guard let self,
+                  self.state == .notConnected,
+                  self.launchLifecycleRestoreFence.finish(
+                      restoreToken,
+                      currentAccountIdentifier: Data(self.accountIdentifier.utf8)
+                  )
+            else {
                 return
             }
-            switch snapshot.recoveryPresentation {
-            case .disconnectIncomplete:
-                self.connectedAccountIdentifier = accountIdentifier
-                self.state = .failed(.disconnectIncomplete)
-            case .revokeUnconfirmed:
-                self.disconnectNotice = Self.revokeUnconfirmedNotice
-            case .none:
-                break
+            switch result.launchProjection {
+            case .unavailable:
+                self.state = .failed(.accountStateUnavailable)
+            case .recovery(let recovery):
+                switch recovery {
+                case .disconnectIncomplete:
+                    self.connectedAccountIdentifier = accountIdentifier
+                    self.state = .failed(.disconnectIncomplete)
+                case .revokeUnconfirmed:
+                    self.disconnectNotice = Self.revokeUnconfirmedNotice
+                case .none:
+                    break
+                }
             }
         }
     }
@@ -590,18 +668,21 @@ final class AccountConnectionViewModel: ObservableObject {
             guard let self, self.operationDeadline.accepts(token) else {
                 return
             }
-            if case .success(let snapshot) = result {
-                switch snapshot.recoveryPresentation {
-                case .disconnectIncomplete:
-                    _ = self.finishOperation(token)
-                    self.connectedAccountIdentifier = accountIdentifier
-                    self.state = .failed(.disconnectIncomplete)
-                    return
-                case .revokeUnconfirmed:
-                    self.disconnectNotice = Self.revokeUnconfirmedNotice
-                case .none:
-                    break
-                }
+            guard case .success(let snapshot) = result else {
+                _ = self.finishOperation(token)
+                self.state = .failed(.accountStateUnavailable)
+                return
+            }
+            switch snapshot.recoveryPresentation {
+            case .disconnectIncomplete:
+                _ = self.finishOperation(token)
+                self.connectedAccountIdentifier = accountIdentifier
+                self.state = .failed(.disconnectIncomplete)
+                return
+            case .revokeUnconfirmed:
+                self.disconnectNotice = Self.revokeUnconfirmedNotice
+            case .none:
+                break
             }
             self.syncWithStoredCredential(accountIdentifier: accountIdentifier, token: token)
         }
@@ -623,6 +704,7 @@ final class AccountConnectionViewModel: ObservableObject {
             case .failure: nil
             }
             self.mailboxFreshness = .afterSync(snapshot: snapshot, offline: offline)
+            self.disconnectNotice = nil
             _ = self.finishOperation(token)
             self.connectedAccountIdentifier = accountIdentifier
             self.state = .connected
