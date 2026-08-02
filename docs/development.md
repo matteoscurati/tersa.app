@@ -69,8 +69,10 @@ time, redundant macOS capacity, cache churn, and artifact growth.
 
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
 build paths fan out conservatively, while documentation, workflow, and xtask-only
-changes avoid Apple evidence. Its table-driven tests must change with every new
-scope rule. A single suite can be reproduced without running unrelated evidence:
+changes avoid Apple evidence. The classifier and its own tests are an exact
+control-path allowlist exercised inside the scope job; every other unknown
+`scripts/` path still fans out. Its table-driven tests must change with every
+new scope rule. A single suite can be reproduced without running unrelated evidence:
 
 ```sh
 gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus

@@ -48,6 +48,10 @@ COMPONENT_PATHS = {
 SHARED_UI_CRATES = ("crates/domain/", "crates/application/", "crates/presentation/")
 APPLE_ADAPTERS = "adapters/"
 DOCS_ONLY_PREFIXES = ("docs/", "xtask/", ".github/")
+CI_CONTROL_PATHS = {
+    "scripts/ci-change-scope.py",
+    "scripts/test_ci_change_scope.py",
+}
 FULL_FANOUT_PATHS = {
     "Cargo.toml",
     "Cargo.lock",
@@ -94,7 +98,7 @@ def classify(paths: Iterable[str], *, full: bool = False) -> Scope:
         if path in FULL_FANOUT_PATHS or path.startswith(FULL_FANOUT_PREFIXES):
             enable_full(scope)
             continue
-        if path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
+        if path in CI_CONTROL_PATHS or path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
             continue
         if path.endswith("/Cargo.toml"):
             scope.enable("notices")

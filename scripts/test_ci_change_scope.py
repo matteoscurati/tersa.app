@@ -58,6 +58,8 @@ class ChangeScopeTests(unittest.TestCase):
             ("docs stay out", ["docs/development.md"], set()),
             ("xtask stays out", ["xtask/src/main.rs"], set()),
             ("workflow stays out", [".github/workflows/ci.yml"], set()),
+            ("scope classifier stays in the control lane", ["scripts/ci-change-scope.py"], set()),
+            ("scope tests stay in the control lane", ["scripts/test_ci_change_scope.py"], set()),
             ("multiple paths union scopes", ["apps/blob-spike/src/main.rs", "apps/search-spike/src/main.rs"], {"blob", "search"}),
         )
         for label, paths, expected in cases:
