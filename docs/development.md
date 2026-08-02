@@ -45,11 +45,19 @@ including its commit-bound locator and review-retention rules.
 
 Open implementation pull requests as drafts. Draft creation and synchronization
 schedule no CI runners; changing the pull request to ready-for-review triggers
-the one required fast lane. Subsequent ready pull-request commits supersede an
-older in-progress run through the per-PR concurrency group. The fast lane runs
-change-scope classification, Linux and macOS Rust verification, supply-chain
-policy, and the real Apple product build when production Apple paths are
-affected. The Apple PR gate builds macOS and the iOS simulator once. Device
+the required path-scoped lane. Subsequent ready pull-request commits supersede
+an older in-progress run through the per-PR concurrency group. Every ready pull
+request runs only the lightweight classifier, its deterministic control-script
+tests, DCO validation, and the final gate. Documentation, workflow, and exact
+self-tested CI-control changes stop there, so their required run normally
+finishes in seconds.
+
+Portable Rust or xtask changes add Linux Rust verification and supply-chain
+policy. macOS Rust verification is reserved for platform, adapter, Apple bridge,
+and macOS CLI paths. Apple product paths add the real macOS and iOS-simulator
+build; that build also covers the Rust linked into the application. Root
+manifests, shared build inputs, and unknown paths still fail closed to the full
+baseline. The Apple PR gate builds macOS and the iOS simulator once. Device
 builds, archives, and OAuth feasibility capture belong to explicit evidence
 runs, not the required PR path.
 
@@ -72,11 +80,13 @@ execution has no billable minute charge. The policy above still minimizes queue
 time, redundant macOS capacity, and artifact growth.
 
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
-build paths fan out conservatively, while documentation, workflow, and xtask-only
-changes avoid Apple evidence. The classifier and its own tests are an exact
-control-path allowlist exercised inside the scope job; every other unknown
-`scripts/` path still fans out. Its table-driven tests must change with every
-new scope rule. A single suite can be reproduced without running unrelated evidence:
+build paths fan out conservatively, while documentation, workflow, and exact
+self-tested control paths avoid build jobs. xtask-only changes run the portable
+Linux and policy baseline but avoid Apple evidence. The classifier and its own
+tests are an exact control-path allowlist exercised inside the scope job; every
+other unknown `scripts/` path still fans out. Its table-driven tests must change
+with every new scope rule. A single suite can be reproduced without running
+unrelated evidence:
 
 ```sh
 gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus

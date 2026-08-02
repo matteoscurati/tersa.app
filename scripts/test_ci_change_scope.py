@@ -31,23 +31,25 @@ class ChangeScopeTests(unittest.TestCase):
             ("root manifest fans out", ["Cargo.toml"], ALL),
             ("Apple project builds only the product lane", ["apple/project.yml"], {"product_apple"}),
             ("shared Apple script fans out", ["apple/scripts/build-rust-staticlib.sh"], ALL),
-            ("Slint component", ["apps/slint-spike/ui/tersa.slint"], {"slint"}),
-            ("Slint manifest also checks notices", ["apps/slint-spike/Cargo.toml"], {"slint", "notices"}),
-            ("Dioxus component", ["apps/dioxus-spike/src/main.rs"], {"dioxus"}),
-            ("SQLCipher component", ["apps/sqlcipher-spike/migrations/global/0001_initial.sql"], {"sqlcipher"}),
-            ("search component", ["apps/search-spike/src/main.rs"], {"search"}),
-            ("MIME component", ["apps/mime-spike/src/lib.rs"], {"mime"}),
-            ("blob component", ["apps/blob-spike/src/format.rs"], {"blob"}),
-            ("fuzz requires MIME and fuzz", ["fuzz/fuzz_targets/mime_display.rs"], {"mime", "mime_fuzz"}),
-            ("MIME fuzz verifier", ["scripts/verify-mime-fuzz.sh"], {"mime", "mime_fuzz"}),
+            ("Slint component", ["apps/slint-spike/ui/tersa.slint"], {"rust_linux", "policy", "slint"}),
+            ("Slint manifest also checks notices", ["apps/slint-spike/Cargo.toml"], {"rust_linux", "policy", "slint", "notices"}),
+            ("Dioxus component", ["apps/dioxus-spike/src/main.rs"], {"rust_linux", "policy", "dioxus"}),
+            ("SQLCipher component", ["apps/sqlcipher-spike/migrations/global/0001_initial.sql"], {"rust_linux", "policy", "sqlcipher"}),
+            ("search component", ["apps/search-spike/src/main.rs"], {"rust_linux", "policy", "search"}),
+            ("MIME component", ["apps/mime-spike/src/lib.rs"], {"rust_linux", "policy", "mime"}),
+            ("blob component", ["apps/blob-spike/src/format.rs"], {"rust_linux", "policy", "blob"}),
+            ("fuzz requires MIME and fuzz", ["fuzz/fuzz_targets/mime_display.rs"], {"rust_linux", "policy", "mime", "mime_fuzz"}),
+            ("MIME fuzz verifier", ["scripts/verify-mime-fuzz.sh"], {"rust_linux", "policy", "mime", "mime_fuzz"}),
             ("notices are isolated", ["apple/licenses/rust-skia-notices.txt"], {"notices"}),
             ("Slint notice config", ["about.toml"], {"slint", "notices"}),
             ("product notice config", ["about-bridge.toml"], {"product_apple", "notices"}),
             ("Dioxus notice config", ["about-dioxus.toml"], {"dioxus", "notices"}),
-            ("shared domain has UI reverse dependants", ["crates/domain/src/lib.rs"], {"product_apple", "slint", "dioxus"}),
-            ("shared presentation has UI reverse dependants", ["crates/presentation/src/lib.rs"], {"product_apple", "slint", "dioxus"}),
-            ("adapter changes build product", ["adapters/keychain-macos/src/lib.rs"], {"product_apple"}),
-            ("adapter manifest also checks notices", ["adapters/keychain-macos/Cargo.toml"], {"product_apple", "notices"}),
+            ("shared domain has UI reverse dependants", ["crates/domain/src/lib.rs"], {"rust_linux", "policy", "product_apple", "slint", "dioxus"}),
+            ("shared presentation has UI reverse dependants", ["crates/presentation/src/lib.rs"], {"rust_linux", "policy", "product_apple", "slint", "dioxus"}),
+            ("adapter changes build product", ["adapters/keychain-macos/src/lib.rs"], {"rust_linux", "rust_macos", "policy", "product_apple"}),
+            ("adapter manifest also checks notices", ["adapters/keychain-macos/Cargo.toml"], {"rust_linux", "rust_macos", "policy", "product_apple", "notices"}),
+            ("Apple Rust bridge checks both hosts", ["apple/rust-bridge/src/lib.rs"], {"rust_linux", "rust_macos", "policy", "product_apple"}),
+            ("macOS CLI checks both hosts", ["apps/cli-macos/src/main.rs"], {"rust_linux", "rust_macos", "policy"}),
             ("Apple product UI host", ["apple/dioxus-ios/Info.plist"], {"product_apple", "dioxus"}),
             ("generic Apple product file", ["apple/macos/AppDelegate.swift"], {"product_apple"}),
             (
@@ -56,11 +58,17 @@ class ChangeScopeTests(unittest.TestCase):
                 {"product_apple"},
             ),
             ("docs stay out", ["docs/development.md"], set()),
-            ("xtask stays out", ["xtask/src/main.rs"], set()),
+            ("xtask runs the portable baseline and policy", ["xtask/src/main.rs"], {"rust_linux", "policy"}),
             ("workflow stays out", [".github/workflows/ci.yml"], set()),
+            ("DCO checker stays in the control lane", ["scripts/check-dco.py"], set()),
+            ("DCO tests stay in the control lane", ["scripts/test_check_dco.py"], set()),
             ("scope classifier stays in the control lane", ["scripts/ci-change-scope.py"], set()),
             ("scope tests stay in the control lane", ["scripts/test_ci_change_scope.py"], set()),
-            ("multiple paths union scopes", ["apps/blob-spike/src/main.rs", "apps/search-spike/src/main.rs"], {"blob", "search"}),
+            ("performance reporter stays in its tested control lane", ["scripts/macos-performance-report.py"], set()),
+            ("performance tests stay in the control lane", ["scripts/test_macos_performance_report.py"], set()),
+            ("M0 gate verifier stays in its self-tested control lane", ["scripts/verify-m0-gates.py"], set()),
+            ("evidence manifest stays in its self-tested control lane", ["scripts/write-evidence-manifest.py"], set()),
+            ("multiple paths union scopes", ["apps/blob-spike/src/main.rs", "apps/search-spike/src/main.rs"], {"rust_linux", "policy", "blob", "search"}),
         )
         for label, paths, expected in cases:
             with self.subTest(label=label):
@@ -71,6 +79,11 @@ class ChangeScopeTests(unittest.TestCase):
     def test_full_mode_forces_every_scope(self) -> None:
         scope = MODULE.classify(["docs/development.md"], full=True)
         self.assertEqual({name for name in NAMES if getattr(scope, name)}, ALL)
+
+    def test_baseline_mode_adds_portable_rust_and_policy(self) -> None:
+        scope = MODULE.classify(["apple/licenses/rust-skia-notices.txt"], baseline=True)
+        actual = {name for name in NAMES if getattr(scope, name)}
+        self.assertEqual(actual, {"rust_linux", "policy", "notices"})
 
     def test_cli_reads_stdin_and_emits_github_output_format(self) -> None:
         result = subprocess.run(
@@ -124,6 +137,31 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("Swatinem/rust-cache@", workflow)
         self.assertNotIn("cache-save-if:", workflow)
         self.assertNotIn("cache-on-failure:", workflow)
+
+    def test_workflow_path_scopes_baseline_jobs(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for output in ("rust_linux", "rust_macos", "policy"):
+            self.assertIn(f"      {output}: ${{{{ steps.scope.outputs.{output} }}}}", workflow)
+            self.assertIn(f"if: ${{{{ needs.changes.outputs.{output} == 'true' }}}}", workflow)
+        self.assertIn("python3 scripts/ci-change-scope.py --baseline", workflow)
+        self.assertNotIn("matrix:\n        os: [ubuntu-24.04, macos-15]", workflow)
+
+    def test_workflow_keeps_dco_in_the_required_control_job(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        changes_start = workflow.index("  changes:\n")
+        changes_end = workflow.index("\n  apple_product:\n", changes_start)
+        changes_job = workflow[changes_start:changes_end]
+        self.assertIn("python3 scripts/check-dco.py", changes_job)
+        self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
+        self.assertIn("python3 scripts/write-evidence-manifest.py --self-test", changes_job)
+        self.assertNotIn("cargo run --locked --package xtask -- dco", workflow)
+
+    def test_optional_baselines_remain_visible_to_both_gates(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        needs = "needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]"
+        self.assertEqual(workflow.count(needs), 2)
+        for result in ("RUST_LINUX_RESULT", "RUST_MACOS_RESULT", "POLICY_RESULT"):
+            self.assertEqual(workflow.count(f'case "${result}" in'), 2)
 
     def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
