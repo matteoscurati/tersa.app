@@ -1,9 +1,9 @@
 # macOS UI development-signed accessibility and App Sandbox evidence
 
-## Current Apple Development capture — 2026-08-01
+## Current Apple Development capture — 2026-08-02
 
 The capture script built tracked Release/arm64 source at commit
-`8254d45c5296432445e0af73ee85b9a18c5022cc`. It selected the one available
+`f89a427cdd6f1ad6a957bdbb98e5fd29d6b1aaac`. It selected the one available
 Apple Development identity and the one current matching Mac Development
 profile without printing either identifier. The resulting app used Hardened
 Runtime and the exact five committed production entitlements; no entitlement
@@ -15,6 +15,8 @@ was weakened or rewritten in the repository.
 | Provisioning and entitlement binding | PASS — current embedded profile and the exact five-key set; team values redacted |
 | Product launch and App Sandbox container | PASS — the app remained running and `~/Library/Containers/app.tersa.mac` existed |
 | Sandbox denial and observation-path control | PASS — the same-signature bundled canary was denied an outside-container create; its unsandboxed control succeeded |
+| Live Gmail connect and bounded sync | PASS — owner completed consent; the mailbox reader observed 50 rows and the UI rendered the inbox |
+| Live disconnect and local teardown | PASS — clean disconnect confirmation; signed probes observed 0 mailbox rows, no refresh token, and no account identity |
 | VoiceOver-only five-screen walk | PENDING — not executed; no spoken-output claim |
 | Full Keyboard Access-only five-screen walk | PENDING — not executed; no keyboard-navigation claim |
 
@@ -24,11 +26,19 @@ semantics and a screenshot are not substituted for VoiceOver speech or physical
 keyboard evidence. The script leaves the exact interactive checklist visible
 after every successful automated capture.
 
+The live run used the same full production entitlement set. Google first returned
+an explicit `openid`-only scope after Gmail access was not selected; the owner
+then repeated consent and allowed Gmail read access. The resulting product fix
+rejects any explicit callback or token-response scope set missing
+`gmail.readonly`, stores no credential for that attempt, and presents a specific
+permission-required recovery message. Scope values, credentials, account data,
+and mail metadata were not retained in this evidence.
+
 This is development-only, explicitly non-gate evidence. It is not Developer ID,
 notarization, retained distribution evidence, or independent accessibility
-approval. The earlier ADR-0023 Step-3f live OAuth, sync, and disconnect result
-remains separately recorded; [PR #76](https://github.com/matteoscurati/tersa.app/pull/76)
-contains the source fixes found by that run.
+approval. The ADR-0023 Step-3f live OAuth, sync, and disconnect outcome is also
+recorded in the project resume memory; the current branch contains the source
+fixes found by the run.
 
 ## Historical ad-hoc capture
 
