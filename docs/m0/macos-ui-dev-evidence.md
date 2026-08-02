@@ -3,7 +3,7 @@
 ## Current Apple Development capture — 2026-08-02
 
 The capture script built tracked Release/arm64 source at commit
-`9fca00c81e09abf9db7e63ee8bcc7026afdbedea`. It selected the one available
+`beda68b512e32f9cf7be1e4dfacccc81e1acce70`. It selected the one available
 Apple Development identity and the one current matching Mac Development
 profile without printing either identifier. The resulting app used Hardened
 Runtime and the exact five committed production entitlements; no entitlement
