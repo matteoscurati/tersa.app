@@ -3791,23 +3791,31 @@ fn has_exact_token_broker_protocol_version_assignment(code: &str) -> bool {
     if matches.next().is_some() {
         return false;
     }
-    token_broker_version_assignment_terminates(body, index + assignment.len())
+    // Masked comments are whitespace; only the enum's closing `}` may follow.
+    swift_expression_terminates_before_boundary(
+        body,
+        index + assignment.len(),
+        is_swift_closing_brace_boundary,
+    )
 }
 
-/// Accept only optional ASCII spaces/tabs and an optional `//` line comment
-/// after the exact `= 1` assignment before end-of-line or end-of-input.
-fn token_broker_version_assignment_terminates(code: &str, mut index: usize) -> bool {
-    let bytes = code.as_bytes();
-    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
-        index += 1;
-    }
-    if index >= bytes.len() || matches!(bytes[index], b'\n' | b'\r') {
-        return true;
-    }
-    if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
-        return true;
-    }
-    false
+/// After an exact reviewed expression value at `index`, skip every ASCII
+/// whitespace byte (including newlines). Comment/string-masked regions are
+/// already spaces, so optional trailing comments remain accepted. The next
+/// executable token must satisfy `is_boundary`; next-line operators, calls,
+/// members, second literals, and other expression continuations fail closed.
+fn swift_expression_terminates_before_boundary(
+    code: &str,
+    index: usize,
+    is_boundary: fn(&str, usize) -> bool,
+) -> bool {
+    is_boundary(code, skip_ascii_whitespace(code, index))
+}
+
+/// True only at a closing `}` — the sole valid boundary after the reviewed
+/// protocol-version assignment inside its balanced enum body.
+fn is_swift_closing_brace_boundary(code: &str, index: usize) -> bool {
+    code.as_bytes().get(index) == Some(&b'}')
 }
 
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
@@ -5811,8 +5819,12 @@ fn closed_token_broker_protocol_operation_violations(code: &str) -> Vec<String> 
 /// Compact every `func` signature in `code` by stripping ASCII whitespace.
 /// Effect specifiers (`async`, `reasync`, `throws`, `rethrows`, typed throws)
 /// and top-level return types are consumed into the compact form so they cannot
-/// silently match the closed allowlist. Unbalanced parameter lists and
-/// unexpected non-whitespace trailing tokens fail closed with `None`.
+/// silently match the closed allowlist. Once an identifier-boundary `func`
+/// keyword is found, a nonempty plain ASCII identifier and an immediately
+/// following `(` are required; backtick-escaped names, operators, unicode,
+/// missing parameter lists, unbalanced parameter lists, and unexpected
+/// trailing tokens all fail closed with `None`. Non-keyword substring matches
+/// of `func` still continue.
 fn swift_func_signature_compacts(code: &str) -> Option<Vec<String>> {
     let mut signatures = Vec::new();
     let mut search_from = 0;
@@ -5827,18 +5839,17 @@ fn swift_func_signature_compacts(code: &str) -> Option<Vec<String>> {
             .bytes()
             .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
             .count();
+        // Fail closed on backtick-escaped, operator, unicode, or missing names
+        // so a sixth declaration cannot be skipped out of the closed set.
         if name_length == 0 {
-            search_from = start + "func".len();
-            continue;
+            return None;
         }
         let after_name = skip_ascii_whitespace(code, name_start + name_length);
-        let Some(paren_relative) = code[after_name..].find('(') else {
-            search_from = start + "func".len();
-            continue;
-        };
-        let paren = after_name + paren_relative;
-        // Reject generic methods (`func name<T>(...)`) by including the gap in
-        // the compact form so it cannot match the closed allowlist.
+        // `(` must be the next meaningful token; generics and other gaps fail.
+        if code.as_bytes().get(after_name) != Some(&b'(') {
+            return None;
+        }
+        let paren = after_name;
         let parameters = balanced_delimited_body(code, paren, b'(', b')')?;
         let after_params = paren + parameters.len();
         let end = consume_swift_func_signature_tail(code, after_params)?;
@@ -6028,6 +6039,7 @@ fn token_broker_code_signing_requirement_violations(document: &str) -> Vec<Strin
     let has_exact_assignment = declaration_starts.len() == 1
         && exact_token_broker_code_signing_requirement_assignment_at(
             document,
+            &code,
             declaration_starts[0],
             constant,
             &swift_string,
@@ -6086,10 +6098,13 @@ fn executable_static_let_assignment_starts(code: &str, constant: &str) -> Vec<us
 
 /// True when `document[start..]` is exactly
 /// `static let <constant> = <swift_string>` with ASCII whitespace flexibility
-/// and a terminated expression (no trailing tokens, concatenation, or
-/// alternate literals).
+/// and a boundary-terminated expression. Termination is checked against
+/// `code` (comment/string-masked, byte-offset-preserving) so optional trailing
+/// comments remain whitespace while next-line operators, concatenation, calls,
+/// members, second literals, and other expression continuations fail closed.
 fn exact_token_broker_code_signing_requirement_assignment_at(
     document: &str,
+    code: &str,
     start: usize,
     constant: &str,
     swift_string: &str,
@@ -6126,7 +6141,16 @@ fn exact_token_broker_code_signing_requirement_assignment_at(
     if !document[after_equals..].starts_with(swift_string) {
         return false;
     }
-    token_broker_version_assignment_terminates(document, after_equals + swift_string.len())
+    // Masked offsets match the original; next executable token must be a
+    // declaration boundary (reviewed file: `func listener(...)`).
+    if code.len() != document.len() {
+        return false;
+    }
+    swift_expression_terminates_before_boundary(
+        code,
+        after_equals + swift_string.len(),
+        is_swift_func_signature_boundary,
+    )
 }
 
 fn validate_tersa_mac_top_level_keys(
@@ -13070,19 +13094,62 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 ),
             ),
         ] {
-            let mut mutated = reviewed_token_broker_sources();
-            if let Some(entry) = mutated.iter_mut().find(|(path, _)| path == protocol_path) {
-                entry.1 = document;
-            }
-            let violations = token_broker_source_surface_violations(&mutated);
-            assert!(
-                violations.iter().any(|violation| {
-                    violation.contains("exact reviewed closed broker protocol operations")
-                        || violation.contains("parseable closed broker protocol operations")
-                }),
-                "{label} must fail closed; got {violations:?}"
-            );
+            assert_token_broker_protocol_operations_fail_closed(protocol_path, document, label);
         }
+    }
+
+    /// A sixth declaration must fail closed even when its name is not a plain
+    /// ASCII identifier the scanner can compact (backtick/operator/unicode) or
+    /// when `(` is missing after a real `func` keyword. The exact five reviewed
+    /// methods still pass via the baseline surface checks.
+    #[test]
+    fn token_broker_protocol_surface_rejects_unparseable_sixth_operations() {
+        let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let reviewed =
+            include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
+        for (label, document) in [
+            (
+                "backtick-escaped sixth operation",
+                format!(
+                    "{reviewed}\n    func `exportStoredSecret`(withReply reply: @escaping (Int) -> Void)\n"
+                ),
+            ),
+            (
+                "operator sixth operation",
+                format!("{reviewed}\n    func + (lhs: Int, rhs: Int) -> Int\n"),
+            ),
+            (
+                "unicode-named sixth operation",
+                format!(
+                    "{reviewed}\n    func exportStoredSécret(withReply reply: @escaping (Int) -> Void)\n"
+                ),
+            ),
+            (
+                "missing-paren sixth operation",
+                format!("{reviewed}\n    func exportStoredSecret\n"),
+            ),
+        ] {
+            assert_token_broker_protocol_operations_fail_closed(protocol_path, document, label);
+        }
+    }
+
+    fn assert_token_broker_protocol_operations_fail_closed(
+        protocol_path: &Path,
+        document: String,
+        label: &str,
+    ) {
+        let mut mutated = reviewed_token_broker_sources();
+        if let Some(entry) = mutated.iter_mut().find(|(path, _)| path == protocol_path) {
+            entry.1 = document;
+        }
+        let violations = token_broker_source_surface_violations(&mutated);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("exact reviewed closed broker protocol operations")
+                    || violation.contains("parseable closed broker protocol operations")
+            }),
+            "{label} must fail closed; got {violations:?}"
+        );
     }
 
     #[test]
@@ -13097,6 +13164,19 @@ protocol TersaMacTokenBrokerProtocolV1 {
             ("addition expression", "static let value: Int = 1 + 1"),
             ("shift expression", "static let value: Int = 1 << 4"),
             ("value 3 in reviewed enum", "static let value: Int = 3"),
+            // Next-line arithmetic/bitshift/call continuations must not widen `= 1`.
+            (
+                "next-line addition",
+                "static let value: Int = 1\n        + 1",
+            ),
+            (
+                "next-line bitshift",
+                "static let value: Int = 1\n        << 4",
+            ),
+            (
+                "next-line member call continuation",
+                "static let value: Int = 1\n        .advanced(by: 1)",
+            ),
         ] {
             let mutated_version = reviewed.replace("static let value: Int = 1", assignment);
             let mut mutated = reviewed_token_broker_sources();
@@ -13402,6 +13482,34 @@ protocol TersaMacTokenBrokerProtocolV1 {
                     &reviewed_assignment,
                     &format!(
                         "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal} + \"\""
+                    ),
+                ),
+            ),
+            // Next-line / same-line expression continuations widen the requirement.
+            (
+                "next-line concatenation",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal}\n        + \" or anchor apple\""
+                    ),
+                ),
+            ),
+            (
+                "next-line operator call continuation",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal}\n        .appending(\" or anchor apple\")"
+                    ),
+                ),
+            ),
+            (
+                "same-line member continuation",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal}.appending(\"\")"
                     ),
                 ),
             ),
