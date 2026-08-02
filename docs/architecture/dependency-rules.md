@@ -191,6 +191,12 @@ wildcard, and crate-alias forms. This textual guard is defense in depth, not
 semantic or compiler-level non-reachability; a true boundary requires a future
 facade/crate ADR.
 
+The TersaMac verifier also keeps a closed table of every reviewed bridge-header
+C symbol that production Swift calls, including its exact allowed Swift file and
+call count. It strips comments and string literals before counting and rejects
+extra calls, moved calls, aliases, or missing reviewed calls. This is review
+drift detection, not an ABI or operating-system security boundary.
+
 PR 32 keeps root retrieval and HKDF derivation private to the trusted adapter.
 It exposes neither raw root/derived bytes nor a database opener. PR 33a owns the
 trusted database-opening composition and must feed the privately derived key

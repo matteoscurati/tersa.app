@@ -114,13 +114,20 @@ loopback transport, and is rejected. No other feasibility invariant is weakened.
 ### Token lifecycle and ownership
 
 - The **refresh token** is the only persisted credential: a single Keychain item
-  per canonical `AccountId`, in the existing access group, with
+  per canonical `AccountId`, in the existing access group for the delivered
+  Step-3 development architecture, with
   `WhenUnlockedThisDeviceOnly` accessibility (stricter than the root key and
   sufficient, since sync is user-triggered with no background work); never written
   to SQLCipher, never crossed over the C ABI, never logged. The store is the 3c
   `RefreshTokenStore` in `tersa-keychain-macos`; the trusted composition that loads
   and rotates it is the dedicated `tersa-oauth-sync-macos` crate (see Sync
   composition, amended 2026-07-21).
+
+[ADR 0024](adr-0024-macos-token-process-isolation.md) supersedes the
+same-process Keychain-group follow-up for distribution: the refresh-token item
+moves behind a separately signed XPC broker, and the main app no longer carries
+that group.
+
 - **Rotation is an atomic in-place replace.** Google may return a new refresh token
   on refresh or re-consent. A refresh-token item has one fixed Keychain primary key
   (service + `AccountId` + access group), so a second `SecItemAdd` returns
@@ -499,6 +506,7 @@ rerun. No credential or live authorization artifact was committed or logged.
   `GMAIL_MODIFY_SCOPE` with `gmail.readonly` so no `gmail.modify` code path remains.
   No I/O; deterministic tests. Its request shape is frozen only after the
   client-secret `curl` probe above.
+
 - **3b** — the token-endpoint transport (`/token`, `/revoke`) as a distinct `POST`
   component in `tersa-gmail-rest-macos` (reusing its pinned HTTP policy;
   `GmailMailbox` unchanged), implementing 3a's port; carries the ADR 0016 amendment.

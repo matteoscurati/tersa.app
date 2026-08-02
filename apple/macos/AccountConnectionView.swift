@@ -144,6 +144,8 @@ struct AccountConnectionView: View {
             return "Sign in again"
         case .disconnectIncomplete:
             return "Disconnect again"
+        case .disconnectTimedOut:
+            return "Keep waiting"
         default:
             return "Try again"
         }

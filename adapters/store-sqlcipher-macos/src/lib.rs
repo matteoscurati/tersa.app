@@ -29,6 +29,9 @@ mod macos {
     use rustix::fd::OwnedFd;
     use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags};
     use tersa_application::identity::{AccountIdentityStore, IdentityHash, IdentityReconcile};
+    use tersa_application::lifecycle::{
+        AccountLifecycleMetadata, AccountLifecycleStore, DisconnectRecoveryState,
+    };
     use tersa_application::mailbox::{
         AccountPurgeStore, BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
     };
@@ -56,7 +59,7 @@ mod macos {
     // hash, so a scheme change can never produce a false match. Pre-release with no
     // shipped stores, so a v1 dev store reads `Corrupted` and is re-bootstrapped.
     const IDENTITY_ALGO_VERSION: i64 = 2;
-    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 5;
+    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 6;
     const MAX_SCHEMA_KIND_LEN: i64 = 16;
     const MAX_SCHEMA_NAME_LEN: i64 = 256;
     const MAX_SCHEMA_SQL_LEN: i64 = 16 * 1_024;
@@ -697,11 +700,85 @@ mod macos {
                         params![account.as_str()],
                     )
                     .map_err(store_error)?;
+                // Freshness is mailbox-derived and must never outlive a local
+                // purge. The disconnect recovery marker is intentionally NOT
+                // cleared here: it is the durable evidence that tells a later
+                // retry/relaunch whether provider revoke remained unconfirmed.
+                transaction
+                    .execute(
+                        "UPDATE account_lifecycle SET last_successful_sync_unix_millis = NULL WHERE singleton = 1",
+                        [],
+                    )
+                    .map_err(store_error)?;
                 #[cfg(test)]
                 if self.take_failpoint()? {
                     return Err(MailboxStoreError::Storage);
                 }
                 transaction.commit().map_err(store_error)
+            })
+        }
+
+        fn read_lifecycle_metadata(&self) -> Result<AccountLifecycleMetadata, MailboxStoreError> {
+            self.with_connection(|connection| {
+                let row = connection.query_row(
+                    "SELECT CASE WHEN disconnect_recovery IS NULL OR (typeof(disconnect_recovery) = 'integer' AND disconnect_recovery IN (1, 2)) THEN disconnect_recovery END, last_successful_sync_unix_millis FROM account_lifecycle WHERE singleton = 1",
+                    [],
+                    |row| {
+                        let recovery: Option<i64> = row.get(0)?;
+                        let freshness: Option<i64> = row.get(1)?;
+                        Ok((recovery, freshness))
+                    },
+                );
+                let (recovery, freshness) = match row {
+                    Ok(values) => values,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AccountLifecycleMetadata::default()),
+                    Err(error) => return Err(store_error(error)),
+                };
+                let recovery = match recovery {
+                    None => None,
+                    Some(1) => Some(DisconnectRecoveryState::IncompleteTeardown),
+                    Some(2) => Some(DisconnectRecoveryState::RevokeUnconfirmed),
+                    Some(_) => return Err(MailboxStoreError::Corrupted),
+                };
+                if freshness.is_some_and(|value| value < 0) {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                AccountLifecycleMetadata::new(recovery, freshness)
+                    .ok_or(MailboxStoreError::Corrupted)
+            })
+        }
+
+        fn update_recovery(
+            &self,
+            recovery: Option<DisconnectRecoveryState>,
+        ) -> Result<(), MailboxStoreError> {
+            let value = recovery.map_or(0_i64, |state| match state {
+                DisconnectRecoveryState::IncompleteTeardown => 1,
+                DisconnectRecoveryState::RevokeUnconfirmed => 2,
+            });
+            self.with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, NULLIF(?1, 0), NULL) ON CONFLICT(singleton) DO UPDATE SET disconnect_recovery = excluded.disconnect_recovery",
+                        params![value],
+                    )
+                    .map_err(store_error)?;
+                Ok(())
+            })
+        }
+
+        fn record_successful_sync_at(&self, unix_millis: i64) -> Result<(), MailboxStoreError> {
+            if unix_millis < 0 {
+                return Err(MailboxStoreError::Corrupted);
+            }
+            self.with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, NULL, ?1) ON CONFLICT(singleton) DO UPDATE SET last_successful_sync_unix_millis = excluded.last_successful_sync_unix_millis",
+                        params![unix_millis],
+                    )
+                    .map_err(store_error)?;
+                Ok(())
             })
         }
 
@@ -2001,6 +2078,59 @@ mod macos {
         }
     }
 
+    impl AccountLifecycleStore for SqlCipherMailboxStore {
+        fn lifecycle_metadata<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<AccountLifecycleMetadata, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.read_lifecycle_metadata()
+            })
+        }
+
+        fn mark_disconnect_started<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.update_recovery(Some(DisconnectRecoveryState::IncompleteTeardown))
+            })
+        }
+
+        fn mark_revoke_unconfirmed<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.update_recovery(Some(DisconnectRecoveryState::RevokeUnconfirmed))
+            })
+        }
+
+        fn clear_disconnect_recovery<'a>(
+            &'a self,
+            account: &'a AccountId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.update_recovery(None)
+            })
+        }
+
+        fn record_successful_sync<'a>(
+            &'a self,
+            account: &'a AccountId,
+            unix_millis: i64,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.record_successful_sync_at(unix_millis)
+            })
+        }
+    }
+
     impl MailboxReader for SqlCipherMailboxStore {
         fn list_envelopes<'a>(
             &'a self,
@@ -2522,6 +2652,13 @@ mod macos {
                 "account_identity".into(),
                 normalize(
                     "CREATE TABLE account_identity ( account_id TEXT PRIMARY KEY, identity_hash BLOB NOT NULL, algo_version INTEGER NOT NULL )",
+                ),
+            ),
+            (
+                "table".into(),
+                "account_lifecycle".into(),
+                normalize(
+                    "CREATE TABLE account_lifecycle ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), disconnect_recovery INTEGER NULL CHECK (disconnect_recovery IN (1, 2)), last_successful_sync_unix_millis INTEGER NULL CHECK (last_successful_sync_unix_millis >= 0) )",
                 ),
             ),
             (
@@ -5144,6 +5281,98 @@ mod macos {
             // reads as a first connect (no identity recorded).
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert!(reopened.read_identity_hash(&account()).unwrap().is_none());
+        }
+
+        #[test]
+        fn lifecycle_recovery_transitions_survive_reopen_and_purge_preserves_marker() {
+            let (database, store) = open("lifecycle-recovery");
+            assert_eq!(
+                run(store.lifecycle_metadata(&account())).unwrap(),
+                AccountLifecycleMetadata::default()
+            );
+            run(store.mark_disconnect_started(&account())).unwrap();
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .recovery(),
+                Some(DisconnectRecoveryState::IncompleteTeardown)
+            );
+            drop(store);
+
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .recovery(),
+                Some(DisconnectRecoveryState::IncompleteTeardown),
+                "a crash/relaunch must retain the incomplete-teardown fence"
+            );
+            run(reopened.mark_revoke_unconfirmed(&account())).unwrap();
+            run(reopened.purge_account(&account())).unwrap();
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .recovery(),
+                Some(DisconnectRecoveryState::RevokeUnconfirmed)
+            );
+            run(reopened.clear_disconnect_recovery(&account())).unwrap();
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .recovery(),
+                None
+            );
+        }
+
+        #[test]
+        fn lifecycle_freshness_updates_only_on_success_and_purge_clears_it() {
+            let (database, store) = open("lifecycle-freshness");
+            run(store.record_successful_sync(&account(), 1_000)).unwrap();
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(1_000)
+            );
+            // A failed sync does not invoke record_successful_sync; its prior
+            // confirmed freshness remains available for offline presentation.
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(1_000)
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(1_000)
+            );
+            run(reopened.record_successful_sync(&account(), 3_000)).unwrap();
+            run(reopened.purge_account(&account())).unwrap();
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                None
+            );
+        }
+
+        #[test]
+        fn lifecycle_rejects_a_negative_freshness_timestamp() {
+            let (_database, store) = open("lifecycle-negative-freshness");
+            assert_eq!(
+                run(store.record_successful_sync(&account(), -1)),
+                Err(MailboxStoreError::Corrupted)
+            );
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                None
+            );
         }
 
         #[test]

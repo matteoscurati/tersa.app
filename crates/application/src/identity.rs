@@ -191,6 +191,24 @@ pub trait AccountIdentityStore: Send + Sync {
     ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
 }
 
+impl<T: AccountIdentityStore + ?Sized> AccountIdentityStore for &T {
+    fn load_identity<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> BoxFuture<'a, Result<Option<IdentityHash>, MailboxStoreError>> {
+        (**self).load_identity(account)
+    }
+    fn reconcile_identity<'a>(
+        &'a self,
+        account: &'a AccountId,
+        fresh: &'a IdentityHash,
+        action: IdentityReconcile,
+        expected: Option<&'a IdentityHash>,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).reconcile_identity(account, fresh, action, expected)
+    }
+}
+
 /// The gate's preserve-vs-clear decision for the fixed local account slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityDecision {

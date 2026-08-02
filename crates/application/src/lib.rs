@@ -8,6 +8,8 @@
 
 /// Account-identity gate ports and the pure preserve-vs-clear decision.
 pub mod identity;
+/// Privacy-safe durable sync freshness and disconnect-recovery metadata.
+pub mod lifecycle;
 /// Shared inward mailbox ports and pagination contracts.
 pub mod mailbox;
 /// Body-free metadata projections for explicit output adapters.

@@ -71,6 +71,12 @@ int32_t tersa_mailbox_macos_disconnect_begin(
     size_t account_id_len,
     uint64_t *output_session_id
 );
+int32_t tersa_mailbox_macos_lifecycle_get(
+    const uint8_t *account_id,
+    size_t account_id_len,
+    int32_t *output_recovery,
+    int64_t *output_last_successful_sync_unix_millis
+);
 int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
 
 #endif

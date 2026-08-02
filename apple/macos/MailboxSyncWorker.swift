@@ -139,6 +139,12 @@ enum MailboxPollStatus {
     }
 }
 
+/// Closed result of the privacy-safe lifecycle metadata query.
+enum MailboxLifecycleReadResult {
+    case success(MailboxLifecycleSnapshot)
+    case failure
+}
+
 /// Serializes the mailbox connect, disconnect, and sync begins — and their
 /// ONE shared FFI poll loop — away from the AppKit main thread. One active
 /// session at a time: the UI cannot legally run two flows, and the Rust
@@ -188,6 +194,42 @@ final class MailboxSyncWorker: @unchecked Sendable {
         completion: @escaping @MainActor (MailboxPollStatus) -> Void
     ) {
         enqueueBegin(.sync(clientID, accountIdentifier), completion: completion)
+    }
+
+    /// Reads only disconnect recovery and last-successful-sync metadata on the
+    /// worker queue. It never creates a mailbox store and never returns account
+    /// identity, OAuth material, or mailbox content.
+    func readLifecycle(
+        accountIdentifier: Data,
+        completion: @escaping @MainActor (MailboxLifecycleReadResult) -> Void
+    ) {
+        queue.async {
+            var recovery: Int32 = 0
+            var lastSuccessfulSync: Int64 = -1
+            let status = Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                tersa_mailbox_macos_lifecycle_get(
+                    accountBuffer.baseAddress,
+                    accountBuffer.count,
+                    &recovery,
+                    &lastSuccessfulSync
+                )
+            }
+            let result: MailboxLifecycleReadResult
+            if status == 0,
+               recovery == 0 || MailboxLifecycleSnapshot.DisconnectRecovery(rawValue: recovery) != nil,
+               lastSuccessfulSync >= -1 {
+                let date = lastSuccessfulSync >= 0
+                    ? Date(timeIntervalSince1970: Double(lastSuccessfulSync) / 1_000)
+                    : nil
+                result = .success(MailboxLifecycleSnapshot(
+                    disconnectRecovery: MailboxLifecycleSnapshot.DisconnectRecovery(rawValue: recovery),
+                    lastSuccessfulSync: date
+                ))
+            } else {
+                result = .failure
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     private func enqueueBegin(

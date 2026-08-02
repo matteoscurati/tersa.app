@@ -691,6 +691,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         violations.extend(swift_bootstrap_source_violations(&worker, &app_delegate));
         violations.extend(swift_bootstrap_inventory_violations(&macos_sources));
     }
+    violations.extend(swift_ffi_symbol_inventory_violations(&macos_sources));
     violations.extend(swift_oauth_foreground_handoff_violations(&macos_sources));
     Ok(violations)
 }
@@ -1239,7 +1240,7 @@ const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production expo
 /// set. It pins THIS crate's own four declared `#[no_mangle]` exports; the
 /// archive the application links carries those four plus the Apple bridge's
 /// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
-const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own four reviewed begin, connect, disconnect, and poll no_mangle exports (the shipped archive surface is these four plus the Apple bridge's reviewed eleven)";
+const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports (the shipped archive surface is these five plus the Apple bridge's reviewed eleven)";
 
 /// Pins a static-library package's exported C ABI to an exact reviewed set: every
 /// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
@@ -1381,6 +1382,10 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
         (
             "tersa_mailbox_macos_disconnect_begin",
             "pubunsafeextern\"C\"fntersa_mailbox_macos_disconnect_begin(account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_lifecycle_get",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_lifecycle_get(account_id:*constu8,account_id_len:usize,output_recovery:*muti32,output_last_successful_sync_unix_millis:*muti64,)->i32",
         ),
         (
             "tersa_mailbox_macos_sync_begin",
@@ -2869,10 +2874,134 @@ const uint8_t *account_id,
 size_t account_id_len,
 uint64_t *output_session_id
 );
+int32_t tersa_mailbox_macos_lifecycle_get(
+const uint8_t *account_id,
+size_t account_id_len,
+int32_t *output_recovery,
+int64_t *output_last_successful_sync_unix_millis
+);
 int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
 #endif";
 
 const CANONICAL_TERSA_MAC_BRIDGING_HEADER: &str = "#include \"TersaRustBridge.h\"";
+
+struct SwiftFfiSymbolSpec {
+    symbol: &'static str,
+    allowed_calls: &'static [(&'static str, usize)],
+}
+
+/// The closed production Swift call surface for every C symbol declared in the
+/// reviewed bridge header. This detects review drift; it is not an ABI or OS
+/// security boundary.
+const SWIFT_FFI_SYMBOL_SPECS: &[SwiftFfiSymbolSpec] = &[
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_apple_bridge_version",
+        allowed_calls: &[("apple/macos/AppDelegate.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_macos_bootstrap_default_account",
+        allowed_calls: &[("apple/macos/BootstrapWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_macos_mailbox_read_inbox",
+        allowed_calls: &[("apple/macos/MailboxReadWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_macos_mailbox_read_thread",
+        allowed_calls: &[("apple/macos/MailboxReadWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_macos_mailbox_search",
+        allowed_calls: &[("apple/macos/MailboxReadWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_oauth_macos_begin",
+        allowed_calls: &[("apple/macos/OAuthAuthorizationSession.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_oauth_macos_poll",
+        allowed_calls: &[("apple/macos/OAuthAuthorizationSession.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_oauth_cancel",
+        allowed_calls: &[
+            ("apple/macos/AccountConnectionViewModel.swift", 5),
+            ("apple/macos/OAuthAuthorizationSession.swift", 2),
+        ],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_sync_begin",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_connect_begin",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_disconnect_begin",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_lifecycle_get",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_sync_poll",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+];
+
+fn swift_ffi_symbol_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for spec in SWIFT_FFI_SYMBOL_SPECS {
+        for (allowed_path, allowed_count) in spec.allowed_calls {
+            let actual_count = sources
+                .iter()
+                .find(|(path, _)| path == Path::new(allowed_path))
+                .filter(|(path, _)| {
+                    path.extension().and_then(|extension| extension.to_str()) == Some("swift")
+                })
+                .map(|(_, document)| swift_call_count(&strip_swift_non_code(document), spec.symbol))
+                .unwrap_or_default();
+            if actual_count != *allowed_count {
+                violations.push(format!(
+                    "{allowed_path} must call `{}` exactly {allowed_count} time(s), found {actual_count}",
+                    spec.symbol
+                ));
+            }
+        }
+
+        for (path, document) in sources.iter().filter(|(path, _)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("swift")
+        }) {
+            let code = strip_swift_non_code(document);
+            let occurrences = identifier_occurrence_count(&code, spec.symbol);
+            let calls = swift_call_count(&code, spec.symbol);
+            if occurrences != calls {
+                violations.push(format!(
+                    "{} must not alias or reference the `{}` C ABI outside an exact call site",
+                    path.display(),
+                    spec.symbol
+                ));
+            }
+            let allowed_count = spec
+                .allowed_calls
+                .iter()
+                .find_map(|(allowed_path, count)| {
+                    (path == Path::new(allowed_path)).then_some(*count)
+                })
+                .unwrap_or_default();
+            if calls != allowed_count {
+                violations.push(format!(
+                    "{} must call `{}` exactly {allowed_count} time(s), found {calls}",
+                    path.display(),
+                    spec.symbol
+                ));
+            }
+        }
+    }
+    violations
+}
 
 fn normalized_source_lines(document: &str) -> String {
     document
@@ -4440,6 +4569,12 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         violations.push("the TersaMac target must declare platform macOS".to_owned());
     }
     violations.extend(tersa_mac_target_surface_violations(&application.body));
+    match targets.iter().find(|target| target.name == "TersaMacTests") {
+        Some(test_target) => {
+            violations.extend(tersa_mac_test_target_surface_violations(test_target));
+        }
+        None => violations.push("apple/project.yml is missing the TersaMacTests target".to_owned()),
+    }
     if !matches!(
         yaml_path(&application.body, &["entitlements", "path"]),
         Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
@@ -4736,14 +4871,75 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
             scheme.len() == 1
                 && matches!(
                     scheme.get("testTargets"),
-                    Some(StrictYamlValue::Sequence(targets)) if targets.is_empty()
+                    Some(StrictYamlValue::Sequence(targets))
+                        if matches!(targets.as_slice(), [StrictYamlValue::String(target)] if target == "TersaMacTests")
                 )
         }
         _ => false,
     };
     if !valid_scheme {
         violations.push(
-            "the TersaMac scheme must contain only an empty testTargets list and no executable actions"
+            "the TersaMac scheme must contain only the TersaMacTests test target and no executable actions"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<String> {
+    let mut violations = Vec::new();
+    if target.platform != "macOS" {
+        violations.push("the TersaMacTests target must declare platform macOS".to_owned());
+    }
+    let Ok(body) = yaml_mapping(&target.body, "TersaMacTests target") else {
+        return vec!["the TersaMacTests target must be a direct mapping".to_owned()];
+    };
+    let expected_keys = BTreeSet::from(["platform", "settings", "sources", "type"]);
+    if body.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
+        violations.push(
+            "the TersaMacTests target must contain only the exact reviewed top-level XcodeGen keys"
+                .to_owned(),
+        );
+    }
+    if !matches!(
+        body.get("type"),
+        Some(StrictYamlValue::String(value)) if value == "bundle.unit-test"
+    ) {
+        violations
+            .push("the TersaMacTests target type must be exactly bundle.unit-test".to_owned());
+    }
+    let valid_sources = matches!(
+        body.get("sources"),
+        Some(StrictYamlValue::Sequence(sources))
+            if matches!(sources.as_slice(), [
+                StrictYamlValue::Mapping(test_sources),
+                StrictYamlValue::Mapping(coordinator_source),
+                StrictYamlValue::Mapping(lifecycle_source),
+            ] if test_sources.len() == 1
+                && matches!(test_sources.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-tests")
+                && coordinator_source.len() == 1
+                && matches!(coordinator_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionOperationDeadline.swift")
+                && lifecycle_source.len() == 1
+                && matches!(lifecycle_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxLifecyclePresentation.swift"))
+    );
+    if !valid_sources {
+        violations.push(
+            "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift state models"
+                .to_owned(),
+        );
+    }
+    let valid_settings = matches!(
+        body.get("settings"),
+        Some(StrictYamlValue::Mapping(settings))
+            if settings.len() == 1
+                && matches!(settings.get("base"), Some(StrictYamlValue::Mapping(base))
+                    if base.len() == 2
+                        && matches!(base.get("PRODUCT_BUNDLE_IDENTIFIER"), Some(StrictYamlValue::String(value)) if value == "app.tersa.mac.tests")
+                        && matches!(base.get("MACOSX_DEPLOYMENT_TARGET"), Some(StrictYamlValue::String(value)) if value == "15.0"))
+    );
+    if !valid_settings {
+        violations.push(
+            "the TersaMacTests settings must contain only its reviewed bundle identifier and macOS deployment target"
                 .to_owned(),
         );
     }
@@ -7021,8 +7217,9 @@ mod tests {
         sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
         strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
         swift_bootstrap_source_violations, swift_bridge_call_inventory,
-        swift_oauth_foreground_handoff_violations, target_metadata_options,
-        tracked_apple_signing_inventory, tracked_project_generation_violations,
+        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
+        target_metadata_options, tracked_apple_signing_inventory,
+        tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -7073,7 +7270,19 @@ targets:
         basedOnDependencyAnalysis: false
         script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
     scheme:
-      testTargets: []
+      testTargets:
+        - TersaMacTests
+  TersaMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: macos-tests
+      - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/MailboxLifecyclePresentation.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
   OtherMac:
     platform: macOS
   OtherIOS:
@@ -7929,6 +8138,13 @@ pub unsafe extern "C" fn tersa_mailbox_macos_disconnect_begin(
     output_session_id: *mut u64,
 ) -> i32 {}
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_lifecycle_get(
+    account_id: *const u8,
+    account_id_len: usize,
+    output_recovery: *mut i32,
+    output_last_successful_sync_unix_millis: *mut i64,
+) -> i32 {}
+#[unsafe(no_mangle)]
 pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
 "#
     }
@@ -7977,7 +8193,7 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
         let violations = ffi_export_violations(&fifth_symbol);
         assert!(
             violations.iter().any(|violation| violation
-                .contains("four reviewed begin, connect, disconnect, and poll no_mangle exports")),
+                .contains("five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports")),
             "a fifth symbol must trip the reviewed-count message: {violations:?}"
         );
     }
@@ -8659,6 +8875,106 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
             assert!(
                 !violations.is_empty(),
                 "header drift must fail closed: {drift:?}"
+            );
+        }
+    }
+
+    fn reviewed_swift_ffi_documents() -> Vec<(PathBuf, String)> {
+        [
+            (
+                "apple/macos/AppDelegate.swift",
+                include_str!("../../apple/macos/AppDelegate.swift"),
+            ),
+            (
+                "apple/macos/BootstrapWorker.swift",
+                include_str!("../../apple/macos/BootstrapWorker.swift"),
+            ),
+            (
+                "apple/macos/MailboxReadWorker.swift",
+                include_str!("../../apple/macos/MailboxReadWorker.swift"),
+            ),
+            (
+                "apple/macos/AccountConnectionViewModel.swift",
+                include_str!("../../apple/macos/AccountConnectionViewModel.swift"),
+            ),
+            (
+                "apple/macos/OAuthAuthorizationSession.swift",
+                include_str!("../../apple/macos/OAuthAuthorizationSession.swift"),
+            ),
+            (
+                "apple/macos/MailboxSyncWorker.swift",
+                include_str!("../../apple/macos/MailboxSyncWorker.swift"),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, source)| (PathBuf::from(path), source.to_owned()))
+        .collect()
+    }
+
+    #[test]
+    fn swift_ffi_inventory_is_closed_over_reviewed_symbols_and_call_sites() {
+        let reviewed = reviewed_swift_ffi_documents();
+        assert!(
+            swift_ffi_symbol_inventory_violations(&reviewed).is_empty(),
+            "reviewed Swift FFI surface must match its closed inventory: {:?}",
+            swift_ffi_symbol_inventory_violations(&reviewed)
+        );
+
+        let mut extra_call = reviewed.clone();
+        let (_, source) = extra_call
+            .iter_mut()
+            .find(|(path, _)| path == Path::new("apple/macos/MailboxSyncWorker.swift"))
+            .expect("mailbox sync worker fixture must exist");
+        source.push_str("\nlet extra = tersa_mailbox_macos_sync_poll(0)\n");
+        assert!(
+            !swift_ffi_symbol_inventory_violations(&extra_call).is_empty(),
+            "an extra reviewed FFI call must fail closed"
+        );
+
+        let mut moved_call = reviewed.clone();
+        let (_, oauth_source) = moved_call
+            .iter_mut()
+            .find(|(path, _)| path == Path::new("apple/macos/OAuthAuthorizationSession.swift"))
+            .expect("OAuth session fixture must exist");
+        *oauth_source = oauth_source.replace(
+            "let status = tersa_oauth_macos_poll(sessionID)",
+            "let status: Int32 = 0",
+        );
+        let (_, app_source) = moved_call
+            .iter_mut()
+            .find(|(path, _)| path == Path::new("apple/macos/AppDelegate.swift"))
+            .expect("app delegate fixture must exist");
+        app_source.push_str("\nlet moved = tersa_oauth_macos_poll(0)\n");
+        assert!(
+            !swift_ffi_symbol_inventory_violations(&moved_call).is_empty(),
+            "a moved reviewed FFI call must fail closed"
+        );
+
+        let mut alternate_invocation = reviewed.clone();
+        let (_, oauth_source) = alternate_invocation
+            .iter_mut()
+            .find(|(path, _)| path == Path::new("apple/macos/OAuthAuthorizationSession.swift"))
+            .expect("OAuth session fixture must exist");
+        *oauth_source = oauth_source.replace(
+            "tersa_oauth_macos_poll(sessionID)",
+            "tersa_oauth_macos_poll /* recognized formatting */ (sessionID)",
+        );
+        assert!(
+            swift_ffi_symbol_inventory_violations(&alternate_invocation).is_empty(),
+            "a recognized whitespace/comment-equivalent invocation must remain valid"
+        );
+
+        for spelling in ["__asm", "__asm__", "asm"] {
+            let alias =
+                format!("extern int32_t alias(uint64_t) {spelling}(\"tersa_oauth_macos_poll\");");
+            let (violations, _) = swift_bridge_call_inventory(
+                Path::new("apple/macos/TersaRustBridge.h"),
+                true,
+                &alias,
+            );
+            assert!(
+                !violations.is_empty(),
+                "a C header alias spelling must fail closed: {spelling}"
             );
         }
     }
@@ -9876,19 +10192,8 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
         );
     }
 
-    #[test]
-    fn signing_parser_uses_declared_platform_with_interleaved_targets() {
-        let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-  <key>com.apple.security.app-sandbox</key><true/>
-  <key>com.apple.security.network.client</key><true/>
-  <key>com.apple.security.network.server</key><true/>
-  <key>com.apple.security.application-groups</key>
-  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
-  <key>keychain-access-groups</key>
-  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
-</dict></plist>"#;
-        let project = r#"name: Tersa
+    fn valid_signing_project_with_interleaved_targets() -> &'static str {
+        r#"name: Tersa
 options:
   bundleIdPrefix: app.tersa
   deploymentTarget: { macOS: "15.0", iOS: "18.0" }
@@ -9927,12 +10232,39 @@ targets:
         basedOnDependencyAnalysis: false
         script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
     scheme:
-      testTargets: []
+      testTargets:
+        - TersaMacTests
+  TersaMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: macos-tests
+      - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/MailboxLifecyclePresentation.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
   MiddleMac:
     platform: macOS
   LastIOS:
     platform: iOS
-"#;
+"#
+    }
+
+    #[test]
+    fn signing_parser_uses_declared_platform_with_interleaved_targets() {
+        let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.security.network.server</key><true/>
+  <key>com.apple.security.application-groups</key>
+  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+  <key>keychain-access-groups</key>
+  <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#;
+        let project = valid_signing_project_with_interleaved_targets();
         let targets = match parse_project_targets(project) {
             Ok(targets) => targets,
             Err(error) => panic!("interleaved target fixture must parse: {error}"),
@@ -9947,6 +10279,7 @@ targets:
                 ("LastIOS", "iOS"),
                 ("MiddleMac", "macOS"),
                 ("TersaMac", "macOS"),
+                ("TersaMacTests", "macOS"),
             ]
         );
         assert!(signing_configuration_violations(entitlements, project).is_empty());
@@ -10499,16 +10832,16 @@ targets:
             (
                 "post-build script",
                 VALID_SIGNING_PROJECT.replace(
-                    "    scheme:\n      testTargets: []",
-                    "    postBuildScripts:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n    scheme:\n      testTargets: []",
+                    "    scheme:\n      testTargets:\n        - TersaMacTests",
+                    "    postBuildScripts:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n    scheme:\n      testTargets:\n        - TersaMacTests",
                 ),
                 "postBuildScripts",
             ),
             (
                 "scheme action",
                 VALID_SIGNING_PROJECT.replace(
-                    "    scheme:\n      testTargets: []",
-                    "    scheme:\n      testTargets: []\n      preActions:\n        - script: sh unreviewed.sh",
+                    "    scheme:\n      testTargets:\n        - TersaMacTests",
+                    "    scheme:\n      testTargets:\n        - TersaMacTests\n      preActions:\n        - script: sh unreviewed.sh",
                 ),
                 "no executable actions",
             ),

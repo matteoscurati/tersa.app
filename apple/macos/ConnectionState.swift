@@ -21,6 +21,14 @@ enum ConnectionFailure: Equatable {
     case signInUnavailable
     /// Google sign-in completed without granting Gmail read access.
     case permissionRequired
+    /// A connect or stored-credential sync did not complete within its bounded
+    /// client-side deadline. Late callbacks are ignored.
+    case connectionTimedOut
+    /// The browser authorization did not return within its bounded deadline.
+    case authorizationTimedOut
+    /// Disconnect has exceeded its presentation deadline. Rust teardown keeps
+    /// running and its late terminal remains authoritative.
+    case disconnectTimedOut
     /// The disconnect teardown did not converge; the Rust slot stays fenced
     /// against sync and connect until a disconnect does. Its retry re-issues
     /// the disconnect, never the connect ladder.
@@ -46,6 +54,12 @@ enum ConnectionFailure: Equatable {
             return "Tersa couldn't open the sign-in page in your browser. Check that a default browser is set, then try again."
         case .permissionRequired:
             return "Gmail read access wasn't granted. Sign in again and allow Tersa to read your email."
+        case .connectionTimedOut:
+            return "Connecting took too long. Check your connection and try again."
+        case .authorizationTimedOut:
+            return "Sign-in took too long. Return to Tersa and sign in again."
+        case .disconnectTimedOut:
+            return "Disconnect is still finishing. Keep Tersa open; it will confirm when access and local mail are removed."
         case .disconnectIncomplete:
             return "Tersa couldn't finish disconnecting. This account stays unavailable until it does. Try again — or remove Tersa from your Google Account to revoke its access now."
         }
@@ -54,7 +68,14 @@ enum ConnectionFailure: Equatable {
     /// The failure's operation-aware headline, shared by the failure view and
     /// its VoiceOver value so the two never drift.
     var title: String {
-        self == .disconnectIncomplete ? "Disconnect failed" : "Connection failed"
+        switch self {
+        case .disconnectIncomplete:
+            return "Disconnect failed"
+        case .disconnectTimedOut:
+            return "Disconnect delayed"
+        default:
+            return "Connection failed"
+        }
     }
 }
 

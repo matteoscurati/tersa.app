@@ -7,8 +7,9 @@ import Combine
 import Foundation
 
 /// Owns the account-connection UI state. Product bootstrap starts only from
-/// the reviewed `connect` user-intent entry below; nothing here runs at app
-/// launch or view construction time.
+/// the reviewed `connect` user-intent entry below. Launch performs only a
+/// content-free lifecycle read for the last opaque local account alias so a
+/// durable disconnect warning survives relaunch; it never starts OAuth or sync.
 ///
 /// `connect` runs a ladder, never an unconditional OAuth (the connection
 /// state is in-memory only, so re-consenting on every launch would open the
@@ -19,6 +20,9 @@ import Foundation
 final class AccountConnectionViewModel: ObservableObject {
     @Published private(set) var state: ConnectionState = .notConnected
     @Published private(set) var connectedAccountIdentifier: Data?
+    /// Aggregate freshness only; no mailbox content or provider identity is
+    /// retained in the Swift presentation state.
+    @Published private(set) var mailboxFreshness: MailboxFreshnessState = .unknown
     /// The M2 WARNING banner shown after a disconnect whose provider-side
     /// revoke could not be confirmed — the account may still be authorized at
     /// Google. Separate from the state machine AND from the plain-success
@@ -33,6 +37,12 @@ final class AccountConnectionViewModel: ObservableObject {
     @Published var accountIdentifier: String = ""
 
     private let syncWorker = MailboxSyncWorker()
+    private let operationDeadline = ConnectionOperationDeadline()
+    private var operationTimer: Timer?
+    private static let connectAndSyncTimeout: TimeInterval = 45
+    private static let authorizationTimeout: TimeInterval = 5 * 60
+    private static let disconnectTimeout: TimeInterval = 45
+    private static let lastAccountIdentifierKey = "TersaLastAccountIdentifier"
     /// A finished browser authorization may arrive while Chrome is still the
     /// foreground app. `WhenUnlockedThisDeviceOnly` Data Protection Keychain
     /// operations can then fail with `errSecInteractionNotAllowed`; retain the
@@ -41,6 +51,7 @@ final class AccountConnectionViewModel: ObservableObject {
     private var activationPending = false
     private var activationObserver: NSObjectProtocol?
     private var activationTimeout: Timer?
+    private var didRestorePersistedLifecycle = false
 
     /// The M2 warning copy for a disconnect that returned
     /// `.succeededRevokeUnconfirmed`: fact → what we can't confirm → the
@@ -51,6 +62,23 @@ final class AccountConnectionViewModel: ObservableObject {
     private static let disconnectConfirmed = "Disconnected. Tersa's access to your Google Account was removed and mail stored on this Mac was deleted."
     /// Where the M2 banner sends the user to revoke access themselves.
     static let googleConnectionsURL = URL(string: "https://myaccount.google.com/connections")!
+
+    /// Restores the content-free lifecycle projection once when the root view
+    /// appears. Keeping this separate from initialization preserves the
+    /// source-enforced rule that construction never enters product bootstrap.
+    func restorePersistedLifecycleOnLaunch() {
+        guard !didRestorePersistedLifecycle else {
+            return
+        }
+        didRestorePersistedLifecycle = true
+        guard let savedIdentifier = UserDefaults.standard.string(
+            forKey: Self.lastAccountIdentifierKey
+        ), !savedIdentifier.isEmpty else {
+            return
+        }
+        accountIdentifier = savedIdentifier
+        restorePersistedLifecycle(accountIdentifier: Data(savedIdentifier.utf8))
+    }
 
     /// The OAuth client id handed to the sync and connect begins: the SAME
     /// `TersaOAuthClientID` Info.plist key `OAuthAuthorizationSession` reads,
@@ -73,6 +101,53 @@ final class AccountConnectionViewModel: ObservableObject {
         accountIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Starts a monotonic deadline and replaces any previous UI-only deadline.
+    /// The underlying Rust worker is not cancelled by this replacement; its
+    /// callback is generation-fenced by `operationDeadline` below.
+    private func beginOperation(
+        _ kind: ConnectionOperationKind,
+        timeout: TimeInterval
+    ) -> ConnectionOperationToken {
+        operationTimer?.invalidate()
+        let token = operationDeadline.start(kind: kind, timeout: timeout)
+        operationTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleOperationTimeout(token)
+            }
+        }
+        return token
+    }
+
+    private func finishOperation(_ token: ConnectionOperationToken) -> Bool {
+        guard operationDeadline.finish(token) else {
+            return false
+        }
+        operationTimer?.invalidate()
+        operationTimer = nil
+        return true
+    }
+
+    /// A normal timeout invalidates its callback generation. Disconnect is the
+    /// exception: its Rust teardown has already begun, so the late terminal is
+    /// still allowed to settle the UI and no connect may start in between.
+    private func handleOperationTimeout(_ token: ConnectionOperationToken) {
+        switch token.kind {
+        case .connectAndSync:
+            guard operationDeadline.timeOut(token, keepAlive: false) else { return }
+            operationTimer = nil
+            state = .failed(.connectionTimedOut)
+        case .authorization:
+            guard operationDeadline.timeOut(token, keepAlive: false) else { return }
+            operationTimer = nil
+            (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
+            state = .failed(.authorizationTimedOut)
+        case .disconnect:
+            guard operationDeadline.timeOut(token, keepAlive: true) else { return }
+            operationTimer = nil
+            state = .failed(.disconnectTimedOut)
+        }
+    }
+
     /// The single reviewed user-intent entry into product bootstrap, and the
     /// first ladder rung: bootstrap the profile, then sync with the stored
     /// credential. A non-ready bootstrap surfaces as its mapped failure —
@@ -82,15 +157,14 @@ final class AccountConnectionViewModel: ObservableObject {
         guard !trimmedIdentifier.isEmpty,
               state != .connecting,
               state != .authorizing,
-              state != .disconnecting
+              state != .disconnecting,
+              !operationDeadline.disconnectIsActive
         else {
             return
         }
-        // A new connect supersedes any prior disconnect banner: a revoke-
-        // unconfirmed warning or a clean-disconnect confirmation is stale the
-        // moment the user reconnects (and the warning's "remove Tersa from
-        // Google" advice would break the connection they are making now).
-        disconnectNotice = nil
+        // A new connect supersedes only a clean-disconnect confirmation. A
+        // durable revoke-unconfirmed warning remains visible until the next
+        // disconnect converges or the user dismisses it explicitly.
         disconnectConfirmation = nil
         // Fail fast on a missing/unconfigured client id with the config-specific
         // message, rather than letting a bad id reach the sync rung and surface
@@ -101,15 +175,24 @@ final class AccountConnectionViewModel: ObservableObject {
         }
         state = .connecting
         let accountIdentifierData = Data(trimmedIdentifier.utf8)
+        let token = beginOperation(.connectAndSync, timeout: Self.connectAndSyncTimeout)
         let completion: @MainActor (ProductBootstrapStatus) -> Void = { [weak self] status in
             guard let self else {
                 return
             }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
             guard status == .ready else {
+                _ = self.finishOperation(token)
                 self.state = ConnectionState(status: status)
                 return
             }
-            self.syncWithStoredCredential(accountIdentifier: accountIdentifierData)
+            UserDefaults.standard.set(trimmedIdentifier, forKey: Self.lastAccountIdentifierKey)
+            self.inspectLifecycleBeforeSync(
+                accountIdentifier: accountIdentifierData,
+                token: token
+            )
         }
         (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(
             accountIdentifier: accountIdentifierData,
@@ -139,6 +222,10 @@ final class AccountConnectionViewModel: ObservableObject {
         if failure == .disconnectIncomplete {
             state = .notConnected
             disconnect()
+        } else if failure == .disconnectTimedOut, operationDeadline.disconnectIsActive {
+            // The destructive worker is still live. Re-enter progress without
+            // issuing a second begin; its late terminal remains authoritative.
+            state = .disconnecting
         } else {
             retry()
         }
@@ -148,7 +235,6 @@ final class AccountConnectionViewModel: ObservableObject {
     /// teardown). Any in-flight OAuth is cancelled FIRST and unconditionally:
     /// a pending grant landing within the bridge's authorization lifetime
     /// after a successful disconnect would silently re-connect the account,
-    /// and the disconnect cannot tombstone it.
     func disconnect() {
         (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
         guard let accountIdentifier = connectedAccountIdentifier, state != .disconnecting else {
@@ -159,15 +245,22 @@ final class AccountConnectionViewModel: ObservableObject {
         disconnectNotice = nil
         disconnectConfirmation = nil
         state = .disconnecting
+        let token = beginOperation(.disconnect, timeout: Self.disconnectTimeout)
         syncWorker.beginDisconnect(accountIdentifier: accountIdentifier) { [weak self] status in
             guard let self else {
                 return
             }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
+            _ = self.finishOperation(token)
             switch status {
             case .succeeded:
                 self.state = .notConnected
                 self.disconnectConfirmation = Self.disconnectConfirmed
                 self.connectedAccountIdentifier = nil
+                self.mailboxFreshness = .unknown
+                UserDefaults.standard.removeObject(forKey: Self.lastAccountIdentifierKey)
             case .succeededRevokeUnconfirmed:
                 self.state = .notConnected
                 self.disconnectNotice = Self.revokeUnconfirmedNotice
@@ -206,7 +299,10 @@ final class AccountConnectionViewModel: ObservableObject {
     /// `.needsReconnect` climbs to browser re-consent (the stored credential
     /// is gone or never existed); a network or gate problem maps straight to
     /// a failure and never re-prompts OAuth.
-    private func syncWithStoredCredential(accountIdentifier: Data) {
+    private func syncWithStoredCredential(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
         syncWorker.beginSync(
             clientID: Self.oauthClientID,
             accountIdentifier: accountIdentifier
@@ -214,10 +310,16 @@ final class AccountConnectionViewModel: ObservableObject {
             guard let self else {
                 return
             }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
             switch status {
             case .succeeded, .succeededRevokeUnconfirmed:
-                self.connectedAccountIdentifier = accountIdentifier
-                self.state = .connected
+                self.completeConnected(
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    offline: false
+                )
             case .syncFailed:
                 // A returning user reaches their locally-synced inbox even when
                 // the network refresh can't complete (the offline case: the
@@ -233,16 +335,22 @@ final class AccountConnectionViewModel: ObservableObject {
                 // data. No NEW identity can be introduced on this rung (it uses
                 // the STORED credential); the fresh-consent handoff lives on the
                 // connect rung, which deliberately does NOT land connected here.
-                self.connectedAccountIdentifier = accountIdentifier
-                self.state = .connected
+                self.completeConnected(
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    offline: true
+                )
             case .needsReconnect, .permissionRequired:
+                _ = self.finishOperation(token)
                 self.authorizeAndConnect(accountIdentifier: accountIdentifier)
             case .cancelled:
                 // A disconnect dropped the in-flight sync; land neutral —
                 // not a failure, and never rendered as "disconnected".
+                _ = self.finishOperation(token)
                 self.state = .notConnected
             case .gateBlocked, .internalError, .unknownSession, .unrecognized,
                  .running:
+                _ = self.finishOperation(token)
                 self.state = .failed(Self.terminalFailure(status))
             }
         }
@@ -257,24 +365,34 @@ final class AccountConnectionViewModel: ObservableObject {
             state = .failed(.signInUnavailable)
             return
         }
+        let token = beginOperation(.authorization, timeout: Self.authorizationTimeout)
         let started = session.start { [weak self] outcome in
             guard let self else {
                 return
             }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
             switch outcome {
             case .succeeded(let oauthSession):
+                _ = self.finishOperation(token)
                 self.state = .connecting
+                let connectToken = self.beginOperation(.connectAndSync, timeout: Self.connectAndSyncTimeout)
                 self.connectAfterApplicationActivation(
                     accountIdentifier: accountIdentifier,
-                    oauthSession: oauthSession
+                    oauthSession: oauthSession,
+                    token: connectToken
                 )
             case .cancelled:
                 // Sign-in cancelled: land neutral — not a failure, and a
                 // cancelled re-connect never renders as "disconnected".
+                _ = self.finishOperation(token)
                 self.state = .notConnected
             case .permissionRequired:
+                _ = self.finishOperation(token)
                 self.state = .failed(.permissionRequired)
             case .failed:
+                _ = self.finishOperation(token)
                 self.state = .failed(.signInFailed)
             }
         }
@@ -282,6 +400,7 @@ final class AccountConnectionViewModel: ObservableObject {
             // A PRE-FLIGHT refusal — the sign-in page never opened (missing/
             // unconfigured client id, a session already in flight, or the
             // browser wouldn't open the URL). NOT a browser sign-in failure.
+            _ = finishOperation(token)
             state = .failed(.signInUnavailable)
             return
         }
@@ -294,11 +413,15 @@ final class AccountConnectionViewModel: ObservableObject {
     /// race; the post-activate `isActive` check closes the opposite race.
     private func connectAfterApplicationActivation(
         accountIdentifier: Data,
-        oauthSession: OAuthSessionID
+        oauthSession: OAuthSessionID,
+        token: ConnectionOperationToken
     ) {
-        guard !activationPending else {
+        guard operationDeadline.accepts(token), !activationPending else {
             _ = tersa_oauth_cancel(oauthSession.rawValue)
-            state = .failed(.unavailable)
+            if operationDeadline.accepts(token) {
+                _ = finishOperation(token)
+                state = .failed(.unavailable)
+            }
             return
         }
         activationPending = true
@@ -306,7 +429,8 @@ final class AccountConnectionViewModel: ObservableObject {
         if NSApp.isActive {
             finishApplicationActivation(
                 accountIdentifier: accountIdentifier,
-                oauthSession: oauthSession
+                oauthSession: oauthSession,
+                token: token
             )
             return
         }
@@ -319,7 +443,8 @@ final class AccountConnectionViewModel: ObservableObject {
             MainActor.assumeIsolated {
                 self?.finishApplicationActivation(
                     accountIdentifier: accountIdentifier,
-                    oauthSession: oauthSession
+                    oauthSession: oauthSession,
+                    token: token
                 )
             }
         }
@@ -329,7 +454,12 @@ final class AccountConnectionViewModel: ObservableObject {
                     return
                 }
                 self.clearApplicationActivation()
+                guard self.operationDeadline.accepts(token) else {
+                    _ = tersa_oauth_cancel(oauthSession.rawValue)
+                    return
+                }
                 _ = tersa_oauth_cancel(oauthSession.rawValue)
+                _ = self.finishOperation(token)
                 self.state = .failed(.unavailable)
             }
         }
@@ -337,7 +467,8 @@ final class AccountConnectionViewModel: ObservableObject {
         if NSApp.isActive {
             finishApplicationActivation(
                 accountIdentifier: accountIdentifier,
-                oauthSession: oauthSession
+                oauthSession: oauthSession,
+                token: token
             )
         }
     }
@@ -347,9 +478,15 @@ final class AccountConnectionViewModel: ObservableObject {
     /// makes a duplicate activation notification harmless.
     private func finishApplicationActivation(
         accountIdentifier: Data,
-        oauthSession: OAuthSessionID
+        oauthSession: OAuthSessionID,
+        token: ConnectionOperationToken
     ) {
         guard activationPending else {
+            return
+        }
+        guard operationDeadline.accepts(token) else {
+            clearApplicationActivation()
+            _ = tersa_oauth_cancel(oauthSession.rawValue)
             return
         }
         clearApplicationActivation()
@@ -357,7 +494,7 @@ final class AccountConnectionViewModel: ObservableObject {
             _ = tersa_oauth_cancel(oauthSession.rawValue)
             return
         }
-        connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession, token: token)
     }
 
     private func clearApplicationActivation() {
@@ -374,7 +511,11 @@ final class AccountConnectionViewModel: ObservableObject {
     /// `.needsReconnect` here means the grant lapsed between consent and
     /// claim — the sign-in expired — so it surfaces as a failure and never
     /// loops back into another browser prompt.
-    private func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+    private func connectWithGrant(
+        accountIdentifier: Data,
+        oauthSession: OAuthSessionID,
+        token: ConnectionOperationToken
+    ) {
         syncWorker.beginConnect(
             accountIdentifier: accountIdentifier,
             oauthSession: oauthSession
@@ -382,15 +523,24 @@ final class AccountConnectionViewModel: ObservableObject {
             guard let self else {
                 return
             }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
             switch status {
             case .succeeded, .succeededRevokeUnconfirmed:
-                self.connectedAccountIdentifier = accountIdentifier
-                self.state = .connected
+                self.completeConnected(
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    offline: false
+                )
             case .needsReconnect:
+                _ = self.finishOperation(token)
                 self.state = .failed(.signInExpired)
             case .permissionRequired:
+                _ = self.finishOperation(token)
                 self.state = .failed(.permissionRequired)
             case .cancelled:
+                _ = self.finishOperation(token)
                 self.state = .notConnected
             case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
                  .running:
@@ -403,8 +553,79 @@ final class AccountConnectionViewModel: ObservableObject {
                 // one tap: retry() -> the stored-credential rung, which is where a
                 // genuinely-stored token gets the gate. (The offline regression is
                 // fully fixed on that rung; this rung is unreachable offline.)
+                _ = self.finishOperation(token)
                 self.state = .failed(Self.terminalFailure(status))
             }
+        }
+    }
+
+    /// Restores a durable disconnect warning as soon as the one remembered,
+    /// opaque local account alias is available. This reads only the bounded
+    /// lifecycle projection; it never starts OAuth or a mailbox sync at launch.
+    private func restorePersistedLifecycle(accountIdentifier: Data) {
+        syncWorker.readLifecycle(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, case .success(let snapshot) = result else {
+                return
+            }
+            switch snapshot.recoveryPresentation {
+            case .disconnectIncomplete:
+                self.connectedAccountIdentifier = accountIdentifier
+                self.state = .failed(.disconnectIncomplete)
+            case .revokeUnconfirmed:
+                self.disconnectNotice = Self.revokeUnconfirmedNotice
+            case .none:
+                break
+            }
+        }
+    }
+
+    /// Checks recovery before the stored-credential rung. An incomplete local
+    /// teardown must converge before reconnecting; a revoke-unconfirmed marker
+    /// remains visible but does not prevent an explicit new consent attempt.
+    private func inspectLifecycleBeforeSync(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        syncWorker.readLifecycle(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, self.operationDeadline.accepts(token) else {
+                return
+            }
+            if case .success(let snapshot) = result {
+                switch snapshot.recoveryPresentation {
+                case .disconnectIncomplete:
+                    _ = self.finishOperation(token)
+                    self.connectedAccountIdentifier = accountIdentifier
+                    self.state = .failed(.disconnectIncomplete)
+                    return
+                case .revokeUnconfirmed:
+                    self.disconnectNotice = Self.revokeUnconfirmedNotice
+                case .none:
+                    break
+                }
+            }
+            self.syncWithStoredCredential(accountIdentifier: accountIdentifier, token: token)
+        }
+    }
+
+    /// Projects the aggregate timestamp after the worker terminal, then makes
+    /// cached mail visible. A metadata read failure never invents a time.
+    private func completeConnected(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken,
+        offline: Bool
+    ) {
+        syncWorker.readLifecycle(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, self.operationDeadline.accepts(token) else {
+                return
+            }
+            let snapshot: MailboxLifecycleSnapshot? = switch result {
+            case .success(let snapshot): snapshot
+            case .failure: nil
+            }
+            self.mailboxFreshness = .afterSync(snapshot: snapshot, offline: offline)
+            _ = self.finishOperation(token)
+            self.connectedAccountIdentifier = accountIdentifier
+            self.state = .connected
         }
     }
 
