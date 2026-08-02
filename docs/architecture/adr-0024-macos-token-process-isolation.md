@@ -177,36 +177,68 @@ or a partial write. Monitoring should read a sustained rise in refresh-path
 the bound — a signal to review the constant — not only as response
 corruption.
 
+A deliberate identity asymmetry behind these properties is recorded once so
+point 3 and reviewers do not normalize it away: a granted refresh
+re-validates the exact stored subject FIRST and refuses to persist anything
+— including a valid rotation — when the provider answer belongs to a
+different subject, while an explicitly under-scoped refresh CANNOT validate
+identity at all (the scope verdict is decided before claims validation) and
+persists a valid rotation solely as a local revocation handle for the grant
+before reporting the scope failure. The two paths intentionally treat a
+rotation differently.
+
 A fourth, forward-looking constraint is recorded for the point-3 service
 integration as a design and acceptance requirement, not as implemented
-behavior. The version-1 protocol surface is deliberately closed at five
-status codes, and the broker core's public error vocabulary is likewise
-closed. The point-3 XPC operation-to-status mapping, and the main app's
-status-to-UI mapping behind it, must nevertheless preserve four distinct
-recovery semantics end to end, and acceptance evidence must demonstrate
-each: an unconfirmed provider revocation (`RevokeUnconfirmed`) stays
-visibly distinct from a clean teardown so the app can direct the user to
-revoke the grant manually in their Google account settings; an explicitly
-under-scoped grant (`InsufficientScope`) keeps its own recovery naming the
-Gmail consent that must be allowed on retry, AND — because the broker
-deliberately persists and revokes nothing on that path and can leave a live
-under-scoped grant at Google that the app cannot revoke (see the second
-operational property above) — must also offer retain-or-retry recovery and
-direct the user to their Google account-permissions page for external
-manual revocation; a revoked consent and a
-missing refresh token (`ConsentRevoked`, `MissingRefreshToken`) route to
-re-connect after the destructive local deletion the former licenses; and
-an exchange-time authorization-code rejection — the token layer's
-`AuthorizationCodeRejected`, a stale, already redeemed, or mismatched
-code, which the broker core preserves as its own closed
-`BrokerError::AuthorizationCodeRejected` variant so the XPC mapping can
-route it without guessing — surfaces as the existing closed v1
-sign-in-expired status with the "sign in again"
-recovery, never as an opaque retryable failure, never folded into the
-ordinary provider-rejected status, and never as a claim that a
-stored credential was deleted (none exists on that path). Collapsing any
-of these into one opaque failure code, or widening the wire surface into
-an open-ended error channel to express them, fails acceptance.
+behavior. Today's version-1 protocol surface is the point-1 skeleton:
+`TersaTokenBrokerStatusV1` is closed at exactly five bootstrap status codes
+(`success`, `notImplemented`, `notProvisioned`, `invalidRequest`,
+`rejectedClient`) and carries NO operational recovery case — no
+sign-in-expired, provider-rejected, insufficient-scope, or
+revoke-unconfirmed status exists on the wire yet. The broker core's public
+error vocabulary is likewise closed. Point 3 therefore EXTENDS
+`TersaTokenBrokerStatusV1` with a reviewed closed set of operational
+recovery cases and updates the exact protocol and xtask inventory guards to
+that reviewed set: adding reviewed closed enum cases is a revision inside
+the closed-surface discipline, not an open-ended error channel, and
+open-ended status strings, codes, or error payloads remain forbidden. The
+point-3 XPC operation-to-status mapping, and the main app's status-to-UI
+mapping behind it, must preserve four distinct recovery semantics end to
+end, and acceptance evidence must demonstrate each: an unconfirmed provider
+revocation (`RevokeUnconfirmed`) stays visibly distinct from a clean
+teardown so the app can direct the user to revoke the grant manually in
+their Google account settings; an explicitly under-scoped grant
+(`InsufficientScope`) keeps its own recovery naming the Gmail consent that
+must be allowed on retry, AND — because the broker deliberately persists
+and revokes nothing on that path and can leave a live under-scoped grant at
+Google that the app cannot revoke (see the second operational property
+above) — must also offer retain-or-retry recovery and direct the user to
+their Google account-permissions page for external manual revocation; a
+revoked consent and a missing refresh token (`ConsentRevoked`,
+`MissingRefreshToken`) route to re-connect after the destructive local
+deletion the former licenses; and an exchange-time authorization-code
+rejection — the token layer's `AuthorizationCodeRejected`, a stale,
+already redeemed, or mismatched code, which the broker core preserves as
+its own closed `BrokerError::AuthorizationCodeRejected` variant so the XPC
+mapping can route it without guessing — maps to a NEW closed v1
+operational status defined in point 3, which the app then maps to its
+EXISTING `ConnectionFailure.signInExpired` UI recovery with the "sign in
+again" remedy (today reached through the legacy `STATUS_NEEDS_RECONNECT`
+status). It must never surface as an opaque retryable failure, never be
+folded into the ordinary provider-rejected status — itself a distinct
+operational status point 3 defines, not an existing v1 case — and never
+claim that a stored credential was deleted (none exists on that path). The
+closed operational statuses must also preserve BY OPERATION the context the
+broker error vocabulary deliberately does not carry: `PersistenceFailed` is
+one variant across operations, so point 3 maps it by operation.
+`PersistenceFailed` returned while loading during `revoke_provider_grant`
+means the revocation is unconfirmed: local teardown should still be
+attempted and the outcome visibly reported. `PersistenceFailed` returned
+from `delete_stored_tokens` means local teardown is incomplete and must
+never be reported clean. The broker error vocabulary must not be widened
+merely to carry this call-site context; the operation the app invoked
+supplies it. Collapsing any of these recovery semantics into one opaque
+failure code, or widening the wire surface into an open-ended error channel
+to express them, fails acceptance.
 
 Neither piece activates runtime isolation. The portable core is not yet linked
 into the XPC target, which still links no Rust; there is no production

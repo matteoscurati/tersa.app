@@ -8,7 +8,7 @@
 //! injected transport, refresh-token store, clocks, and entropy ports. It owns
 //! the full lifecycle — begin/complete authorization, refresh, provider
 //! revoke, and local delete — under the crate's security invariants: strict
-//! literal-IPv4 loopback redirects with an explicit ephemeral port, an
+//! literal-IPv4 loopback redirects with an explicit non-privileged port, an
 //! atomically claimed bounded session registry, per-subject single-flight
 //! permits released by RAII (a completion claims its account's permit before
 //! any store read or write), persistence of any refresh credential BEFORE a
@@ -52,9 +52,13 @@ use crate::subject::ValidatedSubject;
 /// the URL parser would otherwise normalize to the same address.
 const LOOPBACK_REDIRECT_PREFIX: &str = "http://127.0.0.1:";
 
-/// The inclusive ephemeral port range accepted for the loopback redirect.
+/// The inclusive lower bound of the non-privileged port range accepted for
+/// the loopback redirect (`1024..=65535`). There is deliberately no
+/// upper-bound constant: a parsed URL port is already a `u16`, so 65,535 is
+/// inherent and a `MAX` comparison would be a dead no-op. The accepted range
+/// is the NON-PRIVILEGED range, not the IANA ephemeral range
+/// (`49152..=65535`): only privilege separation is enforced.
 const MIN_LOOPBACK_PORT: u16 = 1024;
-const MAX_LOOPBACK_PORT: u16 = 65535;
 
 /// Caps the redirect text accepted by `begin_authorization`. The accepted
 /// shape is a few dozen bytes; anything larger is adversarial.
@@ -250,9 +254,9 @@ where
 
     /// Begins an authorization attempt for a strictly validated redirect.
     ///
-    /// Accepts only `http://127.0.0.1:PORT/` with an explicit port in
-    /// `1024..=65535`, the exact root path, and no credentials, query, or
-    /// fragment. The same client identifier feeds the authorization and token
+    /// Accepts only `http://127.0.0.1:PORT/` with an explicit non-privileged
+    /// port in `1024..=65535`, the exact root path, and no credentials,
+    /// query, or fragment. The same client identifier feeds the authorization and token
     /// client configurations, so they match by construction; the token
     /// configuration is validated now (failing before the browser round trip)
     /// and rebuilt from the claimed session at completion.
@@ -346,8 +350,8 @@ where
     /// lapsed — never [`BrokerError::ConsentRevoked`]: nothing is stored on
     /// this path, so no local deletion is asserted or performed. The variant
     /// stays distinct from [`BrokerError::ProviderRejected`] so the point-3
-    /// XPC/status mapping can route it to the existing closed v1
-    /// sign-in-expired status (ADR-0024).
+    /// XPC/status mapping can route it to a NEW closed v1 operational status
+    /// the app maps to its existing sign-in-expired UI recovery (ADR-0024).
     pub async fn complete_authorization(
         &self,
         session_handle: &str,
@@ -506,8 +510,11 @@ where
         {
             Ok(outcome) => outcome,
             Err(TokenError::ConsentRevoked) => {
-                // Consent is gone: the stored credential is dead weight and a
-                // re-connect signal must not be masked by a delete failure.
+                // ConsentRevoked ASSERTS the stored credential was deleted.
+                // A delete failure must therefore fail closed as
+                // PersistenceFailed — the `?` below intentionally withholds
+                // the re-connect signal — rather than falsely claim a
+                // deletion that was never confirmed.
                 self.store
                     .delete(&subject)
                     .map_err(|_error| BrokerError::PersistenceFailed)?;
@@ -788,19 +795,19 @@ fn revoke_handle(success: &TokenSuccess) -> Option<&Zeroizing<String>> {
 }
 
 /// Parses a redirect, accepting only the exact root-form literal IPv4
-/// loopback with an explicit ephemeral port: `http://127.0.0.1:PORT/` with
-/// `PORT` in `1024..=65535` and no credentials, query, or fragment.
+/// loopback with an explicit non-privileged port: `http://127.0.0.1:PORT/`
+/// with `PORT` in `1024..=65535` and no credentials, query, or fragment.
 fn parse_loopback_redirect(text: &str) -> Result<Url, BrokerError> {
     if text.len() > MAX_REDIRECT_LEN || !text.starts_with(LOOPBACK_REDIRECT_PREFIX) {
         return Err(BrokerError::InvalidInput);
     }
     let url = Url::parse(text).map_err(|_error| BrokerError::InvalidInput)?;
-    let ephemeral_port = url
-        .port()
-        .is_some_and(|port| (MIN_LOOPBACK_PORT..=MAX_LOOPBACK_PORT).contains(&port));
+    // A parsed URL port is already a `u16`, so only the lower bound of the
+    // non-privileged range needs a check; 65,535 is inherent.
+    let non_privileged_port = url.port().is_some_and(|port| port >= MIN_LOOPBACK_PORT);
     let exact_root_loopback = url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
-        && ephemeral_port
+        && non_privileged_port
         && url.path() == "/"
         && url.username().is_empty()
         && url.password().is_none()
@@ -841,9 +848,10 @@ fn map_oauth_error(error: OAuthError) -> BrokerError {
 /// The exchange-only [`TokenError::AuthorizationCodeRejected`] keeps its own
 /// dedicated broker variant: the sign-in lapsed, nothing is stored on the
 /// exchange path, and the point-3 XPC/status mapping must be able to route it
-/// to the existing closed v1 sign-in-expired status (ADR-0024) — folding it
-/// into [`BrokerError::ProviderRejected`] would make that input
-/// indistinguishable at the broker surface.
+/// to a NEW closed v1 operational status the app maps to its existing
+/// sign-in-expired UI recovery (ADR-0024) — folding it into
+/// [`BrokerError::ProviderRejected`] would make that input indistinguishable
+/// at the broker surface.
 fn map_token_error(error: TokenError) -> BrokerError {
     match error {
         TokenError::InvalidConfiguration => BrokerError::InvalidConfiguration,
@@ -956,6 +964,36 @@ mod tests {
     impl SessionHandleEntropy for CounterEntropy {
         fn handle_bytes(&self) -> Result<[u8; SESSION_HANDLE_BYTES], BrokerError> {
             let counter = self.0.fetch_add(1, Ordering::Relaxed);
+            let mut bytes = [0_u8; SESSION_HANDLE_BYTES];
+            bytes[..8].copy_from_slice(&counter.to_be_bytes());
+            Ok(bytes)
+        }
+    }
+
+    /// A switchable entropy source: fails while its flag is set, then mints
+    /// distinct handles like `CounterEntropy`, so a test can fail one begin
+    /// and then recover on the SAME broker.
+    #[derive(Clone, Debug, Default)]
+    struct SwitchableEntropy {
+        fail: Arc<AtomicBool>,
+        counter: Arc<AtomicU64>,
+    }
+
+    impl SwitchableEntropy {
+        fn failing() -> Self {
+            Self {
+                fail: Arc::new(AtomicBool::new(true)),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl SessionHandleEntropy for SwitchableEntropy {
+        fn handle_bytes(&self) -> Result<[u8; SESSION_HANDLE_BYTES], BrokerError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(BrokerError::Unavailable);
+            }
+            let counter = self.counter.fetch_add(1, Ordering::Relaxed);
             let mut bytes = [0_u8; SESSION_HANDLE_BYTES];
             bytes[..8].copy_from_slice(&counter.to_be_bytes());
             Ok(bytes)
@@ -1456,7 +1494,7 @@ mod tests {
         oversized.push_str(&"A".repeat(MAX_REDIRECT_LEN));
         for rejected in [
             "http://127.0.0.1/",              // no explicit port
-            "http://127.0.0.1:1023/",         // below the ephemeral range
+            "http://127.0.0.1:1023/",         // below the non-privileged range
             "http://localhost:8080/",         // named loopback
             "http://[::1]:8080/",             // IPv6 loopback
             "http://127.1:8080/",             // noncanonical IPv4
@@ -1845,6 +1883,126 @@ mod tests {
     }
 
     #[test]
+    fn an_entropy_failure_at_begin_fails_closed_without_allocating_a_session() {
+        // The entropy port fails: begin fails closed as Unavailable BEFORE a
+        // session is allocated, with no transport, store, or registry side
+        // effect and nothing sensitive in the rendered failure.
+        let shared = events();
+        let entropy = SwitchableEntropy::failing();
+        let broker = BrokerCore::new(
+            CLIENT_ID.to_owned(),
+            None,
+            Duration::from_secs(600),
+            (
+                FakeTransport::success(&shared, Some(REFRESH_TOKEN)),
+                FakeStore::new(&shared),
+                TestClock::default(),
+                TestWallClock(NOW),
+                entropy.clone(),
+            ),
+        )
+        .unwrap();
+        let result = broker.begin_authorization(REDIRECT);
+        assert!(
+            matches!(result, Err(BrokerError::Unavailable)),
+            "an entropy failure must fail closed as Unavailable: {result:?}"
+        );
+        let rendered = format!("{result:?}");
+        for sensitive in [REDIRECT, CLIENT_ID] {
+            assert!(
+                !rendered.contains(sensitive),
+                "the begin failure leaks {sensitive}: {rendered}"
+            );
+        }
+        assert!(shared.lock().unwrap().is_empty());
+        // The entropy failure preceded insertion inside `registry.insert`, so
+        // no session was allocated: the registry is still empty.
+        assert!(
+            format!("{broker:?}").contains("pending: 0"),
+            "an entropy failure must leave the registry empty: {broker:?}"
+        );
+
+        // Once entropy recovers, a healthy begin on the SAME broker works and
+        // its handle completes the full lifecycle.
+        entropy.fail.store(false, Ordering::Relaxed);
+        let pending = broker.begin_authorization(REDIRECT).unwrap();
+        let callback = callback_for(&pending, AUTH_CODE);
+        let token =
+            ready(broker.complete_authorization(pending.session_handle(), callback.as_str()))
+                .unwrap();
+        assert_eq!(token.subject(), SUBJECT);
+        assert_eq!(
+            *shared.lock().unwrap(),
+            vec![
+                Event::Exchange,
+                Event::Load(SUBJECT.to_owned()),
+                Event::Store(SUBJECT.to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_session_handle_is_rejected_before_any_registry_or_port_side_effect() {
+        // A malformed handle fails shape validation BEFORE the registry is
+        // touched: no claim runs, so a live session is never consumed by a
+        // malformed attempt, and no transport, store, or revoke follows.
+        let shared = events();
+        let transport = FakeTransport::success(&shared, Some(REFRESH_TOKEN));
+        let store = FakeStore::new(&shared);
+        let broker = make_broker(&transport, &store, None);
+        let pending = broker.begin_authorization(REDIRECT).unwrap();
+        // The minted shape is 22 URL-safe base64 characters: wrong length or
+        // wrong charset is malformed.
+        let wrong_length = "A".repeat(23);
+        let mut wrong_charset = pending.session_handle().to_owned();
+        wrong_charset.replace_range(..1, "+");
+        for malformed in ["", "short", wrong_length.as_str(), wrong_charset.as_str()] {
+            assert!(
+                matches!(
+                    ready(broker.complete_authorization(malformed, REDIRECT)),
+                    Err(BrokerError::InvalidInput)
+                ),
+                "a malformed handle must fail closed as InvalidInput: {malformed:?}"
+            );
+        }
+        // No registry claim, transport call, store access, or revoke ran —
+        // and the live session the malformed attempts never named is still
+        // completable.
+        assert!(shared.lock().unwrap().is_empty());
+        assert!(transport.revoked_handles().is_empty());
+        let callback = callback_for(&pending, AUTH_CODE);
+        let token =
+            ready(broker.complete_authorization(pending.session_handle(), callback.as_str()))
+                .unwrap();
+        assert_eq!(token.subject(), SUBJECT);
+    }
+
+    #[test]
+    fn a_well_formed_unknown_session_handle_is_session_unknown_without_side_effects() {
+        // The handle has the exact minted shape but names no live session:
+        // SessionUnknown, with no transport, store, or revoke side effect,
+        // and the same terminal answer on every attempt.
+        let shared = events();
+        let transport = FakeTransport::success(&shared, Some(REFRESH_TOKEN));
+        let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+        let broker = make_broker(&transport, &store, None);
+        // 22 URL-safe base64 characters — the exact minted handle shape.
+        let unknown = "A".repeat(22);
+        for attempt in 0..2 {
+            let result = ready(broker.complete_authorization(&unknown, REDIRECT));
+            assert!(
+                matches!(result, Err(BrokerError::SessionUnknown)),
+                "attempt {attempt}: an unknown handle must be SessionUnknown: {result:?}"
+            );
+        }
+        // No claim ever matched, so nothing ran: no exchange, no load, no
+        // store, no revoke, and the stored credential is retained untouched.
+        assert!(shared.lock().unwrap().is_empty());
+        assert!(transport.revoked_handles().is_empty());
+        assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
+    }
+
+    #[test]
     fn an_exchange_without_a_refresh_token_is_terminal_and_revokes_best_effort() {
         let shared = events();
         // The best-effort revoke may itself fail; the terminal must not change.
@@ -1920,10 +2078,10 @@ mod tests {
             // code: the token layer keeps it distinct as
             // `TokenError::AuthorizationCodeRejected`, and the broker preserves
             // that distinction in its closed surface so point 3 can map it to
-            // the existing closed v1 sign-in-expired status — NEVER
-            // ConsentRevoked, which claims a stored credential was deleted
-            // (none exists on this path), and never folded into the ordinary
-            // ProviderRejected.
+            // a NEW closed v1 operational status routed to the app's existing
+            // sign-in-expired UI recovery — NEVER ConsentRevoked, which claims
+            // a stored credential was deleted (none exists on this path), and
+            // never folded into the ordinary ProviderRejected.
             (
                 TokenTransportError::InvalidGrant,
                 BrokerError::AuthorizationCodeRejected,
@@ -2350,7 +2508,9 @@ mod tests {
         assert!(store.is_empty());
 
         // When the delete itself fails the broker fails closed as
-        // PersistenceFailed: the re-connect signal is masked, never reported.
+        // PersistenceFailed: ConsentRevoked asserts the deletion happened,
+        // so the re-connect signal is intentionally withheld, never falsely
+        // reported.
         let shared = events();
         let transport = FakeTransport::success(&shared, None)
             .with_refresh_error(TokenTransportError::InvalidGrant);

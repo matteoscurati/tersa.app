@@ -14,8 +14,8 @@ use std::fmt;
 #[non_exhaustive]
 pub enum BrokerError {
     /// A caller-supplied value failed validation: the redirect URI was not an
-    /// exact root-form literal IPv4 loopback with an explicit ephemeral port,
-    /// the session handle was malformed, the subject was not conservative
+    /// exact root-form literal IPv4 loopback with an explicit non-privileged
+    /// port, the session handle was malformed, the subject was not conservative
     /// Google-subject text, the callback URL was oversized or unparsable, or
     /// the callback did not match the pending session (redirect, state,
     /// parameter shape).
@@ -28,8 +28,12 @@ pub enum BrokerError {
     /// handle could not be allocated within the attempt bound.
     Unavailable,
     /// A bounded resource is momentarily exhausted: the pending-session
-    /// registry is at capacity (retry after sessions expire) or another
-    /// mutation already holds the subject's single-flight permit.
+    /// registry is at capacity (retry after pending sessions expire), another
+    /// mutation already holds the subject's single-flight permit, or the
+    /// global bounded subject-permit table is full even though the requested
+    /// subject has no current mutation. Every cause is bounded and transient
+    /// — the caller backs off and retries — and the variant deliberately
+    /// carries no subject or count, so no account identity leaks through it.
     Busy,
     /// The session handle names no live pending session: it is unknown, it
     /// expired, or a prior callback already consumed it. Every callback
@@ -46,9 +50,12 @@ pub enum BrokerError {
     /// stored on the exchange path, so this is never a deletion license and
     /// never [`Self::ConsentRevoked`]. The broker keeps this terminal distinct
     /// from [`Self::ProviderRejected`] so the point-3 XPC/status mapping can
-    /// route it to the existing closed v1 sign-in-expired status with the
-    /// "sign in again" recovery (ADR-0024); it widens neither the broker
-    /// surface beyond this closed variant nor the wire protocol.
+    /// route it to a NEW closed v1 operational status (today's five v1
+    /// skeleton cases carry no operational recovery status; point 3 extends
+    /// the reviewed closed set) that the app maps to its existing
+    /// sign-in-expired "sign in again" UI recovery (ADR-0024); it widens
+    /// neither the broker surface beyond this closed variant nor the wire
+    /// protocol into an open-ended channel.
     AuthorizationCodeRejected,
     /// The token or revocation endpoint could not be reached.
     Transport,
@@ -93,6 +100,13 @@ pub enum BrokerError {
     /// success whose credential was never durably stored. An unreadable
     /// pre-mutation snapshot during completion fails closed the same way,
     /// before any store write or provider revoke.
+    ///
+    /// Point 3 must not treat every `PersistenceFailed` as an ordinary
+    /// transient: after a definitive refresh-time `invalid_grant`, a delete
+    /// failure intentionally fails closed HERE instead of reporting
+    /// [`Self::ConsentRevoked`], withholding the re-connect signal until the
+    /// local deletion can be confirmed — a persistent store failure on that
+    /// path is a stuck dead credential, not a retry-and-forget hiccup.
     PersistenceFailed,
     /// The provider did not confirm a requested grant revocation. The local
     /// stored token is deliberately NOT deleted: ADR-0024's disconnect

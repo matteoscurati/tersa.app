@@ -15,7 +15,7 @@
 //! Security invariants enforced here:
 //!
 //! - `begin_authorization` accepts only an exact root-form literal IPv4
-//!   loopback redirect with an explicit ephemeral port.
+//!   loopback redirect with an explicit non-privileged port.
 //! - Pending authorization sessions live in a bounded registry with an
 //!   absolute TTL, deterministic reaping, no live-entry eviction, and
 //!   poisoned-lock fail-closed wiping; a completion claims its session
@@ -50,8 +50,9 @@
 //! - The closed broker error vocabulary keeps an exchange-time
 //!   authorization-code rejection (`BrokerError::AuthorizationCodeRejected` —
 //!   the sign-in lapsed) distinct from an ordinary provider rejection, so the
-//!   point-3 XPC/status mapping can route it to the existing closed v1
-//!   sign-in-expired status (ADR-0024).
+//!   point-3 XPC/status mapping can route it to a NEW closed v1 operational
+//!   status, which the app maps to its existing sign-in-expired UI recovery
+//!   (ADR-0024).
 
 #![forbid(unsafe_code)]
 
