@@ -51,7 +51,6 @@ DOCS_ONLY_PREFIXES = ("docs/", "xtask/", ".github/")
 FULL_FANOUT_PATHS = {
     "Cargo.toml",
     "Cargo.lock",
-    "apple/project.yml",
 }
 FULL_FANOUT_PREFIXES = (
     "apple/scripts/",

@@ -29,7 +29,7 @@ class ChangeScopeTests(unittest.TestCase):
             ("unknown path fails closed", ["new-area/input.txt"], ALL),
             ("ambiguous path fails closed", ["../Cargo.toml"], ALL),
             ("root manifest fans out", ["Cargo.toml"], ALL),
-            ("Apple project fans out", ["apple/project.yml"], ALL),
+            ("Apple project builds only the product lane", ["apple/project.yml"], {"product_apple"}),
             ("shared Apple script fans out", ["apple/scripts/build-rust-staticlib.sh"], ALL),
             ("Slint component", ["apps/slint-spike/ui/tersa.slint"], {"slint"}),
             ("Slint manifest also checks notices", ["apps/slint-spike/Cargo.toml"], {"slint", "notices"}),
@@ -90,6 +90,35 @@ class ChangeScopeTests(unittest.TestCase):
             'git diff --no-renames --name-only "$merge_base" "$HEAD_SHA"',
             workflow,
         )
+
+    def test_workflow_runs_expensive_pr_jobs_only_after_draft(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", workflow)
+        self.assertIn("github.event.pull_request.draft == false", workflow)
+
+    def test_workflow_keeps_deep_evidence_manual(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("\n  push:\n", workflow)
+        self.assertNotIn("github.event_name == 'push'", workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}", workflow)
+
+    def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("name: Verify built Rust bridge symbols", workflow)
+        self.assertIn(
+            "apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
+            workflow,
+        )
+        for step in (
+            "Build unsigned iOS device debug application",
+            "Archive unsigned macOS debug application",
+            "Archive unsigned iOS debug application",
+            "Verify archived Rust bridge symbols",
+            "Verify OAuth PKCE and sandbox feasibility",
+        ):
+            marker = f"- name: {step}\n        if: github.event_name == 'workflow_dispatch'"
+            self.assertIn(marker, workflow)
 
 
 if __name__ == "__main__":
