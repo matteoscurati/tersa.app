@@ -134,8 +134,9 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "tests construct valid fixtures")]
 
     use std::collections::VecDeque;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use tersa_application::oauth::{
@@ -358,6 +359,44 @@ mod tests {
         assert!(matches!(
             registry.claim(&unknown),
             Err(BrokerError::SessionUnknown)
+        ));
+    }
+
+    #[test]
+    fn a_poisoned_lock_fails_closed_and_wipes_resident_sessions() {
+        let registry = SessionRegistry::new();
+        let clock = TestClock::default();
+        let entropy = CounterEntropy::default();
+        let handle = registry
+            .insert(make_session(&clock, 17_000), &entropy)
+            .unwrap();
+
+        // Poison the lock with a live session resident: a panicking thread
+        // dropped the guard mid-operation. `catch_unwind` keeps the
+        // deliberate panic contained to this test.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = registry.sessions.lock().unwrap();
+            panic!("deliberate test poison");
+        }));
+        assert!(poisoned.is_err());
+
+        // Fail closed: a registry operation never trusts the poisoned map.
+        assert!(matches!(
+            registry.claim(&handle),
+            Err(BrokerError::Unavailable)
+        ));
+        // The fail-closed operation wiped the poisoned map: no session or
+        // verifier remains resident (dropping a session zeroizes them).
+        let inner = registry
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(inner.is_empty());
+        drop(inner);
+        // The lock stays poisoned, so later operations keep failing closed.
+        assert!(matches!(
+            registry.insert(make_session(&clock, 17_001), &entropy),
+            Err(BrokerError::Unavailable)
         ));
     }
 }

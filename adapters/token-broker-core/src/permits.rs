@@ -93,6 +93,9 @@ impl fmt::Debug for SubjectPermit {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests construct valid fixtures")]
 
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::PoisonError;
+
     use super::{MAX_SUBJECT_PERMITS, SubjectPermits};
     use crate::error::BrokerError;
 
@@ -132,5 +135,50 @@ mod tests {
         let rendered = format!("{guard:?}");
         assert!(!rendered.contains("110169484474386276334"));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn a_poisoned_lock_fails_claim_closed() {
+        let permits = SubjectPermits::new();
+
+        // Poison the lock. `catch_unwind` keeps the deliberate panic
+        // contained to this test.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = permits.held.lock().unwrap();
+            panic!("deliberate test poison");
+        }));
+        assert!(poisoned.is_err());
+
+        // Fail closed: a claim never trusts the poisoned set.
+        assert!(matches!(
+            permits.claim("subject-a"),
+            Err(BrokerError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn a_guard_drop_through_a_poisoned_lock_still_releases_the_slot() {
+        let permits = SubjectPermits::new();
+        let permit = permits.claim("subject-a").unwrap();
+
+        // Poison the shared lock while the guard still holds its slot.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = permits.held.lock().unwrap();
+            panic!("deliberate test poison");
+        }));
+        assert!(poisoned.is_err());
+
+        // The RAII drop recovers through the poison and frees the slot, so
+        // the subject is never wedged behind Busy for the process lifetime.
+        drop(permit);
+        let inner = permits.held.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(inner.is_empty());
+        drop(inner);
+        // The lock correctly remains poisoned: later claims still fail closed
+        // rather than succeeding.
+        assert!(matches!(
+            permits.claim("subject-a"),
+            Err(BrokerError::Unavailable)
+        ));
     }
 }

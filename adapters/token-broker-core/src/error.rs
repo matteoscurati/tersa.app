@@ -43,9 +43,14 @@ pub enum BrokerError {
     /// A provider response did not parse into a complete, bounded token
     /// response (including an out-of-bound access token or expiry).
     MalformedResponse,
-    /// The granted scope set omitted Gmail read access. On exchange the
-    /// minted credential was revoked best-effort and nothing was persisted;
-    /// on refresh any rotated credential was persisted first.
+    /// The granted scope set omitted Gmail read access. On exchange nothing
+    /// was persisted and nothing was revoked: the under-scoped outcome has
+    /// no validated identity, so no subject-keyed snapshot is possible and
+    /// no grant-wide revoke is safe. The fail-safe contract is deliberately
+    /// non-destructive — it can leave a first-connect under-scoped grant
+    /// active at the provider (the point-3 UI must offer retain or
+    /// manual-revoke recovery), but it can never destroy an unknown prior
+    /// working grant. On refresh any rotated credential was persisted first.
     InsufficientScope,
     /// The token response carried no verified account identity, or its
     /// `id_token` failed freshness validation against the wall clock.
@@ -56,8 +61,9 @@ pub enum BrokerError {
     /// minted access token is dropped without being exposed.
     IdentityMismatch,
     /// No usable refresh token exists: the exchange granted no refresh token
-    /// (the minted access token was revoked best-effort), or none is stored
-    /// for the subject. Re-connect is required.
+    /// (the stranded grant was revoked best-effort, but only when a
+    /// definitive empty store snapshot licensed the grant-wide revoke), or
+    /// none is stored for the subject. Re-connect is required.
     MissingRefreshToken,
     /// The provider reported `invalid_grant`: consent was withdrawn or the
     /// stored refresh token expired. The stored token was deleted; re-connect
@@ -65,7 +71,9 @@ pub enum BrokerError {
     ConsentRevoked,
     /// The refresh-token store rejected a read, write, or delete. On a
     /// persistence-first path the broker fails closed rather than reporting a
-    /// success whose credential was never durably stored.
+    /// success whose credential was never durably stored. An unreadable
+    /// pre-mutation snapshot during completion fails closed the same way,
+    /// before any store write or provider revoke.
     PersistenceFailed,
     /// The provider did not confirm a requested grant revocation. The local
     /// stored token is deliberately NOT deleted: ADR-0024's disconnect

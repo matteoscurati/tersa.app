@@ -22,7 +22,21 @@
 //!   atomically BEFORE any callback validation, so every callback is terminal.
 //! - Token mutations serialize per validated subject through bounded
 //!   single-flight permits released by RAII guards (cancellation-safe); no
-//!   mutex guard is held across an `.await`.
+//!   mutex guard is held across an `.await`. A completion claims its
+//!   account's permit immediately after subject validation, before any
+//!   store read or write.
+//! - A granted exchange snapshots the stored credential under the permit
+//!   before replacing it; a stranded post-exchange grant is revoked
+//!   best-effort only when that snapshot is definitively empty, because
+//!   Google revocation is grant-wide and a prior credential could be the
+//!   working connection. An unreadable snapshot fails closed as
+//!   `PersistenceFailed` before any store write or revoke.
+//! - An explicitly under-scoped completion carries no validated identity and
+//!   the XPC-shaped begin operation supplies no account identity, so no
+//!   subject-keyed snapshot is possible: it fails safe and non-destructively
+//!   (nothing persisted, nothing revoked). This can leave a first-connect
+//!   under-scoped grant active at the provider; the point-3 UI must surface
+//!   the failure and offer retain or manual-revoke recovery.
 //! - Success values carry only a zeroizing access token, a zeroizing subject,
 //!   and a bounded positive expiry; every `Debug`/`Display` redacts
 //!   account-identifying and secret-bearing values.
