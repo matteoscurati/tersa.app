@@ -275,7 +275,6 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
         if self.state.as_slice().ct_eq(state.as_bytes()).unwrap_u8() != 1 {
             return Err(OAuthError::StateMismatch);
         }
-
         let code = parameters.get("code");
         let provider_error = parameters.get("error");
         match (code, provider_error) {
@@ -283,10 +282,19 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
             (None, Some(_)) => Err(OAuthError::ProviderRejected),
             (None, None) => Err(OAuthError::MissingParameter("code")),
             (Some(code), None) if code.is_empty() => Err(OAuthError::MissingParameter("code")),
-            (Some(code), None) => Ok(AuthorizationGrant {
-                code: code.clone(),
-                verifier: Zeroizing::new(std::mem::take(&mut *self.verifier)),
-            }),
+            (Some(code), None) => {
+                if parameters.get("scope").is_some_and(|scope| {
+                    !scope
+                        .split_ascii_whitespace()
+                        .any(|granted| granted == GMAIL_READONLY_SCOPE)
+                }) {
+                    return Err(OAuthError::InsufficientScope);
+                }
+                Ok(AuthorizationGrant {
+                    code: code.clone(),
+                    verifier: Zeroizing::new(std::mem::take(&mut *self.verifier)),
+                })
+            }
         }
     }
 
@@ -348,6 +356,8 @@ pub enum OAuthError {
     ConflictingCallback,
     /// The provider returned an OAuth error.
     ProviderRejected,
+    /// The provider granted a scope set that omits Gmail read access.
+    InsufficientScope,
     /// The callback redirect does not exactly match the configured redirect.
     RedirectMismatch,
     /// The returned state does not match the pending session.
@@ -369,6 +379,7 @@ impl fmt::Display for OAuthError {
             Self::DuplicateParameter => "the OAuth callback contains duplicate parameters",
             Self::ConflictingCallback => "the OAuth callback contains conflicting outcomes",
             Self::ProviderRejected => "the OAuth provider rejected the request",
+            Self::InsufficientScope => "the OAuth grant omitted Gmail read access",
             Self::RedirectMismatch => "the OAuth redirect does not match",
             Self::StateMismatch => "the OAuth state does not match",
             Self::Expired => "the OAuth request expired",
@@ -630,6 +641,35 @@ mod tests {
             session.finish(&callback),
             Err(OAuthError::AlreadyConsumed)
         ));
+    }
+
+    #[test]
+    fn rejects_an_explicit_callback_scope_without_gmail_read_access() {
+        let prepared = make_prepared(31);
+        let mut callback = make_callback(prepared.authorization_url(), "under-scoped-code");
+        callback
+            .query_pairs_mut()
+            .append_pair("scope", OPENID_SCOPE);
+        let (_, mut session) = prepared.into_parts();
+        assert!(matches!(
+            session.finish(&callback),
+            Err(OAuthError::InsufficientScope)
+        ));
+        assert!(matches!(
+            session.finish(&callback),
+            Err(OAuthError::AlreadyConsumed)
+        ));
+
+        let prepared = make_prepared(32);
+        let mut callback = make_callback(prepared.authorization_url(), "fully-scoped-code");
+        callback
+            .query_pairs_mut()
+            .append_pair("scope", REQUESTED_SCOPE);
+        let (_, mut session) = prepared.into_parts();
+        assert_eq!(
+            session.finish(&callback).unwrap().code(),
+            "fully-scoped-code"
+        );
     }
 
     #[test]

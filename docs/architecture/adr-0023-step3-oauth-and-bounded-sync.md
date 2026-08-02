@@ -379,7 +379,16 @@ verdict that the fence alone was the guarantee.)
     to an error-agnostic `Future<Output = i32>` op so it drives both a bare
     `gated_sync` and this refresh-then-sync cycle; a missing stored token maps to a
     distinct `STATUS_NEEDS_RECONNECT` (re-consent, not retry), while setup/refresh/
-    session failures collapse to the opaque sync-failed code (no oracle). Isolating the
+    session failures collapse to the opaque sync-failed code (no oracle). The 3f live
+    run additionally proved that Google can return an explicitly reduced scope set
+    when Gmail access is not selected. The callback and token-response boundaries now
+    reject any explicit scope set missing `gmail.readonly` before credential storage,
+    carrying a distinct permission-required terminal to the macOS UI. The token-
+    response fallback decides explicit under-scope before OIDC identity validation and
+    preserves zeroizing token handles through lifecycle cleanup, so a first-connect
+    under-scope grant is revoked best-effort rather than stranded and a rotated
+    under-scope refresh credential remains available for later revocation; an absent
+    scope field remains valid per OAuth. Isolating the
     network stack out of the minimal bootstrap bridge, the `extern "C"` sync-begin/poll
     FFI will live in a **separate crate** (not `apple/rust-bridge`), a later slice.
 

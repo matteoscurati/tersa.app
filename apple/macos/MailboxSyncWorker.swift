@@ -88,6 +88,8 @@ enum MailboxPollStatus {
     /// No refresh token is stored for the account: it must be reconnected
     /// (re-consent) rather than retried.
     case needsReconnect
+    /// Google explicitly omitted Gmail read access from the granted scopes.
+    case permissionRequired
     /// The poll named an unregistered or already-reaped session id.
     case unknownSession
     /// A poll returned a code this build does not know. Terminal
@@ -112,6 +114,8 @@ enum MailboxPollStatus {
             self = .internalError
         case -6:
             self = .needsReconnect
+        case -9:
+            self = .permissionRequired
         case -8:
             self = .unknownSession
         default:

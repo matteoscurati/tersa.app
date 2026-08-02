@@ -10,6 +10,7 @@ import AppKit
 enum OAuthOutcome {
     case succeeded(OAuthSessionID)
     case cancelled
+    case permissionRequired
     case failed
 }
 
@@ -17,6 +18,7 @@ enum OAuthOutcome {
 final class OAuthAuthorizationSession {
     private static let pendingStatus: Int32 = 0
     private static let succeededStatus: Int32 = 1
+    private static let insufficientScopeStatus: Int32 = -8
 
     private var sessionID: UInt64?
     private var pollTimer: Timer?
@@ -111,9 +113,14 @@ final class OAuthAuthorizationSession {
             // session and the terminal outcome is delivered exactly once. A
             // success still hands the connect flow the OAuth session id it
             // claims the grant with.
-            let outcome: OAuthOutcome = status == Self.succeededStatus
-                ? .succeeded(OAuthSessionID(rawValue: sessionID))
-                : .failed
+            let outcome: OAuthOutcome
+            if status == Self.succeededStatus {
+                outcome = .succeeded(OAuthSessionID(rawValue: sessionID))
+            } else if status == Self.insufficientScopeStatus {
+                outcome = .permissionRequired
+            } else {
+                outcome = .failed
+            }
             let callback = onOutcome
             finishLocally()
             callback?(outcome)

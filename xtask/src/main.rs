@@ -691,6 +691,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         violations.extend(swift_bootstrap_source_violations(&worker, &app_delegate));
         violations.extend(swift_bootstrap_inventory_violations(&macos_sources));
     }
+    violations.extend(swift_oauth_foreground_handoff_violations(&macos_sources));
     Ok(violations)
 }
 
@@ -2558,6 +2559,99 @@ fn swift_bootstrap_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<St
         sources,
         &owner_entries,
     ));
+    violations
+}
+
+/// Keeps the browser-to-Keychain handoff foreground-gated. A successful OAuth
+/// callback commonly arrives while the browser is still active; starting the
+/// connect worker there can make the `WhenUnlockedThisDeviceOnly` token store
+/// fail with `errSecInteractionNotAllowed` on macOS. This structural check makes
+/// the reviewed activation boundary part of the Apple product surface.
+fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let path = Path::new(ACCOUNT_CONNECTION_VIEW_MODEL_PATH);
+    let Some((_path, document)) = sources.iter().find(|(candidate, _)| candidate == path) else {
+        return vec![format!(
+            "the OAuth foreground handoff source `{}` must be tracked",
+            path.display()
+        )];
+    };
+    let code = strip_swift_non_code(document);
+    let mut violations = Vec::new();
+
+    let authorize = swift_function_bodies(&code, "authorizeAndConnect");
+    let [authorize] = authorize.as_slice() else {
+        return vec![
+            "AccountConnectionViewModel must contain exactly one authorizeAndConnect function"
+                .to_owned(),
+        ];
+    };
+    if !authorize.contains("connectAfterApplicationActivation(")
+        || authorize.contains("connectWithGrant(")
+    {
+        violations.push(
+            "a successful OAuth outcome must enter the application-activation handoff, never connect directly"
+                .to_owned(),
+        );
+    }
+
+    let activation = swift_function_bodies(&code, "connectAfterApplicationActivation");
+    let [activation] = activation.as_slice() else {
+        violations.push(
+            "AccountConnectionViewModel must contain exactly one connectAfterApplicationActivation function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    for required in [
+        "NSApplication.didBecomeActiveNotification",
+        "NSApp.activate()",
+        "finishApplicationActivation(",
+    ] {
+        if !activation.contains(required) {
+            violations.push(format!(
+                "the OAuth activation handoff must contain `{required}`"
+            ));
+        }
+    }
+    let observer_position = activation.find("activationObserver =");
+    let activate_position = activation.find("NSApp.activate()");
+    if !matches!(
+        (observer_position, activate_position),
+        (Some(observer), Some(activate)) if observer < activate
+    ) {
+        violations.push(
+            "the OAuth activation observer must be installed before NSApp.activate()".to_owned(),
+        );
+    }
+
+    let finish = swift_function_bodies(&code, "finishApplicationActivation");
+    let [finish] = finish.as_slice() else {
+        violations.push(
+            "AccountConnectionViewModel must contain exactly one finishApplicationActivation function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    let clear_position = finish.find("clearApplicationActivation()");
+    let connect_position = finish.find("connectWithGrant(");
+    if !finish.contains("guard activationPending")
+        || !matches!(
+            (clear_position, connect_position),
+            (Some(clear), Some(connect)) if clear < connect
+        )
+    {
+        violations.push(
+            "the activation completion must clear its one-shot state before claiming the OAuth grant"
+                .to_owned(),
+        );
+    }
+
+    let connect_callers = swift_function_names_with(&code, "connectWithGrant(");
+    if connect_callers != ["finishApplicationActivation".to_owned()] {
+        violations.push(
+            "finishApplicationActivation must be the sole caller of connectWithGrant".to_owned(),
+        );
+    }
     violations
 }
 
@@ -6926,7 +7020,8 @@ mod tests {
         shipped_direct_dependency_names, signing_configuration_violations,
         sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
         strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
-        swift_bootstrap_source_violations, swift_bridge_call_inventory, target_metadata_options,
+        swift_bootstrap_source_violations, swift_bridge_call_inventory,
+        swift_oauth_foreground_handoff_violations, target_metadata_options,
         tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
@@ -8652,6 +8747,95 @@ private enum TersaApplication {
             assert!(
                 !swift_bootstrap_source_violations(worker, &drift).is_empty(),
                 "an uninstalled or ambiguous AppKit entrypoint must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn swift_oauth_foreground_handoff_accepts_one_shot_activation() {
+        let view_model = r"
+func authorizeAndConnect() {
+    connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+}
+func connectAfterApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+    activationPending = true
+    if NSApp.isActive {
+        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        return
+    }
+    activationObserver = NotificationCenter.default.addObserver(
+        forName: NSApplication.didBecomeActiveNotification,
+        object: NSApp,
+        queue: .main
+    ) { _ in
+        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    }
+    NSApp.activate()
+    if NSApp.isActive {
+        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    }
+}
+func finishApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+    guard activationPending else { return }
+    clearApplicationActivation()
+    connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+}
+func clearApplicationActivation() {}
+func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {}
+";
+        let sources = vec![(
+            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+            view_model.to_owned(),
+        )];
+
+        assert!(
+            swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+            "the reviewed foreground handoff must pass: {:?}",
+            swift_oauth_foreground_handoff_violations(&sources)
+        );
+    }
+
+    #[test]
+    fn swift_oauth_foreground_handoff_rejects_background_connect_and_late_observer() {
+        let valid = r"
+func authorizeAndConnect() {
+    connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+}
+func connectAfterApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+    activationObserver = NotificationCenter.default.addObserver(
+        forName: NSApplication.didBecomeActiveNotification,
+        object: NSApp,
+        queue: .main
+    ) { _ in
+        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    }
+    NSApp.activate()
+    finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+}
+func finishApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+    guard activationPending else { return }
+    clearApplicationActivation()
+    connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+}
+func clearApplicationActivation() {}
+func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {}
+";
+        let direct_connect = valid.replace(
+            "connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)",
+            "connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)",
+        );
+        let late_observer = valid.replace(
+            "    activationObserver = NotificationCenter.default.addObserver(\n",
+            "    NSApp.activate()\n    activationObserver = NotificationCenter.default.addObserver(\n",
+        );
+        for drift in [direct_connect, late_observer] {
+            let sources = vec![(
+                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                drift,
+            )];
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "a background-capable OAuth handoff must fail closed"
             );
         }
     }

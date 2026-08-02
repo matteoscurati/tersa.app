@@ -140,7 +140,7 @@ struct AccountConnectionView: View {
     /// "Disconnect failed" can't read as "retry connecting".
     private func retryLabel(_ failure: ConnectionFailure) -> String {
         switch failure {
-        case .signInExpired, .signInFailed, .signInUnavailable:
+        case .signInExpired, .signInFailed, .signInUnavailable, .permissionRequired:
             return "Sign in again"
         case .disconnectIncomplete:
             return "Disconnect again"

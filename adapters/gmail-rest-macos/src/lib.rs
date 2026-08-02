@@ -27,6 +27,8 @@ use tersa_application::mailbox::{
     BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
 #[cfg(any(target_os = "macos", test))]
+use tersa_application::oauth::GMAIL_READONLY_SCOPE;
+#[cfg(any(target_os = "macos", test))]
 use tersa_application::token::{
     ExchangeRequest, IdTokenClaims, RefreshRequest, TokenResponse, TokenTransport,
     TokenTransportError,
@@ -839,7 +841,7 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
     #[derive(Deserialize)]
     #[expect(
         dead_code,
-        reason = "the token type and granted scope complete the provider response shape but carry no state the port retains"
+        reason = "the token type completes the provider response shape but carries no state the port retains"
     )]
     struct TokenResponseBody {
         #[serde(deserialize_with = "deserialize_zeroizing")]
@@ -854,15 +856,26 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
     }
     let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
-    let id_token_claims = match parsed.id_token {
-        Some(id_token) => Some(parse_id_token_claims(id_token.as_str())?),
-        None => None,
+    let gmail_read_granted = parsed.scope.as_deref().is_none_or(|scope| {
+        scope
+            .split_ascii_whitespace()
+            .any(|granted| granted == GMAIL_READONLY_SCOPE)
+    });
+    // Scope is the earlier security boundary: an explicitly under-scoped
+    // response must reach lifecycle cleanup with its minted token handles even
+    // when the same response carries a malformed id_token. Identity is never
+    // consumed for a rejected scope, so parsing it here would only strand the
+    // provider grant before the caller can revoke it.
+    let id_token_claims = match (gmail_read_granted, parsed.id_token) {
+        (true, Some(id_token)) => Some(parse_id_token_claims(id_token.as_str())?),
+        (true, None) | (false, _) => None,
     };
     Ok(TokenResponse::new(
         parsed.access_token,
         Duration::from_secs(parsed.expires_in),
         parsed.refresh_token,
         id_token_claims,
+        gmail_read_granted,
     ))
 }
 
@@ -1910,19 +1923,50 @@ mod tests {
             r#"{{"access_token":"a","expires_in":3599,"token_type":"Bearer","id_token":"{}"}}"#,
             jwt(payload)
         );
-        let (_access, _expires, _refresh, claims) = parse_token_response(body.as_bytes())
-            .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
-            .into_parts();
+        let (_access, _expires, _refresh, claims, gmail_read_granted) =
+            parse_token_response(body.as_bytes())
+                .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+                .into_parts();
         assert!(claims.is_some());
+        assert!(gmail_read_granted);
     }
 
     #[test]
     fn parse_token_response_without_an_id_token_carries_no_claims() {
         let body = r#"{"access_token":"a","expires_in":3599,"token_type":"Bearer"}"#;
-        let (_access, _expires, _refresh, claims) = parse_token_response(body.as_bytes())
-            .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
-            .into_parts();
+        let (_access, _expires, _refresh, claims, gmail_read_granted) =
+            parse_token_response(body.as_bytes())
+                .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+                .into_parts();
         assert!(claims.is_none());
+        assert!(gmail_read_granted);
+    }
+
+    #[test]
+    fn token_response_records_an_explicit_scope_without_gmail_read_access() {
+        let under_scoped =
+            br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid"}"#;
+        let response = parse_token_response(under_scoped)
+            .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
+        assert!(!response.gmail_read_granted());
+
+        let fully_scoped = br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid https://www.googleapis.com/auth/gmail.readonly"}"#;
+        let response = parse_token_response(fully_scoped)
+            .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
+        assert!(response.gmail_read_granted());
+    }
+
+    #[test]
+    fn under_scoped_response_preserves_tokens_despite_a_malformed_id_token() {
+        let under_scoped = br#"{"access_token":"access","expires_in":3599,"refresh_token":"refresh","token_type":"Bearer","scope":"openid","id_token":"malformed"}"#;
+        let (access, _expires, refresh, claims, gmail_read_granted) =
+            parse_token_response(under_scoped)
+                .unwrap_or_else(|error| panic!("expected an under-scoped response: {error:?}"))
+                .into_parts();
+        assert_eq!(access.as_str(), "access");
+        assert_eq!(refresh.as_deref().map(String::as_str), Some("refresh"));
+        assert!(claims.is_none());
+        assert!(!gmail_read_granted);
     }
 
     #[test]

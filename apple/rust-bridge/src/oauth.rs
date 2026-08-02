@@ -63,6 +63,7 @@ const STATUS_REJECTED: i32 = -4;
 const STATUS_CANCELLED: i32 = -5;
 const STATUS_EXPIRED: i32 = -6;
 const STATUS_INTERNAL: i32 = -7;
+const STATUS_INSUFFICIENT_SCOPE: i32 = -8;
 
 type PendingSession = AuthorizationSession<SystemMonotonicClock>;
 
@@ -466,6 +467,7 @@ fn status_for_error(error: OAuthError) -> i32 {
         OAuthError::Expired => STATUS_EXPIRED,
         OAuthError::EntropyUnavailable => STATUS_INTERNAL,
         OAuthError::InvalidConfiguration => STATUS_CONFIGURATION_MISSING,
+        OAuthError::InsufficientScope => STATUS_INSUFFICIENT_SCOPE,
         _ => STATUS_REJECTED,
     }
 }
@@ -1564,14 +1566,23 @@ mod tests {
 
     use super::{
         AUTHORIZATION_LIFETIME, AuthorizationConfig, AuthorizationGrant, CANCEL_TOMBSTONE_LIFETIME,
-        IosSessionEntry, MAX_PENDING_GRANTS, NEXT_SESSION_ID, Ordering, PENDING_GRANT_LIFETIME,
-        PoisonError, STATUS_CANCELLED, STATUS_CONFIGURATION_MISSING, STATUS_EXPIRED, STATUS_OK,
-        STATUS_REJECTED, STATUS_SUCCEEDED, StoreOutcome, SystemMonotonicClock, Url,
-        allocate_session_id, claim_grant, complete_session, finish_and_store, ios_redirect_uri,
-        ios_sessions, is_session_cancelled, pending_grants, prepare_authorization,
-        reap_expired_ios_sessions, reap_expired_pending_grants, registry_test_guard, store_grant,
+        IosSessionEntry, MAX_PENDING_GRANTS, NEXT_SESSION_ID, OAuthError, Ordering,
+        PENDING_GRANT_LIFETIME, PoisonError, STATUS_CANCELLED, STATUS_CONFIGURATION_MISSING,
+        STATUS_EXPIRED, STATUS_INSUFFICIENT_SCOPE, STATUS_OK, STATUS_REJECTED, STATUS_SUCCEEDED,
+        StoreOutcome, SystemMonotonicClock, Url, allocate_session_id, claim_grant,
+        complete_session, finish_and_store, ios_redirect_uri, ios_sessions, is_session_cancelled,
+        pending_grants, prepare_authorization, reap_expired_ios_sessions,
+        reap_expired_pending_grants, registry_test_guard, status_for_error, store_grant,
         store_grant_at, tersa_oauth_cancel, tersa_oauth_ios_begin, tersa_oauth_ios_finish,
     };
+
+    #[test]
+    fn insufficient_scope_has_a_distinct_bridge_status() {
+        assert_eq!(
+            status_for_error(OAuthError::InsufficientScope),
+            STATUS_INSUFFICIENT_SCOPE
+        );
+    }
 
     /// Builds a live session with the given lifetime plus the well-formed
     /// callback whose state and code would finish it successfully, without

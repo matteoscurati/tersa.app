@@ -33,6 +33,14 @@ final class AccountConnectionViewModel: ObservableObject {
     @Published var accountIdentifier: String = ""
 
     private let syncWorker = MailboxSyncWorker()
+    /// A finished browser authorization may arrive while Chrome is still the
+    /// foreground app. `WhenUnlockedThisDeviceOnly` Data Protection Keychain
+    /// operations can then fail with `errSecInteractionNotAllowed`; retain the
+    /// one activation handoff until AppKit confirms Tersa is active, and only
+    /// then let the Rust connect worker claim and persist the grant.
+    private var activationPending = false
+    private var activationObserver: NSObjectProtocol?
+    private var activationTimeout: Timer?
 
     /// The M2 warning copy for a disconnect that returned
     /// `.succeededRevokeUnconfirmed`: fact → what we can't confirm → the
@@ -165,7 +173,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 self.disconnectNotice = Self.revokeUnconfirmedNotice
                 self.connectedAccountIdentifier = nil
             case .cancelled, .gateBlocked, .syncFailed, .internalError, .needsReconnect,
-                 .unknownSession, .unrecognized, .running:
+                 .permissionRequired, .unknownSession, .unrecognized, .running:
                 // Fail closed: the fence stays set in Rust until a disconnect
                 // converges, so this failure's retry re-issues the DISCONNECT
                 // (see retryAfterFailure) rather than the connect ladder. Only
@@ -227,7 +235,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 // connect rung, which deliberately does NOT land connected here.
                 self.connectedAccountIdentifier = accountIdentifier
                 self.state = .connected
-            case .needsReconnect:
+            case .needsReconnect, .permissionRequired:
                 self.authorizeAndConnect(accountIdentifier: accountIdentifier)
             case .cancelled:
                 // A disconnect dropped the in-flight sync; land neutral —
@@ -256,11 +264,16 @@ final class AccountConnectionViewModel: ObservableObject {
             switch outcome {
             case .succeeded(let oauthSession):
                 self.state = .connecting
-                self.connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+                self.connectAfterApplicationActivation(
+                    accountIdentifier: accountIdentifier,
+                    oauthSession: oauthSession
+                )
             case .cancelled:
                 // Sign-in cancelled: land neutral — not a failure, and a
                 // cancelled re-connect never renders as "disconnected".
                 self.state = .notConnected
+            case .permissionRequired:
+                self.state = .failed(.permissionRequired)
             case .failed:
                 self.state = .failed(.signInFailed)
             }
@@ -273,6 +286,88 @@ final class AccountConnectionViewModel: ObservableObject {
             return
         }
         state = .authorizing
+    }
+
+    /// Returns focus from the browser before the connect worker touches the
+    /// `WhenUnlockedThisDeviceOnly` refresh-token item. Registering the
+    /// activation observer before `activate()` closes the synchronous-notice
+    /// race; the post-activate `isActive` check closes the opposite race.
+    private func connectAfterApplicationActivation(
+        accountIdentifier: Data,
+        oauthSession: OAuthSessionID
+    ) {
+        guard !activationPending else {
+            _ = tersa_oauth_cancel(oauthSession.rawValue)
+            state = .failed(.unavailable)
+            return
+        }
+        activationPending = true
+
+        if NSApp.isActive {
+            finishApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                oauthSession: oauthSession
+            )
+            return
+        }
+
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.finishApplicationActivation(
+                    accountIdentifier: accountIdentifier,
+                    oauthSession: oauthSession
+                )
+            }
+        }
+        activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.activationPending else {
+                    return
+                }
+                self.clearApplicationActivation()
+                _ = tersa_oauth_cancel(oauthSession.rawValue)
+                self.state = .failed(.unavailable)
+            }
+        }
+        NSApp.activate()
+        if NSApp.isActive {
+            finishApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                oauthSession: oauthSession
+            )
+        }
+    }
+
+    /// Delivers the finished grant exactly once after AppKit confirms Tersa is
+    /// foreground-active. Clearing observer/timer state before the worker begins
+    /// makes a duplicate activation notification harmless.
+    private func finishApplicationActivation(
+        accountIdentifier: Data,
+        oauthSession: OAuthSessionID
+    ) {
+        guard activationPending else {
+            return
+        }
+        clearApplicationActivation()
+        guard state == .connecting else {
+            _ = tersa_oauth_cancel(oauthSession.rawValue)
+            return
+        }
+        connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    }
+
+    private func clearApplicationActivation() {
+        activationPending = false
+        if let activationObserver {
+            NotificationCenter.default.removeObserver(activationObserver)
+        }
+        activationObserver = nil
+        activationTimeout?.invalidate()
+        activationTimeout = nil
     }
 
     /// The final rung: claim the finished OAuth grant with a connect-begin. A
@@ -293,6 +388,8 @@ final class AccountConnectionViewModel: ObservableObject {
                 self.state = .connected
             case .needsReconnect:
                 self.state = .failed(.signInExpired)
+            case .permissionRequired:
+                self.state = .failed(.permissionRequired)
             case .cancelled:
                 self.state = .notConnected
             case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
