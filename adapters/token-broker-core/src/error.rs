@@ -48,9 +48,13 @@ pub enum BrokerError {
     /// no validated identity, so no subject-keyed snapshot is possible and
     /// no grant-wide revoke is safe. The fail-safe contract is deliberately
     /// non-destructive — it can leave a first-connect under-scoped grant
-    /// active at the provider (the point-3 UI must offer retain or
-    /// manual-revoke recovery), but it can never destroy an unknown prior
-    /// working grant. On refresh any rotated credential was persisted first.
+    /// active at the provider, which this API cannot revoke in-app (the
+    /// minted tokens were dropped and no validated subject or stored
+    /// credential exists to revoke against). The point-3 UI must offer
+    /// retain-or-retry recovery and direct the user to their Google
+    /// account-permissions page for manual revocation; the contract can
+    /// never destroy an unknown prior working grant. On refresh any rotated
+    /// credential was persisted first.
     InsufficientScope,
     /// The token response carried no verified account identity, or its
     /// `id_token` failed freshness validation against the wall clock.
@@ -65,9 +69,12 @@ pub enum BrokerError {
     /// definitive empty store snapshot licensed the grant-wide revoke), or
     /// none is stored for the subject. Re-connect is required.
     MissingRefreshToken,
-    /// The provider reported `invalid_grant`: consent was withdrawn or the
+    /// A refresh-time provider `invalid_grant`: consent was withdrawn or the
     /// stored refresh token expired. The stored token was deleted; re-connect
-    /// is required.
+    /// is required. An exchange-time `invalid_grant` (a stale or used
+    /// authorization code) never produces this variant — it surfaces as
+    /// [`Self::ProviderRejected`] because no stored credential exists to
+    /// delete.
     ConsentRevoked,
     /// The refresh-token store rejected a read, write, or delete. On a
     /// persistence-first path the broker fails closed rather than reporting a

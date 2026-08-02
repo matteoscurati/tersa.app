@@ -419,9 +419,11 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
         // token's consent was revoked / it expired. The latter is the COMMON trigger
         // (the owner revoked access in their account settings, long inactivity, a
         // password change) — mapping it to the retry code would silently never-sync.
-        // On the connect path the same code covers an unclaimable grant (the login
-        // window elapsed) and an `invalid_grant` at the initial exchange, which the
-        // token layer surfaces as `ConsentRevoked`.
+        // On the connect path the arm covers an unclaimable grant (the login window
+        // elapsed). An `invalid_grant` at the initial exchange is NOT here: the
+        // token layer surfaces it as the non-destructive `ProviderRejected` (no
+        // stored credential exists to delete for a stale code), which collapses
+        // to the retry code below.
         Err(
             CycleError::ClaimMissing
             | CycleError::Connect(TokenLifecycleError::Token(TokenError::ConsentRevoked))
@@ -1214,9 +1216,11 @@ mod tests {
             ))),
             STATUS_SYNC_FAILED
         );
-        // The connect path's two reconnect-recoverable outcomes: an unclaimable
-        // grant (the login window elapsed), and an `invalid_grant` at the initial
-        // exchange, which the token layer surfaces as ConsentRevoked.
+        // The connect path's reconnect-recoverable outcome is an unclaimable
+        // grant (the login window elapsed). The `Connect(ConsentRevoked)` arm
+        // is defensive: an exchange-time `invalid_grant` surfaces as
+        // `ProviderRejected` (no stored credential exists to delete), so the
+        // token layer no longer produces `ConsentRevoked` on this path.
         assert_eq!(
             status_for_cycle(&Err::<(), _>(CycleError::ClaimMissing)),
             STATUS_NEEDS_RECONNECT

@@ -720,8 +720,12 @@ impl TokenTransport for GmailTokenTransport {
     /// Revokes a token at Google's revoke endpoint, best-effort.
     ///
     /// The token is sent as the single form-encoded `token` parameter. HTTP 200
-    /// is success; any other status, an unparsable error body, or a network
-    /// failure resolves to a [`TokenTransportError`] without provider data.
+    /// is success; a well-formed HTTP 400 `invalid_token` answer (Google's
+    /// response for an unknown or already-revoked token) resolves to
+    /// [`TokenTransportError::InvalidToken`] so the caller can confirm the
+    /// desired end state; any other status, an unparsable error body, or a
+    /// network failure resolves to a [`TokenTransportError`] without provider
+    /// data.
     /// The ADR-0023 disconnect composition treats revocation as best-effort and
     /// still deletes the local token when this call fails. The connect flow's
     /// cancel fences are NOT equivalent to disconnect: they store nothing (or
@@ -743,7 +747,7 @@ impl TokenTransport for GmailTokenTransport {
             let result = if response.status == 200 {
                 Ok(())
             } else {
-                Err(map_error_response(&body))
+                Err(map_revoke_error_response(&body))
             };
             body.zeroize();
             result
@@ -971,6 +975,30 @@ fn map_error_response(bytes: &[u8]) -> TokenTransportError {
         error: String,
     }
     match serde_json::from_slice::<TokenErrorBody>(bytes) {
+        Ok(body) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
+        Ok(_body) => TokenTransportError::ProviderRejected,
+        Err(_error) => TokenTransportError::MalformedResponse,
+    }
+}
+
+/// Maps a revoke-endpoint error body, keeping Google's `invalid_token` answer
+/// distinct from a generic rejection.
+///
+/// Google's revoke endpoint answers HTTP 400 `invalid_token` when the submitted
+/// token is unknown or already revoked: the desired end state (no usable grant)
+/// already holds, so the caller must be able to confirm it. The token-endpoint
+/// mapping above deliberately does NOT special-case `invalid_token` — Google
+/// does not emit it for exchange or refresh, and if a provider ever did, the
+/// conservative `ProviderRejected` answer must not change. Every other
+/// well-formed revoke error matches the token-endpoint mapping.
+#[cfg(any(target_os = "macos", test))]
+fn map_revoke_error_response(bytes: &[u8]) -> TokenTransportError {
+    #[derive(Deserialize)]
+    struct RevokeErrorBody {
+        error: String,
+    }
+    match serde_json::from_slice::<RevokeErrorBody>(bytes) {
+        Ok(body) if body.error == "invalid_token" => TokenTransportError::InvalidToken,
         Ok(body) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
         Ok(_body) => TokenTransportError::ProviderRejected,
         Err(_error) => TokenTransportError::MalformedResponse,
@@ -1867,9 +1895,13 @@ mod tests {
 
     #[test]
     fn maps_other_provider_errors_to_provider_rejected() {
+        // `invalid_token` is included deliberately: the token endpoint mapping
+        // must NOT special-case it — that answer is only meaningful (and only
+        // mapped) on the revoke endpoint.
         for body in [
             r#"{"error":"invalid_client","error_description":"unknown client"}"#,
             r#"{"error":"access_denied"}"#,
+            r#"{"error":"invalid_token"}"#,
         ] {
             let (_, request) = captured_exchange(None);
             let transport =
@@ -2062,6 +2094,28 @@ mod tests {
         assert_eq!(requests[0].0, REVOKE_ENDPOINT);
         assert_eq!(requests[0].1.as_str(), "token=stored-refresh-token");
 
+        // Google's answer for an unknown or already-revoked token is HTTP 400
+        // `invalid_token`: kept distinct so the caller can confirm the desired
+        // end state instead of reporting an unconfirmed revoke.
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+            400,
+            r#"{"error":"invalid_token"}"#,
+        )]));
+        assert_eq!(
+            ready(transport.revoke(&token)),
+            Err(TokenTransportError::InvalidToken)
+        );
+
+        // A well-formed `invalid_grant` revoke answer keeps its own variant.
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+            400,
+            r#"{"error":"invalid_grant"}"#,
+        )]));
+        assert_eq!(
+            ready(transport.revoke(&token)),
+            Err(TokenTransportError::InvalidGrant)
+        );
+
         let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
             400,
             r#"{"error":"unsupported_token_type"}"#,
@@ -2069,6 +2123,14 @@ mod tests {
         assert_eq!(
             ready(transport.revoke(&token)),
             Err(TokenTransportError::ProviderRejected)
+        );
+
+        let transport = GmailTokenTransport::with_transport(FakePostTransport::new(vec![json(
+            400, "not json",
+        )]));
+        assert_eq!(
+            ready(transport.revoke(&token)),
+            Err(TokenTransportError::MalformedResponse)
         );
 
         let transport =

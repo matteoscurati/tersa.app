@@ -148,6 +148,26 @@ refresh-token store port, revoke/delete separation, zeroizing public token
 results, and a closed error surface. It deliberately contains no
 Security.framework/Keychain code, no C ABI, and no IPC.
 
+Two operational properties of that core are recorded here for the later
+service integration. First, Google's revocation endpoint is grant-wide:
+revoking any one token of a grant revokes every token minted for the same
+Google user and OAuth client. The core therefore runs its stranded-grant
+cleanup revoke only against a definitively empty local store snapshot. That
+snapshot is per-install local state, not global grant knowledge: a second
+install or device holding credentials for the same user/client grant is
+invisible to it, so an empty-snapshot cleanup revoke can still invalidate
+that other install's grant. This residual risk is accepted for the
+best-effort cleanup; an unconditional revoke on every failed completion was
+rejected precisely because it would multiply such cross-install damage.
+Second, the core enforces a hard 1,024-byte bound on provider-minted refresh
+tokens, and Google documents no maximum length. A rotation exceeding the
+bound is rejected as `MalformedResponse` before any persistence or revoke
+input, so the failure mode is a visible terminal error, never a truncation
+or a partial write. Monitoring should read a sustained rise in refresh-path
+`MalformedResponse` terminals as a possible provider-side change outgrowing
+the bound — a signal to review the constant — not only as response
+corruption.
+
 Neither piece activates runtime isolation. The portable core is not yet linked
 into the XPC target, which still links no Rust; there is no production
 Keychain adapter bound to its refresh-token store port, no client-side XPC

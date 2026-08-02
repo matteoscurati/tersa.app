@@ -35,8 +35,12 @@
 //!   the XPC-shaped begin operation supplies no account identity, so no
 //!   subject-keyed snapshot is possible: it fails safe and non-destructively
 //!   (nothing persisted, nothing revoked). This can leave a first-connect
-//!   under-scoped grant active at the provider; the point-3 UI must surface
-//!   the failure and offer retain or manual-revoke recovery.
+//!   under-scoped grant active at the provider, and this API cannot offer an
+//!   in-app manual revoke for it — the minted tokens were dropped and there
+//!   is no validated subject or stored credential to revoke against. The
+//!   point-3 UI must surface the failure, offer retain-or-retry recovery,
+//!   and direct the user to their Google account-permissions page for manual
+//!   revocation.
 //! - Success values carry only a zeroizing access token, a zeroizing subject,
 //!   and a bounded positive expiry; every `Debug`/`Display` redacts
 //!   account-identifying and secret-bearing values.

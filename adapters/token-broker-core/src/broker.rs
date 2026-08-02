@@ -68,6 +68,14 @@ const MAX_CALLBACK_LEN: usize = 4_096;
 const MAX_ACCESS_TOKEN_LEN: usize = 4_096;
 
 /// Caps a provider-minted or stored refresh token. Real tokens are ~512 bytes.
+///
+/// Google documents no maximum refresh-token length, so this hard bound has a
+/// deliberate, diagnosable failure mode: an over-bound provider rotation is
+/// rejected as `MalformedResponse` BEFORE any persistence or revoke input —
+/// a visible terminal error, never a truncation or partial write. A sustained
+/// rise in refresh-path `MalformedResponse` terminals should be read as a
+/// possible provider-side change outgrowing the bound (a signal to review
+/// this constant), not only as response corruption.
 const MAX_REFRESH_TOKEN_LEN: usize = 1_024;
 
 /// Caps the access-token lifetime the broker reports, in seconds (24 hours).
@@ -305,9 +313,13 @@ where
     /// grant-wide revoke could invalidate that unknown prior working grant
     /// at the provider — so no revoke runs without a keyed snapshot.
     /// Candidly, this can leave a first-connect under-scoped grant active at
-    /// Google; the point-3 UI must surface the failure and offer retain or
-    /// manual-revoke recovery. That cost is accepted because the
-    /// alternative can destroy a working connection it cannot see.
+    /// Google, and this API CANNOT offer an in-app manual revoke for it: the
+    /// minted tokens were dropped and there is no validated subject or
+    /// stored credential to key a revoke against. The point-3 UI must
+    /// surface the failure, offer retain-or-retry recovery, and direct the
+    /// user to their Google account-permissions page to revoke the grant
+    /// manually. That cost is accepted because the alternative can destroy a
+    /// working connection it cannot see.
     ///
     /// # Errors
     ///
@@ -323,7 +335,11 @@ where
     /// freshness fails; [`BrokerError::PersistenceFailed`] when the stored
     /// credential could not be read or the refresh credential could not be
     /// stored; and the mapped transport, provider, or malformed-response
-    /// terminal otherwise.
+    /// terminal otherwise. An exchange-time `invalid_grant` (a stale,
+    /// already redeemed, or mismatched authorization code) surfaces as
+    /// [`BrokerError::ProviderRejected`], never
+    /// [`BrokerError::ConsentRevoked`]: nothing is stored on this path, so
+    /// no local deletion is asserted or performed.
     pub async fn complete_authorization(
         &self,
         session_handle: &str,
@@ -415,7 +431,10 @@ where
                 // revoke — and a grant-wide revoke could kill an unknown
                 // prior working grant. Nothing is persisted and nothing is
                 // revoked; a possibly stranded first-connect grant is left
-                // for the point-3 UI to retain or manually revoke.
+                // for the point-3 UI to retain/retry or to direct the user
+                // to Google's account-permissions page for manual
+                // revocation (this API has no validated subject or stored
+                // credential to revoke against).
                 Err(BrokerError::InsufficientScope)
             }
         }
@@ -427,9 +446,13 @@ where
     /// `invalid_grant` answer deletes the stored token (consent is gone);
     /// transport, provider, malformed-response, and identity failures retain
     /// it for a retry. A successful refresh re-validates the exact subject
-    /// and the `id_token` freshness, and persists any rotated refresh token
-    /// BEFORE the [`BrokerToken`] is returned. An explicitly under-scoped
-    /// refresh persists a rotation first, then reports the scope failure.
+    /// FIRST — an identity mismatch never persists anything, including a
+    /// rotation — and then persists a well-formed rotated refresh token
+    /// BEFORE the `id_token` freshness and success-minting gates, mirroring
+    /// the under-scoped rationale: a later terminal (stale or future
+    /// identity, malformed access token or expiry) must not strand the grant
+    /// without a local revocation handle. An explicitly under-scoped refresh
+    /// persists a rotation first, then reports the scope failure.
     ///
     /// # Errors
     ///
@@ -482,24 +505,30 @@ where
                 if success.subject().as_str() != subject.as_str() {
                     // The credential no longer belongs to the requested
                     // account. Retain the stored token and drop the minted
-                    // access token without exposing it.
+                    // tokens without exposing them — an identity mismatch
+                    // must NEVER persist anything, including a rotation.
                     return Err(BrokerError::IdentityMismatch);
+                }
+                // Persist a well-formed rotation for the MATCHED subject
+                // BEFORE the freshness and success-minting gates, mirroring
+                // the under-scoped rationale: a later terminal (a stale or
+                // future `id_token`, a malformed access token or expiry)
+                // must not strand the grant without a local revocation
+                // handle. A malformed rotation is rejected BEFORE any store
+                // write, and a store failure fails closed.
+                if let Some(rotated) = success.rotated_refresh_token() {
+                    if rotated.is_empty() || rotated.len() > MAX_REFRESH_TOKEN_LEN {
+                        return Err(BrokerError::MalformedResponse);
+                    }
+                    self.store
+                        .store(&subject, rotated)
+                        .map_err(|_error| BrokerError::PersistenceFailed)?;
                 }
                 success
                     .identity_expiry()
                     .validate_fresh(self.wall_clock.unix_time(), IDENTITY_FRESHNESS_SKEW_SECS)
                     .map_err(|_error| BrokerError::IdentityUnverified)?;
                 let token = self.broker_token(&success)?;
-                if let Some(rotated) = success.rotated_refresh_token() {
-                    if rotated.is_empty() || rotated.len() > MAX_REFRESH_TOKEN_LEN {
-                        return Err(BrokerError::MalformedResponse);
-                    }
-                    // Rotation is persisted BEFORE success so a reported
-                    // success never strands the new credential.
-                    self.store
-                        .store(&subject, rotated)
-                        .map_err(|_error| BrokerError::PersistenceFailed)?;
-                }
                 Ok(token)
             }
             TokenScopeOutcome::InsufficientScope {
@@ -525,13 +554,15 @@ where
     /// Revokes the subject's grant at the provider, keeping the local copy.
     ///
     /// Serialized per subject. A missing stored token succeeds: the desired
-    /// end state (no usable grant known locally) already holds, and a
-    /// provider `invalid_grant` answer succeeds for the same reason — the
-    /// grant is already gone at the provider. Any other failed provider
-    /// revocation maps to [`BrokerError::RevokeUnconfirmed`] and the stored
-    /// token is NEVER deleted here — ADR-0024's disconnect ordering runs
-    /// broker revoke and broker token delete as separate steps, and an
-    /// unconfirmed revoke must stay visible.
+    /// end state (no usable grant known locally) already holds. A provider
+    /// `invalid_grant` or `invalid_token` answer succeeds for the same
+    /// reason — both mean the grant is already gone at the provider
+    /// (`invalid_token` is Google's revoke-endpoint answer for an unknown or
+    /// already-revoked token). Any other failed provider revocation maps to
+    /// [`BrokerError::RevokeUnconfirmed`] and the stored token is NEVER
+    /// deleted here — ADR-0024's disconnect ordering runs broker revoke and
+    /// broker token delete as separate steps, and an unconfirmed revoke must
+    /// stay visible.
     ///
     /// # Errors
     ///
@@ -555,10 +586,13 @@ where
             return Err(BrokerError::PersistenceFailed);
         }
         match self.transport.revoke(&token).await {
-            // `invalid_grant` means the grant is already gone at the
-            // provider: the desired end state holds, so the revoke is
-            // confirmed.
-            Ok(()) | Err(TokenTransportError::InvalidGrant) => Ok(()),
+            // `invalid_grant` and `invalid_token` both mean the grant is
+            // already gone at the provider: the desired end state holds, so
+            // the revoke is confirmed. (`invalid_token` is Google's observed
+            // revoke-endpoint answer for an unknown or already-revoked token.)
+            Ok(()) | Err(TokenTransportError::InvalidGrant | TokenTransportError::InvalidToken) => {
+                Ok(())
+            }
             Err(_error) => Err(BrokerError::RevokeUnconfirmed),
         }
     }
@@ -924,9 +958,10 @@ mod tests {
 
     /// A scripted token transport: every exchange or refresh resolves
     /// immediately with one reusable fully-shaped response unless a scripted
-    /// refresh failure or a pending gate is installed, records its observed
-    /// exchange requests and revoke handles, and appends to the shared event
-    /// log. Its `Debug` redacts every secret it holds or observes.
+    /// exchange or refresh failure or a pending gate is installed, records
+    /// its observed exchange requests and revoke handles, and appends to the
+    /// shared event log. Its `Debug` redacts every secret it holds or
+    /// observes.
     #[derive(Clone)]
     struct FakeTransport {
         events: SharedEvents,
@@ -939,6 +974,7 @@ mod tests {
         gmail_read_granted: bool,
         revoke_error: Option<TokenTransportError>,
         refresh_error: Option<TokenTransportError>,
+        exchange_error: Option<TokenTransportError>,
         refresh_gate: Option<Arc<AtomicBool>>,
         revoke_gate: Option<Arc<AtomicBool>>,
     }
@@ -957,6 +993,7 @@ mod tests {
                 gmail_read_granted: true,
                 revoke_error: None,
                 refresh_error: None,
+                exchange_error: None,
                 refresh_gate: None,
                 revoke_gate: None,
             }
@@ -979,6 +1016,11 @@ mod tests {
 
         fn with_refresh_error(mut self, error: TokenTransportError) -> Self {
             self.refresh_error = Some(error);
+            self
+        }
+
+        fn with_exchange_error(mut self, error: TokenTransportError) -> Self {
+            self.exchange_error = Some(error);
             self
         }
 
@@ -1039,6 +1081,7 @@ mod tests {
                 .field("gmail_read_granted", &self.gmail_read_granted)
                 .field("revoke_error", &self.revoke_error)
                 .field("refresh_error", &self.refresh_error)
+                .field("exchange_error", &self.exchange_error)
                 .field("refresh_gated", &self.refresh_gate.is_some())
                 .field("revoke_gated", &self.revoke_gate.is_some())
                 .field(
@@ -1058,6 +1101,9 @@ mod tests {
             Box::pin(async move {
                 self.events.lock().unwrap().push(Event::Exchange);
                 self.recorded.lock().unwrap().push(request);
+                if let Some(error) = self.exchange_error {
+                    return Err(error);
+                }
                 Ok(self.response())
             })
         }
@@ -1580,8 +1626,10 @@ mod tests {
         // the XPC-shaped begin supplies no account identity, so no
         // subject-keyed snapshot exists and no grant-wide revoke is safe:
         // the pinned fail-safe contract persists nothing and revokes
-        // nothing, leaving any stranded first-connect grant for the point-3
-        // UI to retain or manually revoke.
+        // nothing. Any stranded first-connect grant is left for the point-3
+        // UI to retain/retry or to direct the user to Google's
+        // account-permissions page — this API has no validated subject or
+        // stored credential to revoke it against.
         let shared = events();
         let transport = FakeTransport::success(&shared, Some(REFRESH_TOKEN)).without_gmail_read();
         let store = FakeStore::new(&shared);
@@ -1604,6 +1652,66 @@ mod tests {
         assert_eq!(*shared.lock().unwrap(), vec![Event::Exchange]);
         assert!(transport.revoked_handles().is_empty());
         assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
+    }
+
+    #[test]
+    fn an_exchange_failure_maps_to_its_terminal_without_store_or_revoke_side_effects() {
+        // Every exchange failure is terminal BEFORE a subject exists: the
+        // only observable event is the Exchange itself — no Load, no Store,
+        // no Revoke — and a prior stored credential is retained untouched.
+        for (error, expected) in [
+            (TokenTransportError::Transport, BrokerError::Transport),
+            (
+                TokenTransportError::MalformedResponse,
+                BrokerError::MalformedResponse,
+            ),
+            (
+                TokenTransportError::ProviderRejected,
+                BrokerError::ProviderRejected,
+            ),
+            // An exchange-time invalid_grant is a stale or used authorization
+            // code: it surfaces as the honest, non-destructive
+            // ProviderRejected — NEVER ConsentRevoked, which claims a stored
+            // credential was deleted (none exists on this path).
+            (
+                TokenTransportError::InvalidGrant,
+                BrokerError::ProviderRejected,
+            ),
+        ] {
+            let shared = events();
+            let transport =
+                FakeTransport::success(&shared, Some(REFRESH_TOKEN)).with_exchange_error(error);
+            let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+            let result = run_authorization(&transport, &store);
+            assert_eq!(result.err(), Some(expected), "mapping for {error:?}");
+            assert_eq!(*shared.lock().unwrap(), vec![Event::Exchange]);
+            assert!(transport.revoked_handles().is_empty());
+            assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
+        }
+    }
+
+    #[test]
+    fn a_completion_rejects_a_subject_the_store_shape_rejects_without_side_effects() {
+        // The token layer accepts any nonempty trimmed subject of at most 255
+        // bytes, but the broker keys storage on the conservative visible-ASCII
+        // ValidatedSubject shape. A subject the application validated yet the
+        // store shape rejects (an inner space, non-ASCII text) fails as
+        // IdentityUnverified BEFORE the permit, any store load or write, or
+        // any revoke: no key is fabricated and nothing is persisted.
+        for subject in ["has space", "unicode-ø-subject"] {
+            let shared = events();
+            let transport = FakeTransport::success(&shared, Some(REFRESH_TOKEN))
+                .with_claims(Some(claims_for(subject, NOW - 10, NOW + 3_600)));
+            let store = FakeStore::new(&shared);
+            let result = run_authorization(&transport, &store);
+            assert!(
+                matches!(result, Err(BrokerError::IdentityUnverified)),
+                "a store-shape-rejected subject must be IdentityUnverified: {result:?}"
+            );
+            assert_eq!(*shared.lock().unwrap(), vec![Event::Exchange]);
+            assert!(transport.revoked_handles().is_empty());
+            assert!(store.is_empty());
+        }
     }
 
     #[test]
@@ -1978,24 +2086,135 @@ mod tests {
             assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
         }
 
-        // Identity failures retain the credential too: a missing id_token
-        // fails in the token layer, a stale one fails the broker's wall-clock
-        // freshness check.
+        // A missing id_token fails in the token layer BEFORE a TokenSuccess
+        // exists, so there is no rotation to persist: the stored credential
+        // is retained for a retry. (A stale or future id_token behaves
+        // differently — the subject matched, so the rotation IS persisted
+        // before the freshness gate; see the next test.)
+        let shared = events();
+        let transport =
+            FakeTransport::success(&shared, Some(ROTATED_REFRESH_TOKEN)).with_claims(None);
+        let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+        let broker = make_broker(&transport, &store, None);
+        let result = ready(broker.refresh_access_token(SUBJECT));
+        assert_eq!(result.err(), Some(BrokerError::IdentityUnverified));
+        assert_eq!(
+            *shared.lock().unwrap(),
+            vec![Event::Load(SUBJECT.to_owned()), Event::Refresh]
+        );
+        assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
+    }
+
+    #[test]
+    fn a_granted_refresh_persists_a_valid_rotation_before_the_later_gates() {
+        // A stale or future id_token fails the wall-clock freshness gate, but
+        // the subject already matched: the well-formed rotation is persisted
+        // FIRST, so the grant keeps a local revocation handle across the
+        // terminal.
         let stale = claims_for(SUBJECT, NOW - 7_200, NOW - 3_600);
-        for claims in [None, Some(stale)] {
+        let future = claims_for(SUBJECT, NOW + 3_600, NOW + 7_200);
+        for claims in [stale, future] {
             let shared = events();
-            let transport =
-                FakeTransport::success(&shared, Some(ROTATED_REFRESH_TOKEN)).with_claims(claims);
+            let transport = FakeTransport::success(&shared, Some(ROTATED_REFRESH_TOKEN))
+                .with_claims(Some(claims));
             let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
             let broker = make_broker(&transport, &store, None);
             let result = ready(broker.refresh_access_token(SUBJECT));
             assert_eq!(result.err(), Some(BrokerError::IdentityUnverified));
             assert_eq!(
                 *shared.lock().unwrap(),
+                vec![
+                    Event::Load(SUBJECT.to_owned()),
+                    Event::Refresh,
+                    Event::Store(SUBJECT.to_owned()),
+                ]
+            );
+            assert_eq!(
+                store.stored_token(SUBJECT).as_deref(),
+                Some(ROTATED_REFRESH_TOKEN)
+            );
+        }
+
+        // A malformed access token or an out-of-bound expiry reports
+        // MalformedResponse — again AFTER the rotation was retained.
+        let oversized_token = format!("{ACCESS_TOKEN}{}", "A".repeat(MAX_ACCESS_TOKEN_LEN));
+        for (access_token, expires_in) in [
+            (oversized_token, Duration::from_secs(3_600)),
+            (ACCESS_TOKEN.to_owned(), Duration::ZERO),
+            (
+                ACCESS_TOKEN.to_owned(),
+                Duration::from_secs(MAX_EXPIRES_IN_SECS + 1),
+            ),
+        ] {
+            let shared = events();
+            let transport = FakeTransport::success(&shared, Some(ROTATED_REFRESH_TOKEN))
+                .with_access_token_and_expiry(&access_token, expires_in);
+            let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+            let broker = make_broker(&transport, &store, None);
+            let result = ready(broker.refresh_access_token(SUBJECT));
+            assert!(
+                matches!(result, Err(BrokerError::MalformedResponse)),
+                "out-of-bound provider outcome must be MalformedResponse: {result:?}"
+            );
+            assert_eq!(
+                *shared.lock().unwrap(),
+                vec![
+                    Event::Load(SUBJECT.to_owned()),
+                    Event::Refresh,
+                    Event::Store(SUBJECT.to_owned()),
+                ]
+            );
+            assert_eq!(
+                store.stored_token(SUBJECT).as_deref(),
+                Some(ROTATED_REFRESH_TOKEN)
+            );
+        }
+    }
+
+    #[test]
+    fn a_granted_refresh_rejects_a_malformed_rotation_before_any_store_write() {
+        // An empty or oversized rotation on a Granted refresh is a malformed
+        // response rejected BEFORE any store write: the original credential
+        // is never replaced.
+        let oversized = format!("1//{}", "A".repeat(MAX_REFRESH_TOKEN_LEN));
+        for rotated in ["", oversized.as_str()] {
+            let shared = events();
+            let transport = FakeTransport::success(&shared, Some(rotated));
+            let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+            let broker = make_broker(&transport, &store, None);
+            let result = ready(broker.refresh_access_token(SUBJECT));
+            assert!(
+                matches!(result, Err(BrokerError::MalformedResponse)),
+                "invalid rotation must be MalformedResponse: {result:?}"
+            );
+            assert_eq!(
+                *shared.lock().unwrap(),
                 vec![Event::Load(SUBJECT.to_owned()), Event::Refresh]
             );
             assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
         }
+    }
+
+    #[test]
+    fn a_granted_refresh_rotation_store_failure_fails_closed() {
+        // The rotation is well-formed but the store rejects the write: the
+        // refresh fails closed as PersistenceFailed and the original
+        // credential stays exactly as stored.
+        let shared = events();
+        let transport = FakeTransport::success(&shared, Some(ROTATED_REFRESH_TOKEN));
+        let store = FakeStore::failing_store(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+        let broker = make_broker(&transport, &store, None);
+        let result = ready(broker.refresh_access_token(SUBJECT));
+        assert_eq!(result.err(), Some(BrokerError::PersistenceFailed));
+        assert_eq!(
+            *shared.lock().unwrap(),
+            vec![
+                Event::Load(SUBJECT.to_owned()),
+                Event::Refresh,
+                Event::Store(SUBJECT.to_owned()),
+            ]
+        );
+        assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
     }
 
     #[test]
@@ -2120,6 +2339,37 @@ mod tests {
         assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
         assert!(broker.delete_stored_tokens(SUBJECT).is_ok());
         assert!(store.stored_token(SUBJECT).is_none());
+
+        // Google's observed revoke answer for an unknown or already-revoked
+        // token is invalid_token: confirmed success for the same reason.
+        let shared = events();
+        let transport = FakeTransport::success(&shared, None)
+            .with_revoke_error(TokenTransportError::InvalidToken);
+        let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+        let broker = make_broker(&transport, &store, None);
+        assert!(ready(broker.revoke_provider_grant(SUBJECT)).is_ok());
+        assert_eq!(
+            *shared.lock().unwrap(),
+            vec![Event::Load(SUBJECT.to_owned()), Event::Revoke]
+        );
+        assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
+
+        // Any other provider failure stays an unconfirmed revoke: visible,
+        // and the stored token is retained.
+        let shared = events();
+        let transport = FakeTransport::success(&shared, None)
+            .with_revoke_error(TokenTransportError::ProviderRejected);
+        let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
+        let broker = make_broker(&transport, &store, None);
+        assert!(matches!(
+            ready(broker.revoke_provider_grant(SUBJECT)),
+            Err(BrokerError::RevokeUnconfirmed)
+        ));
+        assert_eq!(
+            *shared.lock().unwrap(),
+            vec![Event::Load(SUBJECT.to_owned()), Event::Revoke]
+        );
+        assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));
 
         // An unconfirmed revoke stays visible and retains the stored token.
         let shared = events();
