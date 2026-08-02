@@ -27,6 +27,8 @@ use tersa_application::mailbox::{
     BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
 #[cfg(any(target_os = "macos", test))]
+use tersa_application::oauth::GMAIL_READONLY_SCOPE;
+#[cfg(any(target_os = "macos", test))]
 use tersa_application::token::{
     ExchangeRequest, IdTokenClaims, RefreshRequest, TokenResponse, TokenTransport,
     TokenTransportError,
@@ -839,7 +841,7 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
     #[derive(Deserialize)]
     #[expect(
         dead_code,
-        reason = "the token type and granted scope complete the provider response shape but carry no state the port retains"
+        reason = "the token type completes the provider response shape but carries no state the port retains"
     )]
     struct TokenResponseBody {
         #[serde(deserialize_with = "deserialize_zeroizing")]
@@ -854,6 +856,13 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
     }
     let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    if parsed.scope.as_deref().is_some_and(|scope| {
+        !scope
+            .split_ascii_whitespace()
+            .any(|granted| granted == GMAIL_READONLY_SCOPE)
+    }) {
+        return Err(TokenTransportError::InsufficientScope);
+    }
     let id_token_claims = match parsed.id_token {
         Some(id_token) => Some(parse_id_token_claims(id_token.as_str())?),
         None => None,
@@ -1923,6 +1932,19 @@ mod tests {
             .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
             .into_parts();
         assert!(claims.is_none());
+    }
+
+    #[test]
+    fn token_response_rejects_an_explicit_scope_without_gmail_read_access() {
+        let under_scoped =
+            br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid"}"#;
+        assert_eq!(
+            parse_token_response(under_scoped).err(),
+            Some(TokenTransportError::InsufficientScope)
+        );
+
+        let fully_scoped = br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid https://www.googleapis.com/auth/gmail.readonly"}"#;
+        assert!(parse_token_response(fully_scoped).is_ok());
     }
 
     #[test]

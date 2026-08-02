@@ -173,7 +173,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 self.disconnectNotice = Self.revokeUnconfirmedNotice
                 self.connectedAccountIdentifier = nil
             case .cancelled, .gateBlocked, .syncFailed, .internalError, .needsReconnect,
-                 .unknownSession, .unrecognized, .running:
+                 .permissionRequired, .unknownSession, .unrecognized, .running:
                 // Fail closed: the fence stays set in Rust until a disconnect
                 // converges, so this failure's retry re-issues the DISCONNECT
                 // (see retryAfterFailure) rather than the connect ladder. Only
@@ -235,7 +235,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 // connect rung, which deliberately does NOT land connected here.
                 self.connectedAccountIdentifier = accountIdentifier
                 self.state = .connected
-            case .needsReconnect:
+            case .needsReconnect, .permissionRequired:
                 self.authorizeAndConnect(accountIdentifier: accountIdentifier)
             case .cancelled:
                 // A disconnect dropped the in-flight sync; land neutral —
@@ -272,6 +272,8 @@ final class AccountConnectionViewModel: ObservableObject {
                 // Sign-in cancelled: land neutral — not a failure, and a
                 // cancelled re-connect never renders as "disconnected".
                 self.state = .notConnected
+            case .permissionRequired:
+                self.state = .failed(.permissionRequired)
             case .failed:
                 self.state = .failed(.signInFailed)
             }
@@ -386,6 +388,8 @@ final class AccountConnectionViewModel: ObservableObject {
                 self.state = .connected
             case .needsReconnect:
                 self.state = .failed(.signInExpired)
+            case .permissionRequired:
+                self.state = .failed(.permissionRequired)
             case .cancelled:
                 self.state = .notConnected
             case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,

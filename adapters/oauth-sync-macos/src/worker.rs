@@ -87,6 +87,9 @@ pub const STATUS_INTERNAL: i32 = -5;
 /// rather than retried. Distinct so the caller can prompt instead of looping; not
 /// an oracle — there is one fixed slot and the caller syncs its own account.
 pub const STATUS_NEEDS_RECONNECT: i32 = -6;
+/// The provider explicitly omitted Gmail read access from the granted scopes.
+/// Distinct so the UI can explain which consent must be allowed on retry.
+pub const STATUS_INSUFFICIENT_SCOPE: i32 = -9;
 
 /// How often a running cycle re-checks the cancel flag. Cancel latency is at most
 /// this past the current await suspension — tens of milliseconds against a
@@ -426,6 +429,10 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
                 | TokenLifecycleError::Token(TokenError::ConsentRevoked),
             ),
         ) => STATUS_NEEDS_RECONNECT,
+        Err(
+            CycleError::Connect(TokenLifecycleError::Token(TokenError::InsufficientScope))
+            | CycleError::Refresh(TokenLifecycleError::Token(TokenError::InsufficientScope)),
+        ) => STATUS_INSUFFICIENT_SCOPE,
         // The bounded sync's own identity-gate fail-closed keeps its distinct code.
         Err(CycleError::Gated(GatedSyncError::Gate(_))) => STATUS_GATE_BLOCKED,
         // A cancel observed at a connect fence whose local cleanup COMPLETED:
@@ -947,11 +954,12 @@ mod tests {
 
     use super::{
         BeginOutcome, ConnectSession, CycleError, GatedSyncError, RevokeDisposition, RevokeOutcome,
-        STATUS_CANCELLED, STATUS_GATE_BLOCKED, STATUS_INTERNAL, STATUS_NEEDS_RECONNECT,
-        STATUS_RUNNING, STATUS_SUCCEEDED, STATUS_SUCCEEDED_REVOKE_UNCONFIRMED, STATUS_SYNC_FAILED,
-        TokenLifecycleError, begin_connect_account_sync, begin_connect_with,
-        begin_default_account_sync, begin_disconnect, begin_disconnect_with, begin_with,
-        complete_after, permit, revoke_best_effort, run_cycle, status_for_cycle, status_for_result,
+        STATUS_CANCELLED, STATUS_GATE_BLOCKED, STATUS_INSUFFICIENT_SCOPE, STATUS_INTERNAL,
+        STATUS_NEEDS_RECONNECT, STATUS_RUNNING, STATUS_SUCCEEDED,
+        STATUS_SUCCEEDED_REVOKE_UNCONFIRMED, STATUS_SYNC_FAILED, TokenLifecycleError,
+        begin_connect_account_sync, begin_connect_with, begin_default_account_sync,
+        begin_disconnect, begin_disconnect_with, begin_with, complete_after, permit,
+        revoke_best_effort, run_cycle, status_for_cycle, status_for_result,
     };
 
     /// A fake [`ConnectSession`]: `claim_missing` never produces a grant (the
@@ -1103,6 +1111,12 @@ mod tests {
             ))),
             STATUS_NEEDS_RECONNECT
         );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Refresh(
+                TokenLifecycleError::Token(TokenError::InsufficientScope)
+            ))),
+            STATUS_INSUFFICIENT_SCOPE
+        );
         // A non-destructive/retryable token error stays on the retry code.
         assert_eq!(
             status_for_cycle(&Err::<(), _>(CycleError::Refresh(
@@ -1122,6 +1136,12 @@ mod tests {
                 TokenLifecycleError::Token(TokenError::ConsentRevoked)
             ))),
             STATUS_NEEDS_RECONNECT
+        );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::InsufficientScope)
+            ))),
+            STATUS_INSUFFICIENT_SCOPE
         );
         // Other exchange/store failures are opaque, non-reconnect, non-identity:
         // they collapse to the same retry code as every other non-gate failure.

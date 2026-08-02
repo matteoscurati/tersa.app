@@ -544,6 +544,8 @@ pub enum TokenTransportError {
     ProviderRejected,
     /// The response did not parse into a complete token response.
     MalformedResponse,
+    /// The success response explicitly omitted Gmail read access.
+    InsufficientScope,
 }
 
 impl fmt::Display for TokenTransportError {
@@ -553,6 +555,7 @@ impl fmt::Display for TokenTransportError {
             Self::InvalidGrant => "the token endpoint reported an invalid grant",
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
+            Self::InsufficientScope => "the token endpoint omitted Gmail read access",
         };
         formatter.write_str(message)
     }
@@ -572,6 +575,8 @@ pub enum TokenError {
     ProviderRejected,
     /// The endpoint response did not parse into a complete token response.
     MalformedResponse,
+    /// The token endpoint explicitly returned a grant without Gmail read access.
+    InsufficientScope,
     /// The grant or refresh token lost validity and re-consent is required.
     ConsentRevoked,
     /// The token op succeeded but its `id_token` was absent or failed identity
@@ -591,6 +596,7 @@ impl fmt::Display for TokenError {
             Self::Transport => "the token endpoint could not be reached",
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
+            Self::InsufficientScope => "the token grant omitted Gmail read access",
             Self::ConsentRevoked => "the granted consent was revoked and re-connect is required",
             Self::IdentityUnverified => "the token response carried no verified account identity",
         };
@@ -872,6 +878,7 @@ fn map_transport_error(error: TokenTransportError) -> TokenError {
         TokenTransportError::InvalidGrant => TokenError::ConsentRevoked,
         TokenTransportError::ProviderRejected => TokenError::ProviderRejected,
         TokenTransportError::MalformedResponse => TokenError::MalformedResponse,
+        TokenTransportError::InsufficientScope => TokenError::InsufficientScope,
     }
 }
 
@@ -1600,6 +1607,10 @@ mod tests {
             (
                 TokenTransportError::MalformedResponse,
                 TokenError::MalformedResponse,
+            ),
+            (
+                TokenTransportError::InsufficientScope,
+                TokenError::InsufficientScope,
             ),
         ];
         let grant = make_grant("exchange-code");

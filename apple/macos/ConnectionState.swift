@@ -19,6 +19,8 @@ enum ConnectionFailure: Equatable {
     /// unconfigured client id, a session already running, or no browser). NOT
     /// a browser sign-in failure — a different remedy applies.
     case signInUnavailable
+    /// Google sign-in completed without granting Gmail read access.
+    case permissionRequired
     /// The disconnect teardown did not converge; the Rust slot stays fenced
     /// against sync and connect until a disconnect does. Its retry re-issues
     /// the disconnect, never the connect ladder.
@@ -42,6 +44,8 @@ enum ConnectionFailure: Equatable {
             return "The sign-in didn't complete. Sign in again."
         case .signInUnavailable:
             return "Tersa couldn't open the sign-in page in your browser. Check that a default browser is set, then try again."
+        case .permissionRequired:
+            return "Gmail read access wasn't granted. Sign in again and allow Tersa to read your email."
         case .disconnectIncomplete:
             return "Tersa couldn't finish disconnecting. This account stays unavailable until it does. Try again — or remove Tersa from your Google Account to revoke its access now."
         }
