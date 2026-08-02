@@ -132,7 +132,16 @@ and IPC protocol increase implementation and packaging cost, but produce a real
 principal boundary that code changes inside either process cannot bypass without
 also changing the signed entitlement topology.
 
-This ADR implements no XPC target, entitlement, Keychain migration, signed
-runtime proof, notarization, or distribution evidence. Until those items land,
-the source guard is defense in depth and final distribution remains blocked by
-issue #51.
+## Current packaging status
+
+The repository now includes the embedded `TersaMacTokenBroker` XPC packaging
+skeleton: an XcodeGen target, a closed version-1 NSXPC protocol surface, a
+fail-closed service entry point, disjoint broker entitlement declarations, and
+xtask inventory guards for those shapes. That skeleton does **not** activate
+runtime isolation. Token authority remains in-process in `TersaMac`. The
+dedicated token Keychain group is declared for the broker only and is not yet
+registered, provisioned, or used. Builds remain unsigned unless an operator
+configures signing locally. This ADR still implements no Keychain migration,
+OAuth/token move, client XPC wiring, signed runtime proof, notarization, or
+distribution evidence. Until those later items land, the source guard is
+defense in depth and final distribution remains blocked by issue #51.

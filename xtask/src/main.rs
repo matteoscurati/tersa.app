@@ -540,8 +540,14 @@ fn finish_architecture_check(violations: &[String]) -> TaskResult {
 
 fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> TaskResult {
     let entitlements = fs::read_to_string("apple/macos/TersaMac.entitlements")?;
+    let broker_entitlements =
+        fs::read_to_string("apple/macos-token-broker/TersaMacTokenBroker.entitlements")?;
     let project = fs::read_to_string("apple/project.yml")?;
-    violations.extend(signing_configuration_violations(&entitlements, &project));
+    violations.extend(signing_configuration_violations(
+        &entitlements,
+        &broker_entitlements,
+        &project,
+    ));
     let mut entitlement_paths = Vec::new();
     collect_entitlement_paths(
         Path::new("apple"),
@@ -558,6 +564,10 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
             continue;
         }
         let document = fs::read_to_string(&path)?;
+        if path == Path::new("apple/macos-token-broker/TersaMacTokenBroker.entitlements") {
+            violations.extend(source_token_broker_entitlement_violations(&document));
+            continue;
+        }
         violations.extend(non_owner_entitlement_violations(
             &path.to_string_lossy(),
             &document,
@@ -571,10 +581,18 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         keychain_authority_sources.extend(tracked_source_documents(Path::new("."), product_root)?);
     }
     keychain_authority_sources.extend(tracked_source_documents(Path::new("."), "apple/macos")?);
+    keychain_authority_sources.extend(tracked_source_documents(
+        Path::new("."),
+        "apple/macos-token-broker",
+    )?);
     violations.extend(keychain_mutation_boundary_violations(
         &keychain_owner_sources,
         &keychain_authority_sources,
     ));
+    let macos_sources = tracked_source_documents(Path::new("."), "apple/macos")?;
+    violations.extend(macos_client_xpc_wiring_violations(&macos_sources));
+    let broker_sources = tracked_source_documents(Path::new("."), "apple/macos-token-broker")?;
+    violations.extend(token_broker_source_surface_violations(&broker_sources));
     let project_generation_wrapper = fs::read_to_string("apple/scripts/generate-project.sh")?;
     let ci = fs::read_to_string(".github/workflows/ci.yml")?;
     let development = fs::read_to_string("docs/development.md")?;
@@ -3584,19 +3602,51 @@ fn swift_call_argument_is_identifier(
     })
 }
 
+/// Exact path of the reviewed closed NSXPC token-broker protocol declaration.
+/// No directory-wide, filename-suffix, or generic `protocol` exemption exists.
+const REVIEWED_TOKEN_BROKER_PROTOCOL_PATH: &str =
+    "apple/macos-token-broker/TokenBrokerProtocol.swift";
+/// Objective-C runtime name and Swift protocol identifier for the closed v1
+/// NSXPC interface. Both must match exactly for the lexical exemption.
+const REVIEWED_TOKEN_BROKER_PROTOCOL_NAME: &str = "TersaMacTokenBrokerProtocolV1";
+/// Exact `@objc(...)` attribute that must immediately precede the reviewed
+/// protocol declaration (modulo ASCII whitespace).
+const REVIEWED_TOKEN_BROKER_PROTOCOL_OBJC_ATTR: &str = "@objc(TersaMacTokenBrokerProtocolV1)";
+/// Explicit bounded wire-version constant name required on the protocol surface.
+const REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_NAME: &str = "TersaMacTokenBrokerProtocolVersion";
+/// Exact assignment for the bounded protocol wire version (`1` only).
+const REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_ASSIGNMENT: &str = "static let value: Int = 1";
+/// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
+const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 6] = [
+    "apple/macos-token-broker/Info.plist",
+    "apple/macos-token-broker/TersaMacTokenBroker.entitlements",
+    "apple/macos-token-broker/TokenBrokerListenerDelegate.swift",
+    REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
+    "apple/macos-token-broker/TokenBrokerService.swift",
+    "apple/macos-token-broker/main.swift",
+];
+
 /// Declarations forbidden in inventoried macOS sources because they run code the
 /// func/init body inventory cannot safely parse (`deinit`, `protocol`,
 /// `subscript`) or would place an app-lifecycle entry point outside
 /// `AppDelegate.swift` (a cross-file `extension AppDelegate`). Returns the first
 /// violation, if any.
+///
+/// The sole reviewed `protocol` exception is the closed NSXPC interface
+/// `@objc(TersaMacTokenBrokerProtocolV1) protocol TersaMacTokenBrokerProtocolV1`
+/// in `apple/macos-token-broker/TokenBrokerProtocol.swift`. Every other protocol
+/// declaration in inventoried product or broker sources fails closed.
 fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<String> {
-    for forbidden in ["deinit", "protocol", "subscript"] {
+    for forbidden in ["deinit", "subscript"] {
         if contains_identifier(code, forbidden) {
             return Some(format!(
                 "{} must not declare `{forbidden}` in inventoried macOS sources",
                 path.display()
             ));
         }
+    }
+    if let Some(violation) = swift_protocol_declaration_violation(path, code) {
+        return Some(violation);
     }
     if path != Path::new("apple/macos/AppDelegate.swift") {
         for (start, _) in code.match_indices("AppDelegate") {
@@ -3611,6 +3661,71 @@ fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<Stri
         }
     }
     None
+}
+
+/// Rejects every `protocol` declaration except the single reviewed closed NSXPC
+/// interface at `REVIEWED_TOKEN_BROKER_PROTOCOL_PATH`.
+fn swift_protocol_declaration_violation(path: &Path, code: &str) -> Option<String> {
+    let mut saw_reviewed = false;
+    for (start, _) in code.match_indices("protocol") {
+        if !is_identifier_at(code, start, "protocol") {
+            continue;
+        }
+        if is_exact_reviewed_token_broker_protocol_declaration(path, code, start) {
+            if saw_reviewed {
+                return Some(format!(
+                    "{} must not declare `protocol` in inventoried macOS sources",
+                    path.display()
+                ));
+            }
+            saw_reviewed = true;
+            continue;
+        }
+        return Some(format!(
+            "{} must not declare `protocol` in inventoried macOS sources",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// True only for the exact reviewed form
+/// `@objc(TersaMacTokenBrokerProtocolV1) protocol TersaMacTokenBrokerProtocolV1`
+/// in `apple/macos-token-broker/TokenBrokerProtocol.swift`.
+fn is_exact_reviewed_token_broker_protocol_declaration(
+    path: &Path,
+    code: &str,
+    protocol_start: usize,
+) -> bool {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH) {
+        return false;
+    }
+    let name_start = skip_ascii_whitespace(code, protocol_start + "protocol".len());
+    if !code[name_start..].starts_with(REVIEWED_TOKEN_BROKER_PROTOCOL_NAME)
+        || !is_identifier_at(code, name_start, REVIEWED_TOKEN_BROKER_PROTOCOL_NAME)
+    {
+        return false;
+    }
+    let mut attr_end = protocol_start;
+    while attr_end > 0 && is_rust_ascii_whitespace(code.as_bytes()[attr_end - 1]) {
+        attr_end -= 1;
+    }
+    let attr = REVIEWED_TOKEN_BROKER_PROTOCOL_OBJC_ATTR;
+    if attr_end < attr.len() {
+        return false;
+    }
+    let attr_start = attr_end - attr.len();
+    &code[attr_start..attr_end] == attr
+}
+
+/// True when the protocol surface pins the bounded wire version to exactly `1`.
+fn has_exact_token_broker_protocol_version_assignment(code: &str) -> bool {
+    let assignment = REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_ASSIGNMENT;
+    code.match_indices(assignment).any(|(index, _)| {
+        code.as_bytes()
+            .get(index + assignment.len())
+            .is_none_or(|byte| !byte.is_ascii_digit())
+    })
 }
 
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
@@ -4415,7 +4530,12 @@ fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
 
 const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
 const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
+const TOKEN_SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.token";
 const TERSA_MAC_ENTITLEMENTS: &str = "macos/TersaMac.entitlements";
+const TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS: &str =
+    "macos-token-broker/TersaMacTokenBroker.entitlements";
+const TERSA_MAC_TOKEN_BROKER_TARGET: &str = "TersaMacTokenBroker";
+const TERSA_MAC_TOKEN_BROKER_BUNDLE_ID: &str = "app.tersa.mac.token-broker";
 const TERSA_MAC_BUILD_SCRIPT: &str =
     r#"sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}""#;
 
@@ -4544,8 +4664,15 @@ impl Visitor<'_> for StrictYamlKeyVisitor {
     }
 }
 
-fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<String> {
+fn signing_configuration_violations(
+    entitlements: &str,
+    broker_entitlements: &str,
+    project: &str,
+) -> Vec<String> {
     let mut violations = source_tersa_mac_entitlement_violations(entitlements);
+    violations.extend(source_token_broker_entitlement_violations(
+        broker_entitlements,
+    ));
     let root = match parse_project_root(project) {
         Ok(root) => root,
         Err(error) => {
@@ -4565,6 +4692,12 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         }
     };
     violations.extend(effective_signing_configuration_violations(&root, &targets));
+    violations.extend(signing_target_surface_violations(&targets));
+    violations
+}
+
+fn signing_target_surface_violations(targets: &[ProjectTarget]) -> Vec<String> {
+    let mut violations = Vec::new();
     let Some(application) = targets.iter().find(|target| target.name == "TersaMac") else {
         violations.push("apple/project.yml is missing the TersaMac target".to_owned());
         return violations;
@@ -4573,14 +4706,32 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         violations.push("the TersaMac target must declare platform macOS".to_owned());
     }
     violations.extend(tersa_mac_target_surface_violations(&application.body));
+    match targets
+        .iter()
+        .find(|target| target.name == TERSA_MAC_TOKEN_BROKER_TARGET)
+    {
+        Some(broker_target) => {
+            violations.extend(tersa_mac_token_broker_target_surface_violations(
+                broker_target,
+            ));
+        }
+        None => violations
+            .push("apple/project.yml is missing the TersaMacTokenBroker target".to_owned()),
+    }
     match targets.iter().find(|target| target.name == "TersaMacTests") {
         Some(test_target) => {
             violations.extend(tersa_mac_test_target_surface_violations(test_target));
         }
         None => violations.push("apple/project.yml is missing the TersaMacTests target".to_owned()),
     }
+    violations.extend(tersa_mac_signing_property_violations(&application.body));
+    violations
+}
+
+fn tersa_mac_signing_property_violations(body: &StrictYamlValue) -> Vec<String> {
+    let mut violations = Vec::new();
     if !matches!(
-        yaml_path(&application.body, &["entitlements", "path"]),
+        yaml_path(body, &["entitlements", "path"]),
         Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
     ) {
         violations.push("the TersaMac target must use only macos/TersaMac.entitlements".to_owned());
@@ -4600,13 +4751,13 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
             "keychain-access-groups",
         ),
     ] {
-        if !yaml_exact_string_array(yaml_path(&application.body, path), SIGNING_GROUP) {
+        if !yaml_exact_string_array(yaml_path(body, path), SIGNING_GROUP) {
             violations.push(format!(
                 "the TersaMac target `{label}` must contain exactly the registered macOS group"
             ));
         }
     }
-    match yaml_path(&application.body, &["entitlements", "properties"]) {
+    match yaml_path(body, &["entitlements", "properties"]) {
         Some(properties) => violations.extend(exact_tersa_mac_entitlement_violations(
             properties,
             "the TersaMac XcodeGen entitlement properties",
@@ -4617,10 +4768,7 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         ),
     }
     if !matches!(
-        yaml_path(
-            &application.body,
-            &["settings", "base", "TERSA_MACOS_APP_GROUP"]
-        ),
+        yaml_path(body, &["settings", "base", "TERSA_MACOS_APP_GROUP"]),
         Some(StrictYamlValue::String(value)) if value == BUILD_SETTING_GROUP
     ) {
         violations.push(
@@ -4629,10 +4777,7 @@ fn signing_configuration_violations(entitlements: &str, project: &str) -> Vec<St
         );
     }
     if !matches!(
-        yaml_path(
-            &application.body,
-            &["settings", "base", "CODE_SIGN_ENTITLEMENTS"]
-        ),
+        yaml_path(body, &["settings", "base", "CODE_SIGN_ENTITLEMENTS"]),
         Some(StrictYamlValue::String(value)) if value == TERSA_MAC_ENTITLEMENTS
     ) {
         violations.push(
@@ -4793,6 +4938,15 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
         return vec!["the TersaMac target must be a direct mapping".to_owned()];
     };
     validate_tersa_mac_top_level_keys(target, &mut violations);
+    validate_tersa_mac_type_settings_and_linkage(target, &mut violations);
+    validate_tersa_mac_sources_dependencies_and_execution(target, &mut violations);
+    violations
+}
+
+fn validate_tersa_mac_type_settings_and_linkage(
+    target: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
     if !matches!(
         target.get("type"),
         Some(StrictYamlValue::String(value)) if value == "application"
@@ -4818,9 +4972,21 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
                 .to_owned(),
         );
     }
+}
+
+fn validate_tersa_mac_sources_dependencies_and_execution(
+    target: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
     if !yaml_exact_tersa_mac_sources(target.get("sources")) {
         violations.push(
             "the TersaMac target sources must match the exact reviewed source and resource sequence"
+                .to_owned(),
+        );
+    }
+    if !yaml_exact_tersa_mac_token_broker_dependency(target.get("dependencies")) {
+        violations.push(
+            "the TersaMac target must embed exactly the TersaMacTokenBroker XPC dependency"
                 .to_owned(),
         );
     }
@@ -4840,8 +5006,22 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
             ));
         }
     }
+    if !yaml_exact_tersa_mac_pre_build_script(target.get("preBuildScripts")) {
+        violations.push(
+            "the TersaMac target must contain only the exact reviewed Rust pre-build script"
+                .to_owned(),
+        );
+    }
+    if !yaml_exact_tersa_mac_scheme(target.get("scheme")) {
+        violations.push(
+            "the TersaMac scheme must contain only the TersaMacTests test target and no executable actions"
+                .to_owned(),
+        );
+    }
+}
 
-    let valid_script = match target.get("preBuildScripts") {
+fn yaml_exact_tersa_mac_pre_build_script(value: Option<&StrictYamlValue>) -> bool {
+    match value {
         Some(StrictYamlValue::Sequence(scripts)) if scripts.len() == 1 => match &scripts[0] {
             StrictYamlValue::Mapping(script) => {
                 let expected_keys = BTreeSet::from(["basedOnDependencyAnalysis", "name", "script"]);
@@ -4862,15 +5042,11 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
             _ => false,
         },
         _ => false,
-    };
-    if !valid_script {
-        violations.push(
-            "the TersaMac target must contain only the exact reviewed Rust pre-build script"
-                .to_owned(),
-        );
     }
+}
 
-    let valid_scheme = match target.get("scheme") {
+fn yaml_exact_tersa_mac_scheme(value: Option<&StrictYamlValue>) -> bool {
+    match value {
         Some(StrictYamlValue::Mapping(scheme)) => {
             scheme.len() == 1
                 && matches!(
@@ -4880,14 +5056,7 @@ fn tersa_mac_target_surface_violations(target: &StrictYamlValue) -> Vec<String> 
                 )
         }
         _ => false,
-    };
-    if !valid_scheme {
-        violations.push(
-            "the TersaMac scheme must contain only the TersaMacTests test target and no executable actions"
-                .to_owned(),
-        );
     }
-    violations
 }
 
 fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<String> {
@@ -4968,11 +5137,589 @@ fn yaml_exact_tersa_mac_sources(value: Option<&StrictYamlValue>) -> bool {
     )
 }
 
+fn yaml_exact_tersa_mac_token_broker_dependency(value: Option<&StrictYamlValue>) -> bool {
+    let Some(StrictYamlValue::Sequence(dependencies)) = value else {
+        return false;
+    };
+    matches!(
+        dependencies.as_slice(),
+        [StrictYamlValue::Mapping(dependency)]
+            if dependency.len() == 2
+                && matches!(
+                    dependency.get("target"),
+                    Some(StrictYamlValue::String(target)) if target == TERSA_MAC_TOKEN_BROKER_TARGET
+                )
+                && matches!(dependency.get("embed"), Some(StrictYamlValue::Bool(true)))
+    )
+}
+
+fn source_token_broker_entitlement_violations(entitlements: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    match plist::from_bytes::<StrictYamlValue>(entitlements.as_bytes()) {
+        Ok(entitlements) => violations.extend(exact_token_broker_entitlement_violations(
+            &entitlements,
+            "apple/macos-token-broker/TersaMacTokenBroker.entitlements",
+        )),
+        Err(error) => violations.push(format!(
+            "apple/macos-token-broker/TersaMacTokenBroker.entitlements plist parse failed: {error}"
+        )),
+    }
+    match parse_plist_string_array(entitlements, "keychain-access-groups") {
+        Ok(values) if values == [TOKEN_SIGNING_GROUP] => {}
+        Ok(_) => violations.push(
+            "apple/macos-token-broker/TersaMacTokenBroker.entitlements `keychain-access-groups` must contain exactly the dedicated token group"
+                .to_owned(),
+        ),
+        Err(error) => violations.push(format!(
+            "apple/macos-token-broker/TersaMacTokenBroker.entitlements has invalid `keychain-access-groups` structure: {error}"
+        )),
+    }
+    for forbidden in [
+        "com.apple.security.application-groups",
+        "com.apple.security.network.server",
+        "com.apple.security.get-task-allow",
+        "com.apple.security.cs.debugger",
+        "com.apple.security.cs.disable-library-validation",
+        "com.apple.security.cs.allow-dyld-environment-variables",
+    ] {
+        if entitlements.contains(forbidden) {
+            violations.push(format!(
+                "apple/macos-token-broker/TersaMacTokenBroker.entitlements must not declare forbidden capability `{forbidden}`"
+            ));
+        }
+    }
+    violations
+}
+
+fn exact_token_broker_entitlement_violations(
+    entitlements: &StrictYamlValue,
+    context: &str,
+) -> Vec<String> {
+    let Ok(entitlements) = yaml_mapping(entitlements, context) else {
+        return vec![format!("{context} must be a dictionary")];
+    };
+    let expected_keys = BTreeSet::from([
+        "com.apple.security.app-sandbox",
+        "com.apple.security.network.client",
+        "keychain-access-groups",
+    ]);
+    let actual_keys = entitlements
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    if actual_keys != expected_keys {
+        violations.push(format!(
+            "{context} must contain exactly the three reviewed token-broker entitlement keys"
+        ));
+    }
+    for key in [
+        "com.apple.security.app-sandbox",
+        "com.apple.security.network.client",
+    ] {
+        if !matches!(entitlements.get(key), Some(StrictYamlValue::Bool(true))) {
+            violations.push(format!("{context} `{key}` must be boolean true"));
+        }
+    }
+    if !yaml_exact_string_array(
+        entitlements.get("keychain-access-groups"),
+        TOKEN_SIGNING_GROUP,
+    ) {
+        violations.push(format!(
+            "{context} `keychain-access-groups` must contain exactly the dedicated token group"
+        ));
+    }
+    for forbidden in [
+        "com.apple.security.application-groups",
+        "com.apple.security.network.server",
+        "com.apple.security.get-task-allow",
+        "com.apple.security.cs.debugger",
+        "com.apple.security.cs.disable-library-validation",
+        "com.apple.security.cs.allow-dyld-environment-variables",
+    ] {
+        if entitlements.contains_key(forbidden) {
+            violations.push(format!(
+                "{context} must not declare forbidden capability `{forbidden}`"
+            ));
+        }
+    }
+    violations
+}
+
+fn tersa_mac_token_broker_target_surface_violations(target: &ProjectTarget) -> Vec<String> {
+    let mut violations = Vec::new();
+    if target.platform != "macOS" {
+        violations.push("the TersaMacTokenBroker target must declare platform macOS".to_owned());
+    }
+    let Ok(body) = yaml_mapping(&target.body, "TersaMacTokenBroker target") else {
+        return vec!["the TersaMacTokenBroker target must be a direct mapping".to_owned()];
+    };
+    validate_token_broker_top_level_keys(body, &mut violations);
+    validate_token_broker_type_and_sources(body, &mut violations);
+    validate_token_broker_info_surface(&target.body, &mut violations);
+    validate_token_broker_entitlements_surface(&target.body, &mut violations);
+    validate_token_broker_settings_surface(body, &mut violations);
+    validate_token_broker_forbidden_surfaces(body, &mut violations);
+    violations
+}
+
+fn validate_token_broker_top_level_keys(
+    body: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    let expected_keys = BTreeSet::from([
+        "entitlements",
+        "info",
+        "platform",
+        "settings",
+        "sources",
+        "type",
+    ]);
+    if body.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
+        violations.push(
+            "the TersaMacTokenBroker target must contain only the exact reviewed top-level XcodeGen keys"
+                .to_owned(),
+        );
+    }
+}
+
+fn validate_token_broker_type_and_sources(
+    body: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    if !matches!(
+        body.get("type"),
+        Some(StrictYamlValue::String(value)) if value == "xpc-service"
+    ) {
+        violations
+            .push("the TersaMacTokenBroker target type must be exactly xpc-service".to_owned());
+    }
+    let valid_sources = matches!(
+        body.get("sources"),
+        Some(StrictYamlValue::Sequence(sources))
+            if matches!(
+                sources.as_slice(),
+                [StrictYamlValue::Mapping(source)]
+                    if source.len() == 1
+                        && matches!(
+                            source.get("path"),
+                            Some(StrictYamlValue::String(path)) if path == "macos-token-broker"
+                        )
+            )
+    );
+    if !valid_sources {
+        violations.push(
+            "the TersaMacTokenBroker sources must be exactly the macos-token-broker root"
+                .to_owned(),
+        );
+    }
+}
+
+fn validate_token_broker_info_surface(body: &StrictYamlValue, violations: &mut Vec<String>) {
+    match yaml_path(body, &["info", "path"]) {
+        Some(StrictYamlValue::String(path)) if path == "macos-token-broker/Info.plist" => {}
+        _ => violations.push(
+            "the TersaMacTokenBroker info path must be macos-token-broker/Info.plist".to_owned(),
+        ),
+    }
+    let valid_info_properties = matches!(
+        yaml_path(body, &["info", "properties"]),
+        Some(StrictYamlValue::Mapping(properties))
+            if properties.len() == 2
+                && matches!(
+                    properties.get("CFBundlePackageType"),
+                    Some(StrictYamlValue::String(value)) if value == "XPC!"
+                )
+                && matches!(
+                    properties.get("XPCService"),
+                    Some(StrictYamlValue::Mapping(service))
+                        if service.len() == 1
+                            && matches!(
+                                service.get("ServiceType"),
+                                Some(StrictYamlValue::String(value)) if value == "Application"
+                            )
+                )
+    );
+    if !valid_info_properties {
+        violations.push(
+            "the TersaMacTokenBroker info properties must declare only the reviewed XPC package type and Application service type"
+                .to_owned(),
+        );
+    }
+}
+
+fn validate_token_broker_entitlements_surface(
+    body: &StrictYamlValue,
+    violations: &mut Vec<String>,
+) {
+    if !matches!(
+        yaml_path(body, &["entitlements", "path"]),
+        Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
+    ) {
+        violations.push(
+            "the TersaMacTokenBroker target must use only macos-token-broker/TersaMacTokenBroker.entitlements"
+                .to_owned(),
+        );
+    }
+    match yaml_path(body, &["entitlements", "properties"]) {
+        Some(properties) => violations.extend(exact_token_broker_entitlement_violations(
+            properties,
+            "the TersaMacTokenBroker XcodeGen entitlement properties",
+        )),
+        None => violations.push(
+            "the TersaMacTokenBroker XcodeGen entitlement properties must contain the exact three-key dictionary"
+                .to_owned(),
+        ),
+    }
+}
+
+fn validate_token_broker_settings_surface(
+    body: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    let settings = body.get("settings").and_then(|value| match value {
+        StrictYamlValue::Mapping(settings) => settings.get("base"),
+        _ => None,
+    });
+    if !yaml_exact_token_broker_base_settings(settings) {
+        violations.push(
+            "the TersaMacTokenBroker settings must contain only the reviewed bundle identity, deployment target, entitlement path, and SKIP_INSTALL"
+                .to_owned(),
+        );
+    }
+}
+
+fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> bool {
+    matches!(
+        settings,
+        Some(StrictYamlValue::Mapping(settings))
+            if settings.len() == 5
+                && matches!(
+                    settings.get("PRODUCT_BUNDLE_IDENTIFIER"),
+                    Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_BUNDLE_ID
+                )
+                && matches!(
+                    settings.get("PRODUCT_NAME"),
+                    Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_TARGET
+                )
+                && matches!(
+                    settings.get("MACOSX_DEPLOYMENT_TARGET"),
+                    Some(StrictYamlValue::String(value)) if value == "15.0"
+                )
+                && matches!(
+                    settings.get("CODE_SIGN_ENTITLEMENTS"),
+                    Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
+                )
+                && matches!(
+                    settings.get("SKIP_INSTALL"),
+                    Some(StrictYamlValue::String(value)) if value == "YES"
+                )
+                && !settings.keys().any(|key| {
+                    key.starts_with("PRODUCT_BUNDLE_IDENTIFIER[")
+                        || key.starts_with("CODE_SIGN_ENTITLEMENTS[")
+                        || key.starts_with("OTHER_LDFLAGS")
+                        || key.contains("ENABLE_USER_SCRIPT_SANDBOXING")
+                })
+    )
+}
+
+fn validate_token_broker_forbidden_surfaces(
+    body: &BTreeMap<String, StrictYamlValue>,
+    violations: &mut Vec<String>,
+) {
+    for key in [
+        "preBuildScripts",
+        "postBuildScripts",
+        "preCompileScripts",
+        "postCompileScripts",
+        "buildRules",
+        "buildToolPlugins",
+        "dependencies",
+        "scheme",
+        "legacy",
+        "attributes",
+        "configFiles",
+        "templates",
+    ] {
+        if body.contains_key(key) {
+            violations.push(format!(
+                "the TersaMacTokenBroker target forbidden surface `{key}` is present"
+            ));
+        }
+    }
+}
+
+fn macos_client_xpc_wiring_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    const FORBIDDEN: [&str; 5] = [
+        "NSXPCConnection",
+        "NSXPCInterface",
+        "NSXPCListener",
+        "setCodeSigningRequirement",
+        REVIEWED_TOKEN_BROKER_PROTOCOL_NAME,
+    ];
+    let mut violations = Vec::new();
+    for (path, document) in sources {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
+            continue;
+        }
+        let code = strip_swift_non_code(document);
+        for forbidden in FORBIDDEN {
+            if contains_identifier(&code, forbidden) {
+                violations.push(format!(
+                    "{} must not contain client-side XPC wiring `{forbidden}` in this packaging skeleton",
+                    path.display()
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn token_broker_source_surface_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let scan = scan_token_broker_source_files(sources, &mut violations);
+    collect_token_broker_inventory_violations(&scan.seen, &mut violations);
+    collect_token_broker_required_surface_violations(
+        &scan.aggregate,
+        scan.protocol_file_has_version_assignment,
+        &scan.seen,
+        &mut violations,
+    );
+    violations
+}
+
+struct TokenBrokerSourceScan {
+    seen: BTreeSet<String>,
+    aggregate: String,
+    protocol_file_has_version_assignment: bool,
+}
+
+fn scan_token_broker_source_files(
+    sources: &[(PathBuf, String)],
+    violations: &mut Vec<String>,
+) -> TokenBrokerSourceScan {
+    const FORBIDDEN_IDENTIFIERS: [&str; 14] = [
+        "processIdentifier",
+        "SecItemAdd",
+        "SecItemCopyMatching",
+        "SecItemUpdate",
+        "SecItemDelete",
+        "URLSession",
+        "URLRequest",
+        "libtersa",
+        "_silgen_name",
+        "refreshToken",
+        "pkceVerifier",
+        "codeVerifier",
+        "genericRPC",
+        "NSXPCListenerEndpoint",
+    ];
+    const FORBIDDEN_SUBSTRINGS: [&str; 5] = [
+        "import Security",
+        "@_cdecl",
+        "NSXPCConnection(",
+        "OTHER_LDFLAGS",
+        "ENABLE_USER_SCRIPT_SANDBOXING",
+    ];
+    const FORBIDDEN_PREFIXES: [&str; 2] = ["SecKeychain", "tersa_"];
+
+    let mut seen = BTreeSet::new();
+    let mut aggregate = String::new();
+    let mut protocol_file_has_version_assignment = false;
+    for (path, document) in sources {
+        let Some(path_str) = path.to_str() else {
+            violations.push(format!(
+                "{} is outside the closed TersaMacTokenBroker source allowlist",
+                path.display()
+            ));
+            continue;
+        };
+        if !TOKEN_BROKER_ALLOWED_SOURCE_PATHS.contains(&path_str) {
+            violations.push(format!(
+                "{path_str} is outside the closed TersaMacTokenBroker source allowlist"
+            ));
+            continue;
+        }
+        seen.insert(path_str.to_owned());
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if extension != Some("swift") {
+            continue;
+        }
+        let code = strip_swift_non_code(document);
+        aggregate.push_str(&code);
+        aggregate.push('\n');
+        if path_str == REVIEWED_TOKEN_BROKER_PROTOCOL_PATH {
+            protocol_file_has_version_assignment =
+                has_exact_token_broker_protocol_version_assignment(&code);
+        }
+        collect_token_broker_file_capability_violations(
+            path_str,
+            &code,
+            &FORBIDDEN_IDENTIFIERS,
+            &FORBIDDEN_SUBSTRINGS,
+            &FORBIDDEN_PREFIXES,
+            violations,
+        );
+    }
+    TokenBrokerSourceScan {
+        seen,
+        aggregate,
+        protocol_file_has_version_assignment,
+    }
+}
+
+fn collect_token_broker_file_capability_violations(
+    path_str: &str,
+    code: &str,
+    forbidden_identifiers: &[&str],
+    forbidden_substrings: &[&str],
+    forbidden_prefixes: &[&str],
+    violations: &mut Vec<String>,
+) {
+    for forbidden in forbidden_identifiers {
+        if contains_identifier(code, forbidden) {
+            violations.push(format!(
+                "{path_str} must not exercise forbidden broker capability `{forbidden}`"
+            ));
+        }
+    }
+    for forbidden in forbidden_substrings {
+        if code.contains(forbidden) {
+            violations.push(format!(
+                "{path_str} must not exercise forbidden broker capability `{forbidden}`"
+            ));
+        }
+    }
+    for forbidden in forbidden_prefixes {
+        if contains_identifier_with_prefix(code, forbidden) {
+            violations.push(format!(
+                "{path_str} must not exercise forbidden broker capability `{forbidden}`"
+            ));
+        }
+    }
+    if protocol_uses_generic_data_parameter(code) {
+        violations.push(format!(
+            "{path_str} must not expose generic Data-based broker operations"
+        ));
+    }
+}
+
+fn collect_token_broker_inventory_violations(
+    seen: &BTreeSet<String>,
+    violations: &mut Vec<String>,
+) {
+    for required in TOKEN_BROKER_ALLOWED_SOURCE_PATHS {
+        if !seen.contains(required) {
+            violations.push(format!(
+                "the TersaMacTokenBroker source inventory is missing required path `{required}`"
+            ));
+        }
+    }
+}
+
+fn collect_token_broker_required_surface_violations(
+    aggregate: &str,
+    protocol_file_has_version_assignment: bool,
+    seen: &BTreeSet<String>,
+    violations: &mut Vec<String>,
+) {
+    const REQUIRED_PROTOCOL_MARKERS: [&str; 7] = [
+        REVIEWED_TOKEN_BROKER_PROTOCOL_NAME,
+        REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_NAME,
+        "beginAuthorizationSession",
+        "completeAuthorizationSession",
+        "refreshAccessToken",
+        "revokeProviderGrant",
+        "deleteStoredTokens",
+    ];
+    const REQUIRED_SERVICE_MARKERS: [&str; 2] = ["setCodeSigningRequirement", "notProvisioned"];
+
+    for required in REQUIRED_PROTOCOL_MARKERS {
+        if !contains_identifier(aggregate, required) {
+            violations.push(format!(
+                "the TersaMacTokenBroker sources are missing required protocol surface `{required}`"
+            ));
+        }
+    }
+    if seen.contains(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH) && !protocol_file_has_version_assignment {
+        violations.push(format!(
+            "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must declare the exact reviewed protocol version constant `{REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_ASSIGNMENT}`"
+        ));
+    }
+    for required in REQUIRED_SERVICE_MARKERS {
+        if !contains_identifier(aggregate, required) {
+            violations.push(format!(
+                "the TersaMacTokenBroker sources are missing required fail-closed marker `{required}`"
+            ));
+        }
+    }
+    if contains_identifier(aggregate, "processIdentifier") {
+        violations.push(
+            "the TersaMacTokenBroker sources must not authenticate with processIdentifier"
+                .to_owned(),
+        );
+    }
+}
+
+fn protocol_uses_generic_data_parameter(code: &str) -> bool {
+    // Reject protocol/service method signatures that take bare Data parameters.
+    // The closed v1 surface uses only String and Int status codes.
+    let bytes = code.as_bytes();
+    let mut index = 0;
+    while index + 4 <= bytes.len() {
+        if bytes[index..].starts_with(b"func")
+            && bytes
+                .get(index + 4)
+                .is_some_and(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        {
+            let mut depth = 0;
+            let mut cursor = index + 4;
+            let mut saw_parameter_list = false;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'(' => {
+                        depth += 1;
+                        saw_parameter_list = true;
+                    }
+                    b')' => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                        if depth == 0 {
+                            let signature = &code[index..=cursor];
+                            if signature.contains(": Data")
+                                || signature.contains(":Data")
+                                || signature.contains("-> Data")
+                                || signature.contains("->Data")
+                            {
+                                return true;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            if !saw_parameter_list {
+                index += 4;
+                continue;
+            }
+            index = cursor.max(index + 1);
+            continue;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn validate_tersa_mac_top_level_keys(
     target: &BTreeMap<String, StrictYamlValue>,
     violations: &mut Vec<String>,
 ) {
     let expected_keys = BTreeSet::from([
+        "dependencies",
         "entitlements",
         "info",
         "platform",
@@ -5112,6 +5859,7 @@ fn allowed_target_entitlement_path(target: &str, path: &str) -> bool {
     matches!(
         (target, path),
         ("TersaMac", TERSA_MAC_ENTITLEMENTS)
+            | ("TersaMacTokenBroker", TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS)
             | ("TersaIOS", "ios/TersaIOS.entitlements")
             | ("TersaMimeMac", "mime-macos/TersaMimeMac.entitlements")
     )
@@ -5193,53 +5941,12 @@ fn is_sensitive_signing_key(key: &str) -> bool {
 fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> bool {
     let components = path.iter().map(String::as_str).collect::<Vec<_>>();
     match components.as_slice() {
-        [
-            "settings",
-            "base",
-            "CODE_SIGNING_ALLOWED" | "CODE_SIGNING_REQUIRED",
-        ] => {
-            matches!(value, StrictYamlValue::String(value) if value == "NO")
+        ["settings", "base", key] => allowed_root_sensitive_base_setting(key, value),
+        ["targets", "TersaMac", rest @ ..] => {
+            allowed_tersa_mac_sensitive_configuration(rest, value)
         }
-        ["settings", "base", "DEVELOPMENT_TEAM"] => {
-            matches!(value, StrictYamlValue::String(value) if value.is_empty())
-        }
-        ["settings", "base", key] => match *key {
-            "TERSA_DIOXUS_CODE_SIGNING_ALLOWED" | "TERSA_DIOXUS_CODE_SIGNING_REQUIRED" => {
-                matches!(value, StrictYamlValue::String(value) if value == "NO")
-            }
-            "TERSA_DIOXUS_DEVELOPMENT_TEAM"
-            | "TERSA_DIOXUS_CODE_SIGN_IDENTITY"
-            | "TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER" => {
-                matches!(value, StrictYamlValue::String(value) if value.is_empty())
-            }
-            "TERSA_DIOXUS_CODE_SIGN_STYLE" => {
-                matches!(value, StrictYamlValue::String(value) if value == "Automatic")
-            }
-            _ => false,
-        },
-        [
-            "targets",
-            "TersaMac",
-            "settings",
-            "base",
-            "TERSA_MACOS_APP_GROUP",
-        ] => {
-            matches!(value, StrictYamlValue::String(value) if value == BUILD_SETTING_GROUP)
-        }
-        [
-            "targets",
-            "TersaMac",
-            "settings",
-            "base",
-            "CODE_SIGN_ENTITLEMENTS",
-        ] => {
-            matches!(value, StrictYamlValue::String(value) if value == TERSA_MAC_ENTITLEMENTS)
-        }
-        ["targets", "TersaMac", "entitlements", "properties", key]
-            if *key == "com.apple.security.application-groups"
-                || *key == "keychain-access-groups" =>
-        {
-            yaml_exact_string_array(Some(value), SIGNING_GROUP)
+        ["targets", "TersaMacTokenBroker", rest @ ..] => {
+            allowed_token_broker_sensitive_configuration(rest, value)
         }
         [
             "targets",
@@ -5259,27 +5966,87 @@ fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> 
         ] => {
             matches!(value, StrictYamlValue::String(value) if value == "mime-macos/TersaMimeMac.entitlements")
         }
-        ["targets", "TersaDioxusIOS", "settings", "base", key] => match *key {
-            "CODE_SIGNING_ALLOWED" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_ALLOWED)")
-            }
-            "CODE_SIGNING_REQUIRED" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_REQUIRED)")
-            }
-            "DEVELOPMENT_TEAM" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_DEVELOPMENT_TEAM)")
-            }
-            "CODE_SIGN_STYLE" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_STYLE)")
-            }
-            "CODE_SIGN_IDENTITY" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_IDENTITY)")
-            }
-            "PROVISIONING_PROFILE_SPECIFIER" => {
-                matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER)")
-            }
-            _ => false,
-        },
+        ["targets", "TersaDioxusIOS", "settings", "base", key] => {
+            allowed_tersa_dioxus_ios_sensitive_base_setting(key, value)
+        }
+        _ => false,
+    }
+}
+
+fn allowed_root_sensitive_base_setting(key: &str, value: &StrictYamlValue) -> bool {
+    match key {
+        "CODE_SIGNING_ALLOWED"
+        | "CODE_SIGNING_REQUIRED"
+        | "TERSA_DIOXUS_CODE_SIGNING_ALLOWED"
+        | "TERSA_DIOXUS_CODE_SIGNING_REQUIRED" => {
+            matches!(value, StrictYamlValue::String(value) if value == "NO")
+        }
+        "DEVELOPMENT_TEAM"
+        | "TERSA_DIOXUS_DEVELOPMENT_TEAM"
+        | "TERSA_DIOXUS_CODE_SIGN_IDENTITY"
+        | "TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER" => {
+            matches!(value, StrictYamlValue::String(value) if value.is_empty())
+        }
+        "TERSA_DIOXUS_CODE_SIGN_STYLE" => {
+            matches!(value, StrictYamlValue::String(value) if value == "Automatic")
+        }
+        _ => false,
+    }
+}
+
+fn allowed_tersa_mac_sensitive_configuration(path: &[&str], value: &StrictYamlValue) -> bool {
+    match path {
+        ["settings", "base", "TERSA_MACOS_APP_GROUP"] => {
+            matches!(value, StrictYamlValue::String(value) if value == BUILD_SETTING_GROUP)
+        }
+        ["settings", "base", "CODE_SIGN_ENTITLEMENTS"] => {
+            matches!(value, StrictYamlValue::String(value) if value == TERSA_MAC_ENTITLEMENTS)
+        }
+        ["entitlements", "properties", key]
+            if *key == "com.apple.security.application-groups"
+                || *key == "keychain-access-groups" =>
+        {
+            yaml_exact_string_array(Some(value), SIGNING_GROUP)
+        }
+        _ => false,
+    }
+}
+
+fn allowed_token_broker_sensitive_configuration(path: &[&str], value: &StrictYamlValue) -> bool {
+    match path {
+        ["settings", "base", "CODE_SIGN_ENTITLEMENTS"] => {
+            matches!(
+                value,
+                StrictYamlValue::String(value) if value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
+            )
+        }
+        ["entitlements", "properties", "keychain-access-groups"] => {
+            yaml_exact_string_array(Some(value), TOKEN_SIGNING_GROUP)
+        }
+        _ => false,
+    }
+}
+
+fn allowed_tersa_dioxus_ios_sensitive_base_setting(key: &str, value: &StrictYamlValue) -> bool {
+    match key {
+        "CODE_SIGNING_ALLOWED" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_ALLOWED)")
+        }
+        "CODE_SIGNING_REQUIRED" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_REQUIRED)")
+        }
+        "DEVELOPMENT_TEAM" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_DEVELOPMENT_TEAM)")
+        }
+        "CODE_SIGN_STYLE" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_STYLE)")
+        }
+        "CODE_SIGN_IDENTITY" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_IDENTITY)")
+        }
+        "PROVISIONING_PROFILE_SPECIFIER" => {
+            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER)")
+        }
         _ => false,
     }
 }
@@ -5292,6 +6059,7 @@ fn collect_protected_values(
     match value {
         StrictYamlValue::String(value)
             if value == TERSA_MAC_ENTITLEMENTS
+                || value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
                 || value.contains("${TeamIdentifierPrefix}")
                 || value.contains("$(TeamIdentifierPrefix)")
                 || value.contains("${AppIdentifierPrefix}")
@@ -5322,27 +6090,41 @@ fn collect_protected_values(
 
 fn allowed_protected_value_path(path: &[String]) -> bool {
     let components = path.iter().map(String::as_str).collect::<Vec<_>>();
-    match components.as_slice() {
-        ["targets", "TersaMac", "entitlements", "path"] => true,
-        ["targets", "TersaMac", "settings", "base", key]
-            if *key == "CODE_SIGN_ENTITLEMENTS" || *key == "TERSA_MACOS_APP_GROUP" =>
-        {
-            true
-        }
+    matches!(
+        components.as_slice(),
         [
+            "targets",
+            "TersaMac" | "TersaMacTokenBroker",
+            "entitlements",
+            "path"
+        ] | [
+            "targets",
+            "TersaMac",
+            "settings",
+            "base",
+            "CODE_SIGN_ENTITLEMENTS" | "TERSA_MACOS_APP_GROUP"
+        ] | [
             "targets",
             "TersaMac",
             "entitlements",
             "properties",
-            key,
-            "[0]",
-        ] if *key == "com.apple.security.application-groups"
-            || *key == "keychain-access-groups" =>
-        {
-            true
-        }
-        _ => false,
-    }
+            "com.apple.security.application-groups" | "keychain-access-groups",
+            "[0]"
+        ] | [
+            "targets",
+            "TersaMacTokenBroker",
+            "settings",
+            "base",
+            "CODE_SIGN_ENTITLEMENTS"
+        ] | [
+            "targets",
+            "TersaMacTokenBroker",
+            "entitlements",
+            "properties",
+            "keychain-access-groups",
+            "[0]"
+        ]
+    )
 }
 
 fn parse_plist_string_array(document: &str, key: &str) -> Result<Vec<String>, String> {
@@ -7212,7 +7994,7 @@ mod tests {
         gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
         is_dioxus_runtime_dependency, is_slint_runtime_dependency,
         keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        mailbox_sync_ffi_direct_dependency_set_violations,
+        macos_client_xpc_wiring_violations, mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
@@ -7221,12 +8003,13 @@ mod tests {
         rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
         rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
         shipped_direct_dependency_names, signing_configuration_violations,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        strip_rust_non_code, strip_rust_test_modules, swift_bootstrap_inventory_violations,
-        swift_bootstrap_source_violations, swift_bridge_call_inventory,
-        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
-        target_metadata_options, tracked_apple_signing_inventory,
-        tracked_project_generation_violations,
+        source_token_broker_entitlement_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
+        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
+        swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
+        swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
+        target_metadata_options, token_broker_source_surface_violations,
+        tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -7235,6 +8018,12 @@ mod tests {
 <key>com.apple.security.network.server</key><true/>
 <key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 <key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
+</dict></plist>"#;
+
+    const VALID_BROKER_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>com.apple.security.network.client</key><true/>
+<key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.token</string></array>
 </dict></plist>"#;
 
     const VALID_SIGNING_PROJECT: &str = r#"
@@ -7265,6 +8054,9 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
         keychain-access-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
+    dependencies:
+      - target: TersaMacTokenBroker
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
@@ -7279,6 +8071,31 @@ targets:
     scheme:
       testTargets:
         - TersaMacTests
+  TersaMacTokenBroker:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: macos-token-broker
+    info:
+      path: macos-token-broker/Info.plist
+      properties:
+        CFBundlePackageType: XPC!
+        XPCService:
+          ServiceType: Application
+    entitlements:
+      path: macos-token-broker/TersaMacTokenBroker.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.token
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.token-broker
+        PRODUCT_NAME: TersaMacTokenBroker
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
+        SKIP_INSTALL: "YES"
   TersaMacTests:
     type: bundle.unit-test
     platform: macOS
@@ -10228,6 +11045,9 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
         keychain-access-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
+    dependencies:
+      - target: TersaMacTokenBroker
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
@@ -10242,6 +11062,31 @@ targets:
     scheme:
       testTargets:
         - TersaMacTests
+  TersaMacTokenBroker:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: macos-token-broker
+    info:
+      path: macos-token-broker/Info.plist
+      properties:
+        CFBundlePackageType: XPC!
+        XPCService:
+          ServiceType: Application
+    entitlements:
+      path: macos-token-broker/TersaMacTokenBroker.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.token
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.token-broker
+        PRODUCT_NAME: TersaMacTokenBroker
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
+        SKIP_INSTALL: "YES"
   TersaMacTests:
     type: bundle.unit-test
     platform: macOS
@@ -10289,18 +11134,26 @@ targets:
                 ("MiddleMac", "macOS"),
                 ("TersaMac", "macOS"),
                 ("TersaMacTests", "macOS"),
+                ("TersaMacTokenBroker", "macOS"),
             ]
         );
-        assert!(signing_configuration_violations(entitlements, project).is_empty());
+        assert!(
+            signing_configuration_violations(entitlements, VALID_BROKER_ENTITLEMENTS, project,)
+                .is_empty()
+        );
 
         let malformed_array = project.replace(
             "        keychain-access-groups:\n          - ${TeamIdentifierPrefix}app.tersa.shared",
             "        keychain-access-groups: ${TeamIdentifierPrefix}app.tersa.shared",
         );
         assert!(
-            signing_configuration_violations(entitlements, &malformed_array)
-                .iter()
-                .any(|violation| violation.contains("`keychain-access-groups`"))
+            signing_configuration_violations(
+                entitlements,
+                VALID_BROKER_ENTITLEMENTS,
+                &malformed_array,
+            )
+            .iter()
+            .any(|violation| violation.contains("`keychain-access-groups`"))
         );
 
         let contaminated = project.replace(
@@ -10308,10 +11161,15 @@ targets:
             "  LastIOS:\n    platform: iOS\n    settings:\n      base:\n        TERSA_MACOS_APP_GROUP: forbidden",
         );
         assert!(
-            signing_configuration_violations(entitlements, &contaminated)
-                .iter()
-                .any(|violation| violation
-                    .contains("targets.LastIOS.settings.base.TERSA_MACOS_APP_GROUP"))
+            signing_configuration_violations(
+                entitlements,
+                VALID_BROKER_ENTITLEMENTS,
+                &contaminated,
+            )
+            .iter()
+            .any(|violation| {
+                violation.contains("targets.LastIOS.settings.base.TERSA_MACOS_APP_GROUP")
+            })
         );
     }
 
@@ -10371,10 +11229,13 @@ targets:
 <key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 <key>keychain-access-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#,
+                VALID_BROKER_ENTITLEMENTS,
                 aliased,
             )
             .iter()
-            .any(|violation| violation.contains("targets.AliasedIOS.settings.base.TERSA_MACOS_APP_GROUP"))
+            .any(|violation| {
+                violation.contains("targets.AliasedIOS.settings.base.TERSA_MACOS_APP_GROUP")
+            })
         );
     }
 
@@ -10462,7 +11323,8 @@ targets:
 <key>com.apple.security.application-groups</key><array></array>
 <key>keychain-access-groups</key><array><string>wrong.group</string></array>
 </dict></plist>"#;
-        let violations = signing_configuration_violations(entitlements, project);
+        let violations =
+            signing_configuration_violations(entitlements, VALID_BROKER_ENTITLEMENTS, project);
         assert!(violations.len() >= 4);
         assert!(
             violations
@@ -10487,7 +11349,12 @@ targets:
     )]
     fn effective_signing_policy_rejects_every_unsupported_xcodegen_bypass() {
         assert!(
-            signing_configuration_violations(VALID_ENTITLEMENTS, VALID_SIGNING_PROJECT).is_empty()
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty()
         );
 
         let project_wide = VALID_SIGNING_PROJECT.replace(
@@ -10602,7 +11469,11 @@ targets:
                 "OTHER_LDFLAGS must link exactly the single mailbox-sync FFI archive",
             ),
         ] {
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
                 violations
                     .iter()
@@ -10637,7 +11508,11 @@ targets:
                 ),
             ),
         ] {
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
                 violations
                     .iter()
@@ -10680,10 +11555,18 @@ targets:
                 "TersaMac target must contain only",
             ),
             (
-                "nested dependency",
+                "nested unreviewed dependency",
                 VALID_SIGNING_PROJECT.replace(
-                    "    type: application",
-                    "    type: application\n    dependencies:\n      - target: Unreviewed",
+                    "    dependencies:\n      - target: TersaMacTokenBroker\n        embed: true\n",
+                    "    dependencies:\n      - target: Unreviewed\n        embed: true\n",
+                ),
+                "embed exactly the TersaMacTokenBroker XPC dependency",
+            ),
+            (
+                "missing embedded broker dependency",
+                VALID_SIGNING_PROJECT.replace(
+                    "    dependencies:\n      - target: TersaMacTokenBroker\n        embed: true\n",
+                    "",
                 ),
                 "TersaMac target must contain only",
             ),
@@ -10697,7 +11580,11 @@ targets:
             ),
         ];
         for (label, project, expected) in cases {
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
                 violations
                     .iter()
@@ -10710,8 +11597,11 @@ targets:
             "  OtherMac:\n    platform: macOS",
             "  OtherMac:\n    platform: macOS\n    attributes:\n      DevelopmentTeam: ATTACKER\n      ProvisioningStyle: Manual",
         );
-        let violations =
-            signing_configuration_violations(VALID_ENTITLEMENTS, &defensive_attributes);
+        let violations = signing_configuration_violations(
+            VALID_ENTITLEMENTS,
+            VALID_BROKER_ENTITLEMENTS,
+            &defensive_attributes,
+        );
         for key in ["DevelopmentTeam", "ProvisioningStyle"] {
             assert!(
                 violations.iter().any(|violation| violation.contains(key)),
@@ -10723,7 +11613,12 @@ targets:
     #[test]
     fn tersa_mac_sources_are_an_exact_ordered_reviewed_sequence() {
         assert!(
-            signing_configuration_violations(VALID_ENTITLEMENTS, VALID_SIGNING_PROJECT).is_empty()
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty()
         );
         for project in [
             VALID_SIGNING_PROJECT.replace(
@@ -10736,9 +11631,15 @@ targets:
             ),
         ] {
             assert!(
-                signing_configuration_violations(VALID_ENTITLEMENTS, &project)
-                    .iter()
-                    .any(|violation| violation.contains("exact reviewed source and resource sequence")),
+                signing_configuration_violations(
+                    VALID_ENTITLEMENTS,
+                    VALID_BROKER_ENTITLEMENTS,
+                    &project,
+                )
+                .iter()
+                .any(|violation| {
+                    violation.contains("exact reviewed source and resource sequence")
+                }),
                 "source sequence bypass must fail closed"
             );
         }
@@ -10762,7 +11663,11 @@ targets:
             VALID_ENTITLEMENTS.replace("<key>com.apple.security.network.server</key><true/>", ""),
         ];
         for source in source_cases {
-            let violations = signing_configuration_violations(&source, VALID_SIGNING_PROJECT);
+            let violations = signing_configuration_violations(
+                &source,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            );
             assert!(
                 violations
                     .iter()
@@ -10790,11 +11695,15 @@ targets:
             ),
         ];
         for project in property_cases {
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
-                violations.iter().any(|violation| violation.contains(
-                    "TersaMac XcodeGen entitlement properties"
-                )),
+                violations.iter().any(|violation| {
+                    violation.contains("TersaMac XcodeGen entitlement properties")
+                }),
                 "XcodeGen entitlement mutation must fail closed; got {violations:?}"
             );
         }
@@ -10880,14 +11789,18 @@ targets:
             (
                 "conditional bundle identifier",
                 VALID_SIGNING_PROJECT.replace(
-                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac",
-                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n        PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]: app.attacker",
+                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n        TERSA_MACOS_APP_GROUP:",
+                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n        PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]: app.attacker\n        TERSA_MACOS_APP_GROUP:",
                 ),
                 "without conditional overrides",
             ),
         ];
         for (label, project, expected) in cases {
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
                 violations
                     .iter()
@@ -10932,10 +11845,16 @@ targets:
             ),
         ] {
             let project = VALID_SIGNING_PROJECT.replace(
-                "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac",
-                &format!("        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n{injected}"),
+                "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n        TERSA_MACOS_APP_GROUP:",
+                &format!(
+                    "        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac\n{injected}\n        TERSA_MACOS_APP_GROUP:"
+                ),
             );
-            let violations = signing_configuration_violations(VALID_ENTITLEMENTS, &project);
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
             assert!(
                 violations
                     .iter()
@@ -10949,9 +11868,13 @@ targets:
             "  OtherMac:\n    platform: macOS\n    settings:\n      base:\n        UNREVIEWED: ${TeamIdentifierPrefix}app.tersa.shared",
         );
         assert!(
-            signing_configuration_violations(VALID_ENTITLEMENTS, &reused_prefix)
-                .iter()
-                .any(|violation| violation.contains("protected signing value is reused"))
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &reused_prefix,
+            )
+            .iter()
+            .any(|violation| violation.contains("protected signing value is reused"))
         );
     }
 
@@ -11295,6 +12218,375 @@ targets:
             vec![
                 "other.entitlements must not contain protected entitlement `keychain-access-groups`"
             ]
+        );
+    }
+
+    #[test]
+    fn token_broker_entitlements_are_exact_and_disjoint_from_tersa_mac() {
+        assert!(source_token_broker_entitlement_violations(VALID_BROKER_ENTITLEMENTS).is_empty());
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty()
+        );
+
+        for (label, mutated, expected) in [
+            (
+                "shared app group on broker",
+                VALID_BROKER_ENTITLEMENTS.replace(
+                    "</dict>",
+                    "<key>com.apple.security.application-groups</key><array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array></dict>",
+                ),
+                "forbidden capability `com.apple.security.application-groups`",
+            ),
+            (
+                "network server on broker",
+                VALID_BROKER_ENTITLEMENTS.replace(
+                    "</dict>",
+                    "<key>com.apple.security.network.server</key><true/></dict>",
+                ),
+                "forbidden capability `com.apple.security.network.server`",
+            ),
+            (
+                "get-task-allow on broker",
+                VALID_BROKER_ENTITLEMENTS.replace(
+                    "</dict>",
+                    "<key>com.apple.security.get-task-allow</key><true/></dict>",
+                ),
+                "forbidden capability `com.apple.security.get-task-allow`",
+            ),
+            (
+                "library-validation exception on broker",
+                VALID_BROKER_ENTITLEMENTS.replace(
+                    "</dict>",
+                    "<key>com.apple.security.cs.disable-library-validation</key><true/></dict>",
+                ),
+                "forbidden capability `com.apple.security.cs.disable-library-validation`",
+            ),
+            (
+                "wrong token group",
+                VALID_BROKER_ENTITLEMENTS.replace(
+                    "${TeamIdentifierPrefix}app.tersa.token",
+                    "${TeamIdentifierPrefix}app.tersa.shared",
+                ),
+                "dedicated token group",
+            ),
+        ] {
+            let violations = source_token_broker_entitlement_violations(&mutated);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_broker_project_surface_rejects_unreviewed_broker_mutations() {
+        let shared_group_on_broker_project = VALID_SIGNING_PROJECT.replace(
+            "          - ${TeamIdentifierPrefix}app.tersa.token",
+            "          - ${TeamIdentifierPrefix}app.tersa.shared",
+        );
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &shared_group_on_broker_project,
+            )
+            .iter()
+            .any(|violation| {
+                violation.contains("dedicated token group")
+                    || violation.contains("protected signing value is reused")
+                    || violation.contains("outside the exact allowlist")
+            })
+        );
+
+        let broker_with_scripts = VALID_SIGNING_PROJECT.replace(
+            "        SKIP_INSTALL: \"YES\"\n",
+            "        SKIP_INSTALL: \"YES\"\n    preBuildScripts:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n",
+        );
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &broker_with_scripts,
+            )
+            .iter()
+            .any(|violation| {
+                violation.contains("TersaMacTokenBroker target forbidden surface `preBuildScripts`")
+            })
+        );
+
+        let broker_with_rust = VALID_SIGNING_PROJECT.replace(
+            "        SKIP_INSTALL: \"YES\"\n",
+            "        SKIP_INSTALL: \"YES\"\n        OTHER_LDFLAGS:\n          - libtersa_apple_bridge.a\n        ENABLE_USER_SCRIPT_SANDBOXING: \"NO\"\n",
+        );
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &broker_with_rust,
+            )
+            .iter()
+            .any(|violation| {
+                violation.contains("TersaMacTokenBroker settings must contain only the reviewed")
+            })
+        );
+
+        let broker_with_server = VALID_SIGNING_PROJECT.replace(
+            "        com.apple.security.network.client: true\n        keychain-access-groups:\n          - ${TeamIdentifierPrefix}app.tersa.token\n",
+            "        com.apple.security.network.client: true\n        com.apple.security.network.server: true\n        keychain-access-groups:\n          - ${TeamIdentifierPrefix}app.tersa.token\n",
+        );
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &broker_with_server,
+            )
+            .iter()
+            .any(|violation| {
+                violation.contains("TersaMacTokenBroker XcodeGen entitlement properties")
+            })
+        );
+    }
+
+    #[test]
+    fn token_broker_source_surface_is_closed_and_fail_closed() {
+        let sources = [
+            (
+                PathBuf::from("apple/macos-token-broker/main.swift"),
+                include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerProtocol.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerService.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerListenerDelegate.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
+                    .to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/Info.plist"),
+                include_str!("../../apple/macos-token-broker/Info.plist").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TersaMacTokenBroker.entitlements"),
+                include_str!("../../apple/macos-token-broker/TersaMacTokenBroker.entitlements")
+                    .to_owned(),
+            ),
+        ];
+        assert!(token_broker_source_surface_violations(&sources).is_empty());
+
+        for (label, path, document, expected) in [
+            (
+                "processIdentifier auth",
+                "apple/macos-token-broker/TokenBrokerListenerDelegate.swift",
+                "func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool { let pid = newConnection.processIdentifier; return pid > 0 }\n",
+                "processIdentifier",
+            ),
+            (
+                "keychain call",
+                "apple/macos-token-broker/TokenBrokerService.swift",
+                "func deleteStoredTokens(accountSubject: String, withReply reply: @escaping (Int) -> Void) { _ = SecItemDelete(nil as CFDictionary); reply(1) }\n",
+                "SecItemDelete",
+            ),
+            (
+                "generic data RPC",
+                "apple/macos-token-broker/TokenBrokerProtocol.swift",
+                "@objc protocol OpenRPC { func invoke(payload: Data, withReply reply: @escaping (Data?) -> Void) }\n",
+                "generic Data-based",
+            ),
+            (
+                "refresh token field",
+                "apple/macos-token-broker/TokenBrokerProtocol.swift",
+                "func leak(refreshToken: String, withReply reply: @escaping (Int) -> Void)\n",
+                "refreshToken",
+            ),
+            (
+                "network call",
+                "apple/macos-token-broker/TokenBrokerService.swift",
+                "func ping() { _ = URLSession.shared }\n",
+                "URLSession",
+            ),
+        ] {
+            let mut mutated = sources.clone();
+            if let Some(entry) = mutated
+                .iter_mut()
+                .find(|(candidate, _)| candidate == Path::new(path))
+            {
+                entry.1 = document.to_owned();
+            }
+            let violations = token_broker_source_surface_violations(&mutated);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+
+        let macos_client = [(
+            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+            "let connection = NSXPCConnection(serviceName: \"app.tersa.mac.token-broker\")\n"
+                .to_owned(),
+        )];
+        assert!(
+            macos_client_xpc_wiring_violations(&macos_client)
+                .iter()
+                .any(|violation| violation.contains("NSXPCConnection"))
+        );
+        assert!(
+            macos_client_xpc_wiring_violations(&[(
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn token_broker_protocol_declaration_is_exact_path_and_form_only() {
+        let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let reviewed =
+            include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
+
+        // Positive: the reviewed declaration at the exact path is accepted.
+        assert!(
+            swift_source_lexical_violations(protocol_path, &reviewed).is_empty(),
+            "reviewed TokenBrokerProtocol.swift must pass the lexical protocol guard"
+        );
+
+        // Negative: a second protocol declaration in the reviewed file fails.
+        let second_protocol =
+            format!("{reviewed}\n@objc(ExtraBrokerProtocol)\nprotocol ExtraBrokerProtocol {{}}\n");
+        assert!(
+            swift_source_lexical_violations(protocol_path, &second_protocol)
+                .iter()
+                .any(|violation| violation.contains("must not declare `protocol`")),
+            "a second protocol declaration must fail closed"
+        );
+
+        // Negative: renaming the reviewed protocol rejects the declaration.
+        let renamed = reviewed
+            .replace(
+                "@objc(TersaMacTokenBrokerProtocolV1)",
+                "@objc(TersaMacTokenBrokerProtocolV2)",
+            )
+            .replace(
+                "protocol TersaMacTokenBrokerProtocolV1",
+                "protocol TersaMacTokenBrokerProtocolV2",
+            );
+        assert!(
+            swift_source_lexical_violations(protocol_path, &renamed)
+                .iter()
+                .any(|violation| violation.contains("must not declare `protocol`")),
+            "a renamed protocol declaration must fail closed"
+        );
+
+        // Negative: the same reviewed form in another broker file fails.
+        let other_broker_path = Path::new("apple/macos-token-broker/TokenBrokerService.swift");
+        let moved_declaration = "\
+@objc(TersaMacTokenBrokerProtocolV1)
+protocol TersaMacTokenBrokerProtocolV1 {
+    func ping(withReply reply: @escaping (Int) -> Void)
+}
+";
+        assert!(
+            swift_source_lexical_violations(other_broker_path, moved_declaration)
+                .iter()
+                .any(|violation| violation.contains("must not declare `protocol`")),
+            "protocol declaration outside TokenBrokerProtocol.swift must fail closed"
+        );
+    }
+
+    #[test]
+    fn token_broker_protocol_surface_rejects_broadened_or_wrong_version() {
+        let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let reviewed =
+            include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
+        let mut sources = [
+            (
+                PathBuf::from("apple/macos-token-broker/main.swift"),
+                include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerProtocol.swift"),
+                reviewed.clone(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerService.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerListenerDelegate.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
+                    .to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/Info.plist"),
+                include_str!("../../apple/macos-token-broker/Info.plist").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TersaMacTokenBroker.entitlements"),
+                include_str!("../../apple/macos-token-broker/TersaMacTokenBroker.entitlements")
+                    .to_owned(),
+            ),
+        ];
+
+        // Negative: a broadened generic Data interface still fails the surface guard.
+        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
+            entry.1.push_str(
+                "\nfunc invoke(payload: Data, withReply reply: @escaping (Data?) -> Void)\n",
+            );
+        }
+        assert!(
+            token_broker_source_surface_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("generic Data-based")),
+            "broadened Data-based broker interface must fail closed"
+        );
+
+        // Negative: wrong protocol version constant value fails.
+        let wrong_version =
+            reviewed.replace("static let value: Int = 1", "static let value: Int = 2");
+        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
+            entry.1 = wrong_version;
+        }
+        assert!(
+            token_broker_source_surface_violations(&sources)
+                .iter()
+                .any(|violation| {
+                    violation.contains("exact reviewed protocol version constant")
+                        || violation.contains("static let value: Int = 1")
+                }),
+            "protocol version other than 1 must fail closed"
+        );
+
+        // Negative: missing version marker fails.
+        let missing_version = reviewed.replace(
+            "enum TersaMacTokenBrokerProtocolVersion {\n    static let value: Int = 1\n}\n\n",
+            "",
+        );
+        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
+            entry.1 = missing_version;
+        }
+        assert!(
+            token_broker_source_surface_violations(&sources)
+                .iter()
+                .any(|violation| {
+                    violation.contains("TersaMacTokenBrokerProtocolVersion")
+                        || violation.contains("exact reviewed protocol version constant")
+                }),
+            "missing protocol version surface must fail closed"
         );
     }
 
