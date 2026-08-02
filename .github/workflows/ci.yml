@@ -138,8 +138,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -312,8 +311,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -376,8 +374,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -474,8 +471,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Build SQLCipher diagnostic for iOS targets
@@ -513,8 +509,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Cross-build encrypted search diagnostic
@@ -553,8 +548,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Install XcodeGen 2.45.4
@@ -621,8 +615,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-14
           components: clippy,rust-src,rustfmt
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Install exact fuzz and policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
@@ -687,8 +680,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify Xcode 26
         run: xcodebuild -version | grep -Fx 'Xcode 26.6'
       - name: Cross-build portable blob diagnostic for iOS
@@ -721,8 +713,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Install notice generator
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
@@ -746,8 +737,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Prepare verified rust-skia archive
         if: runner.os == 'macOS'
         run: |
@@ -768,8 +758,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-on-failure: false
-          cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}
+          cache: false
       - name: Verify M0 product gates
         run: |
           python3 scripts/verify-m0-gates.py --self-test
