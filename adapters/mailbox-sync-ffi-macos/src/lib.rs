@@ -444,6 +444,63 @@ mod macos {
         result.map_or_else(|status| status, |()| STATUS_STARTED)
     }
 
+    /// Reads the content-free lifecycle projection for an account without
+    /// creating a mailbox store. `output_recovery` receives 0 for none, 1 for
+    /// incomplete teardown, or 2 for revoke unconfirmed. `output_last_sync`
+    /// receives Unix milliseconds or -1 when no fully successful sync exists.
+    /// No mailbox rows, OAuth material, provider identifiers, or account identity
+    /// values cross this ABI.
+    ///
+    /// # Safety
+    ///
+    /// `account_id` must either be null or point to a readable buffer of the
+    /// stated length. Both outputs must be writable for one integer and all
+    /// non-null pointers must remain valid for the duration of this call.
+    #[expect(
+        unsafe_code,
+        reason = "the C ABI validates and copies caller-owned byte buffers"
+    )]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn tersa_mailbox_macos_lifecycle_get(
+        account_id: *const u8,
+        account_id_len: usize,
+        output_recovery: *mut i32,
+        output_last_successful_sync_unix_millis: *mut i64,
+    ) -> i32 {
+        let result = (|| {
+            if output_recovery.is_null() || output_last_successful_sync_unix_millis.is_null() {
+                return Err(STATUS_INVALID_INPUT);
+            }
+            // SAFETY: the function contract requires a readable account-id buffer.
+            let account_id = unsafe { read_utf8(account_id, account_id_len) }?;
+            let account = AccountId::new(account_id).map_err(|_error| STATUS_INVALID_INPUT)?;
+            let metadata =
+                worker::lifecycle_metadata(&account).map_err(|_error| STATUS_INTERNAL)?;
+            let (recovery, freshness) = match metadata {
+                None => (0, -1),
+                Some(metadata) => {
+                    let recovery = match metadata.recovery() {
+                        None => 0,
+                        Some(tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown) => 1,
+                        Some(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed) => 2,
+                    };
+                    (
+                        recovery,
+                        metadata.last_successful_sync_unix_millis().unwrap_or(-1),
+                    )
+                }
+            };
+            // SAFETY: both outputs were checked non-null and the contract requires
+            // one writable integer at each address.
+            unsafe {
+                *output_recovery = recovery;
+                *output_last_successful_sync_unix_millis = freshness;
+            }
+            Ok(())
+        })();
+        result.map_or_else(|status| status, |()| STATUS_STARTED)
+    }
+
     /// Polls one bounded-sync session, returning the worker's closed status integer
     /// and reaping the session once it reaches a terminal status.
     ///
@@ -501,8 +558,8 @@ mod macos {
         use super::{
             BridgeConnectSession, MAX_INPUT_BYTES, STATUS_INVALID_INPUT, STATUS_UNKNOWN_SESSION,
             client_secret_from_build_setting, read_utf8, tersa_mailbox_macos_connect_begin,
-            tersa_mailbox_macos_disconnect_begin, tersa_mailbox_macos_sync_begin,
-            tersa_mailbox_macos_sync_poll,
+            tersa_mailbox_macos_disconnect_begin, tersa_mailbox_macos_lifecycle_get,
+            tersa_mailbox_macos_sync_begin, tersa_mailbox_macos_sync_poll,
         };
 
         fn insert_test_session(status: i32) -> u64 {
@@ -691,6 +748,22 @@ mod macos {
                 tersa_mailbox_macos_disconnect_begin(
                     account.as_ptr(),
                     account.len(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+        }
+
+        #[test]
+        fn lifecycle_get_rejects_null_outputs_without_opening_storage() {
+            let account = b"account";
+            // SAFETY: the non-null input points to `account.len()` readable bytes;
+            // null outputs are deliberately the invalid-input fixture.
+            let status = unsafe {
+                tersa_mailbox_macos_lifecycle_get(
+                    account.as_ptr(),
+                    account.len(),
+                    ptr::null_mut(),
                     ptr::null_mut(),
                 )
             };

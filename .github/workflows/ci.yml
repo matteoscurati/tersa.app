@@ -155,13 +155,13 @@ jobs:
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
       - name: Generate Apple project
         run: sh apple/scripts/generate-project.sh
-      - name: Build unsigned macOS debug application
+      - name: Test unsigned macOS debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
           -configuration Debug -destination 'platform=macOS,arch=arm64'
           -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
           TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
       - name: Build unsigned iOS simulator debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
@@ -215,15 +215,14 @@ jobs:
         run: |
           set -euo pipefail
           # The macOS app links ONLY this archive (the bridge archive is no longer
-          # built for macOS), so it must define the 4 mailbox-sync symbols AND
-          # re-export all 11 bridge symbols. The 4 symbols no Swift caller uses
-          # yet are dead-stripped from the final binary, hence asserted here in
-          # the .a rather than in the archived app.
+          # built for macOS), so it must define the 5 mailbox-sync symbols AND
+          # re-export all 11 bridge symbols. Assert the closed export inventory
+          # in the archive so dead stripping cannot hide a missing entry point.
           archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
           test -f "$archive"
           symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
           printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
-          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 15
+          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 16
           for expected in \
             _tersa_apple_bridge_version \
             _tersa_macos_bootstrap_default_account \
@@ -232,6 +231,7 @@ jobs:
             _tersa_macos_mailbox_search \
             _tersa_mailbox_macos_connect_begin \
             _tersa_mailbox_macos_disconnect_begin \
+            _tersa_mailbox_macos_lifecycle_get \
             _tersa_mailbox_macos_sync_begin \
             _tersa_mailbox_macos_sync_poll \
             _tersa_oauth_cancel \

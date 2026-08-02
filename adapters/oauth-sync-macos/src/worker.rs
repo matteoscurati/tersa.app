@@ -37,8 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use tersa_application::identity::{AccountIdentityHasher, AccountIdentityStore};
+use tersa_application::lifecycle::{AccountLifecycleMetadata, AccountLifecycleStore};
 use tersa_application::mailbox::{
-    AccountId, AccountPurgeStore, MailboxStore, PageSize, StoreLimit,
+    AccountId, AccountPurgeStore, MailboxStore, MailboxStoreError, PageSize, StoreLimit,
 };
 use tersa_application::oauth::{AuthorizationGrant, SystemMonotonicClock, SystemWallClock};
 use tersa_application::sync::{SyncPolicy, SyncReport};
@@ -506,9 +507,11 @@ async fn run_default_account_cycle(
         .map_err(CycleError::Refresh)?;
     let session = GmailSession::new(account.clone(), connected, &wall_clock)
         .map_err(|_error| CycleError::Session)?;
-    gated_sync(account, session, &hasher, store, policy)
+    let report = gated_sync(account, session, &hasher, &store, policy)
         .await
-        .map_err(CycleError::Gated)
+        .map_err(CycleError::Gated)?;
+    finalize_successful_sync(&store, account, &wall_clock).await?;
+    Ok(report)
 }
 
 /// Begins a bounded sync for an already-connected `account` on a background worker,
@@ -629,9 +632,41 @@ async fn run_claimed_connect_cycle<St: ConnectSession>(
     .map_err(CycleError::Connect)?;
     let session = GmailSession::new(account.clone(), connected, &wall_clock)
         .map_err(|_error| CycleError::Session)?;
-    gated_sync(account, session, &hasher, store, policy)
+    let report = gated_sync(account, session, &hasher, &store, policy)
         .await
-        .map_err(CycleError::Gated)
+        .map_err(CycleError::Gated)?;
+    finalize_successful_sync(&store, account, &wall_clock).await?;
+    Ok(report)
+}
+
+/// Records freshness only after the whole gated sync returns successfully. The
+/// injected wall clock keeps this transition deterministic in tests; conversion
+/// overflow fails closed rather than manufacturing a misleading timestamp.
+async fn finalize_successful_sync<S: AccountLifecycleStore>(
+    store: &S,
+    account: &AccountId,
+    clock: &impl tersa_application::oauth::WallClock,
+) -> Result<(), CycleError> {
+    // A successful sync after RevokeUnconfirmed necessarily used a newly
+    // consented credential: disconnect deleted the prior local token before it
+    // reported that state. Clearing recovery is therefore required before the
+    // worker reports success, so stale revoke advice never targets the new
+    // connection.
+    store
+        .clear_disconnect_recovery(account)
+        .await
+        .map_err(|_error| CycleError::Setup)?;
+    let Some(millis) = i64::try_from(clock.unix_time())
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+    else {
+        return Ok(());
+    };
+    // Freshness is presentational aggregate metadata. Its failure must not
+    // turn an exchanged credential and fully committed mailbox sync into a
+    // false connection failure; Swift explicitly renders an unavailable time.
+    let _ = store.record_successful_sync(account, millis).await;
+    Ok(())
 }
 
 /// Begins a bounded sync for a newly-connected `account` on a background worker,
@@ -710,9 +745,26 @@ async fn run_teardown_with<S, T, P, F, E>(
 where
     S: RefreshTokenStore,
     T: TokenTransport,
-    P: AccountPurgeStore,
+    P: AccountPurgeStore + AccountLifecycleStore,
     F: FnOnce() -> Result<Option<P>, E>,
 {
+    // Open before destructive work when possible. Read the prior recovery
+    // before replacing it with IncompleteTeardown: an absent token after a
+    // crashed attempt cannot prove that the provider revoke succeeded.
+    let store = open_store();
+    let (prior_recovery, marker_failed) = match &store {
+        Ok(Some(store)) => {
+            let prior = store.lifecycle_metadata(account).await;
+            let marker_failed =
+                prior.is_err() || store.mark_disconnect_started(account).await.is_err();
+            (
+                prior.ok().and_then(AccountLifecycleMetadata::recovery),
+                marker_failed,
+            )
+        }
+        Ok(None) => (None, false),
+        Err(_) => (None, true),
+    };
     // load-under-permit: an in-flight sync may rotate the token; only the
     // permit serializes us behind it. Loading at BEGIN instead could revoke a
     // rotated-out stale token and miss the live one.
@@ -743,21 +795,38 @@ where
             }
         }
         (Ok(Some(_)), None) | (Err(_), _) => RevokeDisposition::Unconfirmed,
+        (Ok(None), _) if prior_recovery.is_some() => RevokeDisposition::Unconfirmed,
         (Ok(None), _) => RevokeDisposition::NotNeeded,
     };
-    // The token capability dies BEFORE any local-store work: opening the
-    // mailbox store can FAIL (corrupt DB, unavailable root key), and a
-    // pre-delete open failure must never abort the mandatory token delete —
-    // that would leave a usable credential behind. So delete first, then open
-    // and purge, mapping an open failure to `Purge` (post-delete, retryable).
     refresh_store
         .delete(account)
         .map_err(|_error| TeardownError::TokenDelete)?;
-    if let Some(store) = open_store().map_err(|_error| TeardownError::Purge)? {
+    let store = store.map_err(|_error| TeardownError::Purge)?;
+    if let Some(store) = store {
         store
             .purge_account(account)
             .await
             .map_err(|_error| TeardownError::Purge)?;
+        if marker_failed {
+            return Err(TeardownError::Purge);
+        }
+        match disposition {
+            RevokeDisposition::Unconfirmed => store
+                .mark_revoke_unconfirmed(account)
+                .await
+                .map_err(|_error| TeardownError::Purge)?,
+            RevokeDisposition::Confirmed | RevokeDisposition::NotNeeded => store
+                .clear_disconnect_recovery(account)
+                .await
+                .map_err(|_error| TeardownError::Purge)?,
+        }
+    }
+    // A missing persistent store is an allowed no-op for never-connected
+    // accounts. A store that existed but could not accept the pre-marker is
+    // fail-closed after token deletion, so a retry/relaunch never claims a
+    // clean teardown without durable evidence.
+    if marker_failed {
+        return Err(TeardownError::Purge);
     }
     Ok(disposition)
 }
@@ -778,13 +847,38 @@ async fn run_disconnect_teardown(account: &AccountId) -> Result<RevokeDispositio
     // failure (TLS/reqwest builder) becomes a SKIPPED revoke, exactly like a
     // failed token load — it must never gate the mandatory local teardown.
     let transport = GmailTokenTransport::new().ok();
-    // The mailbox store is opened LAZILY, AFTER the token delete inside
-    // `run_teardown_with`, so a store-open failure can never precede — and thus
-    // abort — the credential delete.
+    // The store is presence-checked before deletion only to persist recovery
+    // state; a failed open still never aborts mandatory credential deletion.
     run_teardown_with(account, &refresh_store, transport.as_ref(), || {
         open_default_mailbox_store_if_present(account)
     })
     .await
+}
+
+/// Reads content-free persisted lifecycle state without creating a store.
+///
+/// An absent database means this account has never stored local mailbox data,
+/// therefore it has neither durable recovery state nor sync freshness.
+///
+/// # Errors
+///
+/// Returns an opaque store error when the presence check, protected-store open,
+/// or metadata read cannot complete.
+pub fn lifecycle_metadata(
+    account: &AccountId,
+) -> Result<Option<AccountLifecycleMetadata>, MailboxStoreError> {
+    let Some(store) = open_default_mailbox_store_if_present(account)
+        .map_err(|_error| MailboxStoreError::Storage)?
+    else {
+        return Ok(None);
+    };
+    // The SQLCipher adapter's lifecycle operation is lazy but synchronous by
+    // construction; the worker is the only production caller and runs off the
+    // main thread. Runtime construction failure stays an opaque storage error.
+    let runtime = build_sync_runtime().map_err(|_error| MailboxStoreError::Storage)?;
+    runtime
+        .block_on(store.lifecycle_metadata(account))
+        .map(Some)
 }
 
 /// Spawns the disconnect worker for `account`: a plain thread that
@@ -895,15 +989,10 @@ where
             // retried disconnect or a process restart. Only a teardown FAILURE
             // keeps the fence set (fail-closed): the teardown is idempotent, so
             // a retried disconnect converges; a restart clears the in-memory
-            // flag. KNOWN GAP (not neutral): a retry after a PARTIAL teardown —
-            // delete ok, purge failed, revoke unconfirmed — reports plain
-            // SUCCEEDED because the token is gone (Ok(None)) by the retry. Since
-            // 3e-2a, the ABSENCE of the revoke-unconfirmed signal is an
-            // affirmative "revocation was fine" claim, which is FALSE here (the
-            // grant may still be live at Google). The in-process fix is a sticky
-            // per-slot `revoke_unconfirmed` bit OR'd into a later retry's
-            // disposition (3e-2b); cross-restart durability is the deferred F6
-            // marker. Bounded: the user saw the first attempt fail.
+            // flag. The durable lifecycle marker preserves incomplete or
+            // unconfirmed recovery across both retry and restart, so an absent
+            // token can never be misreported as proof that provider revoke was
+            // confirmed.
             if matches!(
                 outcome,
                 STATUS_SUCCEEDED | STATUS_SUCCEEDED_REVOKE_UNCONFIRMED
@@ -944,6 +1033,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use tersa_application::identity::{GateError, HasherError};
+    use tersa_application::lifecycle::AccountLifecycleMetadata;
     use tersa_application::mailbox::AccountId;
     use tersa_application::oauth::{
         AuthorizationConfig, AuthorizationGrant, SystemMonotonicClock, prepare_authorization,
@@ -1722,6 +1812,11 @@ mod tests {
     struct FakePurgeStore {
         purges: AtomicUsize,
         failing_purges: AtomicUsize,
+        lifecycle: std::sync::Mutex<AccountLifecycleMetadata>,
+        fail_marker: AtomicBool,
+        fail_freshness: AtomicBool,
+        freshness_writes: AtomicUsize,
+        log_lifecycle: AtomicBool,
         log: std::sync::Arc<OrderLog>,
     }
 
@@ -1730,6 +1825,11 @@ mod tests {
             Self {
                 purges: AtomicUsize::new(0),
                 failing_purges: AtomicUsize::new(0),
+                lifecycle: std::sync::Mutex::new(AccountLifecycleMetadata::default()),
+                fail_marker: AtomicBool::new(false),
+                fail_freshness: AtomicBool::new(false),
+                freshness_writes: AtomicUsize::new(0),
+                log_lifecycle: AtomicBool::new(false),
                 log,
             }
         }
@@ -1739,6 +1839,32 @@ mod tests {
         }
         fn purge_calls(&self) -> usize {
             self.purges.load(Ordering::SeqCst)
+        }
+        fn with_recovery(
+            self,
+            recovery: tersa_application::lifecycle::DisconnectRecoveryState,
+        ) -> Self {
+            *self.lifecycle.lock().unwrap() =
+                AccountLifecycleMetadata::new(Some(recovery), None).unwrap();
+            self
+        }
+        fn fail_marker(self) -> Self {
+            self.fail_marker.store(true, Ordering::SeqCst);
+            self
+        }
+        fn fail_freshness(self) -> Self {
+            self.fail_freshness.store(true, Ordering::SeqCst);
+            self
+        }
+        fn freshness_writes(&self) -> usize {
+            self.freshness_writes.load(Ordering::SeqCst)
+        }
+        fn with_lifecycle_log(self) -> Self {
+            self.log_lifecycle.store(true, Ordering::SeqCst);
+            self
+        }
+        fn recovery(&self) -> Option<tersa_application::lifecycle::DisconnectRecoveryState> {
+            self.lifecycle.lock().unwrap().recovery()
         }
     }
 
@@ -1763,6 +1889,102 @@ mod tests {
         }
     }
 
+    impl tersa_application::lifecycle::AccountLifecycleStore for FakePurgeStore {
+        fn lifecycle_metadata<'a>(
+            &'a self,
+            _account: &'a AccountId,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<
+                tersa_application::lifecycle::AccountLifecycleMetadata,
+                tersa_application::mailbox::MailboxStoreError,
+            >,
+        > {
+            Box::pin(async move { Ok(*self.lifecycle.lock().unwrap()) })
+        }
+        fn mark_disconnect_started<'a>(
+            &'a self,
+            _account: &'a AccountId,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::mailbox::MailboxStoreError>,
+        > {
+            Box::pin(async move {
+                if self.log_lifecycle.load(Ordering::SeqCst) {
+                    self.log.record("marker-start");
+                }
+                if self.fail_marker.load(Ordering::SeqCst) {
+                    return Err(tersa_application::mailbox::MailboxStoreError::Storage);
+                }
+                *self.lifecycle.lock().unwrap() = AccountLifecycleMetadata::new(
+                    Some(tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown),
+                    None,
+                )
+                .unwrap();
+                Ok(())
+            })
+        }
+        fn mark_revoke_unconfirmed<'a>(
+            &'a self,
+            _account: &'a AccountId,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::mailbox::MailboxStoreError>,
+        > {
+            Box::pin(async move {
+                if self.log_lifecycle.load(Ordering::SeqCst) {
+                    self.log.record("marker-unconfirmed");
+                }
+                *self.lifecycle.lock().unwrap() = AccountLifecycleMetadata::new(
+                    Some(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed),
+                    None,
+                )
+                .unwrap();
+                Ok(())
+            })
+        }
+        fn clear_disconnect_recovery<'a>(
+            &'a self,
+            _account: &'a AccountId,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::mailbox::MailboxStoreError>,
+        > {
+            Box::pin(async move {
+                if self.log_lifecycle.load(Ordering::SeqCst) {
+                    self.log.record("marker-clear");
+                }
+                *self.lifecycle.lock().unwrap() = AccountLifecycleMetadata::default();
+                Ok(())
+            })
+        }
+        fn record_successful_sync<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _unix_millis: i64,
+        ) -> tersa_application::mailbox::BoxFuture<
+            'a,
+            Result<(), tersa_application::mailbox::MailboxStoreError>,
+        > {
+            Box::pin(async move {
+                self.freshness_writes.fetch_add(1, Ordering::SeqCst);
+                if self.fail_freshness.load(Ordering::SeqCst) {
+                    return Err(tersa_application::mailbox::MailboxStoreError::Storage);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedWallClock(u64);
+
+    impl tersa_application::oauth::WallClock for FixedWallClock {
+        fn unix_time(&self) -> u64 {
+            self.0
+        }
+    }
+
     fn drive_teardown<S, T, P>(
         slot: &AccountId,
         refresh_store: &S,
@@ -1772,10 +1994,12 @@ mod tests {
     where
         S: tersa_keychain_macos::oauth_token::RefreshTokenStore,
         T: tersa_application::token::TokenTransport,
-        P: tersa_application::mailbox::AccountPurgeStore,
+        P: tersa_application::mailbox::AccountPurgeStore
+            + tersa_application::lifecycle::AccountLifecycleStore,
     {
         // Mirror the production call shape: an OPTIONAL transport (a `None`
-        // skips the revoke) and a LAZY store opener invoked AFTER the delete.
+        // skips the revoke) and a lazy store opener invoked before destructive
+        // work so it can persist the recovery marker.
         // The already-built fake is handed back by reference through the closure.
         test_runtime().block_on(super::run_teardown_with(
             slot,
@@ -1926,6 +2150,81 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_marker_precedes_delete_and_confirmed_revoke_clears_it() {
+        let slot = account("lifecycle-order");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log)).with_lifecycle_log();
+        assert!(matches!(
+            drive_teardown(&slot, &refresh, &transport, Some(&store)),
+            Ok(RevokeDisposition::Confirmed)
+        ));
+        assert_eq!(
+            log.steps(),
+            vec!["marker-start", "revoke", "delete", "purge", "marker-clear"]
+        );
+        assert_eq!(store.recovery(), None);
+    }
+
+    #[test]
+    fn successful_sync_clears_recovery_even_when_freshness_write_fails() {
+        let slot = account("lifecycle-sync-reconcile");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let store = FakePurgeStore::new(log)
+            .with_recovery(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed)
+            .fail_freshness();
+
+        assert!(
+            test_runtime()
+                .block_on(super::finalize_successful_sync(
+                    &store,
+                    &slot,
+                    &FixedWallClock(1_800_000_000),
+                ))
+                .is_ok(),
+            "freshness metadata must not fail a successful sync"
+        );
+
+        assert_eq!(store.recovery(), None);
+        assert_eq!(store.freshness_writes(), 1);
+    }
+
+    #[test]
+    fn retry_after_crash_preserves_unconfirmed_recovery_when_token_is_gone() {
+        let slot = account("lifecycle-retry");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh = FakeRefreshStore::empty(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log)).with_recovery(
+            tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown,
+        );
+        assert!(matches!(
+            drive_teardown(&slot, &refresh, &transport, Some(&store)),
+            Ok(RevokeDisposition::Unconfirmed)
+        ));
+        assert_eq!(
+            store.recovery(),
+            Some(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn marker_write_failure_deletes_capability_but_stays_fail_closed() {
+        let slot = account("lifecycle-marker-failure");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let refresh = FakeRefreshStore::with_token(std::sync::Arc::clone(&log));
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log));
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log)).fail_marker();
+        assert!(matches!(
+            drive_teardown(&slot, &refresh, &transport, Some(&store)),
+            Err(super::TeardownError::Purge)
+        ));
+        assert_eq!(refresh.stored_token(), None);
+        assert_eq!(store.recovery(), None);
+    }
+
+    #[test]
     fn teardown_with_a_failed_load_skips_the_revoke_and_still_tears_down() {
         // Err on load: whether a token lives at the provider is unknown, so
         // nothing is revoked — but the idempotent delete and the purge still
@@ -2052,12 +2351,10 @@ mod tests {
         // already ran), so no second revoke fires; delete is an idempotent
         // no-op; the purge succeeds.
         let second = drive_teardown(&slot, &refresh_store, &transport, Some(&purge_store));
-        // Nothing stored → NotNeeded: this is the accepted risk of the
-        // success-family fence clear — a retry after a PARTIAL teardown (delete
-        // ok, purge failed, revoke unconfirmed) reports the PLAIN success
-        // because the token is gone by the retry (durable revoke-memory is the
-        // deferred F6 marker, not this slice).
-        assert!(matches!(second, Ok(RevokeDisposition::NotNeeded)));
+        // The prior incomplete marker survives the failed purge. With no token
+        // left to submit, retry cannot prove provider revoke, so it remains
+        // revoke-unconfirmed rather than falsely downgrading to NotNeeded.
+        assert!(matches!(second, Ok(RevokeDisposition::Unconfirmed)));
         permit::clear_disconnecting(&slot);
         assert!(
             permit::try_acquire(&slot, None).is_some(),

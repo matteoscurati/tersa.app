@@ -17,6 +17,7 @@ struct RootView: View {
                 if let accountIdentifier = viewModel.connectedAccountIdentifier {
                     InboxView(
                         accountIdentifier: accountIdentifier,
+                        freshness: viewModel.mailboxFreshness,
                         onDisconnect: viewModel.disconnect
                     )
                 } else {
@@ -27,6 +28,9 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 480, minHeight: 360)
+        .onAppear {
+            viewModel.restorePersistedLifecycleOnLaunch()
+        }
         .onChange(of: viewModel.state) { oldState, newState in
             // A disconnect resolving to not-connected is announced by the
             // disconnect banner (the security-relevant "revoke unconfirmed" or
@@ -34,6 +38,12 @@ struct RootView: View {
             // here — two consecutive VoiceOver announcements interrupt each
             // other, and the banner's must win.
             if oldState == .disconnecting, newState == .notConnected {
+                return
+            }
+            if newState == .connected, viewModel.mailboxFreshness.isVisible {
+                AccessibilityNotification.Announcement(
+                    "Connected. " + viewModel.mailboxFreshness.message()
+                ).post()
                 return
             }
             announceConnectionState(newState)

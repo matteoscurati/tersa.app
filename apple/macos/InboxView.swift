@@ -12,6 +12,7 @@ import SwiftUI
 @MainActor
 struct InboxView: View {
     let accountIdentifier: Data
+    let freshness: MailboxFreshnessState
     let onDisconnect: () -> Void
 
     @State private var worker = MailboxReadWorker()
@@ -22,7 +23,12 @@ struct InboxView: View {
 
     var body: some View {
         NavigationStack {
-            content
+            VStack(spacing: 0) {
+                if freshness.isVisible {
+                    freshnessBanner
+                }
+                content
+            }
                 .navigationTitle("Inbox")
                 .navigationDestination(for: String.self) { threadId in
                     ThreadView(
@@ -72,6 +78,44 @@ struct InboxView: View {
         .onAppear(perform: loadInbox)
         .onChange(of: outcome) { _, newOutcome in
             announceOutcome(newOutcome)
+        }
+    }
+
+    private var freshnessBanner: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: freshnessIcon)
+                .foregroundStyle(freshnessColor)
+                .accessibilityHidden(true)
+            Text(freshness.message())
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(freshnessColor.opacity(0.12))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(freshness.accessibilityLabel)
+        .accessibilityValue(freshness.message())
+    }
+
+    private var freshnessIcon: String {
+        switch freshness {
+        case .offline:
+            return "wifi.slash"
+        case .fresh, .unknown:
+            return "checkmark.circle"
+        }
+    }
+
+    private var freshnessColor: Color {
+        switch freshness {
+        case .offline:
+            return .orange
+        case .fresh, .unknown:
+            return .secondary
         }
     }
 

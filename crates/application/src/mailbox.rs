@@ -305,6 +305,24 @@ pub trait MailboxReader: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
 }
 
+impl<T: MailboxReader + ?Sized> MailboxReader for &T {
+    fn list_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+        (**self).list_envelopes(account, limit)
+    }
+    fn thread_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        thread_id: &'a ThreadId,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+        (**self).thread_envelopes(account, thread_id, limit)
+    }
+}
+
 /// Persists mailbox data in a local store.
 ///
 /// Store mutations must be atomic and all-or-nothing. After dropping a future,
@@ -374,6 +392,47 @@ pub trait MailboxStore: MailboxReader {
         account: &'a AccountId,
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>>;
+}
+
+impl<T: MailboxStore + ?Sized> MailboxStore for &T {
+    fn upsert_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        envelopes: &'a [MessageEnvelope],
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).upsert_envelopes(account, envelopes)
+    }
+    fn put_message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message: &'a Message,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).put_message(account, message)
+    }
+    fn reconcile_recent_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        envelopes: &'a [MessageEnvelope],
+        keep_limit: StoreLimit,
+        fence: &'a IdentityHash,
+    ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+        (**self).reconcile_recent_envelopes(account, envelopes, keep_limit, fence)
+    }
+    fn cache_message_if_present<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message: &'a Message,
+        fence: &'a IdentityHash,
+    ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
+        (**self).cache_message_if_present(account, message, fence)
+    }
+    fn message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+        (**self).message(account, message_id)
+    }
 }
 
 /// Purges one account's local data on disconnect (OAuth consent withdrawal).
