@@ -27,10 +27,19 @@ def parse_identity(identity: str) -> tuple[str, str] | None:
     if " <" not in identity or not identity.endswith(">"):
         return None
     name, email = identity.rsplit(" <", 1)
+    name = name.strip()
     email = email[:-1]
-    if not name or not email:
+    if not name or "@" not in email:
         return None
     return name, email
+
+
+def ascii_fold(value: str) -> str:
+    """Fold only ASCII letters, matching Rust's ``eq_ignore_ascii_case``."""
+    return "".join(
+        chr(ord(character) + 32) if "A" <= character <= "Z" else character
+        for character in value
+    )
 
 
 def unsigned_commits(log: str) -> list[str]:
@@ -47,7 +56,7 @@ def unsigned_commits(log: str) -> list[str]:
         if not commit or not author_name or not author_email:
             raise DcoError("git log record contains an empty required field")
         signed_by_author = any(
-            signer_name == author_name and signer_email.casefold() == author_email.casefold()
+            signer_name == author_name and ascii_fold(signer_email) == ascii_fold(author_email)
             for signer in sign_offs.split(SIGNER_SEPARATOR)
             if (identity := parse_identity(signer)) is not None
             for signer_name, signer_email in (identity,)

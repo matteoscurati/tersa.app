@@ -72,6 +72,18 @@ class DcoTests(unittest.TestCase):
         log = record("abc123", "Ada", "ada@example.test", ["Ada ada@example.test"])
         self.assertEqual(MODULE.unsigned_commits(log), ["abc123"])
 
+    def test_email_without_at_sign_does_not_match(self) -> None:
+        log = record("abc123", "Ada", "invalid-email", ["Ada <invalid-email>"])
+        self.assertEqual(MODULE.unsigned_commits(log), ["abc123"])
+
+    def test_non_ascii_case_folding_does_not_match(self) -> None:
+        log = record("abc123", "Ada", "ada@\u212a.test", ["Ada <ada@k.test>"])
+        self.assertEqual(MODULE.unsigned_commits(log), ["abc123"])
+
+    def test_signer_name_is_trimmed_like_the_rust_checker(self) -> None:
+        log = record("abc123", "Ada", "ada@example.test", ["Ada   <ada@example.test>"])
+        self.assertEqual(MODULE.unsigned_commits(log), [])
+
 
 if __name__ == "__main__":
     unittest.main()
