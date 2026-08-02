@@ -861,9 +861,14 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
             .split_ascii_whitespace()
             .any(|granted| granted == GMAIL_READONLY_SCOPE)
     });
-    let id_token_claims = match parsed.id_token {
-        Some(id_token) => Some(parse_id_token_claims(id_token.as_str())?),
-        None => None,
+    // Scope is the earlier security boundary: an explicitly under-scoped
+    // response must reach lifecycle cleanup with its minted token handles even
+    // when the same response carries a malformed id_token. Identity is never
+    // consumed for a rejected scope, so parsing it here would only strand the
+    // provider grant before the caller can revoke it.
+    let id_token_claims = match (gmail_read_granted, parsed.id_token) {
+        (true, Some(id_token)) => Some(parse_id_token_claims(id_token.as_str())?),
+        (true, None) | (false, _) => None,
     };
     Ok(TokenResponse::new(
         parsed.access_token,
@@ -1949,6 +1954,19 @@ mod tests {
         let response = parse_token_response(fully_scoped)
             .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
         assert!(response.gmail_read_granted());
+    }
+
+    #[test]
+    fn under_scoped_response_preserves_tokens_despite_a_malformed_id_token() {
+        let under_scoped = br#"{"access_token":"access","expires_in":3599,"refresh_token":"refresh","token_type":"Bearer","scope":"openid","id_token":"malformed"}"#;
+        let (access, _expires, refresh, claims, gmail_read_granted) =
+            parse_token_response(under_scoped)
+                .unwrap_or_else(|error| panic!("expected an under-scoped response: {error:?}"))
+                .into_parts();
+        assert_eq!(access.as_str(), "access");
+        assert_eq!(refresh.as_deref().map(String::as_str), Some("refresh"));
+        assert!(claims.is_none());
+        assert!(!gmail_read_granted);
     }
 
     #[test]

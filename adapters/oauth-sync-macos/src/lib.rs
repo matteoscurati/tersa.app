@@ -1916,9 +1916,10 @@ mod token_lifecycle_tests {
     #[test]
     fn first_connect_with_insufficient_scope_revokes_and_stores_nothing() {
         let store = FakeRefreshStore::empty();
-        // Scope rejection must happen before identity validation: Google may
-        // omit the id_token on the same response, but the rejected first grant
-        // still needs to be revoked rather than stranded at the provider.
+        // The Gmail parser maps a malformed identity on an explicit
+        // under-scope response to no claims, preserving these token handles.
+        // Scope rejection must then happen before identity validation so the
+        // rejected first grant is revoked rather than stranded at the provider.
         let transport = FakeTransport::without_id_token().under_scoped();
         let error = drive(connect_account(
             &account(),
