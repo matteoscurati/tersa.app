@@ -384,9 +384,11 @@ verdict that the fence alone was the guarantee.)
     when Gmail access is not selected. The callback and token-response boundaries now
     reject any explicit scope set missing `gmail.readonly` before credential storage,
     carrying a distinct permission-required terminal to the macOS UI. The token-
-    response fallback preserves a zeroizing token handle through lifecycle cleanup so
-    a first-connect under-scope grant is revoked best-effort rather than stranded; an
-    absent scope field remains valid per OAuth. Isolating the
+    response fallback decides explicit under-scope before OIDC identity validation and
+    preserves zeroizing token handles through lifecycle cleanup, so a first-connect
+    under-scope grant is revoked best-effort rather than stranded and a rotated
+    under-scope refresh credential remains available for later revocation; an absent
+    scope field remains valid per OAuth. Isolating the
     network stack out of the minimal bootstrap bridge, the `extern "C"` sync-begin/poll
     FFI will live in a **separate crate** (not `apple/rust-bridge`), a later slice.
 

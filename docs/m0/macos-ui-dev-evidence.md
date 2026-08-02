@@ -3,7 +3,7 @@
 ## Current Apple Development capture — 2026-08-02
 
 The capture script built tracked Release/arm64 source at commit
-`37641bbdab6b29ada5cb55689e790c89f445455e`. It selected the one available
+`9fca00c81e09abf9db7e63ee8bcc7026afdbedea`. It selected the one available
 Apple Development identity and the one current matching Mac Development
 profile without printing either identifier. The resulting app used Hardened
 Runtime and the exact five committed production entitlements; no entitlement
@@ -31,9 +31,11 @@ an explicit `openid`-only scope after Gmail access was not selected; the owner
 then repeated consent and allowed Gmail read access. The resulting product fix
 rejects any explicit callback or token-response scope set missing
 `gmail.readonly`, stores no credential for that attempt, revokes a first-connect
-under-scoped token best-effort, and presents a specific permission-required
-recovery message. Scope values, credentials, account data, and mail metadata
-were not retained in this evidence.
+under-scoped token best-effort before attempting OIDC identity validation, and
+presents a specific permission-required recovery message. An under-scoped
+refresh also retains any rotated refresh token as the local revocation handle.
+Scope values, credentials, account data, and mail metadata were not retained in
+this evidence.
 
 This is development-only, explicitly non-gate evidence. It is not Developer ID,
 notarization, retained distribution evidence, or independent accessibility
