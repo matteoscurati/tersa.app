@@ -13,6 +13,14 @@
 //! a poisoned lock while still wiping resident sessions and keys so no
 //! verifier, state, or handle lingers in a map the broker will never trust
 //! again.
+//!
+//! Reaping happens ONLY at insert time, by deliberate design: with no timers,
+//! threads, or background tasks, up to [`MAX_PENDING_SESSIONS`] expired
+//! sessions can remain resident — their verifiers and state held in zeroizing
+//! memory — until the next insert reclaims them. That bounded residue is an
+//! accepted operational property, not a functional defect: capacity is
+//! recovered exactly when new demand arrives, and a session's absolute TTL
+//! still gates every claim independently of reaping.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -29,7 +37,7 @@ use crate::handle::SessionHandle;
 use crate::ports::SessionHandleEntropy;
 
 /// The explicit maximum of concurrently pending authorization sessions.
-const MAX_PENDING_SESSIONS: usize = 8;
+pub(crate) const MAX_PENDING_SESSIONS: usize = 8;
 
 /// The attempts to allocate a collision-free handle before failing closed.
 /// With 128 random bits a collision is already cryptographically negligible;
@@ -332,6 +340,11 @@ mod tests {
 
     #[test]
     fn expired_sessions_are_reaped_and_capacity_is_recovered() {
+        // Reaping is insert-time ONLY (an accepted, bounded operational
+        // property — see the module documentation): the expired sessions
+        // below stay resident in the registry until a later insert reclaims
+        // them. The completion path still never redeems one, because the
+        // session's own absolute TTL fails its `finish` after the claim.
         let registry = SessionRegistry::new();
         let clock = TestClock::default();
         let entropy = CounterEntropy::default();

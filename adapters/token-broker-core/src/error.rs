@@ -37,14 +37,19 @@ pub enum BrokerError {
     SessionUnknown,
     /// The provider rejected the request or the authorization attempt with an
     /// error other than a refresh-time `invalid_grant` (which is
-    /// [`Self::ConsentRevoked`]). An exchange-time `invalid_grant` (a stale,
-    /// already redeemed, or mismatched authorization code) also surfaces here:
-    /// nothing is stored on the exchange path, so the answer is
-    /// non-destructive and never a deletion license. The token layer keeps
-    /// that terminal distinct as `TokenError::AuthorizationCodeRejected`; the
-    /// sign-in-expired recovery distinction is a point-3 XPC/status concern
-    /// (ADR-0024), deliberately not part of this closed vocabulary.
+    /// [`Self::ConsentRevoked`]) or an exchange-time `invalid_grant` (which
+    /// is [`Self::AuthorizationCodeRejected`]).
     ProviderRejected,
+    /// The provider rejected the authorization code at exchange time with an
+    /// `invalid_grant` answer: the code was stale, already redeemed, or
+    /// mismatched, so the sign-in itself lapsed. Non-destructive: nothing is
+    /// stored on the exchange path, so this is never a deletion license and
+    /// never [`Self::ConsentRevoked`]. The broker keeps this terminal distinct
+    /// from [`Self::ProviderRejected`] so the point-3 XPC/status mapping can
+    /// route it to the existing closed v1 sign-in-expired status with the
+    /// "sign in again" recovery (ADR-0024); it widens neither the broker
+    /// surface beyond this closed variant nor the wire protocol.
+    AuthorizationCodeRejected,
     /// The token or revocation endpoint could not be reached.
     Transport,
     /// A provider response did not parse into a complete, bounded token
@@ -80,8 +85,8 @@ pub enum BrokerError {
     /// stored refresh token expired. The stored token was deleted; re-connect
     /// is required. An exchange-time `invalid_grant` (a stale or used
     /// authorization code) never produces this variant — it surfaces as
-    /// [`Self::ProviderRejected`] because no stored credential exists to
-    /// delete.
+    /// [`Self::AuthorizationCodeRejected`] because no stored credential
+    /// exists to delete.
     ConsentRevoked,
     /// The refresh-token store rejected a read, write, or delete. On a
     /// persistence-first path the broker fails closed rather than reporting a
@@ -105,6 +110,7 @@ impl fmt::Display for BrokerError {
             Self::Busy => "a bounded broker resource is momentarily exhausted",
             Self::SessionUnknown => "the authorization session is unknown, expired, or consumed",
             Self::ProviderRejected => "the OAuth provider rejected the request",
+            Self::AuthorizationCodeRejected => "the authorization code was rejected; sign in again",
             Self::Transport => "the provider endpoint could not be reached",
             Self::MalformedResponse => "the provider returned an unusable response",
             Self::InsufficientScope => "the grant omitted Gmail read access",
@@ -134,6 +140,7 @@ mod tests {
             BrokerError::Busy,
             BrokerError::SessionUnknown,
             BrokerError::ProviderRejected,
+            BrokerError::AuthorizationCodeRejected,
             BrokerError::Transport,
             BrokerError::MalformedResponse,
             BrokerError::InsufficientScope,

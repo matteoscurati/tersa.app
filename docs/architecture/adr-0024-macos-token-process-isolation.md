@@ -148,7 +148,7 @@ refresh-token store port, revoke/delete separation, zeroizing public token
 results, and a closed error surface. It deliberately contains no
 Security.framework/Keychain code, no C ABI, and no IPC.
 
-Two operational properties of that core are recorded here for the later
+Three operational properties of that core are recorded here for the later
 service integration. First, Google's revocation endpoint is grant-wide:
 revoking any one token of a grant revokes every token minted for the same
 Google user and OAuth client. The core therefore runs its stranded-grant
@@ -159,7 +159,16 @@ invisible to it, so an empty-snapshot cleanup revoke can still invalidate
 that other install's grant. This residual risk is accepted for the
 best-effort cleanup; an unconditional revoke on every failed completion was
 rejected precisely because it would multiply such cross-install damage.
-Second, the core enforces a hard 1,024-byte bound on provider-minted refresh
+Second, an explicitly under-scoped first-connect completion
+(`InsufficientScope`) is deliberately non-destructive: the broker persists
+nothing and revokes nothing, because the under-scoped outcome carries no
+validated identity and no subject-keyed snapshot exists to gate a
+grant-wide revoke. The accepted cost is that this path can leave a live
+under-scoped grant at Google, and the app CANNOT revoke it in-app — the
+minted tokens were dropped and there is no validated subject or stored
+credential to revoke against. The only remedies are the point-3 UI recovery
+below (retain-or-retry, or external manual revocation). Third, the core
+enforces a hard 1,024-byte bound on provider-minted refresh
 tokens, and Google documents no maximum length. A rotation exceeding the
 bound is rejected as `MalformedResponse` before any persistence or revoke
 input, so the failure mode is a visible terminal error, never a truncation
@@ -168,7 +177,7 @@ or a partial write. Monitoring should read a sustained rise in refresh-path
 the bound — a signal to review the constant — not only as response
 corruption.
 
-A third, forward-looking constraint is recorded for the point-3 service
+A fourth, forward-looking constraint is recorded for the point-3 service
 integration as a design and acceptance requirement, not as implemented
 behavior. The version-1 protocol surface is deliberately closed at five
 status codes, and the broker core's public error vocabulary is likewise
@@ -179,13 +188,22 @@ each: an unconfirmed provider revocation (`RevokeUnconfirmed`) stays
 visibly distinct from a clean teardown so the app can direct the user to
 revoke the grant manually in their Google account settings; an explicitly
 under-scoped grant (`InsufficientScope`) keeps its own recovery naming the
-Gmail consent that must be allowed on retry; a revoked consent and a
+Gmail consent that must be allowed on retry, AND — because the broker
+deliberately persists and revokes nothing on that path and can leave a live
+under-scoped grant at Google that the app cannot revoke (see the second
+operational property above) — must also offer retain-or-retry recovery and
+direct the user to their Google account-permissions page for external
+manual revocation; a revoked consent and a
 missing refresh token (`ConsentRevoked`, `MissingRefreshToken`) route to
 re-connect after the destructive local deletion the former licenses; and
 an exchange-time authorization-code rejection — the token layer's
 `AuthorizationCodeRejected`, a stale, already redeemed, or mismatched
-code — surfaces as the sign-in-expired outcome with the "sign in again"
-recovery, never as an opaque retryable failure and never as a claim that a
+code, which the broker core preserves as its own closed
+`BrokerError::AuthorizationCodeRejected` variant so the XPC mapping can
+route it without guessing — surfaces as the existing closed v1
+sign-in-expired status with the "sign in again"
+recovery, never as an opaque retryable failure, never folded into the
+ordinary provider-rejected status, and never as a claim that a
 stored credential was deleted (none exists on that path). Collapsing any
 of these into one opaque failure code, or widening the wire surface into
 an open-ended error channel to express them, fails acceptance.

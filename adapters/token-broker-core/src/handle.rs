@@ -38,7 +38,12 @@ impl SessionHandle {
     /// Returns [`BrokerError::Unavailable`] when the entropy source fails.
     pub(crate) fn generate<E: SessionHandleEntropy>(entropy: &E) -> Result<Self, BrokerError> {
         let bytes = Zeroizing::new(entropy.handle_bytes()?);
-        Ok(Self(Zeroizing::new(URL_SAFE_NO_PAD.encode(*bytes))))
+        // Encode through a borrowed slice: passing `*bytes` by value would
+        // create an unwiped 16-byte stack copy of the handle entropy, leaving
+        // the zeroizing buffer no longer the only explicit byte storage.
+        Ok(Self(Zeroizing::new(
+            URL_SAFE_NO_PAD.encode(bytes.as_slice()),
+        )))
     }
 
     /// Validates handle text previously returned by

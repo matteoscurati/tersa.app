@@ -47,6 +47,11 @@
 //! - Success values carry only a zeroizing access token, a zeroizing subject,
 //!   and a bounded positive expiry; every `Debug`/`Display` redacts
 //!   account-identifying and secret-bearing values.
+//! - The closed broker error vocabulary keeps an exchange-time
+//!   authorization-code rejection (`BrokerError::AuthorizationCodeRejected` —
+//!   the sign-in lapsed) distinct from an ordinary provider rejection, so the
+//!   point-3 XPC/status mapping can route it to the existing closed v1
+//!   sign-in-expired status (ADR-0024).
 
 #![forbid(unsafe_code)]
 
