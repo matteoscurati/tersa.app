@@ -17,6 +17,8 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-ui-evidence.XXXXXX")"
 SOURCE="$SCRATCH/source"
 RESOLVED_ENTITLEMENTS="$SCRATCH/resolved.entitlements.plist"
 EMBEDDED_ENTITLEMENTS="$SCRATCH/embedded.entitlements.plist"
+TEAM_PROBE_SOURCE="$SCRATCH/tersa-team-probe.c"
+TEAM_PROBE="$SCRATCH/tersa-team-probe"
 SANDBOX_CANARY_APP="$SCRATCH/Tersa Sandbox Canary.app"
 SANDBOX_CANARY="$SANDBOX_CANARY_APP/Contents/MacOS/tersa-sandbox-write-canary"
 UNSANDBOXED_CANARY="$SCRATCH/tersa-sandbox-write-canary-unsandboxed"
@@ -43,6 +45,20 @@ IDENTITY_COUNT="$(printf '%s\n' "$IDENTITIES" | awk 'NF { count += 1 } END { pri
 IDENTITY_HASH="$(printf '%s\n' "$IDENTITIES" | awk 'NF { print $1 }')"
 [ -n "$IDENTITY_HASH" ] || fail 'the Apple Development identity is incomplete'
 
+# Resolve the effective Team Identifier BEFORE the unsigned Xcode build. The
+# Rust adapters compile TERSA_MACOS_APP_GROUP into the binary, so deriving the
+# team only after the build would sign one group while the adapters address the
+# unprefixed app.tersa.shared group at runtime.
+cat >"$TEAM_PROBE_SOURCE" <<'TEAM_PROBE_C'
+int main(void) { return 0; }
+TEAM_PROBE_C
+cc "$TEAM_PROBE_SOURCE" -o "$TEAM_PROBE"
+codesign -s "$IDENTITY_HASH" --force --options runtime --timestamp=none \
+  "$TEAM_PROBE" >/dev/null 2>&1
+TEAM_ID="$(codesign -dv --verbose=4 "$TEAM_PROBE" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+printf '%s\n' "$TEAM_ID" | grep -qE '^[A-Z0-9]{10}$' \
+  || fail 'the effective Apple Development team identifier is unavailable'
+
 mkdir -p "$SOURCE" "$BUILD_DIR"
 git archive --format=tar --output="$SCRATCH/source.tar" "$COMMIT"
 tar -xf "$SCRATCH/source.tar" -C "$SOURCE"
@@ -56,22 +72,22 @@ printf 'signing_tier=Apple Development (identity and team redacted)\n'
 
 section 'Build tracked Release source'
 sh apple/scripts/generate-project.sh >/dev/null
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac -configuration Release \
-  -destination 'platform=macOS,arch=arm64' -derivedDataPath "$DERIVED" \
-  CODE_SIGNING_ALLOWED=NO \
-  TERSA_OAUTH_CLIENT_ID="${TERSA_OAUTH_CLIENT_ID:-public-development-evidence.apps.googleusercontent.com}" \
-  TERSA_OAUTH_REDIRECT_SCHEME="${TERSA_OAUTH_REDIRECT_SCHEME:-app.tersa.oauth.development-evidence}" \
-  build >/dev/null
+set -- -project apple/Tersa.xcodeproj -scheme TersaMac -configuration Release \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath "$DERIVED"
+if [ -f "$ROOT/apple/local.xcconfig" ]; then
+  set -- "$@" -xcconfig "$ROOT/apple/local.xcconfig"
+else
+  set -- "$@" \
+    TERSA_OAUTH_CLIENT_ID="${TERSA_OAUTH_CLIENT_ID:-public-development-evidence.apps.googleusercontent.com}" \
+    TERSA_OAUTH_REDIRECT_SCHEME="${TERSA_OAUTH_REDIRECT_SCHEME:-app.tersa.oauth.development-evidence}"
+fi
+set -- "$@" CODE_SIGNING_ALLOWED=NO \
+  TERSA_MACOS_APP_GROUP="$TEAM_ID.app.tersa.shared"
+xcodebuild "$@" build >/dev/null
 printf 'unsigned_build=ok\n'
-
-# Derive the effective Team Identifier from a first, entitlement-free signature.
-# The human-readable certificate label is not authoritative and may contain a
-# different parenthesized account identifier on development certificates.
-codesign -s "$IDENTITY_HASH" --force --options runtime --timestamp=none \
-  "$APP" >/dev/null 2>&1
-TEAM_ID="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
-printf '%s\n' "$TEAM_ID" | grep -qE '^[A-Z0-9]{10}$' \
-  || fail 'the effective Apple Development team identifier is unavailable'
+LC_ALL=C grep -aFq "$TEAM_ID.app.tersa.shared" "$APP/Contents/MacOS/Tersa" \
+  || fail 'the Rust binary did not compile the team-prefixed App Group'
+printf 'compiled_application_group=matches signing team (identifier redacted)\n'
 
 PROFILE_MATCH=''
 PROFILE_COUNT=0
