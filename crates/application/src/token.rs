@@ -396,12 +396,14 @@ const MAX_SUBJECT_LEN: usize = 255;
 ///
 /// The transport parses the response body; this value never holds wire bytes
 /// or JSON. The optional refresh token models provider rotation. The optional
-/// identity claims are present when the response carried an `id_token`.
+/// identity claims are present when the response carried an `id_token`. The
+/// Gmail-scope verdict preserves only a boolean, never the provider scope text.
 pub struct TokenResponse {
     access_token: Zeroizing<String>,
     expires_in: Duration,
     rotated_refresh_token: Option<Zeroizing<String>>,
     id_token_claims: Option<IdTokenClaims>,
+    gmail_read_granted: bool,
 }
 
 impl TokenResponse {
@@ -418,6 +420,25 @@ impl TokenResponse {
             expires_in,
             rotated_refresh_token,
             id_token_claims,
+            gmail_read_granted: true,
+        }
+    }
+
+    /// Creates a token response with the transport's explicit Gmail-scope verdict.
+    #[must_use]
+    pub fn new_with_gmail_read_grant(
+        access_token: Zeroizing<String>,
+        expires_in: Duration,
+        rotated_refresh_token: Option<Zeroizing<String>>,
+        id_token_claims: Option<IdTokenClaims>,
+        gmail_read_granted: bool,
+    ) -> Self {
+        Self {
+            access_token,
+            expires_in,
+            rotated_refresh_token,
+            id_token_claims,
+            gmail_read_granted,
         }
     }
 
@@ -442,6 +463,12 @@ impl TokenResponse {
         self.rotated_refresh_token.as_ref()
     }
 
+    /// Returns whether the explicit token response scope included Gmail read access.
+    #[must_use]
+    pub fn gmail_read_granted(&self) -> bool {
+        self.gmail_read_granted
+    }
+
     /// Separates the response into its owned fields.
     #[must_use]
     pub fn into_parts(
@@ -451,12 +478,14 @@ impl TokenResponse {
         Duration,
         Option<Zeroizing<String>>,
         Option<IdTokenClaims>,
+        bool,
     ) {
         (
             self.access_token,
             self.expires_in,
             self.rotated_refresh_token,
             self.id_token_claims,
+            self.gmail_read_granted,
         )
     }
 }
@@ -475,6 +504,7 @@ impl fmt::Debug for TokenResponse {
                     .map(|_token| "[REDACTED]"),
             )
             .field("id_token_claims", &self.id_token_claims)
+            .field("gmail_read_granted", &self.gmail_read_granted)
             .finish()
     }
 }
@@ -544,8 +574,6 @@ pub enum TokenTransportError {
     ProviderRejected,
     /// The response did not parse into a complete token response.
     MalformedResponse,
-    /// The success response explicitly omitted Gmail read access.
-    InsufficientScope,
 }
 
 impl fmt::Display for TokenTransportError {
@@ -555,7 +583,6 @@ impl fmt::Display for TokenTransportError {
             Self::InvalidGrant => "the token endpoint reported an invalid grant",
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
-            Self::InsufficientScope => "the token endpoint omitted Gmail read access",
         };
         formatter.write_str(message)
     }
@@ -657,8 +684,8 @@ impl fmt::Debug for AccessToken {
     }
 }
 
-/// Carries a granted access token, any rotated refresh token, and the validated
-/// account subject.
+/// Carries a granted access token, any rotated refresh token, the validated
+/// account subject, and the Gmail-scope verdict.
 ///
 /// A validated [`AccountSubject`] is MANDATORY to construct: a token op that
 /// yields an access token but no verified `sub` fails entirely
@@ -671,6 +698,7 @@ pub struct TokenSuccess {
     rotated_refresh_token: Option<Zeroizing<String>>,
     subject: AccountSubject,
     identity_expiry: IdentityExpiry,
+    gmail_read_granted: bool,
 }
 
 impl TokenSuccess {
@@ -679,7 +707,7 @@ impl TokenSuccess {
         now: Duration,
         config: &TokenClientConfig,
     ) -> Result<Self, TokenError> {
-        let (access_token, expires_in, rotated_refresh_token, id_token_claims) =
+        let (access_token, expires_in, rotated_refresh_token, id_token_claims, gmail_read_granted) =
             response.into_parts();
         if access_token.is_empty() {
             return Err(TokenError::MalformedResponse);
@@ -698,6 +726,7 @@ impl TokenSuccess {
             rotated_refresh_token,
             subject,
             identity_expiry,
+            gmail_read_granted,
         })
     }
 
@@ -729,6 +758,12 @@ impl TokenSuccess {
         self.rotated_refresh_token.as_ref()
     }
 
+    /// Returns whether the provider's explicit scope set included Gmail read access.
+    #[must_use]
+    pub fn gmail_read_granted(&self) -> bool {
+        self.gmail_read_granted
+    }
+
     /// Separates the access token, any rotated refresh token, the subject, and the
     /// identity freshness window.
     #[must_use]
@@ -739,12 +774,14 @@ impl TokenSuccess {
         Option<Zeroizing<String>>,
         AccountSubject,
         IdentityExpiry,
+        bool,
     ) {
         (
             self.access_token,
             self.rotated_refresh_token,
             self.subject,
             self.identity_expiry,
+            self.gmail_read_granted,
         )
     }
 }
@@ -810,6 +847,7 @@ impl fmt::Debug for TokenSuccess {
             )
             .field("subject", &self.subject)
             .field("identity_expiry", &self.identity_expiry)
+            .field("gmail_read_granted", &self.gmail_read_granted)
             .finish()
     }
 }
@@ -878,7 +916,6 @@ fn map_transport_error(error: TokenTransportError) -> TokenError {
         TokenTransportError::InvalidGrant => TokenError::ConsentRevoked,
         TokenTransportError::ProviderRejected => TokenError::ProviderRejected,
         TokenTransportError::MalformedResponse => TokenError::MalformedResponse,
-        TokenTransportError::InsufficientScope => TokenError::InsufficientScope,
     }
 }
 
@@ -1542,7 +1579,7 @@ mod tests {
             &clock,
         ))
         .unwrap();
-        let (access_token, rotated, subject, expiry) = success.into_parts();
+        let (access_token, rotated, subject, expiry, gmail_read_granted) = success.into_parts();
         assert_eq!(subject.as_str(), TEST_SUBJECT);
         assert_eq!(
             expiry,
@@ -1550,6 +1587,7 @@ mod tests {
         );
         assert_eq!(access_token.secret().as_str(), "fake-access-token");
         assert_eq!(access_token.expires_at(), Duration::from_secs(3_600));
+        assert!(gmail_read_granted);
         assert_eq!(
             rotated.as_ref().map(|token| token.as_str()),
             Some("rotated-refresh-token")
@@ -1607,10 +1645,6 @@ mod tests {
             (
                 TokenTransportError::MalformedResponse,
                 TokenError::MalformedResponse,
-            ),
-            (
-                TokenTransportError::InsufficientScope,
-                TokenError::InsufficientScope,
             ),
         ];
         let grant = make_grant("exchange-code");

@@ -23,7 +23,22 @@ SANDBOX_CANARY_APP="$SCRATCH/Tersa Sandbox Canary.app"
 SANDBOX_CANARY="$SANDBOX_CANARY_APP/Contents/MacOS/tersa-sandbox-write-canary"
 UNSANDBOXED_CANARY="$SCRATCH/tersa-sandbox-write-canary-unsandboxed"
 CANARY_DESTINATION="$BUILD_DIR/outside-sandbox-write-canary"
-trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
+APP_PID=''
+
+cleanup() {
+  if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+    kill -TERM "$APP_PID" 2>/dev/null || true
+    cleanup_attempt=0
+    while kill -0 "$APP_PID" 2>/dev/null && [ "$cleanup_attempt" -lt 20 ]; do
+      cleanup_attempt=$((cleanup_attempt + 1))
+      sleep 0.1
+    done
+    kill -KILL "$APP_PID" 2>/dev/null || true
+  fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 section() { printf '\n== %s ==\n' "$1"; }
 fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -165,11 +180,18 @@ APP_BYTES="$(find "$APP" -type f -exec stat -f%z {} + | awk '{ total += $1 } END
 printf 'installed_app_bytes=%s\n' "$APP_BYTES"
 
 section 'Launch'
+PRE_LAUNCH_PIDS="$SCRATCH/pre-launch-pids"
+pgrep -f "$APP/Contents/MacOS/Tersa" 2>/dev/null | sort -n >"$PRE_LAUNCH_PIDS" || :
 open -n "$APP" >/dev/null 2>&1 || fail 'LaunchServices rejected the signed application'
-APP_PID=''
 attempt=0
 while [ "$attempt" -lt 20 ]; do
-  APP_PID="$(pgrep -f "$APP/Contents/MacOS/Tersa" | head -1 || true)"
+  CANDIDATE_PIDS="$(pgrep -f "$APP/Contents/MacOS/Tersa" 2>/dev/null || true)"
+  for candidate in $CANDIDATE_PIDS; do
+    if ! grep -qx "$candidate" "$PRE_LAUNCH_PIDS"; then
+      APP_PID="$candidate"
+      break
+    fi
+  done
   [ -n "$APP_PID" ] && break
   attempt=$((attempt + 1))
   sleep 0.25
@@ -178,7 +200,7 @@ done
 kill -0 "$APP_PID" 2>/dev/null || fail 'the signed application exited during launch'
 printf 'launch=ok\n'
 [ -d "$HOME/Library/Containers/app.tersa.mac" ] \
-  || fail 'the App Sandbox container was not materialized'
+  || fail 'the App Sandbox container is unavailable'
 printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\n'
 
 section 'App Sandbox denial'

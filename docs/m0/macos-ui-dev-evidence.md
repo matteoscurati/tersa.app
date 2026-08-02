@@ -30,9 +30,10 @@ The live run used the same full production entitlement set. Google first returne
 an explicit `openid`-only scope after Gmail access was not selected; the owner
 then repeated consent and allowed Gmail read access. The resulting product fix
 rejects any explicit callback or token-response scope set missing
-`gmail.readonly`, stores no credential for that attempt, and presents a specific
-permission-required recovery message. Scope values, credentials, account data,
-and mail metadata were not retained in this evidence.
+`gmail.readonly`, stores no credential for that attempt, revokes a first-connect
+under-scoped token best-effort, and presents a specific permission-required
+recovery message. Scope values, credentials, account data, and mail metadata
+were not retained in this evidence.
 
 This is development-only, explicitly non-gate evidence. It is not Developer ID,
 notarization, retained distribution evidence, or independent accessibility
