@@ -3913,72 +3913,10 @@ fn swift_raw_string_starts_at(bytes: &[u8], start: usize) -> bool {
     matches!(bytes.get(start + hashes), Some(b'\"'))
 }
 
-/// Replaces Swift comments with spaces while preserving string-literal bytes
-/// and newlines. Comment markers inside ordinary or multiline string literals
-/// are not treated as comments, so executable string contents remain visible
-/// for exact literal and assignment pins.
-fn strip_swift_comments(document: &str) -> String {
-    let mut output = Vec::with_capacity(document.len());
-    let bytes = document.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let start = index;
-        if bytes[index..].starts_with(b"//") {
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            for byte in &bytes[start..index] {
-                output.push(if *byte == b'\n' { b'\n' } else { b' ' });
-            }
-        } else if bytes[index..].starts_with(b"/*") {
-            index += 2;
-            let mut depth = 1;
-            while index < bytes.len() && depth != 0 {
-                if bytes[index..].starts_with(b"/*") {
-                    depth += 1;
-                    index += 2;
-                } else if bytes[index..].starts_with(b"*/") {
-                    depth -= 1;
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            for byte in &bytes[start..index] {
-                output.push(if *byte == b'\n' { b'\n' } else { b' ' });
-            }
-        } else if bytes[index..].starts_with(b"\"\"\"") {
-            index += 3;
-            while index < bytes.len() && !bytes[index..].starts_with(b"\"\"\"") {
-                index += 1;
-            }
-            index = (index + 3).min(bytes.len());
-            output.extend_from_slice(&bytes[start..index]);
-        } else if bytes[index] == b'"' {
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    index = (index + 2).min(bytes.len());
-                } else {
-                    let done = bytes[index] == b'"';
-                    index += 1;
-                    if done {
-                        break;
-                    }
-                }
-            }
-            output.extend_from_slice(&bytes[start..index.min(bytes.len())]);
-        } else {
-            output.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(output).expect("masking valid Swift comments preserves UTF-8")
-}
-
-/// Swift has the same comment forms as Rust, plus multiline string literals.
-/// Mask them before applying the deliberately textual inventory rules.
+/// Swift has the same comment forms as Rust, plus ordinary, multiline, and raw
+/// string literals. Masks comments and string literals with spaces while
+/// preserving newlines and byte offsets, so executable-declaration pins can map
+/// back into the original document without accepting string or comment decoys.
 fn strip_swift_non_code(document: &str) -> String {
     let mut output = Vec::with_capacity(document.len());
     let bytes = document.as_bytes();
@@ -4006,6 +3944,8 @@ fn strip_swift_non_code(document: &str) -> String {
                 }
             }
             index
+        } else if swift_raw_string_starts_at(bytes, index) {
+            consume_swift_raw_string_end(bytes, index)
         } else if bytes[index..].starts_with(b"\"\"\"") {
             index += 3;
             while index < bytes.len() && !bytes[index..].starts_with(b"\"\"\"") {
@@ -4032,11 +3972,46 @@ fn strip_swift_non_code(document: &str) -> String {
             index += 1;
             continue;
         };
+        index = end;
         for byte in &bytes[start..end] {
             output.push(if *byte == b'\n' { b'\n' } else { b' ' });
         }
     }
     String::from_utf8(output).expect("masking valid Swift source preserves UTF-8")
+}
+
+/// Advance past a Swift raw string literal starting at `start` (`#"..."#`,
+/// `#"""..."""#`, or with more hash delimiters). Unclosed literals consume
+/// through end-of-input so their body cannot be treated as executable code.
+fn consume_swift_raw_string_end(bytes: &[u8], start: usize) -> usize {
+    let hashes = bytes[start..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    let after_hashes = start + hashes;
+    let multiline = bytes[after_hashes..].starts_with(b"\"\"\"");
+    let mut index = after_hashes + if multiline { 3 } else { 1 };
+    while index < bytes.len() {
+        if multiline {
+            if bytes[index..].starts_with(b"\"\"\"")
+                && bytes[index + 3..].len() >= hashes
+                && bytes[index + 3..index + 3 + hashes]
+                    .iter()
+                    .all(|byte| *byte == b'#')
+            {
+                return index + 3 + hashes;
+            }
+        } else if bytes[index] == b'"'
+            && bytes[index + 1..].len() >= hashes
+            && bytes[index + 1..index + 1 + hashes]
+                .iter()
+                .all(|byte| *byte == b'#')
+        {
+            return index + 1 + hashes;
+        }
+        index += 1;
+    }
+    bytes.len()
 }
 
 fn swift_function_names_with(document: &str, needle: &str) -> Vec<String> {
@@ -5697,6 +5672,7 @@ fn scan_token_broker_source_files(
         let code = strip_swift_non_code(document);
         aggregate.push_str(&code);
         aggregate.push('\n');
+        violations.extend(token_broker_type_shadowing_violations(path_str, &code));
         if path_str == REVIEWED_TOKEN_BROKER_PROTOCOL_PATH {
             protocol_file_has_version_assignment =
                 has_exact_token_broker_protocol_version_assignment(&code);
@@ -6000,41 +5976,67 @@ fn consume_swift_type_end(code: &str, mut index: usize) -> usize {
     index
 }
 
-/// Pin the reviewed requirement literal and its exact constant assignment on
-/// comment-stripped Swift (string bytes preserved) so a doc-comment decoy
-/// cannot satisfy either check while executable code uses a weakened value.
-/// Pin the exact `newConnection.setCodeSigningRequirement(Self.<constant>)`
-/// call on comment/string-stripped Swift so documentation mentions cannot
-/// satisfy or inflate the executable call count.
+/// Fail closed unless inventoried broker Swift has no executable `typealias`
+/// and does not declare a local type named `String`. The closed protocol
+/// allowlist matches textual `String`; a module-scope alias or type named
+/// `String` would otherwise rebind every wire value (for example to `Data`).
+/// Comments and string literals are already masked by the caller.
+fn token_broker_type_shadowing_violations(path: &str, code: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    if contains_identifier(code, "typealias") {
+        violations.push(format!(
+            "{path} must not declare `typealias` in inventoried token-broker sources"
+        ));
+    }
+    for keyword in ["struct", "class", "enum", "actor", "protocol"] {
+        for (start, _) in code.match_indices(keyword) {
+            if !is_identifier_at(code, start, keyword) {
+                continue;
+            }
+            let name_start = skip_ascii_whitespace(code, start + keyword.len());
+            if code[name_start..].starts_with("String")
+                && is_identifier_at(code, name_start, "String")
+            {
+                violations.push(format!(
+                    "{path} must not shadow `String` with a local type declaration in inventoried token-broker sources"
+                ));
+                break;
+            }
+        }
+    }
+    violations
+}
+
+/// Pin the reviewed requirement literal via the single executable
+/// `static let <constant> =` declaration (comment/string-stripped offsets map
+/// back into the original document). String/comment decoys and weakened
+/// executable values therefore cannot satisfy the pin. Also pin the exact
+/// `newConnection.setCodeSigningRequirement(Self.<constant>)` call on
+/// executable code so documentation mentions cannot satisfy or inflate the
+/// call count.
 fn token_broker_code_signing_requirement_violations(document: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let path = REVIEWED_TOKEN_BROKER_LISTENER_PATH;
+    let constant = REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CONSTANT;
     let swift_string = format!(
         "\"{}\"",
         REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_LITERAL.replace('\"', "\\\"")
     );
-    // Literal and assignment: comments masked, string-literal bytes preserved.
-    let comments_stripped = strip_swift_comments(document);
-    if comments_stripped.matches(&swift_string).count() != 1 {
-        violations.push(format!(
-            "{path} must declare the exact reviewed code-signing requirement literal"
-        ));
-    }
-    let constant = REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CONSTANT;
-    let assignment_compact =
-        rust_token_canonical(&format!("static let {constant} = {swift_string}"));
-    let compact_comments_stripped = rust_token_canonical(&comments_stripped);
-    if compact_comments_stripped
-        .matches(&assignment_compact)
-        .count()
-        != 1
-    {
+    // Comments and strings masked; offsets match the original document.
+    let code = strip_swift_non_code(document);
+    let declaration_starts = executable_static_let_assignment_starts(&code, constant);
+    let has_exact_assignment = declaration_starts.len() == 1
+        && exact_token_broker_code_signing_requirement_assignment_at(
+            document,
+            declaration_starts[0],
+            constant,
+            &swift_string,
+        );
+    if !has_exact_assignment {
         violations.push(format!(
             "{path} must assign the reviewed code-signing requirement literal to `{constant}`"
         ));
     }
-    // Call marker and exact call: executable code only (comments/strings masked).
-    let code = strip_swift_non_code(document);
     if identifier_occurrence_count(&code, "setCodeSigningRequirement") != 1 {
         violations.push(format!(
             "{path} must call setCodeSigningRequirement exactly once"
@@ -6048,6 +6050,83 @@ fn token_broker_code_signing_requirement_violations(document: &str) -> Vec<Strin
         ));
     }
     violations
+}
+
+/// Offsets of every executable `static let <constant> =` declaration prefix in
+/// comment/string-stripped Swift. Alternate type annotations, computed forms,
+/// and non-`static let` bindings are not matched.
+fn executable_static_let_assignment_starts(code: &str, constant: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    for (start, _) in code.match_indices("static") {
+        if !is_identifier_at(code, start, "static") {
+            continue;
+        }
+        let after_static = skip_ascii_whitespace(code, start + "static".len());
+        if !code[after_static..].starts_with("let") || !is_identifier_at(code, after_static, "let")
+        {
+            continue;
+        }
+        let after_let = skip_ascii_whitespace(code, after_static + "let".len());
+        if !code[after_let..].starts_with(constant) || !is_identifier_at(code, after_let, constant)
+        {
+            continue;
+        }
+        let after_constant = skip_ascii_whitespace(code, after_let + constant.len());
+        if code.as_bytes().get(after_constant) != Some(&b'=') {
+            continue;
+        }
+        // Reject `==` / `=>` so only a true assignment operator matches.
+        if matches!(code.as_bytes().get(after_constant + 1), Some(b'=' | b'>')) {
+            continue;
+        }
+        starts.push(start);
+    }
+    starts
+}
+
+/// True when `document[start..]` is exactly
+/// `static let <constant> = <swift_string>` with ASCII whitespace flexibility
+/// and a terminated expression (no trailing tokens, concatenation, or
+/// alternate literals).
+fn exact_token_broker_code_signing_requirement_assignment_at(
+    document: &str,
+    start: usize,
+    constant: &str,
+    swift_string: &str,
+) -> bool {
+    if start > document.len() || !document[start..].starts_with("static") {
+        return false;
+    }
+    if !is_identifier_at(document, start, "static") {
+        return false;
+    }
+    let after_static = skip_ascii_whitespace(document, start + "static".len());
+    if !document[after_static..].starts_with("let")
+        || !is_identifier_at(document, after_static, "let")
+    {
+        return false;
+    }
+    let after_let = skip_ascii_whitespace(document, after_static + "let".len());
+    if !document[after_let..].starts_with(constant)
+        || !is_identifier_at(document, after_let, constant)
+    {
+        return false;
+    }
+    let after_constant = skip_ascii_whitespace(document, after_let + constant.len());
+    if document.as_bytes().get(after_constant) != Some(&b'=') {
+        return false;
+    }
+    if matches!(
+        document.as_bytes().get(after_constant + 1),
+        Some(b'=' | b'>')
+    ) {
+        return false;
+    }
+    let after_equals = skip_ascii_whitespace(document, after_constant + 1);
+    if !document[after_equals..].starts_with(swift_string) {
+        return false;
+    }
+    token_broker_version_assignment_terminates(document, after_equals + swift_string.len())
 }
 
 fn validate_tersa_mac_top_level_keys(
@@ -13185,9 +13264,9 @@ protocol TersaMacTokenBrokerProtocolV1 {
         }
     }
 
-    #[test]
-    fn token_broker_code_signing_requirement_rejects_comment_decoys() {
-        let listener_path = Path::new("apple/macos-token-broker/TokenBrokerListenerDelegate.swift");
+    /// Fixture for mutating the reviewed listener assignment while keeping the
+    /// rest of the inventoried broker surface intact.
+    fn listener_signing_assignment_fixture() -> (String, String, &'static str, &'static str) {
         let reviewed =
             include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
                 .to_owned();
@@ -13195,15 +13274,46 @@ protocol TersaMacTokenBrokerProtocolV1 {
         let reviewed_assignment = format!(
             "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal}"
         );
-        let sources = reviewed_token_broker_sources();
+        let weakened_assignment =
+            "    static let embeddingAppCodeSigningRequirement =\n        \"anchor apple generic\"";
+        (
+            reviewed,
+            reviewed_assignment,
+            weakened_assignment,
+            reviewed_literal,
+        )
+    }
 
-        for (label, document) in [
+    fn assert_listener_signing_assignment_cases(cases: &[(&str, String)]) {
+        let listener_path = Path::new("apple/macos-token-broker/TokenBrokerListenerDelegate.swift");
+        let sources = reviewed_token_broker_sources();
+        // Baseline: reviewed inventory still pins the exact assignment/call.
+        assert!(
+            token_broker_source_surface_violations(&sources).is_empty(),
+            "reviewed broker baseline must pass code-signing pin; got {:?}",
+            token_broker_source_surface_violations(&sources)
+        );
+        for (label, document) in cases {
+            assert_token_broker_listener_signing_fails(
+                &sources,
+                listener_path,
+                document.clone(),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn token_broker_code_signing_requirement_rejects_comment_decoys() {
+        let (reviewed, reviewed_assignment, weakened_assignment, reviewed_literal) =
+            listener_signing_assignment_fixture();
+        assert_listener_signing_assignment_cases(&[
             (
                 "decoy comment assignment with weakened executable",
                 reviewed.replace(
                     &reviewed_assignment,
                     &format!(
-                        "    // static let embeddingAppCodeSigningRequirement = {reviewed_literal}\n    static let embeddingAppCodeSigningRequirement =\n        \"anchor apple generic\""
+                        "    // static let embeddingAppCodeSigningRequirement = {reviewed_literal}\n{weakened_assignment}"
                     ),
                 ),
             ),
@@ -13216,6 +13326,85 @@ protocol TersaMacTokenBrokerProtocolV1 {
                     ),
                 ),
             ),
+        ]);
+    }
+
+    #[test]
+    fn token_broker_code_signing_requirement_rejects_string_assignment_decoys() {
+        let (reviewed, reviewed_assignment, weakened_assignment, reviewed_literal) =
+            listener_signing_assignment_fixture();
+        assert_listener_signing_assignment_cases(&[
+            (
+                "multiline-string decoy assignment with weakened executable",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    let decoy = \"\"\"\n    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal}\n    \"\"\"\n{weakened_assignment}"
+                    ),
+                ),
+            ),
+            (
+                "single-line string decoy assignment with weakened executable",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    let decoy = \"static let embeddingAppCodeSigningRequirement = {reviewed_literal}\"\n{weakened_assignment}"
+                    ),
+                ),
+            ),
+            (
+                "raw-string decoy assignment with weakened executable",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    let decoy = #\"static let embeddingAppCodeSigningRequirement = {reviewed_literal}\"#\n{weakened_assignment}"
+                    ),
+                ),
+            ),
+            (
+                "raw-string-only assignment decoy",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    let decoy = #\"static let embeddingAppCodeSigningRequirement = {reviewed_literal}\"#"
+                    ),
+                ),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn token_broker_code_signing_requirement_rejects_wrong_assignment_forms() {
+        let (reviewed, reviewed_assignment, weakened_assignment, reviewed_literal) =
+            listener_signing_assignment_fixture();
+        assert_listener_signing_assignment_cases(&[
+            (
+                "correct literal on different constant with weakened reviewed constant",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let otherRequirement =\n        {reviewed_literal}\n{weakened_assignment}"
+                    ),
+                ),
+            ),
+            (
+                "alternate type annotation with correct literal",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let embeddingAppCodeSigningRequirement: String =\n        {reviewed_literal}"
+                    ),
+                ),
+            ),
+            (
+                "concatenated literal value",
+                reviewed.replace(
+                    &reviewed_assignment,
+                    &format!(
+                        "    static let embeddingAppCodeSigningRequirement =\n        {reviewed_literal} + \"\""
+                    ),
+                ),
+            ),
             (
                 "duplicate executable assignment",
                 reviewed.replace(
@@ -13223,16 +13412,83 @@ protocol TersaMacTokenBrokerProtocolV1 {
                     &format!("{reviewed_assignment}\n{reviewed_assignment}"),
                 ),
             ),
+        ]);
+    }
+
+    #[test]
+    fn token_broker_sources_reject_string_type_shadowing() {
+        let sources = reviewed_token_broker_sources();
+        assert!(token_broker_source_surface_violations(&sources).is_empty());
+
+        let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let service_path = Path::new("apple/macos-token-broker/TokenBrokerService.swift");
+        let reviewed_protocol =
+            include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
+        let reviewed_service =
+            include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned();
+
+        for (label, path, document, expected) in [
             (
-                "duplicate executable literal",
-                reviewed.replace(
-                    reviewed_literal,
-                    &format!("{reviewed_literal}\n    let decoy = {reviewed_literal}"),
+                "typealias String = Data",
+                protocol_path,
+                format!("{reviewed_protocol}\ntypealias String = Data\n"),
+                "typealias",
+            ),
+            (
+                "indirect typealias chain",
+                protocol_path,
+                format!(
+                    "{reviewed_protocol}\ntypealias WireText = Data\ntypealias String = WireText\n"
                 ),
+                "typealias",
+            ),
+            (
+                "typealias in another broker source file",
+                service_path,
+                format!("{reviewed_service}\ntypealias String = Data\n"),
+                "typealias",
+            ),
+            (
+                "struct String shadow",
+                protocol_path,
+                format!("{reviewed_protocol}\nstruct String {{}}\n"),
+                "shadow `String`",
+            ),
+            (
+                "class String shadow",
+                service_path,
+                format!("{reviewed_service}\nclass String {{}}\n"),
+                "shadow `String`",
+            ),
+            (
+                "enum String shadow",
+                protocol_path,
+                format!("{reviewed_protocol}\nenum String {{ case decoy }}\n"),
+                "shadow `String`",
             ),
         ] {
-            assert_token_broker_listener_signing_fails(&sources, listener_path, document, label);
+            let mut mutated = sources.clone();
+            if let Some(entry) = mutated.iter_mut().find(|(candidate, _)| candidate == path) {
+                entry.1 = document;
+            }
+            assert_token_broker_surface_contains(&mutated, expected, label);
         }
+
+        // Comments and string mentions of typealias/String must not fail closed.
+        let inert = reviewed_protocol
+            + "\n// typealias String = Data\n/* typealias String = Data */\nlet _ = \"typealias String = Data\"\n";
+        let mut with_inert = sources.clone();
+        if let Some(entry) = with_inert
+            .iter_mut()
+            .find(|(candidate, _)| candidate == protocol_path)
+        {
+            entry.1 = inert;
+        }
+        assert!(
+            token_broker_source_surface_violations(&with_inert).is_empty(),
+            "inert comment/string typealias mentions must not fail closed; got {:?}",
+            token_broker_source_surface_violations(&with_inert)
+        );
     }
 
     fn assert_token_broker_listener_signing_fails(
