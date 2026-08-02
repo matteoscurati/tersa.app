@@ -865,7 +865,7 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
         Some(id_token) => Some(parse_id_token_claims(id_token.as_str())?),
         None => None,
     };
-    Ok(TokenResponse::new_with_gmail_read_grant(
+    Ok(TokenResponse::new(
         parsed.access_token,
         Duration::from_secs(parsed.expires_in),
         parsed.refresh_token,

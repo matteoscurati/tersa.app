@@ -44,8 +44,8 @@ use tersa_application::oauth::{AuthorizationGrant, MonotonicClock, WallClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
 #[cfg(target_os = "macos")]
 use tersa_application::token::{
-    AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenTransport,
-    exchange_grant, refresh_access_token,
+    AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome,
+    TokenTransport, exchange_grant_with_scope_outcome, refresh_access_token_with_scope_outcome,
 };
 #[cfg(target_os = "macos")]
 use tersa_gmail_rest_macos::GmailMailbox;
@@ -529,10 +529,30 @@ where
     let revocable = matches!(loaded, Ok(None));
     let prior = loaded.ok().flatten();
 
-    let success = exchange_grant(&grant, config, transport, clock)
+    let outcome = exchange_grant_with_scope_outcome(&grant, config, transport, clock)
         .await
         .map_err(TokenLifecycleError::Token)?;
     drop(grant);
+    let success = match outcome {
+        TokenScopeOutcome::Granted(success) => success,
+        TokenScopeOutcome::InsufficientScope {
+            access_token,
+            rotated_refresh_token,
+        } => {
+            if session.is_cancelled() {
+                if revocable {
+                    let token_to_revoke = rotated_refresh_token.as_ref().unwrap_or(&access_token);
+                    let _ = revoke_best_effort(transport, token_to_revoke).await;
+                }
+                return Err(TokenLifecycleError::Cancelled);
+            }
+            if revocable {
+                let token_to_revoke = rotated_refresh_token.as_ref().unwrap_or(&access_token);
+                let _ = revoke_best_effort(transport, token_to_revoke).await;
+            }
+            return Err(TokenLifecycleError::Token(TokenError::InsufficientScope));
+        }
+    };
     let (access_token, rotated_refresh, subject, identity_expiry, gmail_read_granted) =
         success.into_parts();
     // PRE-STORE fence: consent withdrawn mid-exchange — abort, storing nothing.
@@ -550,18 +570,7 @@ where
         }
         return Err(TokenLifecycleError::Cancelled);
     }
-    // An explicitly under-scoped first connect must not strand a live provider
-    // grant after Tersa refuses to store it. Preserve the minted zeroizing
-    // access/refresh handle through this lifecycle boundary, revoke it best-
-    // effort when the pre-exchange snapshot definitively proved no prior
-    // credential exists, then surface the permission-specific terminal.
-    if !gmail_read_granted {
-        if revocable {
-            let token_to_revoke = rotated_refresh.as_ref().unwrap_or(access_token.secret());
-            let _ = revoke_best_effort(transport, token_to_revoke).await;
-        }
-        return Err(TokenLifecycleError::Token(TokenError::InsufficientScope));
-    }
+    debug_assert!(gmail_read_granted);
     // NOT gated on cancel: a refresh-less exchange strands the grant's only
     // handle, so revoke the access token IFF the snapshot definitively read
     // empty (an unknown read never revokes).
@@ -675,15 +684,27 @@ where
         .load(account)
         .map_err(TokenLifecycleError::Store)?
         .ok_or(TokenLifecycleError::NoStoredToken)?;
-    let success = refresh_access_token(&stored, config, transport, clock)
+    let outcome = refresh_access_token_with_scope_outcome(&stored, config, transport, clock)
         .await
         .map_err(TokenLifecycleError::Token)?;
     drop(stored);
+    let success = match outcome {
+        TokenScopeOutcome::Granted(success) => success,
+        TokenScopeOutcome::InsufficientScope {
+            access_token: _access_token,
+            rotated_refresh_token,
+        } => {
+            if let Some(refresh) = rotated_refresh_token {
+                refresh_store
+                    .store(account, &refresh)
+                    .map_err(TokenLifecycleError::Store)?;
+            }
+            return Err(TokenLifecycleError::Token(TokenError::InsufficientScope));
+        }
+    };
     let (access_token, rotated_refresh, subject, identity_expiry, gmail_read_granted) =
         success.into_parts();
-    if !gmail_read_granted {
-        return Err(TokenLifecycleError::Token(TokenError::InsufficientScope));
-    }
+    debug_assert!(gmail_read_granted);
     if let Some(refresh) = rotated_refresh {
         refresh_store
             .store(account, &refresh)
@@ -1568,7 +1589,7 @@ mod token_lifecycle_tests {
             self
         }
         fn response(&self) -> TokenResponse {
-            TokenResponse::new_with_gmail_read_grant(
+            TokenResponse::new(
                 Zeroizing::new("fake-access-token".to_owned()),
                 Duration::from_secs(3_600),
                 self.rotated_refresh_token.clone(),
@@ -1895,7 +1916,10 @@ mod token_lifecycle_tests {
     #[test]
     fn first_connect_with_insufficient_scope_revokes_and_stores_nothing() {
         let store = FakeRefreshStore::empty();
-        let transport = FakeTransport::success(Some("under-scoped-refresh")).under_scoped();
+        // Scope rejection must happen before identity validation: Google may
+        // omit the id_token on the same response, but the rejected first grant
+        // still needs to be revoked rather than stranded at the provider.
+        let transport = FakeTransport::without_id_token().under_scoped();
         let error = drive(connect_account(
             &account(),
             make_grant(),
@@ -1910,7 +1934,7 @@ mod token_lifecycle_tests {
             error,
             TokenLifecycleError::Token(TokenError::InsufficientScope)
         ));
-        assert_eq!(transport.revoked(), vec!["under-scoped-refresh".to_owned()]);
+        assert_eq!(transport.revoked(), vec!["refresh".to_owned()]);
         assert_eq!(store.store_calls.load(Ordering::SeqCst), 0);
         assert_eq!(store.stored(), None);
     }
@@ -2275,6 +2299,24 @@ mod token_lifecycle_tests {
         ))
         .unwrap();
         assert_eq!(store.stored().as_deref(), Some("kept-refresh"));
+    }
+
+    #[test]
+    fn under_scoped_refresh_preserves_a_rotated_revocation_handle() {
+        let store = FakeRefreshStore::with_token("old-refresh");
+        let error = drive(refresh_account(
+            &account(),
+            &config(),
+            &FakeTransport::without_id_token().under_scoped(),
+            &store,
+            &TestClock::at(0),
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            TokenLifecycleError::Token(TokenError::InsufficientScope)
+        ));
+        assert_eq!(store.stored().as_deref(), Some("refresh"));
     }
 
     #[test]
