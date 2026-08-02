@@ -339,7 +339,12 @@ where
     /// already redeemed, or mismatched authorization code) surfaces as
     /// [`BrokerError::ProviderRejected`], never
     /// [`BrokerError::ConsentRevoked`]: nothing is stored on this path, so
-    /// no local deletion is asserted or performed.
+    /// no local deletion is asserted or performed. The token layer keeps the
+    /// terminal distinct as `TokenError::AuthorizationCodeRejected` (the
+    /// sign-in lapsed), but the broker's closed public surface deliberately
+    /// folds it into [`BrokerError::ProviderRejected`]; the sign-in-expired
+    /// recovery distinction is a point-3 XPC/status concern (ADR-0024), not
+    /// part of this vocabulary.
     pub async fn complete_authorization(
         &self,
         session_handle: &str,
@@ -809,11 +814,20 @@ fn map_oauth_error(error: OAuthError) -> BrokerError {
 }
 
 /// Maps the token state-machine failures into the closed broker vocabulary.
+///
+/// The exchange-only [`TokenError::AuthorizationCodeRejected`] folds into
+/// [`BrokerError::ProviderRejected`]: the point-2 broker stays non-destructive
+/// (nothing is stored on the exchange path, so no deletion is asserted or
+/// performed) and its public closed error surface does NOT gain a variant. The
+/// sign-in-expired recovery distinction is a point-3 XPC/status concern (see
+/// ADR-0024), not part of this vocabulary.
 fn map_token_error(error: TokenError) -> BrokerError {
     match error {
         TokenError::InvalidConfiguration => BrokerError::InvalidConfiguration,
         TokenError::Transport => BrokerError::Transport,
-        TokenError::ProviderRejected => BrokerError::ProviderRejected,
+        TokenError::ProviderRejected | TokenError::AuthorizationCodeRejected => {
+            BrokerError::ProviderRejected
+        }
         TokenError::MalformedResponse => BrokerError::MalformedResponse,
         TokenError::InsufficientScope => BrokerError::InsufficientScope,
         TokenError::ConsentRevoked => BrokerError::ConsentRevoked,
@@ -1670,7 +1684,9 @@ mod tests {
                 BrokerError::ProviderRejected,
             ),
             // An exchange-time invalid_grant is a stale or used authorization
-            // code: it surfaces as the honest, non-destructive
+            // code: the token layer keeps it distinct as
+            // `TokenError::AuthorizationCodeRejected`, and the broker's closed
+            // surface folds it into the honest, non-destructive
             // ProviderRejected — NEVER ConsentRevoked, which claims a stored
             // credential was deleted (none exists on this path).
             (
@@ -1683,7 +1699,17 @@ mod tests {
                 FakeTransport::success(&shared, Some(REFRESH_TOKEN)).with_exchange_error(error);
             let store = FakeStore::new(&shared).with_stored_token(SUBJECT, REFRESH_TOKEN);
             let result = run_authorization(&transport, &store);
-            assert_eq!(result.err(), Some(expected), "mapping for {error:?}");
+            let Err(actual) = &result else {
+                panic!("expected an exchange failure for {error:?}, got {result:?}");
+            };
+            assert_eq!(*actual, expected, "mapping for {error:?}");
+            assert_ne!(
+                *actual,
+                BrokerError::ConsentRevoked,
+                "an exchange failure must never claim a credential deletion: {error:?}"
+            );
+            // No Load, Store, or Revoke side effects: the only observable
+            // event is the Exchange, and the prior credential is untouched.
             assert_eq!(*shared.lock().unwrap(), vec![Event::Exchange]);
             assert!(transport.revoked_handles().is_empty());
             assert_eq!(store.stored_token(SUBJECT).as_deref(), Some(REFRESH_TOKEN));

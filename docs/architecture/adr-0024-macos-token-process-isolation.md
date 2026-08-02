@@ -168,6 +168,28 @@ or a partial write. Monitoring should read a sustained rise in refresh-path
 the bound — a signal to review the constant — not only as response
 corruption.
 
+A third, forward-looking constraint is recorded for the point-3 service
+integration as a design and acceptance requirement, not as implemented
+behavior. The version-1 protocol surface is deliberately closed at five
+status codes, and the broker core's public error vocabulary is likewise
+closed. The point-3 XPC operation-to-status mapping, and the main app's
+status-to-UI mapping behind it, must nevertheless preserve four distinct
+recovery semantics end to end, and acceptance evidence must demonstrate
+each: an unconfirmed provider revocation (`RevokeUnconfirmed`) stays
+visibly distinct from a clean teardown so the app can direct the user to
+revoke the grant manually in their Google account settings; an explicitly
+under-scoped grant (`InsufficientScope`) keeps its own recovery naming the
+Gmail consent that must be allowed on retry; a revoked consent and a
+missing refresh token (`ConsentRevoked`, `MissingRefreshToken`) route to
+re-connect after the destructive local deletion the former licenses; and
+an exchange-time authorization-code rejection — the token layer's
+`AuthorizationCodeRejected`, a stale, already redeemed, or mismatched
+code — surfaces as the sign-in-expired outcome with the "sign in again"
+recovery, never as an opaque retryable failure and never as a claim that a
+stored credential was deleted (none exists on that path). Collapsing any
+of these into one opaque failure code, or widening the wire surface into
+an open-ended error channel to express them, fails acceptance.
+
 Neither piece activates runtime isolation. The portable core is not yet linked
 into the XPC target, which still links no Rust; there is no production
 Keychain adapter bound to its refresh-token store port, no client-side XPC

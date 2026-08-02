@@ -84,9 +84,12 @@ pub const STATUS_GATE_BLOCKED: i32 = -3;
 pub const STATUS_SYNC_FAILED: i32 = -4;
 /// The worker could not build its runtime, or hit an internal anomaly.
 pub const STATUS_INTERNAL: i32 = -5;
-/// No refresh token is stored for the account: it must be reconnected (re-consent)
-/// rather than retried. Distinct so the caller can prompt instead of looping; not
-/// an oracle — there is one fixed slot and the caller syncs its own account.
+/// The account must be reconnected (re-consent) rather than retried: no refresh
+/// token is stored, the stored token's consent was revoked or it expired, the
+/// connect grant could not be claimed, or the initial exchange rejected the
+/// authorization code (the sign-in itself lapsed). Distinct so the caller can
+/// prompt instead of looping; not an oracle — there is one fixed slot and the
+/// caller syncs its own account.
 pub const STATUS_NEEDS_RECONNECT: i32 = -6;
 /// The provider explicitly omitted Gmail read access from the granted scopes.
 /// Distinct so the UI can explain which consent must be allowed on retry.
@@ -420,13 +423,19 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
         // (the owner revoked access in their account settings, long inactivity, a
         // password change) — mapping it to the retry code would silently never-sync.
         // On the connect path the arm covers an unclaimable grant (the login window
-        // elapsed). An `invalid_grant` at the initial exchange is NOT here: the
-        // token layer surfaces it as the non-destructive `ProviderRejected` (no
-        // stored credential exists to delete for a stale code), which collapses
-        // to the retry code below.
+        // elapsed) AND an `invalid_grant` at the initial exchange: the token layer
+        // surfaces that as `AuthorizationCodeRejected` — the sign-in itself lapsed,
+        // so the "sign in again" recovery applies. It is non-destructive (no stored
+        // credential exists on the exchange path), so it is NOT `ConsentRevoked`;
+        // and it is not an ordinary retryable rejection, so it does not collapse to
+        // the retry code below. Only the CONNECT rung maps it here: the token layer
+        // never produces it on refresh, and a refresh/provider failure must never
+        // be reported as a lapsed sign-in.
         Err(
             CycleError::ClaimMissing
-            | CycleError::Connect(TokenLifecycleError::Token(TokenError::ConsentRevoked))
+            | CycleError::Connect(TokenLifecycleError::Token(
+                TokenError::AuthorizationCodeRejected | TokenError::ConsentRevoked,
+            ))
             | CycleError::Refresh(
                 TokenLifecycleError::NoStoredToken
                 | TokenLifecycleError::Token(TokenError::ConsentRevoked),
@@ -1216,21 +1225,6 @@ mod tests {
             ))),
             STATUS_SYNC_FAILED
         );
-        // The connect path's reconnect-recoverable outcome is an unclaimable
-        // grant (the login window elapsed). The `Connect(ConsentRevoked)` arm
-        // is defensive: an exchange-time `invalid_grant` surfaces as
-        // `ProviderRejected` (no stored credential exists to delete), so the
-        // token layer no longer produces `ConsentRevoked` on this path.
-        assert_eq!(
-            status_for_cycle(&Err::<(), _>(CycleError::ClaimMissing)),
-            STATUS_NEEDS_RECONNECT
-        );
-        assert_eq!(
-            status_for_cycle(&Err::<(), _>(CycleError::Connect(
-                TokenLifecycleError::Token(TokenError::ConsentRevoked)
-            ))),
-            STATUS_NEEDS_RECONNECT
-        );
         assert_eq!(
             status_for_cycle(&Err::<(), _>(CycleError::Connect(
                 TokenLifecycleError::Token(TokenError::InsufficientScope)
@@ -1298,6 +1292,52 @@ mod tests {
                     SyncProtocolError::OversizedPage
                 ))
             )))),
+            STATUS_SYNC_FAILED
+        );
+    }
+
+    #[test]
+    fn authorization_code_rejection_maps_only_connect_to_needs_reconnect() {
+        // The connect path's reconnect-recoverable outcomes are an unclaimable
+        // grant (the login window elapsed) and an exchange-time `invalid_grant`:
+        // the token layer surfaces the latter as `AuthorizationCodeRejected` —
+        // the sign-in itself lapsed, so the UI renders the "sign in again"
+        // recovery (STATUS_NEEDS_RECONNECT → signInExpired), NOT the opaque
+        // retry code. The `Connect(ConsentRevoked)` arm is defensive: the
+        // exchange path never produces `ConsentRevoked` (no stored credential
+        // exists to delete).
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::ClaimMissing)),
+            STATUS_NEEDS_RECONNECT
+        );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::AuthorizationCodeRejected)
+            ))),
+            STATUS_NEEDS_RECONNECT
+        );
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::ConsentRevoked)
+            ))),
+            STATUS_NEEDS_RECONNECT
+        );
+        // `AuthorizationCodeRejected` is an EXCHANGE-only terminal: the token
+        // layer never produces it on refresh, and a refresh/provider failure
+        // must never be reported as a lapsed sign-in. Defensively, the refresh
+        // rung keeps it on the opaque retry code.
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Refresh(
+                TokenLifecycleError::Token(TokenError::AuthorizationCodeRejected)
+            ))),
+            STATUS_SYNC_FAILED
+        );
+        // An ordinary provider rejection on the exchange is NOT the lapsed
+        // sign-in terminal and must stay on the opaque retry code too.
+        assert_eq!(
+            status_for_cycle(&Err::<(), _>(CycleError::Connect(
+                TokenLifecycleError::Token(TokenError::ProviderRejected)
+            ))),
             STATUS_SYNC_FAILED
         );
     }
@@ -1722,6 +1762,7 @@ mod tests {
         revoked: std::sync::Mutex<Vec<String>>,
         fail_revoke: bool,
         failing_revokes: AtomicUsize,
+        revoke_error: Option<tersa_application::token::TokenTransportError>,
         log: std::sync::Arc<OrderLog>,
     }
 
@@ -1731,6 +1772,7 @@ mod tests {
                 revoked: std::sync::Mutex::new(Vec::new()),
                 fail_revoke: false,
                 failing_revokes: AtomicUsize::new(0),
+                revoke_error: None,
                 log,
             }
         }
@@ -1746,6 +1788,14 @@ mod tests {
         fn fail_next_revokes(self, count: usize) -> Self {
             self.failing_revokes.store(count, Ordering::SeqCst);
             self
+        }
+        /// Answers EVERY revoke attempt with the scripted typed error —
+        /// exercises the already-gone confirmation path (no retry).
+        fn with_revoke_error(self, error: tersa_application::token::TokenTransportError) -> Self {
+            Self {
+                revoke_error: Some(error),
+                ..self
+            }
         }
         fn revoked(&self) -> Vec<String> {
             self.revoked.lock().unwrap().clone()
@@ -1790,6 +1840,9 @@ mod tests {
             Box::pin(async move {
                 self.log.record("revoke");
                 self.revoked.lock().unwrap().push(token.as_str().to_owned());
+                if let Some(error) = self.revoke_error {
+                    return Err(error);
+                }
                 if self.fail_revoke {
                     return Err(tersa_application::token::TokenTransportError::Transport);
                 }
@@ -2401,6 +2454,35 @@ mod tests {
         let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
         assert!(matches!(outcome, RevokeOutcome::Failed));
         assert_eq!(transport.revoked().len(), 2);
+    }
+
+    #[test]
+    fn revoke_best_effort_confirms_an_already_gone_token_without_a_retry() {
+        // Google's HTTP 400 `invalid_token` means the submitted token is
+        // unknown or already revoked at the provider: the desired end state
+        // holds, so the revoke is confirmed IMMEDIATELY — exactly one call,
+        // no pointless retry. This matches the ADR-0024 broker's
+        // already-gone semantics over the shared transport error enum.
+        let log = std::sync::Arc::new(OrderLog::default());
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log))
+            .with_revoke_error(tersa_application::token::TokenTransportError::InvalidToken);
+        let token = zeroize::Zeroizing::new("refresh-token".to_owned());
+        let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
+        assert!(matches!(outcome, RevokeOutcome::Confirmed));
+        assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
+    }
+
+    #[test]
+    fn revoke_best_effort_confirms_an_already_gone_grant_without_a_retry() {
+        // An `invalid_grant` revoke answer likewise means the grant is
+        // already gone at the provider: confirmed, exactly one call.
+        let log = std::sync::Arc::new(OrderLog::default());
+        let transport = RecordingTransport::new(std::sync::Arc::clone(&log))
+            .with_revoke_error(tersa_application::token::TokenTransportError::InvalidGrant);
+        let token = zeroize::Zeroizing::new("refresh-token".to_owned());
+        let outcome = test_runtime().block_on(revoke_best_effort(&transport, &token));
+        assert!(matches!(outcome, RevokeOutcome::Confirmed));
+        assert_eq!(transport.revoked(), vec!["refresh-token".to_owned()]);
     }
 
     #[test]

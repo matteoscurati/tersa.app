@@ -36,7 +36,14 @@ pub enum BrokerError {
     /// attempt is terminal, so this is the only answer a replay ever gets.
     SessionUnknown,
     /// The provider rejected the request or the authorization attempt with an
-    /// error other than `invalid_grant`.
+    /// error other than a refresh-time `invalid_grant` (which is
+    /// [`Self::ConsentRevoked`]). An exchange-time `invalid_grant` (a stale,
+    /// already redeemed, or mismatched authorization code) also surfaces here:
+    /// nothing is stored on the exchange path, so the answer is
+    /// non-destructive and never a deletion license. The token layer keeps
+    /// that terminal distinct as `TokenError::AuthorizationCodeRejected`; the
+    /// sign-in-expired recovery distinction is a point-3 XPC/status concern
+    /// (ADR-0024), deliberately not part of this closed vocabulary.
     ProviderRejected,
     /// The token or revocation endpoint could not be reached.
     Transport,

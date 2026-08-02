@@ -4,19 +4,25 @@
 
 //! The bounded pending-authorization-session registry.
 //!
-//! Sessions are keyed by their opaque handle. The registry enforces an
-//! explicit small maximum, reaps expired entries deterministically at insert
-//! time (an expired session is consumed and dropped — zeroizing it — never
-//! evicting a live entry), and fails closed on a poisoned lock while still
-//! wiping resident sessions so no verifier or state lingers in a map the
-//! broker will never trust again.
+//! Sessions are keyed by their opaque handle, stored as a zeroizing
+//! [`HandleKey`] — never a plain `String`, which would be freed unwiped on
+//! claim, reap, or poison-clear and leave the handle bytes in freed heap. The
+//! registry enforces an explicit small maximum, reaps expired entries
+//! deterministically at insert time (an expired session is consumed and
+//! dropped — zeroizing it — never evicting a live entry), and fails closed on
+//! a poisoned lock while still wiping resident sessions and keys so no
+//! verifier, state, or handle lingers in a map the broker will never trust
+//! again.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
 use tersa_application::oauth::{AuthorizationSession, MonotonicClock};
+use zeroize::Zeroizing;
 
 use crate::error::BrokerError;
 use crate::handle::SessionHandle;
@@ -30,9 +36,66 @@ const MAX_PENDING_SESSIONS: usize = 8;
 /// the bound exists so a broken entropy source fails instead of looping.
 const MAX_HANDLE_ALLOCATION_ATTEMPTS: u32 = 3;
 
-/// The bounded pending-session set, keyed by opaque handle text.
+/// The registry's owned copy of a session handle, used as the map key.
+///
+/// A plain `String` key would be freed UNWIPED when its entry is claimed,
+/// reaped at insert, or cleared on the poison path, leaving the opaque
+/// handle bytes resident in freed heap. This key holds the handle in
+/// zeroizing memory — the same posture [`SessionHandle`] itself takes — so
+/// every removal path wipes the resident copy. Equality, hashing, and the
+/// borrowed-`str` lookup all agree on the handle text, and `Debug` redacts
+/// it.
+struct HandleKey(Zeroizing<String>);
+
+impl HandleKey {
+    /// Copies handle text into zeroizing key storage.
+    fn new(text: &str) -> Self {
+        Self(Zeroizing::new(text.to_owned()))
+    }
+
+    /// Returns the handle text without transferring ownership.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Structural test evidence that the key is zeroizing storage, not a
+    /// plain `String`: if the field ever regresses to unwiped storage, the
+    /// compile-time guard that uses this accessor no longer compiles.
+    #[cfg(test)]
+    fn buffer(&self) -> &Zeroizing<String> {
+        &self.0
+    }
+}
+
+impl PartialEq for HandleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for HandleKey {}
+
+impl Hash for HandleKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl Borrow<str> for HandleKey {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for HandleKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HandleKey([REDACTED])")
+    }
+}
+
+/// The bounded pending-session set, keyed by zeroizing opaque handle text.
 pub(crate) struct SessionRegistry<C> {
-    sessions: Mutex<HashMap<String, AuthorizationSession<C>>>,
+    sessions: Mutex<HashMap<HandleKey, AuthorizationSession<C>>>,
 }
 
 impl<C> SessionRegistry<C> {
@@ -63,7 +126,8 @@ impl<C: MonotonicClock> SessionRegistry<C> {
     ) -> Result<SessionHandle, BrokerError> {
         let mut guard = self.lock_sessions()?;
         // Deterministic reaping: `expire` consumes and zeroizes an expired
-        // session and reports `NotExpired` for a live one.
+        // session and reports `NotExpired` for a live one. A removed entry's
+        // `HandleKey` is zeroized with it.
         guard.retain(|_handle, session| session.expire().is_err());
         if guard.len() >= MAX_PENDING_SESSIONS {
             return Err(BrokerError::Busy);
@@ -71,7 +135,9 @@ impl<C: MonotonicClock> SessionRegistry<C> {
         let mut attempts = 0_u32;
         loop {
             let handle = SessionHandle::generate(entropy)?;
-            if let Entry::Vacant(entry) = guard.entry(handle.as_str().to_owned()) {
+            // The key copies the handle text into zeroizing storage; on a
+            // collision the un-inserted copy is dropped — and wiped.
+            if let Entry::Vacant(entry) = guard.entry(HandleKey::new(handle.as_str())) {
                 entry.insert(session);
                 return Ok(handle);
             }
@@ -86,7 +152,9 @@ impl<C: MonotonicClock> SessionRegistry<C> {
     ///
     /// The removal IS the claim: the session leaves the registry before any
     /// callback validation runs, so a duplicate, wrong, or replayed callback
-    /// can only ever meet [`BrokerError::SessionUnknown`].
+    /// can only ever meet [`BrokerError::SessionUnknown`]. The removed
+    /// `HandleKey` is dropped — and zeroized — with the removal, so no
+    /// un-wiped handle copy outlives its session.
     ///
     /// # Errors
     ///
@@ -106,10 +174,11 @@ impl<C: MonotonicClock> SessionRegistry<C> {
     /// A poisoned lock means a panicking thread may have left the map
     /// inconsistent; the broker never trusts it again. The resident sessions
     /// are NOT abandoned: the map is drained (dropping a session zeroizes its
-    /// state and verifier) before the error propagates.
+    /// state and verifier, and dropping a `HandleKey` zeroizes the resident
+    /// handle copy) before the error propagates.
     fn lock_sessions(
         &self,
-    ) -> Result<MutexGuard<'_, HashMap<String, AuthorizationSession<C>>>, BrokerError> {
+    ) -> Result<MutexGuard<'_, HashMap<HandleKey, AuthorizationSession<C>>>, BrokerError> {
         self.sessions.lock().map_err(|poisoned| {
             poisoned.into_inner().clear();
             BrokerError::Unavailable
@@ -143,8 +212,9 @@ mod tests {
         AuthorizationConfig, AuthorizationSession, MonotonicClock, prepare_authorization,
     };
     use url::Url;
+    use zeroize::Zeroizing;
 
-    use super::{MAX_HANDLE_ALLOCATION_ATTEMPTS, MAX_PENDING_SESSIONS, SessionRegistry};
+    use super::{HandleKey, MAX_HANDLE_ALLOCATION_ATTEMPTS, MAX_PENDING_SESSIONS, SessionRegistry};
     use crate::error::BrokerError;
     use crate::handle::{SESSION_HANDLE_BYTES, SessionHandle};
     use crate::ports::SessionHandleEntropy;
@@ -385,8 +455,10 @@ mod tests {
             registry.claim(&handle),
             Err(BrokerError::Unavailable)
         ));
-        // The fail-closed operation wiped the poisoned map: no session or
-        // verifier remains resident (dropping a session zeroizes them).
+        // The fail-closed operation wiped the poisoned map: no session,
+        // verifier, or handle key remains resident (dropping a session
+        // zeroizes its state, dropping a `HandleKey` zeroizes the handle
+        // copy).
         let inner = registry
             .sessions
             .lock()
@@ -398,5 +470,33 @@ mod tests {
             registry.insert(make_session(&clock, 17_001), &entropy),
             Err(BrokerError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn the_handle_key_is_zeroizing_storage_with_a_str_consistent_lookup() {
+        // Compile-time structural guard against a regression to a plain
+        // `String` key: `buffer()` returns the `Zeroizing<String>` field, so
+        // an un-wiped field type no longer compiles this test. The zeroize
+        // crate's `Zeroizing` drop guarantee then covers every removal path
+        // (claim, insert-time reap, poison-clear): dropping the key wipes
+        // the resident handle copy.
+        fn assert_zeroizing(buffer: &Zeroizing<String>) -> &Zeroizing<String> {
+            buffer
+        }
+        let key = HandleKey::new("ABCDEFGHIJKLMNOPQRSTUV");
+        let _: &Zeroizing<String> = assert_zeroizing(key.buffer());
+
+        // Hash/Eq/Borrow agree on the handle text, so a claim by BORROWED
+        // handle text finds and removes the owned zeroizing key — no plain
+        // heap copy is ever needed for a lookup.
+        let mut map = std::collections::HashMap::new();
+        map.insert(HandleKey::new("ABCDEFGHIJKLMNOPQRSTUV"), 1_u8);
+        assert_eq!(map.get("ABCDEFGHIJKLMNOPQRSTUV"), Some(&1));
+        assert_eq!(map.remove("ABCDEFGHIJKLMNOPQRSTUV"), Some(1));
+        assert!(map.is_empty());
+
+        // The key never renders the handle text through Debug.
+        assert!(!format!("{key:?}").contains("ABCDEFGHIJKLMNOPQRSTUV"));
+        assert!(format!("{key:?}").contains("[REDACTED]"));
     }
 }

@@ -20,6 +20,9 @@
 //!   absolute TTL, deterministic reaping, no live-entry eviction, and
 //!   poisoned-lock fail-closed wiping; a completion claims its session
 //!   atomically BEFORE any callback validation, so every callback is terminal.
+//!   Session handles are held in zeroizing memory everywhere, including the
+//!   registry's owned key copies, so no removal path leaves handle bytes in
+//!   freed heap.
 //! - Token mutations serialize per validated subject through bounded
 //!   single-flight permits released by RAII guards (cancellation-safe); no
 //!   mutex guard is held across an `.await`. A completion claims its
