@@ -29,7 +29,21 @@ class ChangeScopeTests(unittest.TestCase):
             ("unknown path fails closed", ["new-area/input.txt"], ALL),
             ("ambiguous path fails closed", ["../Cargo.toml"], ALL),
             ("root manifest fans out", ["Cargo.toml"], ALL),
-            ("Apple project builds only the product lane", ["apple/project.yml"], {"product_apple"}),
+            (
+                "Apple project enables xtask policy and product",
+                ["apple/project.yml"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
+                "token broker Swift enables xtask policy and product",
+                ["apple/macos-token-broker/TokenBrokerProtocol.swift"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
+                "entitlement plist enables xtask policy and product",
+                ["apple/macos-token-broker/TersaMacTokenBroker.entitlements"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
             ("shared Apple script fans out", ["apple/scripts/build-rust-staticlib.sh"], ALL),
             ("Slint component", ["apps/slint-spike/ui/tersa.slint"], {"rust_linux", "policy", "slint"}),
             ("Slint manifest also checks notices", ["apps/slint-spike/Cargo.toml"], {"rust_linux", "policy", "slint", "notices"}),

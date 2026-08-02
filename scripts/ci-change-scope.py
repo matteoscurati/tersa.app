@@ -124,6 +124,18 @@ def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False
         if path.startswith("apple/licenses/"):
             scope.enable("notices")
             continue
+        # Security-critical Apple packaging inputs: the token broker surface,
+        # XcodeGen project, and entitlements can drift the fail-closed policy
+        # checked by `cargo xtask verify`, so they also enable the portable
+        # Rust and policy lanes (not the broader evidence matrix). Exact-scope
+        # these before the generic Apple component fallbacks.
+        if (
+            path.startswith("apple/macos-token-broker/")
+            or path == "apple/project.yml"
+            or (path.startswith("apple/") and path.endswith(".entitlements"))
+        ):
+            scope.enable("rust_linux", "policy", "product_apple")
+            continue
         if path.startswith("apple/slint-"):
             scope.enable("product_apple", "slint")
             continue

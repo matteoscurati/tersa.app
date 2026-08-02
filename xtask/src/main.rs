@@ -3606,6 +3606,10 @@ fn swift_call_argument_is_identifier(
 /// No directory-wide, filename-suffix, or generic `protocol` exemption exists.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_PATH: &str =
     "apple/macos-token-broker/TokenBrokerProtocol.swift";
+/// Exact path of the reviewed NSXPC listener delegate that pins the peer
+/// code-signing requirement.
+const REVIEWED_TOKEN_BROKER_LISTENER_PATH: &str =
+    "apple/macos-token-broker/TokenBrokerListenerDelegate.swift";
 /// Objective-C runtime name and Swift protocol identifier for the closed v1
 /// NSXPC interface. Both must match exactly for the lexical exemption.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_NAME: &str = "TersaMacTokenBrokerProtocolV1";
@@ -3616,11 +3620,31 @@ const REVIEWED_TOKEN_BROKER_PROTOCOL_OBJC_ATTR: &str = "@objc(TersaMacTokenBroke
 const REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_NAME: &str = "TersaMacTokenBrokerProtocolVersion";
 /// Exact assignment for the bounded protocol wire version (`1` only).
 const REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_ASSIGNMENT: &str = "static let value: Int = 1";
+/// Reviewed peer code-signing requirement literal (unescaped). The raw Swift
+/// source must carry this exact string value; empty or anchor-only values fail.
+const REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_LITERAL: &str =
+    "identifier \"app.tersa.mac\" and anchor apple generic";
+/// Reviewed constant that must hold the code-signing requirement literal.
+const REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CONSTANT: &str =
+    "embeddingAppCodeSigningRequirement";
+/// Exact call that must apply the reviewed constant (whitespace-normalized).
+const REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CALL: &str =
+    "newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)";
+/// Whitespace-normalized exact signatures for the five closed v1 broker
+/// protocol operations. Parameter labels and reply value types are part of the
+/// wire contract; top-level returns and additional methods fail closed.
+const REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES: [&str; 5] = [
+    "funcbeginAuthorizationSession(redirectURI:String,withReplyreply:@escaping(_authorizationURL:String?,_sessionHandle:String?,_status:Int)->Void)",
+    "funccompleteAuthorizationSession(sessionHandle:String,callbackURL:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrefreshAccessToken(accountSubject:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrevokeProviderGrant(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
+    "funcdeleteStoredTokens(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
+];
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
 const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 6] = [
     "apple/macos-token-broker/Info.plist",
     "apple/macos-token-broker/TersaMacTokenBroker.entitlements",
-    "apple/macos-token-broker/TokenBrokerListenerDelegate.swift",
+    REVIEWED_TOKEN_BROKER_LISTENER_PATH,
     REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
     "apple/macos-token-broker/TokenBrokerService.swift",
     "apple/macos-token-broker/main.swift",
@@ -3718,14 +3742,34 @@ fn is_exact_reviewed_token_broker_protocol_declaration(
     &code[attr_start..attr_end] == attr
 }
 
-/// True when the protocol surface pins the bounded wire version to exactly `1`.
+/// True when the protocol surface pins the bounded wire version to exactly
+/// integer `1`, with no numeric suffix, underscore, operator, or extra token.
 fn has_exact_token_broker_protocol_version_assignment(code: &str) -> bool {
     let assignment = REVIEWED_TOKEN_BROKER_PROTOCOL_VERSION_ASSIGNMENT;
-    code.match_indices(assignment).any(|(index, _)| {
-        code.as_bytes()
-            .get(index + assignment.len())
-            .is_none_or(|byte| !byte.is_ascii_digit())
-    })
+    let mut matches = code.match_indices(assignment);
+    let Some((index, _)) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() {
+        return false;
+    }
+    token_broker_version_assignment_terminates(code, index + assignment.len())
+}
+
+/// Accept only optional ASCII spaces/tabs and an optional `//` line comment
+/// after the exact `= 1` assignment before end-of-line or end-of-input.
+fn token_broker_version_assignment_terminates(code: &str, mut index: usize) -> bool {
+    let bytes = code.as_bytes();
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    if index >= bytes.len() || matches!(bytes[index], b'\n' | b'\r') {
+        return true;
+    }
+    if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+        return true;
+    }
+    false
 }
 
 fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
@@ -5541,6 +5585,9 @@ fn scan_token_broker_source_files(
             continue;
         }
         seen.insert(path_str.to_owned());
+        if path_str == REVIEWED_TOKEN_BROKER_LISTENER_PATH {
+            violations.extend(token_broker_code_signing_requirement_violations(document));
+        }
         let extension = path.extension().and_then(|extension| extension.to_str());
         if extension != Some("swift") {
             continue;
@@ -5551,6 +5598,7 @@ fn scan_token_broker_source_files(
         if path_str == REVIEWED_TOKEN_BROKER_PROTOCOL_PATH {
             protocol_file_has_version_assignment =
                 has_exact_token_broker_protocol_version_assignment(&code);
+            violations.extend(closed_token_broker_protocol_operation_violations(&code));
         }
         collect_token_broker_file_capability_violations(
             path_str,
@@ -5596,11 +5644,6 @@ fn collect_token_broker_file_capability_violations(
                 "{path_str} must not exercise forbidden broker capability `{forbidden}`"
             ));
         }
-    }
-    if protocol_uses_generic_data_parameter(code) {
-        violations.push(format!(
-            "{path_str} must not expose generic Data-based broker operations"
-        ));
     }
 }
 
@@ -5661,57 +5704,147 @@ fn collect_token_broker_required_surface_violations(
     }
 }
 
-fn protocol_uses_generic_data_parameter(code: &str) -> bool {
-    // Reject protocol/service method signatures that take bare Data parameters.
-    // The closed v1 surface uses only String and Int status codes.
-    let bytes = code.as_bytes();
-    let mut index = 0;
-    while index + 4 <= bytes.len() {
-        if bytes[index..].starts_with(b"func")
-            && bytes
-                .get(index + 4)
-                .is_some_and(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-        {
-            let mut depth = 0;
-            let mut cursor = index + 4;
-            let mut saw_parameter_list = false;
-            while cursor < bytes.len() {
-                match bytes[cursor] {
-                    b'(' => {
-                        depth += 1;
-                        saw_parameter_list = true;
-                    }
-                    b')' => {
-                        if depth == 0 {
-                            break;
-                        }
-                        depth -= 1;
-                        if depth == 0 {
-                            let signature = &code[index..=cursor];
-                            if signature.contains(": Data")
-                                || signature.contains(":Data")
-                                || signature.contains("-> Data")
-                                || signature.contains("->Data")
-                            {
-                                return true;
-                            }
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                cursor += 1;
-            }
-            if !saw_parameter_list {
-                index += 4;
-                continue;
-            }
-            index = cursor.max(index + 1);
+/// Fail closed unless the protocol file declares exactly the five reviewed
+/// operation signatures (parameter types `String` and trailing
+/// `@escaping (...) -> Void` reply values of `String`, `String?`, or `Int`).
+/// Top-level non-Void returns, arrays, Data/NSData/UInt8, aliases, generics,
+/// dictionaries, extra methods, and missing methods all fail.
+fn closed_token_broker_protocol_operation_violations(code: &str) -> Vec<String> {
+    let Some(actual) = swift_func_signature_compacts(code) else {
+        return vec![format!(
+            "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must expose only parseable closed broker protocol operations"
+        )];
+    };
+    let expected = REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actual_set = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual.len() != REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES.len()
+        || actual_set != expected
+    {
+        return vec![format!(
+            "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must expose only the exact reviewed closed broker protocol operations"
+        )];
+    }
+    Vec::new()
+}
+
+/// Compact every `func` signature in `code` by stripping ASCII whitespace.
+/// Unbalanced parameter lists fail closed with `None`.
+fn swift_func_signature_compacts(code: &str) -> Option<Vec<String>> {
+    let mut signatures = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = code[search_from..].find("func") {
+        let start = search_from + relative;
+        if !is_identifier_at(code, start, "func") {
+            search_from = start + "func".len();
             continue;
         }
-        index += 1;
+        let name_start = skip_ascii_whitespace(code, start + "func".len());
+        let name_length = code[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_length == 0 {
+            search_from = start + "func".len();
+            continue;
+        }
+        let after_name = skip_ascii_whitespace(code, name_start + name_length);
+        let Some(paren_relative) = code[after_name..].find('(') else {
+            search_from = start + "func".len();
+            continue;
+        };
+        let paren = after_name + paren_relative;
+        // Reject generic methods (`func name<T>(...)`) by including the gap in
+        // the compact form so it cannot match the closed allowlist.
+        let parameters = balanced_delimited_body(code, paren, b'(', b')')?;
+        let after_params = paren + parameters.len();
+        let mut end = after_params;
+        let after_params_trimmed = skip_ascii_whitespace(code, after_params);
+        if code[after_params_trimmed..].starts_with("->") {
+            end = consume_swift_type_end(code, after_params_trimmed + "->".len());
+        }
+        signatures.push(rust_token_canonical(&code[start..end]));
+        search_from = end;
     }
-    false
+    Some(signatures)
+}
+
+/// Advance past a simple Swift type expression used as a top-level return type.
+fn consume_swift_type_end(code: &str, mut index: usize) -> usize {
+    index = skip_ascii_whitespace(code, index);
+    let bytes = code.as_bytes();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'?' | b'!' => {
+                index += 1;
+            }
+            b'[' => {
+                let Some(body) = balanced_delimited_body(code, index, b'[', b']') else {
+                    return index;
+                };
+                index += body.len();
+            }
+            b'(' => {
+                let Some(body) = balanced_delimited_body(code, index, b'(', b')') else {
+                    return index;
+                };
+                index += body.len();
+            }
+            b'<' => {
+                let Some(body) = balanced_delimited_body(code, index, b'<', b'>') else {
+                    return index;
+                };
+                index += body.len();
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+/// Pin the raw listener document to the reviewed requirement literal, and pin
+/// the exact `newConnection.setCodeSigningRequirement(Self.<constant>)` call on
+/// comment/string-stripped Swift so documentation mentions cannot satisfy or
+/// inflate the executable call count.
+fn token_broker_code_signing_requirement_violations(document: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let path = REVIEWED_TOKEN_BROKER_LISTENER_PATH;
+    let swift_string = format!(
+        "\"{}\"",
+        REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_LITERAL.replace('\"', "\\\"")
+    );
+    // Literal and assignment stay on raw source: stripping strings would hide them.
+    if document.matches(&swift_string).count() != 1 {
+        violations.push(format!(
+            "{path} must declare the exact reviewed code-signing requirement literal"
+        ));
+    }
+    let constant = REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CONSTANT;
+    let assignment_compact =
+        rust_token_canonical(&format!("static let {constant} = {swift_string}"));
+    let compact_raw = rust_token_canonical(document);
+    if !compact_raw.contains(&assignment_compact) {
+        violations.push(format!(
+            "{path} must assign the reviewed code-signing requirement literal to `{constant}`"
+        ));
+    }
+    // Call marker and exact call: executable code only (comments/strings masked).
+    let code = strip_swift_non_code(document);
+    if identifier_occurrence_count(&code, "setCodeSigningRequirement") != 1 {
+        violations.push(format!(
+            "{path} must call setCodeSigningRequirement exactly once"
+        ));
+    }
+    let call_compact = rust_token_canonical(REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CALL);
+    let compact_code = rust_token_canonical(&code);
+    if compact_code.matches(&call_compact).count() != 1 {
+        violations.push(format!(
+            "{path} must apply the reviewed code-signing requirement via the exact reviewed call"
+        ));
+    }
+    violations
 }
 
 fn validate_tersa_mac_top_level_keys(
@@ -8008,8 +8141,9 @@ mod tests {
         swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
         swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
         swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
-        target_metadata_options, token_broker_source_surface_violations,
-        tracked_apple_signing_inventory, tracked_project_generation_violations,
+        target_metadata_options, token_broker_code_signing_requirement_violations,
+        token_broker_source_surface_violations, tracked_apple_signing_inventory,
+        tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -12354,9 +12488,8 @@ targets:
         );
     }
 
-    #[test]
-    fn token_broker_source_surface_is_closed_and_fail_closed() {
-        let sources = [
+    fn reviewed_token_broker_sources() -> [(PathBuf, String); 6] {
+        [
             (
                 PathBuf::from("apple/macos-token-broker/main.swift"),
                 include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
@@ -12383,7 +12516,26 @@ targets:
                 include_str!("../../apple/macos-token-broker/TersaMacTokenBroker.entitlements")
                     .to_owned(),
             ),
-        ];
+        ]
+    }
+
+    fn assert_token_broker_surface_contains(
+        sources: &[(PathBuf, String)],
+        expected: &str,
+        label: &str,
+    ) {
+        let violations = token_broker_source_surface_violations(sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{label} must fail closed; got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn token_broker_source_surface_is_closed_and_fail_closed() {
+        let sources = reviewed_token_broker_sources();
         assert!(token_broker_source_surface_violations(&sources).is_empty());
 
         for (label, path, document, expected) in [
@@ -12403,7 +12555,7 @@ targets:
                 "generic data RPC",
                 "apple/macos-token-broker/TokenBrokerProtocol.swift",
                 "@objc protocol OpenRPC { func invoke(payload: Data, withReply reply: @escaping (Data?) -> Void) }\n",
-                "generic Data-based",
+                "exact reviewed closed broker protocol operations",
             ),
             (
                 "refresh token field",
@@ -12425,13 +12577,7 @@ targets:
             {
                 entry.1 = document.to_owned();
             }
-            let violations = token_broker_source_surface_violations(&mutated);
-            assert!(
-                violations
-                    .iter()
-                    .any(|violation| violation.contains(expected)),
-                "{label} must fail closed; got {violations:?}"
-            );
+            assert_token_broker_surface_contains(&mutated, expected, label);
         }
 
         let macos_client = [(
@@ -12450,6 +12596,47 @@ targets:
                 include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
             )])
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn token_broker_source_inventory_and_signing_call_are_fail_closed() {
+        let sources = reviewed_token_broker_sources();
+
+        let mut with_extra = sources.to_vec();
+        with_extra.push((
+            PathBuf::from("apple/macos-token-broker/ExtraBrokerSurface.swift"),
+            "import Foundation\n".to_owned(),
+        ));
+        assert_token_broker_surface_contains(
+            &with_extra,
+            "outside the closed TersaMacTokenBroker source allowlist",
+            "extra seventh broker file",
+        );
+
+        let mut missing_required = sources.to_vec();
+        missing_required.retain(|(path, _)| {
+            path != Path::new("apple/macos-token-broker/TokenBrokerService.swift")
+        });
+        assert_token_broker_surface_contains(
+            &missing_required,
+            "source inventory is missing required path",
+            "missing required broker path",
+        );
+
+        let mut without_signing_call = sources.to_vec();
+        if let Some(entry) = without_signing_call.iter_mut().find(|(path, _)| {
+            path == Path::new("apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
+        }) {
+            entry.1 = entry.1.replace(
+                "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                "",
+            );
+        }
+        assert_token_broker_surface_contains(
+            &without_signing_call,
+            "setCodeSigningRequirement",
+            "removed setCodeSigningRequirement call",
         );
     }
 
@@ -12509,85 +12696,172 @@ protocol TersaMacTokenBrokerProtocolV1 {
     }
 
     #[test]
-    fn token_broker_protocol_surface_rejects_broadened_or_wrong_version() {
+    fn token_broker_protocol_surface_rejects_non_allowlisted_operations() {
+        let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
+        for (label, snippet) in [
+            (
+                "broadened Data RPC",
+                "\nfunc invoke(payload: Data, withReply reply: @escaping (Data?) -> Void)\n",
+            ),
+            (
+                "array Data parameter",
+                "\nfunc invoke(payload: [Data], withReply reply: @escaping (Int) -> Void)\n",
+            ),
+            (
+                "NSData parameter",
+                "\nfunc invoke(payload: NSData, withReply reply: @escaping (Int) -> Void)\n",
+            ),
+            (
+                "Foundation.Data parameter",
+                "\nfunc invoke(payload: Foundation.Data, withReply reply: @escaping (Int) -> Void)\n",
+            ),
+            (
+                "UInt8 array parameter",
+                "\nfunc invoke(payload: [UInt8], withReply reply: @escaping (Int) -> Void)\n",
+            ),
+            ("top-level Data return", "\nfunc snapshot() -> Data\n"),
+        ] {
+            let mut mutated = reviewed_token_broker_sources();
+            if let Some(entry) = mutated.iter_mut().find(|(path, _)| path == protocol_path) {
+                entry.1.push_str(snippet);
+            }
+            assert_token_broker_surface_contains(
+                &mutated,
+                "exact reviewed closed broker protocol operations",
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn token_broker_protocol_surface_rejects_wrong_version() {
         let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
         let reviewed =
             include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
-        let mut sources = [
-            (
-                PathBuf::from("apple/macos-token-broker/main.swift"),
-                include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
-            ),
-            (
-                PathBuf::from("apple/macos-token-broker/TokenBrokerProtocol.swift"),
-                reviewed.clone(),
-            ),
-            (
-                PathBuf::from("apple/macos-token-broker/TokenBrokerService.swift"),
-                include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned(),
-            ),
-            (
-                PathBuf::from("apple/macos-token-broker/TokenBrokerListenerDelegate.swift"),
-                include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
-                    .to_owned(),
-            ),
-            (
-                PathBuf::from("apple/macos-token-broker/Info.plist"),
-                include_str!("../../apple/macos-token-broker/Info.plist").to_owned(),
-            ),
-            (
-                PathBuf::from("apple/macos-token-broker/TersaMacTokenBroker.entitlements"),
-                include_str!("../../apple/macos-token-broker/TersaMacTokenBroker.entitlements")
-                    .to_owned(),
-            ),
-        ];
 
-        // Negative: a broadened generic Data interface still fails the surface guard.
-        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
-            entry.1.push_str(
-                "\nfunc invoke(payload: Data, withReply reply: @escaping (Data?) -> Void)\n",
+        for (label, assignment) in [
+            ("wrong constant value", "static let value: Int = 2"),
+            ("underscore suffix", "static let value: Int = 1_0"),
+            ("addition expression", "static let value: Int = 1 + 1"),
+            ("shift expression", "static let value: Int = 1 << 4"),
+        ] {
+            let mutated_version = reviewed.replace("static let value: Int = 1", assignment);
+            let mut mutated = reviewed_token_broker_sources();
+            if let Some(entry) = mutated.iter_mut().find(|(path, _)| path == protocol_path) {
+                entry.1 = mutated_version;
+            }
+            assert_token_broker_surface_contains(
+                &mutated,
+                "exact reviewed protocol version constant",
+                label,
             );
         }
-        assert!(
-            token_broker_source_surface_violations(&sources)
-                .iter()
-                .any(|violation| violation.contains("generic Data-based")),
-            "broadened Data-based broker interface must fail closed"
-        );
 
-        // Negative: wrong protocol version constant value fails.
-        let wrong_version =
-            reviewed.replace("static let value: Int = 1", "static let value: Int = 2");
-        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
-            entry.1 = wrong_version;
-        }
-        assert!(
-            token_broker_source_surface_violations(&sources)
-                .iter()
-                .any(|violation| {
-                    violation.contains("exact reviewed protocol version constant")
-                        || violation.contains("static let value: Int = 1")
-                }),
-            "protocol version other than 1 must fail closed"
-        );
-
-        // Negative: missing version marker fails.
         let missing_version = reviewed.replace(
             "enum TersaMacTokenBrokerProtocolVersion {\n    static let value: Int = 1\n}\n\n",
             "",
         );
-        if let Some(entry) = sources.iter_mut().find(|(path, _)| path == protocol_path) {
+        let mut missing = reviewed_token_broker_sources();
+        if let Some(entry) = missing.iter_mut().find(|(path, _)| path == protocol_path) {
             entry.1 = missing_version;
         }
+        let violations = token_broker_source_surface_violations(&missing);
         assert!(
-            token_broker_source_surface_violations(&sources)
-                .iter()
-                .any(|violation| {
-                    violation.contains("TersaMacTokenBrokerProtocolVersion")
-                        || violation.contains("exact reviewed protocol version constant")
-                }),
-            "missing protocol version surface must fail closed"
+            violations.iter().any(|violation| {
+                violation.contains("TersaMacTokenBrokerProtocolVersion")
+                    || violation.contains("exact reviewed protocol version constant")
+            }),
+            "missing protocol version surface must fail closed; got {violations:?}"
         );
+    }
+
+    #[test]
+    fn token_broker_code_signing_requirement_is_exact_literal_and_call() {
+        let listener_path = Path::new("apple/macos-token-broker/TokenBrokerListenerDelegate.swift");
+        let reviewed =
+            include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
+                .to_owned();
+        // Positive: reviewed doc-comment mention plus one executable call passes.
+        // The doc reference must not inflate the executable call count.
+        assert!(
+            token_broker_code_signing_requirement_violations(&reviewed).is_empty(),
+            "reviewed listener with doc mention + one executable call must pass; got {:?}",
+            token_broker_code_signing_requirement_violations(&reviewed)
+        );
+        let sources = reviewed_token_broker_sources();
+        assert!(token_broker_source_surface_violations(&sources).is_empty());
+
+        for (label, document) in [
+            (
+                "empty requirement",
+                reviewed.replace(
+                    "\"identifier \\\"app.tersa.mac\\\" and anchor apple generic\"",
+                    "\"\"",
+                ),
+            ),
+            (
+                "anchor-only requirement",
+                reviewed.replace(
+                    "\"identifier \\\"app.tersa.mac\\\" and anchor apple generic\"",
+                    "\"anchor apple generic\"",
+                ),
+            ),
+            (
+                "changed identifier",
+                reviewed.replace(
+                    "\"identifier \\\"app.tersa.mac\\\" and anchor apple generic\"",
+                    "\"identifier \\\"app.tersa.other\\\" and anchor apple generic\"",
+                ),
+            ),
+            (
+                "changed constant reference",
+                reviewed.replace(
+                    "newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)",
+                    "newConnection.setCodeSigningRequirement(Self.otherRequirement)",
+                ),
+            ),
+            (
+                "missing call",
+                reviewed.replace(
+                    "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                    "",
+                ),
+            ),
+            (
+                "comment-only marker",
+                reviewed.replace(
+                    "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                    "        // newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                ),
+            ),
+            (
+                "string-only marker",
+                reviewed.replace(
+                    "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                    "        let _ = \"newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\"\n",
+                ),
+            ),
+            (
+                "duplicate call",
+                reviewed.replace(
+                    "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                    "        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n        newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)\n",
+                ),
+            ),
+        ] {
+            let mut mutated = sources.clone();
+            if let Some(entry) = mutated.iter_mut().find(|(path, _)| path == listener_path) {
+                entry.1 = document;
+            }
+            let violations = token_broker_source_surface_violations(&mutated);
+            assert!(
+                violations.iter().any(|violation| {
+                    violation.contains("code-signing requirement")
+                        || violation.contains("setCodeSigningRequirement")
+                }),
+                "{label} must fail the exact code-signing pin; got {violations:?}"
+            );
+        }
     }
 
     #[test]
