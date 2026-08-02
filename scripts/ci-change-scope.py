@@ -124,14 +124,38 @@ def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False
         if path.startswith("apple/licenses/"):
             scope.enable("notices")
             continue
+        # Security-critical Apple packaging inputs can drift the fail-closed
+        # policy checked by `cargo xtask verify`, so they also enable the
+        # portable Rust and policy lanes (not the broader evidence matrix).
+        # `apple/macos/**` hosts the product client XPC-wiring guards; the
+        # token broker, XcodeGen project, and entitlements are the other
+        # exact-scoped inputs. Component entitlements keep their component
+        # lanes additively rather than replacing them.
+        is_component_entitlement = path.startswith("apple/") and path.endswith(
+            ".entitlements"
+        )
         if path.startswith("apple/slint-"):
             scope.enable("product_apple", "slint")
+            if is_component_entitlement:
+                scope.enable("rust_linux", "policy")
             continue
         if path.startswith("apple/dioxus-"):
             scope.enable("product_apple", "dioxus")
+            if is_component_entitlement:
+                scope.enable("rust_linux", "policy")
             continue
         if path.startswith("apple/mime-") or path.startswith("apple/mime-common/"):
             scope.enable("product_apple", "mime")
+            if is_component_entitlement:
+                scope.enable("rust_linux", "policy")
+            continue
+        if (
+            path.startswith("apple/macos-token-broker/")
+            or path.startswith("apple/macos/")
+            or path == "apple/project.yml"
+            or is_component_entitlement
+        ):
+            scope.enable("rust_linux", "policy", "product_apple")
             continue
         if path.startswith(SHARED_UI_CRATES):
             scope.enable("rust_linux", "policy", "product_apple", "slint", "dioxus")

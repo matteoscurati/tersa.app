@@ -45,6 +45,9 @@ targets:
           - ${TeamIdentifierPrefix}app.tersa.shared
         keychain-access-groups:
           - ${TeamIdentifierPrefix}app.tersa.shared
+    dependencies:
+      - target: TersaMacTokenBroker
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
@@ -65,6 +68,31 @@ targets:
     scheme:
       testTargets:
         - TersaMacTests
+  TersaMacTokenBroker:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: macos-token-broker
+    info:
+      path: macos-token-broker/Info.plist
+      properties:
+        CFBundlePackageType: XPC!
+        XPCService:
+          ServiceType: Application
+    entitlements:
+      path: macos-token-broker/TersaMacTokenBroker.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        keychain-access-groups:
+          - ${TeamIdentifierPrefix}app.tersa.token
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.token-broker
+        PRODUCT_NAME: TersaMacTokenBroker
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
+        SKIP_INSTALL: "YES"
   TersaMacTests:
     type: bundle.unit-test
     platform: macOS

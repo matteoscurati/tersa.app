@@ -65,3 +65,15 @@ their Cargo build phases because Cargo and rustup read the compiler sysroot
 outside `SRCROOT`. The scripts accept fixed platform/configuration values, use
 the workspace lockfile, and write intermediates only below the ignored
 `apple/build` directory. No other target inherits this exception.
+
+`TersaMac` also embeds the `TersaMacTokenBroker` XPC service packaging skeleton
+required by
+[ADR 0024](../docs/architecture/adr-0024-macos-token-process-isolation.md). The
+broker target lives under `macos-token-broker`, declares only App Sandbox,
+outbound network client, and the dedicated token Keychain access group, and
+exports a closed fail-closed version-1 NSXPC protocol. Runtime isolation is
+**not** active in this slice: OAuth and token authority remain in-process in
+`TersaMac`, the dedicated token group is not provisioned or used, there is no
+client-side XPC wiring in `macos/`, and local builds remain unsigned unless
+signing is configured. The broker target does not disable script sandboxing,
+link Rust, or perform Keychain, network, or OAuth work.
