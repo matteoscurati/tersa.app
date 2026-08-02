@@ -721,28 +721,32 @@ mod macos {
         fn read_lifecycle_metadata(&self) -> Result<AccountLifecycleMetadata, MailboxStoreError> {
             self.with_connection(|connection| {
                 let row = connection.query_row(
-                    "SELECT CASE WHEN disconnect_recovery IS NULL OR (typeof(disconnect_recovery) = 'integer' AND disconnect_recovery IN (1, 2)) THEN disconnect_recovery END, last_successful_sync_unix_millis FROM account_lifecycle WHERE singleton = 1",
+                    "SELECT typeof(disconnect_recovery), CASE WHEN typeof(disconnect_recovery) = 'integer' THEN disconnect_recovery ELSE 0 END, typeof(last_successful_sync_unix_millis), CASE WHEN typeof(last_successful_sync_unix_millis) = 'integer' THEN last_successful_sync_unix_millis ELSE 0 END FROM account_lifecycle WHERE singleton = 1",
                     [],
                     |row| {
-                        let recovery: Option<i64> = row.get(0)?;
-                        let freshness: Option<i64> = row.get(1)?;
-                        Ok((recovery, freshness))
+                        let recovery_type: String = row.get(0)?;
+                        let recovery_value: i64 = row.get(1)?;
+                        let freshness_type: String = row.get(2)?;
+                        let freshness_value: i64 = row.get(3)?;
+                        Ok((recovery_type, recovery_value, freshness_type, freshness_value))
                     },
                 );
-                let (recovery, freshness) = match row {
+                let (recovery_type, recovery_value, freshness_type, freshness_value) = match row {
                     Ok(values) => values,
                     Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AccountLifecycleMetadata::default()),
                     Err(error) => return Err(store_error(error)),
                 };
-                let recovery = match recovery {
-                    None => None,
-                    Some(1) => Some(DisconnectRecoveryState::IncompleteTeardown),
-                    Some(2) => Some(DisconnectRecoveryState::RevokeUnconfirmed),
-                    Some(_) => return Err(MailboxStoreError::Corrupted),
+                let recovery = match (recovery_type.as_str(), recovery_value) {
+                    ("null", _) => None,
+                    ("integer", 1) => Some(DisconnectRecoveryState::IncompleteTeardown),
+                    ("integer", 2) => Some(DisconnectRecoveryState::RevokeUnconfirmed),
+                    _ => return Err(MailboxStoreError::Corrupted),
                 };
-                if freshness.is_some_and(|value| value < 0) {
-                    return Err(MailboxStoreError::Corrupted);
-                }
+                let freshness = match (freshness_type.as_str(), freshness_value) {
+                    ("null", _) => None,
+                    ("integer", value) if value >= 0 => Some(value),
+                    _ => return Err(MailboxStoreError::Corrupted),
+                };
                 AccountLifecycleMetadata::new(recovery, freshness)
                     .ok_or(MailboxStoreError::Corrupted)
             })
@@ -5372,6 +5376,69 @@ mod macos {
                     .unwrap()
                     .last_successful_sync_unix_millis(),
                 None
+            );
+        }
+
+        #[test]
+        fn lifecycle_rejects_injected_non_null_recovery_corruption() {
+            let (_database, store) = open("lifecycle-recovery-corruption");
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, 99, NULL)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                run(store.lifecycle_metadata(&account())),
+                Err(MailboxStoreError::Corrupted)
+            );
+
+            let (_database, typed_store) = open("lifecycle-recovery-type-corruption");
+            let connection = typed_store.connection.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, 'invalid', NULL)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                run(typed_store.lifecycle_metadata(&account())),
+                Err(MailboxStoreError::Corrupted)
+            );
+
+            let (_database, freshness_store) = open("lifecycle-freshness-type-corruption");
+            let connection = freshness_store.connection.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, NULL, 'invalid')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                run(freshness_store.lifecycle_metadata(&account())),
+                Err(MailboxStoreError::Corrupted)
             );
         }
 

@@ -133,6 +133,15 @@ class ChangeScopeTests(unittest.TestCase):
             marker = f"- name: {step}\n        if: github.event_name == 'workflow_dispatch'"
             self.assertIn(marker, workflow)
 
+    def test_product_lane_runs_macos_tests_in_its_single_debug_build(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("      - name: Test unsigned macOS debug application")
+        end = workflow.index("      - name: Build unsigned iOS simulator debug application", start)
+        macos_step = workflow[start:end]
+        self.assertIn(" xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac", macos_step)
+        self.assertTrue(macos_step.rstrip().endswith("test"))
+        self.assertNotIn("Build unsigned macOS debug application", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

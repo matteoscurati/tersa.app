@@ -155,13 +155,13 @@ jobs:
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
       - name: Generate Apple project
         run: sh apple/scripts/generate-project.sh
-      - name: Build unsigned macOS debug application
+      - name: Test unsigned macOS debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
           -configuration Debug -destination 'platform=macOS,arch=arm64'
           -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
           TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
+          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
       - name: Build unsigned iOS simulator debug application
         run: >-
           xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
