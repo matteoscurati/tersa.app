@@ -137,11 +137,25 @@ also changing the signed entitlement topology.
 The repository now includes the embedded `TersaMacTokenBroker` XPC packaging
 skeleton: an XcodeGen target, a closed version-1 NSXPC protocol surface, a
 fail-closed service entry point, disjoint broker entitlement declarations, and
-xtask inventory guards for those shapes. That skeleton does **not** activate
-runtime isolation. Token authority remains in-process in `TersaMac`. The
-dedicated token Keychain group is declared for the broker only and is not yet
-registered, provisioned, or used. Builds remain unsigned unless an operator
-configures signing locally. This ADR still implements no Keychain migration,
-OAuth/token move, client XPC wiring, signed runtime proof, notarization, or
-distribution evidence. Until those later items land, the source guard is
-defense in depth and final distribution remains blocked by issue #51.
+xtask inventory guards for those shapes.
+
+The portable token-broker lifecycle core now also exists as the
+`tersa-token-broker-core` workspace crate (`adapters/token-broker-core`). It
+implements the broker's process-agnostic OAuth/token logic over generic ports:
+authorization begin/complete with a bounded TTL'd PKCE session registry, code
+exchange, refresh, rotation, per-subject serialized token mutation, a
+refresh-token store port, revoke/delete separation, zeroizing public token
+results, and a closed error surface. It deliberately contains no
+Security.framework/Keychain code, no C ABI, and no IPC.
+
+Neither piece activates runtime isolation. The portable core is not yet linked
+into the XPC target, which still links no Rust; there is no production
+Keychain adapter bound to its refresh-token store port, no client-side XPC
+wiring in `macos/`, and no entitlement activation. Token authority remains
+in-process in `TersaMac`. The dedicated token Keychain group is declared for
+the broker only and is not yet registered, provisioned, or used. Builds remain
+unsigned unless an operator configures signing locally. This ADR still
+implements no Keychain migration, OAuth/token move behind XPC, signed runtime
+proof, notarization, or distribution evidence. Until those later items land,
+the source guard is defense in depth and final distribution remains blocked by
+issue #51.
