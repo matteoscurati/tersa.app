@@ -5990,11 +5990,19 @@ fn consume_swift_type_end(code: &str, mut index: usize) -> usize {
 }
 
 /// Fail closed unless inventoried broker Swift has no executable `typealias`
-/// and does not declare a local type named `String`. The closed protocol
-/// allowlist matches textual `String`; a module-scope alias or type named
-/// `String` would otherwise rebind every wire value (for example to `Data`).
-/// Comments and string literals are already masked by the caller.
+/// and does not declare a local type that shadows a reviewed primitive wire
+/// type (`String`, `Int`, or `Void`). The closed protocol allowlist matches
+/// those names textually; a module-scope alias or type with the same name
+/// would otherwise rebind every wire value (for example `String`/`Int` to
+/// `Data`, or `Void` to a non-empty payload) while leaving the signature
+/// guard unchanged. Plain and well-formed backtick-escaped declaration names
+/// are compared on their unescaped spelling (a backtick-escaped `String`
+/// declaration rebinds unqualified `String`). Comments and string literals are
+/// already masked by the caller.
 fn token_broker_type_shadowing_violations(path: &str, code: &str) -> Vec<String> {
+    // Reviewed primitive wire types that appear in closed XPC signatures and
+    // the pinned protocol version (`static let value: Int = 1`).
+    const REVIEWED_PRIMITIVE_WIRE_TYPES: &[&str] = &["String", "Int", "Void"];
     let mut violations = Vec::new();
     if contains_identifier(code, "typealias") {
         violations.push(format!(
@@ -6007,17 +6015,52 @@ fn token_broker_type_shadowing_violations(path: &str, code: &str) -> Vec<String>
                 continue;
             }
             let name_start = skip_ascii_whitespace(code, start + keyword.len());
-            if code[name_start..].starts_with("String")
-                && is_identifier_at(code, name_start, "String")
+            let Some(name) = swift_type_declaration_name_at(code, name_start) else {
+                continue;
+            };
+            if let Some(primitive) = REVIEWED_PRIMITIVE_WIRE_TYPES
+                .iter()
+                .copied()
+                .find(|primitive| *primitive == name)
             {
                 violations.push(format!(
-                    "{path} must not shadow `String` with a local type declaration in inventoried token-broker sources"
+                    "{path} must not shadow `{primitive}` with a local type declaration in inventoried token-broker sources"
                 ));
                 break;
             }
         }
     }
     violations
+}
+
+/// Type name immediately after a type-introducing keyword. Accepts a plain
+/// ASCII identifier or a well-formed backtick-escaped ASCII identifier and
+/// returns the unescaped spelling so `` `String` `` compares equal to `String`.
+fn swift_type_declaration_name_at(code: &str, name_start: usize) -> Option<&str> {
+    let bytes = code.as_bytes();
+    if bytes.get(name_start) == Some(&b'`') {
+        let inner_start = name_start + 1;
+        let name_length = code[inner_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_length == 0 {
+            return None;
+        }
+        let closing = inner_start + name_length;
+        if bytes.get(closing) != Some(&b'`') {
+            return None;
+        }
+        return Some(&code[inner_start..closing]);
+    }
+    let name_length = code[name_start..]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_length == 0 {
+        return None;
+    }
+    Some(&code[name_start..name_start + name_length])
 }
 
 /// Pin the reviewed requirement literal via the single executable
@@ -13541,8 +13584,105 @@ protocol TersaMacTokenBrokerProtocolV1 {
         ]);
     }
 
+    /// Fail-closed fixtures for typealias rebinding and local type declarations
+    /// that shadow reviewed primitive wire types (`String`, `Int`, `Void`).
+    fn primitive_wire_type_shadowing_cases(
+        protocol_path: &Path,
+        service_path: &Path,
+        reviewed_protocol: &str,
+        reviewed_service: &str,
+    ) -> Vec<(String, PathBuf, String, String)> {
+        let mut cases = vec![
+            (
+                "typealias String = Data".to_owned(),
+                protocol_path.to_path_buf(),
+                format!("{reviewed_protocol}\ntypealias String = Data\n"),
+                "typealias".to_owned(),
+            ),
+            (
+                "indirect typealias chain".to_owned(),
+                protocol_path.to_path_buf(),
+                format!(
+                    "{reviewed_protocol}\ntypealias WireText = Data\ntypealias String = WireText\n"
+                ),
+                "typealias".to_owned(),
+            ),
+            (
+                "typealias in another broker source file".to_owned(),
+                service_path.to_path_buf(),
+                format!("{reviewed_service}\ntypealias String = Data\n"),
+                "typealias".to_owned(),
+            ),
+        ];
+        for primitive in ["String", "Int", "Void"] {
+            cases.push((
+                format!("struct {primitive} shadow"),
+                protocol_path.to_path_buf(),
+                format!("{reviewed_protocol}\nstruct {primitive} {{}}\n"),
+                format!("shadow `{primitive}`"),
+            ));
+            cases.push((
+                format!("class {primitive} shadow"),
+                service_path.to_path_buf(),
+                format!("{reviewed_service}\nclass {primitive} {{}}\n"),
+                format!("shadow `{primitive}`"),
+            ));
+            cases.push((
+                format!("enum {primitive} shadow"),
+                protocol_path.to_path_buf(),
+                format!("{reviewed_protocol}\nenum {primitive} {{ case decoy }}\n"),
+                format!("shadow `{primitive}`"),
+            ));
+        }
+        // Backtick-escaped declaration names resolve to the same local type as
+        // the unescaped form; textual wire signatures stay pinned while the
+        // resolved type is rebound. Ordinary non-primitive backtick names are
+        // not in the reviewed set and must not bypass these primitives.
+        cases.push((
+            "backtick-escaped struct `String` shadow".to_owned(),
+            protocol_path.to_path_buf(),
+            format!("{reviewed_protocol}\nstruct `String` {{}}\n"),
+            "shadow `String`".to_owned(),
+        ));
+        cases.push((
+            "backtick-escaped class `Int` shadow".to_owned(),
+            service_path.to_path_buf(),
+            format!("{reviewed_service}\nclass `Int` {{}}\n"),
+            "shadow `Int`".to_owned(),
+        ));
+        cases.push((
+            "backtick-escaped enum `Void` shadow".to_owned(),
+            protocol_path.to_path_buf(),
+            format!("{reviewed_protocol}\nenum `Void` {{ case decoy }}\n"),
+            "shadow `Void`".to_owned(),
+        ));
+        cases
+    }
+
+    /// Comments and string mentions of typealias/primitives must not fail closed.
+    fn assert_inert_primitive_wire_type_mentions_do_not_fail_closed(
+        sources: &[(PathBuf, String)],
+        protocol_path: &Path,
+        reviewed_protocol: &str,
+    ) {
+        let inert = reviewed_protocol.to_owned()
+            + "\n// typealias String = Data\n/* struct Int {} */\n/* class Void {} */\nlet _ = \"typealias String = Data\"\nlet _ = \"struct Int {}\"\nlet _ = \"class Void {}\"\n";
+        let mut with_inert = sources.to_vec();
+        if let Some(entry) = with_inert
+            .iter_mut()
+            .find(|(candidate, _)| candidate == protocol_path)
+        {
+            entry.1 = inert;
+        }
+        assert!(
+            token_broker_source_surface_violations(&with_inert).is_empty(),
+            "inert comment/string typealias/primitive mentions must not fail closed; got {:?}",
+            token_broker_source_surface_violations(&with_inert)
+        );
+    }
+
     #[test]
-    fn token_broker_sources_reject_string_type_shadowing() {
+    fn token_broker_sources_reject_primitive_wire_type_shadowing() {
         let sources = reviewed_token_broker_sources();
         assert!(token_broker_source_surface_violations(&sources).is_empty());
 
@@ -13553,67 +13693,23 @@ protocol TersaMacTokenBrokerProtocolV1 {
         let reviewed_service =
             include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned();
 
-        for (label, path, document, expected) in [
-            (
-                "typealias String = Data",
-                protocol_path,
-                format!("{reviewed_protocol}\ntypealias String = Data\n"),
-                "typealias",
-            ),
-            (
-                "indirect typealias chain",
-                protocol_path,
-                format!(
-                    "{reviewed_protocol}\ntypealias WireText = Data\ntypealias String = WireText\n"
-                ),
-                "typealias",
-            ),
-            (
-                "typealias in another broker source file",
-                service_path,
-                format!("{reviewed_service}\ntypealias String = Data\n"),
-                "typealias",
-            ),
-            (
-                "struct String shadow",
-                protocol_path,
-                format!("{reviewed_protocol}\nstruct String {{}}\n"),
-                "shadow `String`",
-            ),
-            (
-                "class String shadow",
-                service_path,
-                format!("{reviewed_service}\nclass String {{}}\n"),
-                "shadow `String`",
-            ),
-            (
-                "enum String shadow",
-                protocol_path,
-                format!("{reviewed_protocol}\nenum String {{ case decoy }}\n"),
-                "shadow `String`",
-            ),
-        ] {
+        for (label, path, document, expected) in primitive_wire_type_shadowing_cases(
+            protocol_path,
+            service_path,
+            &reviewed_protocol,
+            &reviewed_service,
+        ) {
             let mut mutated = sources.clone();
-            if let Some(entry) = mutated.iter_mut().find(|(candidate, _)| candidate == path) {
+            if let Some(entry) = mutated.iter_mut().find(|(candidate, _)| candidate == &path) {
                 entry.1 = document;
             }
-            assert_token_broker_surface_contains(&mutated, expected, label);
+            assert_token_broker_surface_contains(&mutated, &expected, &label);
         }
 
-        // Comments and string mentions of typealias/String must not fail closed.
-        let inert = reviewed_protocol
-            + "\n// typealias String = Data\n/* typealias String = Data */\nlet _ = \"typealias String = Data\"\n";
-        let mut with_inert = sources.clone();
-        if let Some(entry) = with_inert
-            .iter_mut()
-            .find(|(candidate, _)| candidate == protocol_path)
-        {
-            entry.1 = inert;
-        }
-        assert!(
-            token_broker_source_surface_violations(&with_inert).is_empty(),
-            "inert comment/string typealias mentions must not fail closed; got {:?}",
-            token_broker_source_surface_violations(&with_inert)
+        assert_inert_primitive_wire_type_mentions_do_not_fail_closed(
+            &sources,
+            protocol_path,
+            &reviewed_protocol,
         );
     }
 
