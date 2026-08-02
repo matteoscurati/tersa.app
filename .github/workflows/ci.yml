@@ -299,7 +299,7 @@ jobs:
           retention-days: 90
   slint-apple-evidence:
     name: Slint Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'slint' }}
     runs-on: macos-26
     timeout-minutes: 30
@@ -363,7 +363,7 @@ jobs:
 
   dioxus-apple-evidence:
     name: Dioxus Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'dioxus' }}
     runs-on: macos-26
     timeout-minutes: 60
@@ -459,7 +459,7 @@ jobs:
 
   sqlcipher-apple-evidence:
     name: SQLCipher Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'sqlcipher' }}
     runs-on: macos-26
     timeout-minutes: 20
@@ -498,7 +498,7 @@ jobs:
 
   search-apple-evidence:
     name: Search Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'search' }}
     runs-on: macos-26
     timeout-minutes: 30
@@ -538,7 +538,7 @@ jobs:
 
   mime-apple-evidence:
     name: MIME and HTML Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime' }}
     runs-on: macos-26
     timeout-minutes: 30
@@ -609,7 +609,7 @@ jobs:
 
   mime-parser-fuzz:
     name: Deterministic MIME parser fuzz regression
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime-fuzz' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -672,7 +672,7 @@ jobs:
 
   blob-apple-evidence:
     name: Crash-safe AEAD blob Apple evidence
-    needs: [changes, ci_gate]
+    needs: [changes, manual_evidence_gate]
     if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'blob' }}
     runs-on: macos-26
     timeout-minutes: 30

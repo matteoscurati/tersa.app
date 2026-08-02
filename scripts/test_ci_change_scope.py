@@ -110,6 +110,11 @@ class ChangeScopeTests(unittest.TestCase):
             "github.event_name != 'workflow_dispatch'",
             workflow,
         )
+        self.assertEqual(
+            workflow.count("needs: [changes, manual_evidence_gate]"),
+            7,
+        )
+        self.assertNotIn("needs: [changes, ci_gate]", workflow)
 
     def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
