@@ -59,16 +59,17 @@ SQLCipher, search, MIME, fuzz, blob, and OAuth evidence runs only through an
 explicit `workflow_dispatch` selection. Use `all` at release or at an
 architecture evidence checkpoint, and select one suite while investigating a
 specific diagnostic. These artifacts remain bound to the selected immutable
-commit and retain the existing 90-day protocol lifetime. Cache writes are also
-restricted to explicit evidence runs, preventing intermediate PR keys from
-growing the repository cache toward its storage limit. Manual runs publish
+commit and retain the existing 90-day protocol lifetime. GitHub Actions cache
+restore and save are disabled for every job and event, including manual evidence
+runs. Every run therefore starts without a repository cache and cannot recreate
+the deleted cache inventory. Manual runs publish
 `Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
 evidence selection cannot substitute for the real pull-request scope or DCO
 check.
 
 The repository is public and uses only standard GitHub-hosted runners, so runner
 execution has no billable minute charge. The policy above still minimizes queue
-time, redundant macOS capacity, cache churn, and artifact growth.
+time, redundant macOS capacity, and artifact growth.
 
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
 build paths fan out conservatively, while documentation, workflow, and xtask-only

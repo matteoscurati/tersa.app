@@ -103,7 +103,6 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("\n  push:\n", workflow)
         self.assertNotIn("github.event_name == 'push'", workflow)
         self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
-        self.assertIn("cache-save-if: ${{ github.event_name == 'workflow_dispatch' }}", workflow)
         self.assertIn("\n    name: CI gate\n", workflow)
         self.assertIn("\n    name: Manual evidence gate\n", workflow)
         self.assertIn(
@@ -115,6 +114,16 @@ class ChangeScopeTests(unittest.TestCase):
             7,
         )
         self.assertNotIn("needs: [changes, ci_gate]", workflow)
+
+    def test_workflow_disables_all_github_actions_caches(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        rust_setup_count = workflow.count("uses: actions-rust-lang/setup-rust-toolchain@")
+        self.assertGreater(rust_setup_count, 0)
+        self.assertEqual(workflow.count("          cache: false\n"), rust_setup_count)
+        self.assertNotIn("actions/cache@", workflow)
+        self.assertNotIn("Swatinem/rust-cache@", workflow)
+        self.assertNotIn("cache-save-if:", workflow)
+        self.assertNotIn("cache-on-failure:", workflow)
 
     def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
