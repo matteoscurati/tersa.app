@@ -275,7 +275,7 @@ where
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidInput`] for a malformed handle, an
-    /// oversized or unparseable callback, or a callback that does not match
+    /// oversized or unparsable callback, or a callback that does not match
     /// the pending session; [`BrokerError::SessionUnknown`] when the handle
     /// names no live session (unknown, expired, or consumed);
     /// [`BrokerError::InsufficientScope`] when the grant omitted Gmail read
@@ -1318,7 +1318,7 @@ mod tests {
             None,
         );
 
-        // An unparseable callback consumes the session; a replay of the same
+        // An unparsable callback consumes the session; a replay of the same
         // handle with the otherwise valid callback meets SessionUnknown.
         let pending = broker.begin_authorization(REDIRECT).unwrap();
         let handle = pending.session_handle().to_owned();

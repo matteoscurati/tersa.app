@@ -16,7 +16,7 @@ pub enum BrokerError {
     /// A caller-supplied value failed validation: the redirect URI was not an
     /// exact root-form literal IPv4 loopback with an explicit ephemeral port,
     /// the session handle was malformed, the subject was not conservative
-    /// Google-subject text, the callback URL was oversized or unparseable, or
+    /// Google-subject text, the callback URL was oversized or unparsable, or
     /// the callback did not match the pending session (redirect, state,
     /// parameter shape).
     InvalidInput,
