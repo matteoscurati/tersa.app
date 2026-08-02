@@ -246,7 +246,12 @@ depth:
    fetch bodies; a modify/write scope is forbidden). 3a must **replace** the current
    `GMAIL_MODIFY_SCOPE` constant, not add a read-only one beside it, so no code path
    can still request `gmail.modify`; `access_type=offline` (already present,
-   required for the refresh token) is retained.
+   required for the refresh token) is retained. The browser rung also sends
+   `prompt=consent`: that rung is reached only when no usable refresh token is
+   stored, and Google otherwise normally returns a refresh token only on the
+   first authorization. Explicit re-consent therefore repairs local deletion,
+   provider revocation, and Testing-mode expiry instead of accepting a token
+   response that cannot support the next launch.
 2. No write/send symbol exists in the exported C ABI allowlist (xtask-enforced) —
    also structural.
 3. The adapter is GET-only under the fixed Gmail base (ADR 0016) — a source

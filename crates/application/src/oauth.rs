@@ -425,7 +425,12 @@ fn prepare_with_secrets<C: MonotonicClock>(
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("access_type", "offline");
+        .append_pair("access_type", "offline")
+        // The browser rung is reached only when no usable refresh token is
+        // stored. Google normally returns a refresh token only on the first
+        // authorization, so an explicit re-consent is required after local
+        // deletion, provider revocation, or testing-token expiry.
+        .append_pair("prompt", "consent");
 
     Ok(PreparedAuthorization {
         authorization_url,
@@ -540,7 +545,7 @@ mod tests {
         let prepared = make_prepared(7);
         let pairs: Vec<_> = prepared.authorization_url().query_pairs().collect();
         let parameters: BTreeMap<_, _> = pairs.iter().cloned().collect();
-        assert_eq!(pairs.len(), 8);
+        assert_eq!(pairs.len(), 9);
         assert_eq!(parameters.len(), pairs.len());
         assert_eq!(parameters.get("scope").unwrap(), REQUESTED_SCOPE);
         assert_eq!(
@@ -566,6 +571,7 @@ mod tests {
             "app.tersa.oauth.test:/oauth/callback"
         );
         assert_eq!(parameters.get("access_type").unwrap(), "offline");
+        assert_eq!(parameters.get("prompt").unwrap(), "consent");
         let state = parameters.get("state").unwrap();
         let challenge = parameters.get("code_challenge").unwrap();
         assert_eq!(state.len(), 43);
