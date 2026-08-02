@@ -44,6 +44,9 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-24.04
     outputs:
+      rust_linux: ${{ steps.scope.outputs.rust_linux }}
+      rust_macos: ${{ steps.scope.outputs.rust_macos }}
+      policy: ${{ steps.scope.outputs.policy }}
       product_apple: ${{ steps.scope.outputs.product_apple }}
       slint: ${{ steps.scope.outputs.slint }}
       dioxus: ${{ steps.scope.outputs.dioxus }}
@@ -61,8 +64,20 @@ jobs:
           fetch-depth: 0
       - name: Test change-scope classifier
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_ci_change_scope.py
+      - name: Test lightweight DCO checker
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py
       - name: Test macOS performance report contract
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py
+      - name: Test policy control scripts
+        run: |
+          python3 scripts/verify-m0-gates.py --self-test
+          python3 scripts/write-evidence-manifest.py --self-test
+      - name: Check pull request DCO sign-offs
+        if: github.event_name == 'pull_request'
+        run: >-
+          python3 scripts/check-dco.py
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
       - name: Determine change scope
         id: scope
         env:
@@ -91,7 +106,7 @@ jobs:
                 *) echo "Unsupported evidence suite: $EVIDENCE_SUITE" >&2; exit 1 ;;
               esac
               if [ "$EVIDENCE_SUITE" != all ]; then
-                python3 scripts/ci-change-scope.py "$scope_path" >> "$GITHUB_OUTPUT"
+                python3 scripts/ci-change-scope.py --baseline "$scope_path" >> "$GITHUB_OUTPUT"
                 echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
               fi
               ;;
@@ -723,14 +738,26 @@ jobs:
       - name: Check target-specific third-party notices
         run: sh apple/scripts/generate-third-party-notices.sh --check
 
-  rust:
-    name: Rust (${{ matrix.os }})
+  rust_linux:
+    name: Rust (Linux)
     needs: changes
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
+    if: ${{ needs.changes.outputs.rust_linux == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+      - name: Run baseline verification
+        run: cargo run --locked --package xtask -- verify
+
+  rust_macos:
+    name: Rust (macOS)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust_macos == 'true' }}
+    runs-on: macos-15
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -739,7 +766,6 @@ jobs:
         with:
           cache: false
       - name: Prepare verified rust-skia archive
-        if: runner.os == 'macOS'
         run: |
           skia_url=$(sh apple/scripts/prepare-verified-skia.sh aarch64-apple-darwin)
           printf 'SKIA_BINARIES_URL=%s\n' "$skia_url" >> "$GITHUB_ENV"
@@ -749,6 +775,7 @@ jobs:
   policy:
     name: Policy and supply chain
     needs: changes
+    if: ${{ needs.changes.outputs.policy == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -759,10 +786,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
-      - name: Verify M0 product gates
-        run: |
-          python3 scripts/verify-m0-gates.py --self-test
-          python3 scripts/write-evidence-manifest.py --self-test
       - name: Install policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
@@ -809,15 +832,9 @@ jobs:
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling
         run: typos
-      - name: Check pull request DCO sign-offs
-        if: github.event_name == 'pull_request'
-        run: >-
-          cargo run --locked --package xtask -- dco
-          "${{ github.event.pull_request.base.sha }}"
-          "${{ github.event.pull_request.head.sha }}"
   ci_gate:
     name: CI gate
-    needs: [changes, apple_product, notices, rust, policy]
+    needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
     if: ${{ always() && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-24.04
     steps:
@@ -826,7 +843,8 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
           NOTICES_RESULT: ${{ needs.notices.result }}
-          RUST_RESULT: ${{ needs.rust.result }}
+          RUST_LINUX_RESULT: ${{ needs.rust_linux.result }}
+          RUST_MACOS_RESULT: ${{ needs.rust_macos.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
         run: |
           set -euo pipefail
@@ -834,7 +852,8 @@ jobs:
             "changes=$CHANGES_RESULT" \
             "apple_product=$APPLE_PRODUCT_RESULT" \
             "notices=$NOTICES_RESULT" \
-            "rust=$RUST_RESULT" \
+            "rust_linux=$RUST_LINUX_RESULT" \
+            "rust_macos=$RUST_MACOS_RESULT" \
             "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$CHANGES_RESULT" = success
           case "$APPLE_PRODUCT_RESULT" in
@@ -845,13 +864,23 @@ jobs:
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          test "$RUST_RESULT" = success
-          test "$POLICY_RESULT" = success
+          case "$RUST_LINUX_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$RUST_MACOS_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$POLICY_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
   manual_evidence_gate:
     # Keep manual evidence isolated from the branch-protection context. A
     # narrowly selected suite must never satisfy the pull request's `CI gate`.
     name: Manual evidence gate
-    needs: [changes, apple_product, notices, rust, policy]
+    needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     steps:
@@ -860,7 +889,8 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
           NOTICES_RESULT: ${{ needs.notices.result }}
-          RUST_RESULT: ${{ needs.rust.result }}
+          RUST_LINUX_RESULT: ${{ needs.rust_linux.result }}
+          RUST_MACOS_RESULT: ${{ needs.rust_macos.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
         run: |
           set -euo pipefail
@@ -868,7 +898,8 @@ jobs:
             "changes=$CHANGES_RESULT" \
             "apple_product=$APPLE_PRODUCT_RESULT" \
             "notices=$NOTICES_RESULT" \
-            "rust=$RUST_RESULT" \
+            "rust_linux=$RUST_LINUX_RESULT" \
+            "rust_macos=$RUST_MACOS_RESULT" \
             "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$CHANGES_RESULT" = success
           case "$APPLE_PRODUCT_RESULT" in
@@ -879,5 +910,15 @@ jobs:
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          test "$RUST_RESULT" = success
-          test "$POLICY_RESULT" = success
+          case "$RUST_LINUX_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$RUST_MACOS_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$POLICY_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac

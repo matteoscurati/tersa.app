@@ -17,6 +17,9 @@ from typing import Iterable
 
 @dataclass
 class Scope:
+    rust_linux: bool = False
+    rust_macos: bool = False
+    policy: bool = False
     product_apple: bool = False
     slint: bool = False
     dioxus: bool = False
@@ -47,10 +50,16 @@ COMPONENT_PATHS = {
 # instead of guessing from arbitrary Cargo metadata at CI runtime.
 SHARED_UI_CRATES = ("crates/domain/", "crates/application/", "crates/presentation/")
 APPLE_ADAPTERS = "adapters/"
-DOCS_ONLY_PREFIXES = ("docs/", "xtask/", ".github/")
+DOCS_ONLY_PREFIXES = ("docs/", ".github/")
 CI_CONTROL_PATHS = {
+    "scripts/check-dco.py",
     "scripts/ci-change-scope.py",
+    "scripts/macos-performance-report.py",
+    "scripts/test_check_dco.py",
     "scripts/test_ci_change_scope.py",
+    "scripts/test_macos_performance_report.py",
+    "scripts/verify-m0-gates.py",
+    "scripts/write-evidence-manifest.py",
 }
 FULL_FANOUT_PATHS = {
     "Cargo.toml",
@@ -78,7 +87,7 @@ def normalise_path(path: str) -> str | None:
     return path or None
 
 
-def classify(paths: Iterable[str], *, full: bool = False) -> Scope:
+def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False) -> Scope:
     """Return the union of evidence scopes needed for *paths*.
 
     Empty input, malformed input, and unknown paths fail closed to every scope.
@@ -101,16 +110,16 @@ def classify(paths: Iterable[str], *, full: bool = False) -> Scope:
         if path in CI_CONTROL_PATHS or path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
             continue
         if path.endswith("/Cargo.toml"):
-            scope.enable("notices")
+            scope.enable("rust_linux", "policy", "notices")
         component = next(
             (names for prefix, names in COMPONENT_PATHS.items() if path.startswith(prefix)),
             None,
         )
         if component is not None:
-            scope.enable(*component)
+            scope.enable("rust_linux", "policy", *component)
             continue
         if path.startswith("fuzz/") or path == "scripts/verify-mime-fuzz.sh":
-            scope.enable("mime", "mime_fuzz")
+            scope.enable("rust_linux", "policy", "mime", "mime_fuzz")
             continue
         if path.startswith("apple/licenses/"):
             scope.enable("notices")
@@ -125,10 +134,19 @@ def classify(paths: Iterable[str], *, full: bool = False) -> Scope:
             scope.enable("product_apple", "mime")
             continue
         if path.startswith(SHARED_UI_CRATES):
-            scope.enable("product_apple", "slint", "dioxus")
+            scope.enable("rust_linux", "policy", "product_apple", "slint", "dioxus")
             continue
         if path.startswith("crates/platform/") or path.startswith(APPLE_ADAPTERS):
-            scope.enable("product_apple")
+            scope.enable("rust_linux", "rust_macos", "policy", "product_apple")
+            continue
+        if path.startswith("apple/rust-bridge/"):
+            scope.enable("rust_linux", "rust_macos", "policy", "product_apple")
+            continue
+        if path.startswith("apps/cli-macos/"):
+            scope.enable("rust_linux", "rust_macos", "policy")
+            continue
+        if path.startswith("xtask/"):
+            scope.enable("rust_linux", "policy")
             continue
         if path.startswith("apple/"):
             scope.enable("product_apple")
@@ -158,6 +176,8 @@ def classify(paths: Iterable[str], *, full: bool = False) -> Scope:
 
     if not seen:
         enable_full(scope)
+    if baseline:
+        scope.enable("rust_linux", "policy")
     return scope
 
 
@@ -178,8 +198,13 @@ def main() -> int:
         action="store_true",
         help="Force every evidence scope (for main, merge groups, or manual runs).",
     )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Also require the portable Rust and policy baseline (for a selected manual suite).",
+    )
     arguments = parser.parse_args()
-    scope = classify(read_paths(arguments.paths), full=arguments.full)
+    scope = classify(read_paths(arguments.paths), full=arguments.full, baseline=arguments.baseline)
     for field in fields(Scope):
         print(f"{field.name}={'true' if getattr(scope, field.name) else 'false'}")
     return 0
