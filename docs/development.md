@@ -61,7 +61,10 @@ architecture evidence checkpoint, and select one suite while investigating a
 specific diagnostic. These artifacts remain bound to the selected immutable
 commit and retain the existing 90-day protocol lifetime. Cache writes are also
 restricted to explicit evidence runs, preventing intermediate PR keys from
-growing the repository cache toward its storage limit.
+growing the repository cache toward its storage limit. Manual runs publish
+`Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
+evidence selection cannot substitute for the real pull-request scope or DCO
+check.
 
 The repository is public and uses only standard GitHub-hosted runners, so runner
 execution has no billable minute charge. The policy above still minimizes queue

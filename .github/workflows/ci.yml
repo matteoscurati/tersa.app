@@ -827,12 +827,15 @@ jobs:
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
   ci_gate:
-    name: CI gate
+    # A manual evidence run must never publish the branch-protection context.
+    # Otherwise a narrowly selected suite could satisfy `CI gate` without the
+    # pull request's real scope or DCO check.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Manual evidence gate' || 'CI gate' }}
     needs: [changes, apple_product, notices, rust, policy]
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Require the fast CI lane
+      - name: Require the selected validation lane
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
