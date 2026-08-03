@@ -2,15 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Trusted macOS OAuth token-lifecycle and bounded Gmail sync composition.
+//! Trusted macOS bounded Gmail sync composition, broker-fed by default.
 //!
 //! This crate is the sole executor of Step 3's network-and-write composition:
-//! it forwards the validated OAuth grant into the token exchange, refreshes the
-//! access token proactively, gates account identity, and drives the bounded
-//! recent sync into the encrypted store. It loads the refresh token from the
-//! `tersa-keychain-macos` store, drives the `tersa-gmail-rest-macos` token
-//! transport and read adapter, and reconciles through the validated
-//! `SQLCipher` write path — all on a pinned current-thread `tokio` runtime.
+//! it gates account identity and drives the bounded recent sync into the
+//! encrypted store. In the DEFAULT (broker-only) composition, the separately
+//! signed ADR-0024 token broker owns the whole OAuth token lifecycle — the
+//! grant exchange, refresh, revocation, and the refresh-token Keychain — and
+//! this crate only consumes the broker's short-lived access-token replies via
+//! `GmailSession::from_broker_token`, re-validating the reply's subject at
+//! that trust boundary. The default build therefore compiles NO refresh-token
+//! Keychain access: it drives the `tersa-gmail-rest-macos` read adapter and
+//! reconciles through the validated `SQLCipher` write path on a pinned
+//! current-thread `tokio` runtime, and nothing more.
+//!
+//! An opt-in `legacy-token-lifecycle` feature retains the direct token
+//! lifecycle for legacy/test compositions: forwarding the validated OAuth
+//! grant into the token exchange, proactive refresh, revocation, and the
+//! `tersa-keychain-macos` refresh-token store. It is never enabled by a
+//! production dependency; the production macOS main archive builds this crate
+//! with no default features.
 //!
 //! It is the only macOS crate besides the Gmail adapter that reaches the
 //! network (reqwest, transitively through `tersa-gmail-rest-macos`); the
@@ -19,8 +30,10 @@
 //! 3d-2 landed the account-identity gate and the gated bounded sync over the
 //! inward ports ([`gated_sync`]) plus the token-lifecycle composition. 3d-3a adds
 //! the concrete `GmailSession` — one access token backing both the gate's
-//! subject and the mailbox surface — with `id_token` freshness validated against a
-//! wall clock at construction. Later 3d-3 slices landed the Rust-owned sync
+//! subject and the mailbox surface — built from a broker reply whose subject is
+//! re-validated at the boundary (and, under `legacy-token-lifecycle`, from a
+//! `ConnectedAccount` with `id_token` freshness validated against a wall clock
+//! at construction). Later 3d-3 slices landed the Rust-owned sync
 //! worker, its FFI begins, and the cancel-fenced connect; 3d-3d adds the
 //! disconnect (consent-withdrawal) teardown: the permit slot's disconnecting
 //! coordination with its sync-only cancel registration, and the un-cancellable
@@ -39,18 +52,20 @@ use tersa_application::mailbox::{AccountId, MailboxStore, MailboxStoreError, Rem
 use tersa_application::mailbox::{
     BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize, PageToken, RemoteMailboxError,
 };
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_application::oauth::{AuthorizationGrant, MonotonicClock, WallClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_application::token::{
-    AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome,
-    TokenTransport, TokenTransportError, exchange_grant_with_scope_outcome,
+    AccessToken, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome, TokenTransport,
+    TokenTransportError, exchange_grant_with_scope_outcome,
     refresh_access_token_with_scope_outcome,
 };
 #[cfg(target_os = "macos")]
-use tersa_gmail_rest_macos::GmailMailbox;
+use tersa_application::token::{AccountSubject, BrokerSubjectError};
 #[cfg(target_os = "macos")]
+use tersa_gmail_rest_macos::GmailMailbox;
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 #[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
@@ -229,7 +244,7 @@ where
 /// response, so the access token and the identity-gate `subject` always share an
 /// origin (the same principal). 3d-3 builds the sync session from both, feeding
 /// the subject to the gate and the access token to the mailbox surface.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 pub struct ConnectedAccount {
     access_token: AccessToken,
@@ -237,7 +252,7 @@ pub struct ConnectedAccount {
     identity_expiry: IdentityExpiry,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl ConnectedAccount {
     /// Returns the short-lived access token with its monotonic expiry.
     #[must_use]
@@ -267,7 +282,7 @@ impl ConnectedAccount {
 }
 
 /// Reports why a token-lifecycle step failed.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TokenLifecycleError {
@@ -302,7 +317,7 @@ pub enum TokenLifecycleError {
     CancelledCleanupIncomplete,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl core::fmt::Display for TokenLifecycleError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let message = match self {
@@ -321,7 +336,7 @@ impl core::fmt::Display for TokenLifecycleError {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl std::error::Error for TokenLifecycleError {}
 
 /// One connect-account flow's session: the SINGLE source for both claiming the
@@ -334,7 +349,7 @@ impl std::error::Error for TokenLifecycleError {}
 /// `session_id` and answers [`ConnectSession::claim`] from `claim_grant(id)`
 /// and [`ConnectSession::is_cancelled`] from `is_session_cancelled(id)`, so the
 /// two share the id by construction.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub trait ConnectSession {
     /// Claims the finished grant and its pinned token-client config for this
     /// session, exactly once: a missing, expired, cancelled, or already-claimed
@@ -365,7 +380,7 @@ pub trait ConnectSession {
 /// The connect flow's cancel fences discard it — there the revoke is
 /// fire-and-forget (nothing is stored, or the just-stored copy was deleted
 /// first), so the outcome changes no behavior on that path.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 #[must_use = "the disconnect teardown maps this to the revoke-unconfirmed status; dropping it silently loses the M2 signal"]
 pub(crate) enum RevokeOutcome {
@@ -386,7 +401,7 @@ pub(crate) enum RevokeOutcome {
 /// both CONFIRM the desired end state, so retrying them is pointless. This is
 /// the same already-gone semantics the ADR-0024 broker's
 /// `revoke_provider_grant` applies over this shared transport error enum.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 fn revoke_confirmed(outcome: Result<(), TokenTransportError>) -> bool {
     matches!(
         outcome,
@@ -409,7 +424,7 @@ fn revoke_confirmed(outcome: Result<(), TokenTransportError>) -> bool {
 /// provider with no in-app remedy — the user can only revoke it from their
 /// Google account settings. The single immediate retry shrinks that window to
 /// a persistent network or provider failure; it cannot close it.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub(crate) async fn revoke_best_effort<T: TokenTransport>(
     transport: &T,
     token: &Zeroizing<String>,
@@ -523,7 +538,7 @@ pub(crate) async fn revoke_best_effort<T: TokenTransport>(
 /// [`TokenLifecycleError::Store`] when the Keychain rejects the write (the
 /// minted token is revoked best-effort first IFF the snapshot definitively
 /// read empty).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub(crate) async fn connect_account<T, S, C, St>(
     account: &AccountId,
     grant: AuthorizationGrant,
@@ -655,7 +670,7 @@ where
 /// may still sit in the Keychain, and disconnect (3d-3d) is the remedy. On
 /// success the cancel is clean and [`TokenLifecycleError::Cancelled`] is
 /// returned.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 async fn finish_cancelled_cleanup<S, T>(
     refresh_store: &S,
     transport: &T,
@@ -693,7 +708,7 @@ where
 /// [`TokenLifecycleError::Token`] when the refresh fails (including a
 /// missing/invalid identity), and [`TokenLifecycleError::Store`] on a Keychain
 /// read or write failure.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub async fn refresh_account<T, S, C>(
     account: &AccountId,
     config: &TokenClientConfig,
@@ -752,7 +767,7 @@ where
 /// # Errors
 ///
 /// Propagates [`refresh_account`]'s errors when a refresh is due and fails.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub async fn refresh_if_due<T, S, C>(
     account: &AccountId,
     access_token: &AccessToken,
@@ -776,7 +791,7 @@ where
 }
 
 /// The maximum accepted clock skew when validating `id_token` freshness (2 min).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 const IDENTITY_SKEW_SECS: u64 = 120;
 
 /// Reports why a [`GmailSession`] could not be built.
@@ -785,7 +800,12 @@ const IDENTITY_SKEW_SECS: u64 = 120;
 #[non_exhaustive]
 pub enum GmailSessionError {
     /// The `id_token` was expired or future-dated — non-destructive, retryable.
+    /// Only constructible through the `legacy-token-lifecycle` session
+    /// constructor; the broker-fed path performs no `id_token` freshness check.
+    #[cfg(any(feature = "legacy-token-lifecycle", test))]
     Identity(TokenError),
+    /// The broker reply's subject failed the trust-boundary re-validation.
+    BrokerSubject(BrokerSubjectError),
     /// The mailbox surface could not be constructed from the access token.
     Mailbox(RemoteMailboxError),
 }
@@ -794,7 +814,11 @@ pub enum GmailSessionError {
 impl core::fmt::Display for GmailSessionError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            #[cfg(any(feature = "legacy-token-lifecycle", test))]
             Self::Identity(_) => formatter.write_str("the id_token failed freshness validation"),
+            Self::BrokerSubject(_) => {
+                formatter.write_str("the broker reply carried an unusable account subject")
+            }
             Self::Mailbox(_) => formatter.write_str("the mailbox surface could not be built"),
         }
     }
@@ -808,11 +832,13 @@ impl std::error::Error for GmailSessionError {}
 ///
 /// The gate hashes the subject and the sync reads the mailbox, both backed by the
 /// one token — so the checked identity and the written identity necessarily
-/// coincide (the type-level guarantee [`gated_sync`] relies on). It is built only
-/// from a [`ConnectedAccount`] whose subject the token layer already validated, so
-/// the gate is never fed a hand-minted subject; construction also validates the
-/// `id_token`'s freshness against a wall clock before the session can drive
-/// anything.
+/// coincide (the type-level guarantee [`gated_sync`] relies on). In the default
+/// broker-only composition it is built via [`GmailSession::from_broker_token`]
+/// from the ADR-0024 broker's reply, whose subject is re-validated at that trust
+/// boundary — so the gate is never fed a hand-minted subject. With the opt-in
+/// `legacy-token-lifecycle` feature it can instead be built from a
+/// `ConnectedAccount` whose subject the token layer already validated (with the
+/// `id_token`'s freshness checked against a wall clock at construction).
 #[cfg(target_os = "macos")]
 pub struct GmailSession {
     mailbox: GmailMailbox,
@@ -829,6 +855,7 @@ impl GmailSession {
     /// Returns [`GmailSessionError::Identity`] when the `id_token` is expired or
     /// future-dated (non-destructive), and [`GmailSessionError::Mailbox`] when the
     /// access token cannot construct the mailbox surface.
+    #[cfg(any(feature = "legacy-token-lifecycle", test))]
     pub fn new<W: WallClock>(
         account: AccountId,
         connected: ConnectedAccount,
@@ -840,6 +867,41 @@ impl GmailSession {
             .map_err(GmailSessionError::Identity)?;
         let (access_token, subject, _identity_expiry) = connected.into_parts();
         let mailbox = GmailMailbox::new(account, access_token.secret().as_str().to_owned())
+            .map_err(GmailSessionError::Mailbox)?;
+        Ok(Self { mailbox, subject })
+    }
+
+    /// Builds a session from the ADR-0024 token broker's reply.
+    ///
+    /// The `access_token` (borrowed) and `subject` (consumed) are the
+    /// zeroizing strings from the SAME broker reply, so the identity gate and
+    /// the mailbox surface are
+    /// backed by one principal exactly as on the [`ConnectedAccount`] path. The
+    /// subject is re-validated at this trust boundary
+    /// ([`AccountSubject::from_broker_validated`]) and stored for the
+    /// [`AccountProfile`] identity gate. No refresh token, token transport, or
+    /// Keychain store is accepted or constructed: the separately signed broker
+    /// owns the token lifecycle.
+    ///
+    /// The access token is copied exactly once into the Gmail adapter's owned
+    /// `String` constructor parameter — which immediately re-wraps it in
+    /// zeroizing storage — and that transient copy is dropped; no other
+    /// plaintext clone is made, and neither the token nor the subject ever
+    /// reaches a log or `Debug` sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GmailSessionError::BrokerSubject`] when the subject fails the
+    /// boundary re-validation, and [`GmailSessionError::Mailbox`] when the
+    /// access token cannot construct the mailbox surface.
+    pub fn from_broker_token(
+        account: AccountId,
+        access_token: &Zeroizing<String>,
+        subject: Zeroizing<String>,
+    ) -> Result<Self, GmailSessionError> {
+        let subject = AccountSubject::from_broker_validated(subject)
+            .map_err(GmailSessionError::BrokerSubject)?;
+        let mailbox = GmailMailbox::new(account, access_token.as_str().to_owned())
             .map_err(GmailSessionError::Mailbox)?;
         Ok(Self { mailbox, subject })
     }
@@ -1439,8 +1501,8 @@ mod token_lifecycle_tests {
         AuthorizationConfig, AuthorizationGrant, MonotonicClock, WallClock, prepare_authorization,
     };
     use tersa_application::token::{
-        ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
-        TokenResponse, TokenTransport, TokenTransportError,
+        BrokerSubjectError, ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig,
+        TokenError, TokenResponse, TokenTransport, TokenTransportError,
     };
     use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
     use url::Url;
@@ -1496,6 +1558,43 @@ mod token_lifecycle_tests {
         let error = GmailSession::new(account(), connect_for_session(), &FakeWallClock(1))
             .expect_err("a future-minted id_token must not build a session");
         assert!(matches!(error, GmailSessionError::Identity(_)));
+    }
+
+    #[test]
+    fn broker_session_feeds_the_identity_gate_subject() {
+        // The broker session's stored subject is exactly what the
+        // `AccountProfile` surface hands to the identity gate.
+        let session = GmailSession::from_broker_token(
+            account(),
+            &Zeroizing::new("ya29.test-broker-access-token".to_owned()),
+            Zeroizing::new("112233445566778899001".to_owned()),
+        )
+        .expect("a valid broker reply builds a session");
+        assert_eq!(
+            AccountProfile::subject(&session).as_str(),
+            "112233445566778899001"
+        );
+        // Neither the subject nor the access token reaches Debug output.
+        let rendered = format!("{session:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("112233445566778899001"));
+        assert!(!rendered.contains("ya29.test-broker-access-token"));
+    }
+
+    #[test]
+    fn broker_session_rejects_an_invalid_subject() {
+        let error = GmailSession::from_broker_token(
+            account(),
+            &Zeroizing::new("ya29.test-broker-access-token".to_owned()),
+            Zeroizing::new("has a space".to_owned()),
+        )
+        .expect_err("an invalid broker subject must not build a session");
+        assert!(matches!(
+            error,
+            GmailSessionError::BrokerSubject(BrokerSubjectError::InvalidCharacters)
+        ));
+        // The error never echoes the rejected subject.
+        assert!(!format!("{error}").contains("has a space"));
     }
 
     const CLIENT_ID: &str = "public-test-client";

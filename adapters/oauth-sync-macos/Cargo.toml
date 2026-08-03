@@ -14,6 +14,14 @@ authors.workspace = true
 publish = false
 
 [features]
+# Default features are empty: the production composition is broker-fed. The
+# ADR-0024 token broker owns the refresh-token lifecycle, so the default build
+# compiles no refresh-token Keychain access at all.
+default = []
+# Opt-in legacy refresh-token lifecycle: the crate itself connects, refreshes,
+# and revokes through the `tersa-keychain-macos` refresh-token store. Kept for
+# direct legacy/test compositions; never enabled by a production dependency.
+legacy-token-lifecycle = ["tersa-keychain-macos/oauth-token"]
 # Exposes WorkerHandles' test-only constructor to tests in OTHER workspace crates
 # (the mailbox-sync FFI's session-registry tests). Never enabled by a production
 # dependency; the Apple static-library build does not pass `--all-features`.
@@ -38,6 +46,13 @@ tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+# Dev-only edge that turns on the refresh-token Keychain module for THIS
+# crate's own unit tests (the legacy token-lifecycle tests are `cfg(test)`).
+# Feature unification enables `oauth-token` only when building this crate's
+# tests; the production dependency above stays feature-free.
+tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0", features = [
+    "oauth-token",
+] }
 url = { workspace = true }
 
 [lints]

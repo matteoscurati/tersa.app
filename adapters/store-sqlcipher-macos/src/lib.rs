@@ -46,8 +46,9 @@ mod macos {
     // The schema is fresh-create only: `MIGRATION` runs on an empty file and the
     // open path rejects any store whose objects differ from `canonical_schema`.
     // Phase 1 is pre-release with no shipped stores, so adding the
-    // `account_identity` table intentionally keeps `VERSION` at 1 rather than
-    // introducing a v2 upgrade path — a store created before this change opens as
+    // `account_identity` table and the `account_binding.broker_subject`
+    // column intentionally keeps `VERSION` at 1 rather than introducing a v2
+    // upgrade path — a store created before these changes opens as
     // `Corrupted` and is re-bootstrapped fresh. Once a store ships, a schema
     // change must bump `VERSION` and add an upgrade migration instead.
     const VERSION: i64 = 1;
@@ -484,6 +485,95 @@ mod macos {
             operation(&mut connection)
         }
 
+        /// Stores the account's broker routing subject in the binding row.
+        ///
+        /// The subject is an encrypted account-identifying broker routing
+        /// key: it is never logged or displayed, and it is not an OAuth
+        /// credential. Error values never echo the subject. Exactly one
+        /// binding row must match the exact account, otherwise the store is
+        /// corrupt.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch, an invalid subject (not
+        /// 1..=255 bytes of printable non-space ASCII), or a backend failure,
+        /// and corruption when the binding row is missing or mismatched.
+        pub fn store_broker_subject(
+            &self,
+            account: &AccountId,
+            subject: &str,
+        ) -> Result<(), MailboxStoreError> {
+            self.checked_account(account)?;
+            if !is_valid_broker_subject(subject) {
+                return Err(MailboxStoreError::Storage);
+            }
+            self.with_connection(|connection| {
+                let changed = connection
+                    .execute(
+                        "UPDATE account_binding SET broker_subject = ?1 WHERE singleton = 1 AND account_id = ?2",
+                        params![subject, account.as_str()],
+                    )
+                    .map_err(store_error)?;
+                (changed == 1)
+                    .then_some(())
+                    .ok_or(MailboxStoreError::Corrupted)
+            })
+        }
+
+        /// Loads the account's broker routing subject from the binding row.
+        ///
+        /// The subject is an encrypted account-identifying broker routing
+        /// key: it is never logged or displayed, it is not an OAuth
+        /// credential, and it is wrapped in [`Zeroizing`] immediately so its
+        /// plaintext lifetime stays minimal. A SQL NULL subject returns
+        /// `None`; a missing or mismatched binding row, a non-text subject, or
+        /// text violating the stored shape is corruption, never `None`.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch or backend failure and
+        /// corruption for a missing or mismatched binding row or an invalid
+        /// persisted subject.
+        pub fn load_broker_subject(
+            &self,
+            account: &AccountId,
+        ) -> Result<Option<Zeroizing<String>>, MailboxStoreError> {
+            self.checked_account(account)?;
+            self.with_connection(|connection| {
+                let row = connection.query_row(
+                    "SELECT typeof(broker_subject), CASE WHEN typeof(broker_subject) = 'text' THEN broker_subject END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
+                    [],
+                    |row| {
+                        let subject_type: String = row.get(0)?;
+                        let subject: Option<String> = row.get(1)?;
+                        let binding: Option<String> = row.get(2)?;
+                        Ok((subject_type, subject, binding))
+                    },
+                );
+                let (subject_type, subject, binding) = match row {
+                    Ok(values) => values,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(MailboxStoreError::Corrupted);
+                    }
+                    Err(error) => return Err(store_error(error)),
+                };
+                if binding.as_deref() != Some(account.as_str()) {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                match subject_type.as_str() {
+                    "null" => Ok(None),
+                    "text" => {
+                        let subject = subject.ok_or(MailboxStoreError::Corrupted)?;
+                        if !is_valid_broker_subject(&subject) {
+                            return Err(MailboxStoreError::Corrupted);
+                        }
+                        Ok(Some(Zeroizing::new(subject)))
+                    }
+                    _ => Err(MailboxStoreError::Corrupted),
+                }
+            })
+        }
+
         fn upsert(&self, envelopes: &[MessageEnvelope]) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
                 let transaction = connection.transaction().map_err(store_error)?;
@@ -678,7 +768,10 @@ mod macos {
         /// exactly as the identity-clearing reconcile does), and the
         /// `account_binding` singleton is deliberately left intact: the file
         /// stays bound to its account, so a later re-connect passes the
-        /// open-time binding check instead of failing as an unknown owner.
+        /// open-time binding check instead of failing as an unknown owner. Its
+        /// `broker_subject` — the encrypted account-identifying broker routing
+        /// key, never an OAuth credential — is cleared in the same commit,
+        /// because the routing key must not outlive the account's local data.
         fn purge(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
                 // BEGIN IMMEDIATE takes the write lock up front, mirroring the
@@ -700,6 +793,15 @@ mod macos {
                         params![account.as_str()],
                     )
                     .map_err(store_error)?;
+                let cleared = transaction
+                    .execute(
+                        "UPDATE account_binding SET broker_subject = NULL WHERE singleton = 1 AND account_id = ?1",
+                        params![account.as_str()],
+                    )
+                    .map_err(store_error)?;
+                if cleared != 1 {
+                    return Err(MailboxStoreError::Corrupted);
+                }
                 // Freshness is mailbox-derived and must never outlive a local
                 // purge. The disconnect recovery marker is intentionally NOT
                 // cleared here: it is the durable evidence that tells a later
@@ -2648,7 +2750,7 @@ mod macos {
                 "table".into(),
                 "account_binding".into(),
                 normalize(
-                    "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL )",
+                    "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)) )",
                 ),
             ),
             (
@@ -2679,6 +2781,13 @@ mod macos {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+    // A broker subject is 1..=255 bytes of printable non-space ASCII. This
+    // matches the `account_binding.broker_subject` column CHECK bound and
+    // keeps the routing key free of whitespace and control bytes.
+    fn is_valid_broker_subject(subject: &str) -> bool {
+        let bytes = subject.as_bytes();
+        (1..=255).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
     }
     #[expect(
         clippy::needless_pass_by_value,
@@ -5288,6 +5397,129 @@ mod macos {
         }
 
         #[test]
+        fn broker_subject_round_trips_and_survives_reopen() {
+            let (database, store) = open("broker-subject-round-trip");
+            store
+                .store_broker_subject(&account(), "google-subject-123")
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .map(|subject| subject.to_string()),
+                Some("google-subject-123".to_string())
+            );
+            drop(store);
+
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                reopened
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .map(|subject| subject.to_string()),
+                Some("google-subject-123".to_string())
+            );
+        }
+
+        #[test]
+        fn broker_subject_rejects_wrong_account_without_database_work() {
+            let (_database, store) = open("broker-subject-mismatch");
+            store
+                .store_broker_subject(&account(), "google-subject-123")
+                .unwrap();
+            let foreign = AccountId::new("account-b").unwrap();
+            let changes_before = store.connection.lock().unwrap().total_changes();
+
+            assert!(matches!(
+                store.store_broker_subject(&foreign, "google-subject-123"),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert!(matches!(
+                store.load_broker_subject(&foreign),
+                Err(MailboxStoreError::Storage)
+            ));
+
+            assert_eq!(
+                store.connection.lock().unwrap().total_changes(),
+                changes_before,
+                "a wrong-account broker subject operation must not mutate the database"
+            );
+            assert_eq!(
+                store
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .map(|subject| subject.to_string()),
+                Some("google-subject-123".to_string())
+            );
+        }
+
+        #[test]
+        fn broker_subject_rejects_non_text_storage() {
+            let (_database, store) = open("broker-subject-non-text");
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE account_binding SET broker_subject = X'00' WHERE singleton = 1",
+                    [],
+                )
+                .unwrap();
+
+            assert!(matches!(
+                store.load_broker_subject(&account()),
+                Err(MailboxStoreError::Corrupted)
+            ));
+        }
+
+        #[test]
+        fn broker_subject_rejects_invalid_text_storage() {
+            let (_database, store) = open("broker-subject-invalid-text");
+            let invalid_subjects = [
+                String::new(),
+                "a".repeat(256),
+                "contains space".to_string(),
+                "contains\nnewline".to_string(),
+                "é".to_string(),
+            ];
+
+            for invalid in invalid_subjects {
+                let connection = store.connection.lock().unwrap();
+                connection
+                    .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE account_binding SET broker_subject = ?1 WHERE singleton = 1",
+                        params![invalid],
+                    )
+                    .unwrap();
+                connection
+                    .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                    .unwrap();
+                drop(connection);
+
+                assert!(matches!(
+                    store.load_broker_subject(&account()),
+                    Err(MailboxStoreError::Corrupted)
+                ));
+            }
+        }
+
+        #[test]
+        fn purge_clears_broker_subject_and_keeps_binding() {
+            let (_database, store) = open("purge-broker-subject");
+            store
+                .store_broker_subject(&account(), "google-subject-123")
+                .unwrap();
+            run(store.purge_account(&account())).unwrap();
+            assert!(store.load_broker_subject(&account()).unwrap().is_none());
+            // The binding singleton itself survives the purge: only the broker
+            // routing subject on it is cleared.
+            assert_eq!(row_count(&store, "account_binding"), 1);
+        }
+
+        #[test]
         fn lifecycle_recovery_transitions_survive_reopen_and_purge_preserves_marker() {
             let (database, store) = open("lifecycle-recovery");
             assert_eq!(
@@ -5447,17 +5679,27 @@ mod macos {
             let (_database, store) = open("purge-rollback");
             record_fence(&store);
             run(store.upsert_envelopes(&account(), &[envelope("m1", "t1", 100)])).unwrap();
+            store
+                .store_broker_subject(&account(), "google-subject-123")
+                .unwrap();
             store.fail_next_mutation();
             assert_eq!(
                 run(store.purge_account(&account())),
                 Err(MailboxStoreError::Storage)
             );
-            // Both DELETE statements roll back together: a mid-purge fault never leaves a
-            // half-torn-down account (mailbox cleared but identity kept, or the
-            // reverse).
+            // Messages, identity, and the broker subject roll back together: a
+            // mid-purge fault never leaves a half-torn-down account (mailbox
+            // cleared but identity or broker subject kept, or the reverse).
             assert_eq!(row_count(&store, "messages"), 1);
             assert_eq!(row_count(&store, "account_identity"), 1);
             assert_eq!(row_count(&store, "account_binding"), 1);
+            assert_eq!(
+                store
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .map(|subject| subject.to_string()),
+                Some("google-subject-123".to_string())
+            );
         }
 
         #[test]

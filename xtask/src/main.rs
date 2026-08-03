@@ -447,12 +447,17 @@ fn oauth_sync_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) ->
 /// is a network-free tersa-* crate, not a capability crate: it adds no new
 /// network, `SQLCipher`, or `HMAC` reachability, and it is what lets the
 /// application link only the FFI archive while still seeing the bridge's symbols.
+/// ADR-0024: `zeroize` is an intentional direct dependency — the broker-fed
+/// entry points copy the short-lived access-token and routing-subject buffers
+/// under zeroizing wrappers immediately, and no other crate in this set can
+/// provide that wrapper.
 fn mailbox_sync_ffi_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
-    const REQUIRED: [&str; 4] = [
+    const REQUIRED: [&str; 5] = [
         "tersa-application",
         "tersa-apple-bridge",
         "tersa-oauth-sync-macos",
         "url",
+        "zeroize",
     ];
     let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
     let mut violations = Vec::new();
@@ -715,7 +720,7 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         APPLE_BRIDGE_C_ABI_COUNT_MESSAGE,
     ));
 
-    // The mailbox-sync FFI is a sibling static library with its own four-symbol C ABI;
+    // The mailbox-sync FFI is a sibling static library with its own seven-symbol C ABI;
     // pin its reviewed sources and export inventory exactly as the bridge's, so a new
     // source file or exported symbol cannot land without review.
     let ffi_package_sources =
@@ -1376,10 +1381,13 @@ fn bridge_package_source_surface_violations(
 /// The exact count message for the Apple bridge's reviewed C ABI symbol set.
 const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe";
 /// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol
-/// set. It pins THIS crate's own four declared `#[no_mangle]` exports; the
-/// archive the application links carries those four plus the Apple bridge's
-/// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
-const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports (the shipped archive surface is these five plus the Apple bridge's reviewed eleven)";
+/// set. It pins THIS crate's own seven declared `#[no_mangle]` exports — the
+/// ADR-0024 broker-fed entry points plus the shared lifecycle-query and poll;
+/// the legacy in-process begins are ordinary unsafe Rust functions under
+/// `#[cfg(test)]` only and never exported. The archive the application links
+/// carries those seven plus the Apple bridge's five reviewed safe reexports
+/// (twelve symbols total; see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
+const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own seven reviewed broker sync begin, disconnect prepare/finalize, subject store/get, lifecycle-query, and poll no_mangle exports (the shipped archive surface is these seven plus the Apple bridge's five reviewed safe reexports, twelve symbols total)";
 /// The exact count message for the token-broker FFI's reviewed C ABI symbol set.
 /// Pins exactly five operations: begin, complete, refresh, revoke, and delete.
 const TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE: &str = "the token-broker FFI production exported C ABI set must match the five reviewed begin, complete, refresh, revoke, and delete no_mangle exports";
@@ -1543,15 +1551,31 @@ fn mailbox_sync_ffi_source_surface_violations(
     violations
 }
 
+/// Exact reviewed Rust export inventory for the seven broker-fed mailbox-sync
+/// C ABI operations (ADR-0024). Signatures are whitespace-normalized. The three
+/// legacy in-process begins are `#[cfg(test)]`-only ordinary unsafe Rust
+/// functions — never `no_mangle` — so they must not appear here.
 fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
-            "tersa_mailbox_macos_connect_begin",
-            "pubunsafeextern\"C\"fntersa_mailbox_macos_connect_begin(account_id:*constu8,account_id_len:usize,oauth_session_id:u64,output_session_id:*mutu64,)->i32",
+            "tersa_mailbox_macos_broker_disconnect_finalize",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_broker_disconnect_finalize(account_id:*constu8,account_id_len:usize,revoke_unconfirmed:i32,output_session_id:*mutu64,)->i32",
         ),
         (
-            "tersa_mailbox_macos_disconnect_begin",
-            "pubunsafeextern\"C\"fntersa_mailbox_macos_disconnect_begin(account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
+            "tersa_mailbox_macos_broker_disconnect_prepare",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_broker_disconnect_prepare(account_id:*constu8,account_id_len:usize,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_broker_subject_get",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_broker_subject_get(account_id:*constu8,account_id_len:usize,output_subject:*mutu8,output_subject_capacity:usize,output_subject_len:*mutusize,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_broker_subject_store",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_broker_subject_store(account_id:*constu8,account_id_len:usize,subject:*constu8,subject_len:usize,)->i32",
+        ),
+        (
+            "tersa_mailbox_macos_broker_sync_begin",
+            "pubunsafeextern\"C\"fntersa_mailbox_macos_broker_sync_begin(account_id:*constu8,account_id_len:usize,access_token:*constu8,access_token_len:usize,subject:*constu8,subject_len:usize,output_session_id:*mutu64,)->i32",
         ),
         (
             "tersa_mailbox_macos_lifecycle_get",
@@ -1560,10 +1584,6 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
                 "i32,output_last_successful_sync_unix_millis:*mut",
                 "i64,)->i32"
             ),
-        ),
-        (
-            "tersa_mailbox_macos_sync_begin",
-            "pubunsafeextern\"C\"fntersa_mailbox_macos_sync_begin(client_id:*constu8,client_id_len:usize,account_id:*constu8,account_id_len:usize,output_session_id:*mutu64,)->i32",
         ),
         (
             "tersa_mailbox_macos_sync_poll",
@@ -3062,40 +3082,89 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     let code = strip_swift_non_code(document);
     let mut violations = Vec::new();
 
-    let authorize = swift_function_bodies(&code, "authorizeAndConnect");
-    let [authorize] = authorize.as_slice() else {
+    let Some(authorize) = swift_single_function_body(&code, "authorizeAndConnect") else {
         return vec![
             "AccountConnectionViewModel must contain exactly one authorizeAndConnect function"
                 .to_owned(),
         ];
     };
-    if !authorize.contains("connectAfterApplicationActivation(")
-        || authorize.contains("connectWithGrant(")
-    {
-        violations.push(
-            "a successful OAuth outcome must enter the application-activation handoff, never connect directly"
-                .to_owned(),
-        );
-    }
+    violations.extend(swift_oauth_authorize_entry_violations(authorize));
 
-    let activation = swift_function_bodies(&code, "connectAfterApplicationActivation");
-    let [activation] = activation.as_slice() else {
+    let Some(activation) =
+        swift_single_function_body(&code, "connectBrokerGrantAfterApplicationActivation")
+    else {
         violations.push(
-            "AccountConnectionViewModel must contain exactly one connectAfterApplicationActivation function"
+            "AccountConnectionViewModel must contain exactly one connectBrokerGrantAfterApplicationActivation function"
                 .to_owned(),
         );
         return violations;
     };
+    violations.extend(swift_oauth_activation_handoff_violations(activation));
+
+    let Some(finish) = swift_single_function_body(&code, "finishBrokerGrantApplicationActivation")
+    else {
+        violations.push(
+            "AccountConnectionViewModel must contain exactly one finishBrokerGrantApplicationActivation function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    violations.extend(swift_oauth_finish_persist_violations(finish));
+
+    violations.extend(swift_oauth_sole_connect_caller_violations(&code));
+    violations
+}
+
+fn swift_single_function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let bodies = swift_function_bodies(code, name);
+    let [body] = bodies.as_slice() else {
+        return None;
+    };
+    Some(body)
+}
+
+fn swift_oauth_authorize_entry_violations(authorize: &str) -> Vec<String> {
+    if !authorize.contains("connectBrokerGrantAfterApplicationActivation(")
+        || [
+            "finishBrokerGrantApplicationActivation(",
+            "connectWithBrokerGrant(",
+            "syncWorker.storeBrokerSubject",
+            "syncWorker.beginBrokerSync",
+        ]
+        .iter()
+        .any(|forbidden| authorize.contains(forbidden))
+    {
+        return vec![
+            "a successful OAuth outcome must enter the application-activation handoff, never connect directly"
+                .to_owned(),
+        ];
+    }
+    Vec::new()
+}
+
+fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
+    let mut violations = Vec::new();
     for required in [
         "NSApplication.didBecomeActiveNotification",
         "NSApp.activate()",
-        "finishApplicationActivation(",
+        "Timer.scheduledTimer",
+        "cleanupFreshBrokerGrant(",
+        "finishBrokerGrantApplicationActivation(",
     ] {
         if !activation.contains(required) {
             violations.push(format!(
                 "the OAuth activation handoff must contain `{required}`"
             ));
         }
+    }
+    if ["connectWithBrokerGrant(", "syncWorker.storeBrokerSubject"]
+        .iter()
+        .any(|forbidden| activation.contains(forbidden))
+    {
+        violations.push(
+            "the OAuth activation handoff must deliver only through finishBrokerGrantApplicationActivation"
+                .to_owned(),
+        );
     }
     let observer_position = activation.find("activationObserver =");
     let activate_position = activation.find("NSApp.activate()");
@@ -3107,36 +3176,36 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
             "the OAuth activation observer must be installed before NSApp.activate()".to_owned(),
         );
     }
+    violations
+}
 
-    let finish = swift_function_bodies(&code, "finishApplicationActivation");
-    let [finish] = finish.as_slice() else {
-        violations.push(
-            "AccountConnectionViewModel must contain exactly one finishApplicationActivation function"
-                .to_owned(),
-        );
-        return violations;
-    };
+fn swift_oauth_finish_persist_violations(finish: &str) -> Vec<String> {
     let clear_position = finish.find("clearApplicationActivation()");
-    let connect_position = finish.find("connectWithGrant(");
+    let store_position = finish.find("syncWorker.storeBrokerSubject(");
+    let connect_position = finish.find("connectWithBrokerGrant(");
     if !finish.contains("guard activationPending")
         || !matches!(
-            (clear_position, connect_position),
-            (Some(clear), Some(connect)) if clear < connect
+            (clear_position, store_position, connect_position),
+            (Some(clear), Some(store), Some(connect)) if clear < store && store < connect
         )
     {
-        violations.push(
-            "the activation completion must clear its one-shot state before claiming the OAuth grant"
+        return vec![
+            "the activation completion must clear its one-shot state before persisting the broker subject and connect only from the subject-store completion"
                 .to_owned(),
-        );
+        ];
     }
+    Vec::new()
+}
 
-    let connect_callers = swift_function_names_with(&code, "connectWithGrant(");
-    if connect_callers != ["finishApplicationActivation".to_owned()] {
-        violations.push(
-            "finishApplicationActivation must be the sole caller of connectWithGrant".to_owned(),
-        );
+fn swift_oauth_sole_connect_caller_violations(code: &str) -> Vec<String> {
+    let connect_callers = swift_function_names_with(code, "connectWithBrokerGrant(");
+    if connect_callers != ["finishBrokerGrantApplicationActivation".to_owned()] {
+        return vec![
+            "finishBrokerGrantApplicationActivation must be the sole caller of connectWithBrokerGrant"
+                .to_owned(),
+        ];
     }
-    violations
+    Vec::new()
 }
 
 fn swift_bootstrap_source_inventory(
@@ -3169,7 +3238,16 @@ fn swift_bootstrap_source_inventory(
         } else {
             strip_swift_non_code(document)
         };
-        let (bridge_violations, bridge_count) = swift_bridge_call_inventory(path, is_header, &code);
+        // The exact reviewed-header comparison pins the raw document, including
+        // its reviewed comments; only the lexical/call analysis below uses the
+        // comment-stripped form.
+        let bridge_document = if is_header {
+            document.as_str()
+        } else {
+            code.as_str()
+        };
+        let (bridge_violations, bridge_count) =
+            swift_bridge_call_inventory(path, is_header, bridge_document);
         violations.extend(bridge_violations);
         bridge_calls += bridge_count;
         if bridge_count > 0 && path != worker_path {
@@ -3291,7 +3369,10 @@ fn is_allowed_macos_target_source(path: &Path, extension: Option<&str>) -> bool 
         )
 }
 
-const CANONICAL_TERSA_RUST_BRIDGE_HEADER: &str = r"#ifndef TERSA_RUST_BRIDGE_H
+const CANONICAL_TERSA_RUST_BRIDGE_HEADER: &str = r"// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#ifndef TERSA_RUST_BRIDGE_H
 #define TERSA_RUST_BRIDGE_H
 #include <stddef.h>
 #include <stdint.h>
@@ -3325,33 +3406,55 @@ uint8_t *output,
 size_t output_capacity,
 size_t *output_len
 );
-int32_t tersa_oauth_macos_begin(
-const uint8_t *client_id,
-size_t client_id_len,
-uint64_t *output_session_id,
-uint8_t *output_url,
-size_t output_url_capacity,
-size_t *output_url_len
-);
-int32_t tersa_oauth_macos_poll(uint64_t session_id);
-int32_t tersa_oauth_cancel(uint64_t session_id);
-int32_t tersa_mailbox_macos_sync_begin(
-const uint8_t *client_id,
-size_t client_id_len,
+// Mailbox sync FFI (adapters/mailbox-sync-ffi-macos). The macOS app links only
+// that crate's archive, which also re-exports the bridge symbols above.
+// Begins a broker-driven sync. The access token and subject both come from
+// the same token broker reply and are scoped to this sync cycle; the caller
+// must wipe/discard its own buffers after this call returns. The output
+// session id is written only when the return value is STATUS_STARTED.
+int32_t tersa_mailbox_macos_broker_sync_begin(
 const uint8_t *account_id,
 size_t account_id_len,
+const uint8_t *access_token,
+size_t access_token_len,
+const uint8_t *subject,
+size_t subject_len,
 uint64_t *output_session_id
 );
-int32_t tersa_mailbox_macos_connect_begin(
+// Broker-driven disconnect, two-phase. prepare follows the durable outer
+// disconnect intent and writes the SQLCipher pre-marker/fence for the account.
+int32_t tersa_mailbox_macos_broker_disconnect_prepare(
+const uint8_t *account_id,
+size_t account_id_len
+);
+// finalize is allowed only after broker token deletion; revoke_unconfirmed
+// accepts only 0/1 as the revoke disposition, and output_session_id is
+// published only when the return value is STATUS_STARTED.
+int32_t tersa_mailbox_macos_broker_disconnect_finalize(
 const uint8_t *account_id,
 size_t account_id_len,
-uint64_t oauth_session_id,
+int32_t revoke_unconfirmed,
 uint64_t *output_session_id
 );
-int32_t tersa_mailbox_macos_disconnect_begin(
+// Broker subject routing value, two-phase access. The subject is an
+// account-identifying broker routing value stored only in the encrypted
+// mailbox DB; it is not an OAuth credential. store persists the value for
+// the account.
+int32_t tersa_mailbox_macos_broker_subject_store(
 const uint8_t *account_id,
 size_t account_id_len,
-uint64_t *output_session_id
+const uint8_t *subject,
+size_t subject_len
+);
+// get publishes output_subject bytes and output_subject_len only on status
+// 0, and returns -6 when no subject is stored for the account. The caller
+// must wipe or discard its output buffer after use.
+int32_t tersa_mailbox_macos_broker_subject_get(
+const uint8_t *account_id,
+size_t account_id_len,
+uint8_t *output_subject,
+size_t output_subject_capacity,
+size_t *output_subject_len
 );
 int32_t tersa_mailbox_macos_lifecycle_get(
 const uint8_t *account_id,
@@ -3362,7 +3465,10 @@ int64_t *output_last_successful_sync_unix_millis
 int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
 #endif";
 
-const CANONICAL_TERSA_MAC_BRIDGING_HEADER: &str = "#include \"TersaRustBridge.h\"";
+const CANONICAL_TERSA_MAC_BRIDGING_HEADER: &str = r#"// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#include "TersaRustBridge.h""#;
 
 struct SwiftFfiSymbolSpec {
     symbol: &'static str,
@@ -3394,30 +3500,23 @@ const SWIFT_FFI_SYMBOL_SPECS: &[SwiftFfiSymbolSpec] = &[
         allowed_calls: &[("apple/macos/MailboxReadWorker.swift", 1)],
     },
     SwiftFfiSymbolSpec {
-        symbol: "tersa_oauth_macos_begin",
-        allowed_calls: &[("apple/macos/OAuthAuthorizationSession.swift", 1)],
-    },
-    SwiftFfiSymbolSpec {
-        symbol: "tersa_oauth_macos_poll",
-        allowed_calls: &[("apple/macos/OAuthAuthorizationSession.swift", 1)],
-    },
-    SwiftFfiSymbolSpec {
-        symbol: "tersa_oauth_cancel",
-        allowed_calls: &[
-            ("apple/macos/AccountConnectionViewModel.swift", 5),
-            ("apple/macos/OAuthAuthorizationSession.swift", 2),
-        ],
-    },
-    SwiftFfiSymbolSpec {
-        symbol: "tersa_mailbox_macos_sync_begin",
+        symbol: "tersa_mailbox_macos_broker_sync_begin",
         allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
     },
     SwiftFfiSymbolSpec {
-        symbol: "tersa_mailbox_macos_connect_begin",
+        symbol: "tersa_mailbox_macos_broker_disconnect_prepare",
         allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
     },
     SwiftFfiSymbolSpec {
-        symbol: "tersa_mailbox_macos_disconnect_begin",
+        symbol: "tersa_mailbox_macos_broker_disconnect_finalize",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_broker_subject_store",
+        allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
+    },
+    SwiftFfiSymbolSpec {
+        symbol: "tersa_mailbox_macos_broker_subject_get",
         allowed_calls: &[("apple/macos/MailboxSyncWorker.swift", 1)],
     },
     SwiftFfiSymbolSpec {
@@ -4137,6 +4236,39 @@ const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH: &str =
 const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS: &str = "TokenBrokerSessionResourceBag";
 /// Whitespace-normalized form of the sole reviewed abandoned-session `deinit`.
 const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT: &str = "deinit{release()}";
+/// Exact owner class of the reviewed broker-backed authorization session whose
+/// production `start()` admission guard and per-attempt reset sequence are
+/// pinned. Same reviewed file as
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`.
+const REVIEWED_TOKEN_BROKER_AUTHORIZATION_SESSION_CLASS: &str = "TokenBrokerAuthorizationSession";
+/// Whitespace-normalized signature of the reviewed session `start()` method.
+/// Renamed parameters, changed labels or attributes, and a changed return type
+/// fail closed.
+const REVIEWED_TOKEN_BROKER_SESSION_START_SIGNATURE: &str =
+    "funcstart(onOutcome:@escaping@MainActor(TokenBrokerAuthorizationOutcome)->Void)->Bool";
+/// Whitespace-normalized admission guard that must be the first statement of
+/// the reviewed session `start()`: `attemptLifecycle.canStart`, never a
+/// session-scoped finished latch, is the sole admission gate.
+const REVIEWED_TOKEN_BROKER_SESSION_START_ADMISSION_GUARD: &str =
+    "guardattemptLifecycle.canStart,resources.borrowClient()==nilelse{returnfalse}";
+/// Whitespace-normalized arm-and-reset sequence that must appear verbatim in
+/// the reviewed session `start()`: the `beginAttempt()` generation bump is
+/// immediately followed by the five per-attempt resets in this exact order and
+/// the outcome-handler install, so no prior-attempt state can leak into a
+/// re-armed session.
+const REVIEWED_TOKEN_BROKER_SESSION_START_ARM_AND_RESETS: &str = "letgeneration=attemptLifecycle.beginAttempt()hasAcceptedListenerReady=falsehasForwardedCallback=falsesessionHandle=nilboundLoopbackPort=nilpeerRegistry.removeAll()self.onOutcome=onOutcome";
+/// Exact path of the sole reviewed abandoned-request `deinit` cleanup. No
+/// directory-wide, filename-prefix, or generic `deinit` exemption exists.
+const REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH: &str = "apple/macos/MailboxSyncWorker.swift";
+/// Exact direct owner class of the sole reviewed abandoned-request `deinit`
+/// cleanup: the secrets box zeroizing queued access-token and subject buffers
+/// when a request is abandoned before begin.
+const REVIEWED_BROKER_SYNC_SECRETS_CLASS: &str = "BrokerSyncSecrets";
+/// Exact file-scope class that directly owns `BrokerSyncSecrets`; a file-scope
+/// or differently nested `BrokerSyncSecrets` decoy fails closed.
+const REVIEWED_BROKER_SYNC_SECRETS_OUTER_CLASS: &str = "MailboxSyncWorker";
+/// Whitespace-normalized form of the sole reviewed abandoned-request `deinit`.
+const REVIEWED_BROKER_SYNC_SECRETS_DEINIT: &str = "deinit{wipe()}";
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
 const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 9] = [
     "apple/macos-token-broker/Info.plist",
@@ -4161,14 +4293,20 @@ const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 9] = [
 /// in `apple/macos-token-broker/TokenBrokerProtocol.swift`. Every other protocol
 /// declaration in inventoried product or broker sources fails closed.
 ///
-/// The sole reviewed `deinit` exception is the abandoned-session cleanup
-/// `deinit { release() }` as a direct member of file-scope class
-/// `TokenBrokerSessionResourceBag` in
-/// `apple/macos/TokenBrokerAuthorizationSession.swift`. Exactly one such
-/// declaration is accepted; any second `deinit`, any other path or owner class,
-/// attributes/parameters, extra statements, alternate calls, nested placement,
-/// or comment/string decoys fail closed. `subscript` remains unconditionally
-/// forbidden.
+/// The reviewed `deinit` exceptions are exactly two, each pinned to an exact
+/// path, exact direct owner class, exact body form, and exactly one
+/// occurrence:
+///
+/// 1. The abandoned-session cleanup `deinit { release() }` as a direct member
+///    of file-scope class `TokenBrokerSessionResourceBag` in
+///    `apple/macos/TokenBrokerAuthorizationSession.swift`.
+/// 2. The abandoned-request cleanup `deinit { wipe() }` as a direct member of
+///    class `BrokerSyncSecrets`, itself a direct member of file-scope class
+///    `MailboxSyncWorker`, in `apple/macos/MailboxSyncWorker.swift`.
+///
+/// Any second `deinit`, any other path or owner class, attributes/parameters,
+/// extra statements, alternate calls, nested placement, or comment/string
+/// decoys fail closed. `subscript` remains unconditionally forbidden.
 fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<String> {
     if let Some(violation) = swift_deinit_declaration_violation(path, code) {
         return Some(violation);
@@ -4197,16 +4335,21 @@ fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<Stri
     None
 }
 
-/// Rejects every `deinit` declaration except the single reviewed abandoned-session
-/// cleanup on `TokenBrokerSessionResourceBag` at
-/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`.
+/// Rejects every `deinit` declaration except the two pinned reviewed cleanups:
+/// the abandoned-session cleanup on `TokenBrokerSessionResourceBag` at
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH` and the
+/// abandoned-request cleanup on `BrokerSyncSecrets` at
+/// `REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH`. Each exception accepts exactly
+/// one occurrence; a second `deinit` fails closed.
 fn swift_deinit_declaration_violation(path: &Path, code: &str) -> Option<String> {
     let mut saw_reviewed = false;
     for (start, _) in code.match_indices("deinit") {
         if !is_identifier_at(code, start, "deinit") {
             continue;
         }
-        if is_exact_reviewed_token_broker_session_resource_bag_deinit(path, code, start) {
+        if is_exact_reviewed_token_broker_session_resource_bag_deinit(path, code, start)
+            || is_exact_reviewed_broker_sync_secrets_deinit(path, code, start)
+        {
             if saw_reviewed {
                 return Some(format!(
                     "{} must not declare `deinit` in inventoried macOS sources",
@@ -4257,6 +4400,177 @@ fn is_exact_reviewed_token_broker_session_resource_bag_deinit(
         deinit_start,
         REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS,
     )
+}
+
+/// True only for the exact reviewed form `deinit { wipe() }` as a direct
+/// member of class `BrokerSyncSecrets`, itself a direct member of file-scope
+/// `class MailboxSyncWorker`, in `REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH`.
+/// Leading attributes or modifiers, parameters, body mutations, a file-scope
+/// or differently nested `BrokerSyncSecrets` decoy, deeper member nesting, and
+/// any other path or owner fail closed. Comment/string regions are already
+/// masked by the caller, so decoys cannot satisfy the match.
+fn is_exact_reviewed_broker_sync_secrets_deinit(
+    path: &Path,
+    code: &str,
+    deinit_start: usize,
+) -> bool {
+    if path != Path::new(REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH) {
+        return false;
+    }
+    if swift_declaration_has_attached_prefix(code, deinit_start) {
+        return false;
+    }
+    let after_keyword = skip_ascii_whitespace(code, deinit_start + "deinit".len());
+    if code.as_bytes().get(after_keyword) != Some(&b'{') {
+        return false;
+    }
+    let Some(body) = balanced_brace_body(code, after_keyword) else {
+        return false;
+    };
+    let declaration = &code[deinit_start..after_keyword + body.len()];
+    if rust_token_canonical(declaration) != REVIEWED_BROKER_SYNC_SECRETS_DEINIT {
+        return false;
+    }
+    swift_is_direct_member_of_nested_class(
+        code,
+        deinit_start,
+        REVIEWED_BROKER_SYNC_SECRETS_CLASS,
+        REVIEWED_BROKER_SYNC_SECRETS_OUTER_CLASS,
+    )
+}
+
+/// True when `member_start` is a direct member (brace depth 1 inside the inner
+/// class body) of a `class <inner_name>` that is itself a direct member of
+/// file-scope `class <outer_name>`. Deeper member nesting (a type, function,
+/// or closure inside the inner class), a file-scope or differently nested
+/// `class <inner_name>` decoy, and non-class owners fail closed.
+fn swift_is_direct_member_of_nested_class(
+    code: &str,
+    member_start: usize,
+    inner_name: &str,
+    outer_name: &str,
+) -> bool {
+    for (start, _) in code.match_indices("class") {
+        if !is_identifier_at(code, start, "class") {
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(code, start + "class".len());
+        let Some(name) = swift_type_declaration_name_at(code, name_start) else {
+            continue;
+        };
+        if name != inner_name {
+            continue;
+        }
+        // Inheritance, generics, and where-clauses may appear between the name
+        // and the body brace; comments/strings are already masked to spaces.
+        let Some(brace_relative) = code[name_start..].find('{') else {
+            continue;
+        };
+        let brace = name_start + brace_relative;
+        let Some(body) = balanced_brace_body(code, brace) else {
+            continue;
+        };
+        let body_end = brace + body.len();
+        if member_start <= brace || member_start >= body_end - 1 {
+            continue;
+        }
+        // Direct member only: depth 1 means inside this class body and not
+        // nested inside any further `{ ... }` (method, nested type, closure).
+        if swift_brace_depth_between(code, brace, member_start) != 1 {
+            continue;
+        }
+        // The inner class must itself be a direct member of the reviewed
+        // file-scope outer class; file-scope or differently nested decoys of
+        // the inner class name fail closed.
+        return swift_is_direct_member_of_file_scope_class(code, start, outer_name);
+    }
+    false
+}
+
+/// Production pin for the reviewed broker-backed session `start()`: exactly
+/// one non-initializer `start` as a direct member of file-scope class
+/// `TokenBrokerAuthorizationSession` in
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`, carrying the exact
+/// reviewed signature, the exact `attemptLifecycle.canStart` admission guard as
+/// its first executable statement (never an `isFinished` latch), and the exact
+/// arm-and-reset sequence exactly once. Zero or multiple candidate methods, a
+/// renamed parameter/label/attribute, a changed return type, a reordered or
+/// duplicated reset, and comment/string decoys all fail closed. Comment/string
+/// regions must already be masked by the caller. Returns `None` for every
+/// other path.
+fn token_broker_session_start_violation(path: &Path, code: &str) -> Option<String> {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH) {
+        return None;
+    }
+    let violation = |reason: &str| -> String {
+        format!(
+            "{} has an unreviewed TokenBrokerAuthorizationSession.start: {reason}",
+            path.display()
+        )
+    };
+    let sites: Vec<(usize, &str)> = swift_function_declaration_sites(code)
+        .into_iter()
+        .filter(|(name, _body, is_initializer, start)| {
+            name == "start"
+                && !*is_initializer
+                && swift_is_direct_member_of_file_scope_class(
+                    code,
+                    *start,
+                    REVIEWED_TOKEN_BROKER_AUTHORIZATION_SESSION_CLASS,
+                )
+        })
+        .map(|(_name, body, _is_initializer, start)| (start, body))
+        .collect();
+    if sites.len() != 1 {
+        return Some(violation(
+            "expected exactly one direct `start` method on the reviewed session class",
+        ));
+    }
+    let (opening, body) = sites[0];
+    // Pin the signature on the source span immediately before the balanced
+    // body, never on a whole-file substring. The declaration keyword is the
+    // last `func` identifier before the body brace; any drift between it and
+    // the brace (renamed parameters, changed labels or attributes, a changed
+    // return type, or a smuggled brace) changes the canonical form and fails.
+    let Some(func_start) = code[..opening]
+        .match_indices("func")
+        .filter(|(start, _)| is_identifier_at(code, *start, "func"))
+        .map(|(start, _)| start)
+        .last()
+    else {
+        return Some(violation(
+            "`start` is missing its `func` declaration keyword",
+        ));
+    };
+    if rust_token_canonical(&code[func_start..opening])
+        != REVIEWED_TOKEN_BROKER_SESSION_START_SIGNATURE
+    {
+        return Some(violation(
+            "signature does not match the reviewed declaration",
+        ));
+    }
+    let canonical_body = rust_token_canonical(body);
+    let Some(statements) = canonical_body.strip_prefix('{') else {
+        return Some(violation("method body is not a balanced brace block"));
+    };
+    if !statements.starts_with(REVIEWED_TOKEN_BROKER_SESSION_START_ADMISSION_GUARD) {
+        return Some(violation(
+            "first statement is not the reviewed `attemptLifecycle.canStart` admission guard",
+        ));
+    }
+    if contains_identifier(body, "isFinished") {
+        return Some(violation("must not admit through an `isFinished` latch"));
+    }
+    if canonical_body
+        .match_indices(REVIEWED_TOKEN_BROKER_SESSION_START_ARM_AND_RESETS)
+        .count()
+        != 1
+    {
+        return Some(violation(
+            "arm-and-reset sequence must appear exactly once as a contiguous sequence",
+        ));
+    }
+    None
 }
 
 /// True when a non-whitespace token other than a declaration boundary (`{`,
@@ -4504,6 +4818,9 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
         }
     }
     if let Some(violation) = swift_forbidden_declaration_violation(path, &code) {
+        return vec![violation];
+    }
+    if let Some(violation) = token_broker_session_start_violation(path, &code) {
         return vec![violation];
     }
     let bytes = document.as_bytes();
@@ -9528,8 +9845,9 @@ mod tests {
     use cargo_metadata::PackageId;
 
     use super::{
-        APPLE_BRIDGE_C_ABI_COUNT_MESSAGE, CANONICAL_TERSA_RUST_BRIDGE_HEADER,
-        MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE, REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+        APPLE_BRIDGE_C_ABI_COUNT_MESSAGE, CANONICAL_TERSA_MAC_BRIDGING_HEADER,
+        CANONICAL_TERSA_RUST_BRIDGE_HEADER, MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
+        REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH, REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
         REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH,
         REVIEWED_TOKEN_BROKER_WIRE_STATUSES, ResolvedDependencyIdentity,
         TOKEN_BROKER_ALLOWED_SOURCE_PATHS, TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
@@ -9555,10 +9873,11 @@ mod tests {
         shipped_direct_dependency_names, signing_configuration_violations,
         source_token_broker_entitlement_violations, sqlcipher_dependency_graph_violations,
         sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
-        swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
-        swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
-        target_metadata_options, token_broker_bridge_header_c_abi_violations,
+        swift_bootstrap_inventory_violations, swift_bootstrap_source_inventory,
+        swift_bootstrap_source_violations, swift_bridge_call_inventory,
+        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
+        swift_source_lexical_violations, target_metadata_options,
+        token_broker_bridge_header_c_abi_violations,
         token_broker_code_signing_requirement_violations,
         token_broker_ffi_source_surface_violations, token_broker_protocol_mirror_violations,
         token_broker_source_surface_violations, token_broker_wire_status_coherence_violations,
@@ -10533,25 +10852,41 @@ mod compatibility {{
     fn reviewed_mailbox_sync_ffi_export_source() -> &'static str {
         r#"
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tersa_mailbox_macos_sync_begin(
-    client_id: *const u8,
-    client_id_len: usize,
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_sync_begin(
     account_id: *const u8,
     account_id_len: usize,
+    access_token: *const u8,
+    access_token_len: usize,
+    subject: *const u8,
+    subject_len: usize,
     output_session_id: *mut u64,
 ) -> i32 {}
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tersa_mailbox_macos_connect_begin(
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_disconnect_prepare(
     account_id: *const u8,
     account_id_len: usize,
-    oauth_session_id: u64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_disconnect_finalize(
+    account_id: *const u8,
+    account_id_len: usize,
+    revoke_unconfirmed: i32,
     output_session_id: *mut u64,
 ) -> i32 {}
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tersa_mailbox_macos_disconnect_begin(
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_subject_store(
     account_id: *const u8,
     account_id_len: usize,
-    output_session_id: *mut u64,
+    subject: *const u8,
+    subject_len: usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_subject_get(
+    account_id: *const u8,
+    account_id_len: usize,
+    output_subject: *mut u8,
+    output_subject_capacity: usize,
+    output_subject_len: *mut usize,
 ) -> i32 {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tersa_mailbox_macos_lifecycle_get(
@@ -10824,7 +11159,7 @@ pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
 
         // Widening a parameter, changing the ABI, or renaming a symbol must trip.
         for mutation in [
-            lib.replace("client_id_len: usize", "client_id_len: u32"),
+            lib.replace("access_token_len: usize", "access_token_len: u32"),
             lib.replacen("extern \"C\"", "extern \"system\"", 1),
             lib.replace(
                 "tersa_mailbox_macos_sync_poll",
@@ -10837,15 +11172,40 @@ pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
             );
         }
 
-        // A fifth exported symbol must trip the reviewed-count message.
-        let fifth_symbol = reviewed_mailbox_sync_ffi_documents(format!(
+        // An eighth exported symbol must trip the reviewed-count message.
+        let eighth_symbol = reviewed_mailbox_sync_ffi_documents(format!(
             "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn tersa_mailbox_macos_sync_extra() -> i32 {{}}"
         ));
-        let violations = ffi_export_violations(&fifth_symbol);
+        let violations = ffi_export_violations(&eighth_symbol);
         assert!(
             violations.iter().any(|violation| violation
-                .contains("five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports")),
-            "a fifth symbol must trip the reviewed-count message: {violations:?}"
+                .contains("seven reviewed broker sync begin, disconnect prepare/finalize, subject store/get, lifecycle-query, and poll no_mangle exports")),
+            "an eighth symbol must trip the reviewed-count message: {violations:?}"
+        );
+
+        // A resurrected legacy in-process begin is now an unexpected export and
+        // must fail closed like any other unreviewed symbol.
+        let legacy_begin = reviewed_mailbox_sync_ffi_documents(format!(
+            "{lib}\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn tersa_mailbox_macos_sync_begin(client_id: *const u8, client_id_len: usize, account_id: *const u8, account_id_len: usize, output_session_id: *mut u64) -> i32 {{}}"
+        ));
+        assert!(
+            !ffi_export_violations(&legacy_begin).is_empty(),
+            "a legacy begin re-exported as no_mangle must fail closed"
+        );
+
+        // Missing one of the seven must fail closed.
+        let missing = reviewed_mailbox_sync_ffi_documents(lib.replace(
+            r#"#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_mailbox_macos_broker_disconnect_prepare(
+    account_id: *const u8,
+    account_id_len: usize,
+) -> i32 {}
+"#,
+            "",
+        ));
+        assert!(
+            !ffi_export_violations(&missing).is_empty(),
+            "missing a reviewed broker export must fail closed"
         );
     }
 
@@ -10889,13 +11249,14 @@ pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
             "a declared build script must fail closed"
         );
 
-        // The closed direct-dependency set: exactly the four pass; a capability crate
+        // The closed direct-dependency set: exactly the five pass; a capability crate
         // or a missing required dependency fails.
         let exact = BTreeSet::from([
             "tersa-application",
             "tersa-apple-bridge",
             "tersa-oauth-sync-macos",
             "url",
+            "zeroize",
         ]);
         assert!(mailbox_sync_ffi_direct_dependency_set_violations(&exact).is_empty());
         let mut hostile = exact.clone();
@@ -10903,6 +11264,21 @@ pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
         assert!(!mailbox_sync_ffi_direct_dependency_set_violations(&hostile).is_empty());
         let missing = BTreeSet::from(["tersa-application", "url"]);
         assert!(!mailbox_sync_ffi_direct_dependency_set_violations(&missing).is_empty());
+        // ADR-0024: `zeroize` is an intentional direct dependency (short-lived
+        // broker access-token buffers), so dropping it must fail closed with the
+        // missing-required-dependency diagnostic naming it precisely.
+        let without_zeroize = BTreeSet::from([
+            "tersa-application",
+            "tersa-apple-bridge",
+            "tersa-oauth-sync-macos",
+            "url",
+        ]);
+        let violations = mailbox_sync_ffi_direct_dependency_set_violations(&without_zeroize);
+        assert!(
+            violations.iter().any(|violation| violation
+                == "tersa-mailbox-sync-ffi-macos is missing required direct dependency zeroize"),
+            "dropping zeroize must fail closed naming the dependency: {violations:?}"
+        );
     }
 
     #[test]
@@ -11501,11 +11877,25 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
 
     #[test]
     fn bridge_header_canonical_form_rejects_drift() {
-        let path = Path::new("apple/macos/TersaRustBridge.h");
-        let (violations, calls) =
-            swift_bridge_call_inventory(path, true, CANONICAL_TERSA_RUST_BRIDGE_HEADER);
-        assert!(violations.is_empty(), "{violations:?}");
-        assert_eq!(calls, 0);
+        let header_path = PathBuf::from("apple/macos/TersaRustBridge.h");
+        // Exercise the same production preprocessing path as
+        // `swift_bootstrap_source_inventory`: if comments were stripped before
+        // the canonical comparison, the exact reviewed header would be
+        // rejected and comment-only drift would pass.
+        let header_match_violations = |path: &Path, header: &str| {
+            let sources = [(path.to_path_buf(), header.to_owned())];
+            swift_bootstrap_source_inventory(&sources)
+                .0
+                .into_iter()
+                .filter(|violation| {
+                    violation.contains("must match an exact reviewed TersaMac header")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            header_match_violations(&header_path, CANONICAL_TERSA_RUST_BRIDGE_HEADER).is_empty(),
+            "the exact reviewed header, including its comments, must survive production preprocessing"
+        );
 
         for drift in [
             CANONICAL_TERSA_RUST_BRIDGE_HEADER.replace(
@@ -11521,11 +11911,31 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
             format!(
                 "{CANONICAL_TERSA_RUST_BRIDGE_HEADER}\nint32_t tersa_macos_mailbox_write(const uint8_t *account_id, size_t account_id_len);"
             ),
+            // Comment-only drift in the exact reviewed header must stay rejected.
+            CANONICAL_TERSA_RUST_BRIDGE_HEADER.replace("Mozilla Public", "Mozilla Community"),
         ] {
-            let (violations, _) = swift_bridge_call_inventory(path, true, &drift);
             assert!(
-                !violations.is_empty(),
-                "header drift must fail closed: {drift:?}"
+                !header_match_violations(&header_path, &drift).is_empty(),
+                "header drift must fail closed through production preprocessing: {drift:?}"
+            );
+        }
+
+        let bridging_header_path = PathBuf::from("apple/macos/TersaMac-Bridging-Header.h");
+        assert!(
+            header_match_violations(&bridging_header_path, CANONICAL_TERSA_MAC_BRIDGING_HEADER)
+                .is_empty(),
+            "the exact reviewed bridging header, including its comments, must survive production preprocessing"
+        );
+        for drift in [
+            // Comment-only drift in the exact reviewed header must stay rejected.
+            CANONICAL_TERSA_MAC_BRIDGING_HEADER.replace("Mozilla Public", "Mozilla Community"),
+            format!(
+                "{CANONICAL_TERSA_MAC_BRIDGING_HEADER}\nextern int32_t tersa_macos_unreviewed(void);"
+            ),
+        ] {
+            assert!(
+                !header_match_violations(&bridging_header_path, &drift).is_empty(),
+                "bridging header drift must fail closed through production preprocessing: {drift:?}"
             );
         }
     }
@@ -11547,10 +11957,6 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
             (
                 "apple/macos/AccountConnectionViewModel.swift",
                 include_str!("../../apple/macos/AccountConnectionViewModel.swift"),
-            ),
-            (
-                "apple/macos/OAuthAuthorizationSession.swift",
-                include_str!("../../apple/macos/OAuthAuthorizationSession.swift"),
             ),
             (
                 "apple/macos/MailboxSyncWorker.swift",
@@ -11583,32 +11989,32 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
         );
 
         let mut moved_call = reviewed.clone();
-        let (_, oauth_source) = moved_call
+        let (_, sync_source) = moved_call
             .iter_mut()
-            .find(|(path, _)| path == Path::new("apple/macos/OAuthAuthorizationSession.swift"))
-            .expect("OAuth session fixture must exist");
-        *oauth_source = oauth_source.replace(
-            "let status = tersa_oauth_macos_poll(sessionID)",
-            "let status: Int32 = 0",
+            .find(|(path, _)| path == Path::new("apple/macos/MailboxSyncWorker.swift"))
+            .expect("mailbox sync worker fixture must exist");
+        *sync_source = sync_source.replace(
+            "let rawStatus = tersa_mailbox_macos_sync_poll(session.rawValue)",
+            "let rawStatus: Int32 = 0",
         );
         let (_, app_source) = moved_call
             .iter_mut()
             .find(|(path, _)| path == Path::new("apple/macos/AppDelegate.swift"))
             .expect("app delegate fixture must exist");
-        app_source.push_str("\nlet moved = tersa_oauth_macos_poll(0)\n");
+        app_source.push_str("\nlet moved = tersa_mailbox_macos_sync_poll(0)\n");
         assert!(
             !swift_ffi_symbol_inventory_violations(&moved_call).is_empty(),
             "a moved reviewed FFI call must fail closed"
         );
 
         let mut alternate_invocation = reviewed.clone();
-        let (_, oauth_source) = alternate_invocation
+        let (_, sync_source) = alternate_invocation
             .iter_mut()
-            .find(|(path, _)| path == Path::new("apple/macos/OAuthAuthorizationSession.swift"))
-            .expect("OAuth session fixture must exist");
-        *oauth_source = oauth_source.replace(
-            "tersa_oauth_macos_poll(sessionID)",
-            "tersa_oauth_macos_poll /* recognized formatting */ (sessionID)",
+            .find(|(path, _)| path == Path::new("apple/macos/MailboxSyncWorker.swift"))
+            .expect("mailbox sync worker fixture must exist");
+        *sync_source = sync_source.replace(
+            "tersa_mailbox_macos_sync_poll(session.rawValue)",
+            "tersa_mailbox_macos_sync_poll /* recognized formatting */ (session.rawValue)",
         );
         assert!(
             swift_ffi_symbol_inventory_violations(&alternate_invocation).is_empty(),
@@ -11616,8 +12022,9 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
         );
 
         for spelling in ["__asm", "__asm__", "asm"] {
-            let alias =
-                format!("extern int32_t alias(uint64_t) {spelling}(\"tersa_oauth_macos_poll\");");
+            let alias = format!(
+                "extern int32_t alias(uint64_t) {spelling}(\"tersa_mailbox_macos_sync_poll\");"
+            );
             let (violations, _) = swift_bridge_call_inventory(
                 Path::new("apple/macos/TersaRustBridge.h"),
                 true,
@@ -11721,13 +12128,40 @@ private enum TersaApplication {
     #[test]
     fn swift_oauth_foreground_handoff_accepts_one_shot_activation() {
         let view_model = r"
-func authorizeAndConnect() {
-    connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+func authorizeAndConnect(accountIdentifier: Data) {
+    let started = session.start { [weak self] outcome in
+        guard let self else { return }
+        switch outcome {
+        case .succeeded(let accessToken, let subject, let expiresInSeconds):
+            let brokerToken = TokenBrokerAccessToken(
+                accessToken: accessToken,
+                subject: subject,
+                expiresInSeconds: expiresInSeconds
+            )
+            self.connectBrokerGrantAfterApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                brokerToken: brokerToken,
+                token: connectToken
+            )
+        }
+    }
 }
-func connectAfterApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+func connectBrokerGrantAfterApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    guard !activationPending else {
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+        return
+    }
     activationPending = true
     if NSApp.isActive {
-        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        finishBrokerGrantApplicationActivation(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
         return
     }
     activationObserver = NotificationCenter.default.addObserver(
@@ -11735,20 +12169,52 @@ func connectAfterApplicationActivation(accountIdentifier: Data, oauthSession: OA
         object: NSApp,
         queue: .main
     ) { _ in
-        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        finishBrokerGrantApplicationActivation(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
+    activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { _ in
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
     }
     NSApp.activate()
     if NSApp.isActive {
-        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        finishBrokerGrantApplicationActivation(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
     }
 }
-func finishApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+func finishBrokerGrantApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
     guard activationPending else { return }
     clearApplicationActivation()
-    connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    syncWorker.storeBrokerSubject(
+        accountIdentifier: accountIdentifier,
+        subject: brokerToken.subject
+    ) { persisted in
+        guard persisted else { return }
+        self.connectWithBrokerGrant(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
 }
 func clearApplicationActivation() {}
-func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {}
+func cleanupFreshBrokerGrant(subject: String, token: ConnectionOperationToken) {}
+func connectWithBrokerGrant(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    syncWorker.beginBrokerSync(accountIdentifier: accountIdentifier)
+}
 ";
         let sources = vec![(
             PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
@@ -11763,48 +12229,180 @@ func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {}
     }
 
     #[test]
-    fn swift_oauth_foreground_handoff_rejects_background_connect_and_late_observer() {
-        let valid = r"
-func authorizeAndConnect() {
-    connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    fn swift_oauth_foreground_handoff_rejects_unreviewed_handoff_paths() {
+        let valid = valid_oauth_handoff_view_model();
+        let drifts = [
+            authorize_handoff_bypass_mutations(valid),
+            activation_handoff_mutations(valid),
+            finish_handoff_mutations(valid),
+        ]
+        .concat();
+        for drift in drifts {
+            assert_oauth_handoff_drift_rejected(drift);
+        }
+    }
+
+    fn valid_oauth_handoff_view_model() -> &'static str {
+        r"
+func authorizeAndConnect(accountIdentifier: Data) {
+    connectBrokerGrantAfterApplicationActivation(
+        accountIdentifier: accountIdentifier,
+        brokerToken: brokerToken,
+        token: token
+    )
 }
-func connectAfterApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+func connectBrokerGrantAfterApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    activationPending = true
     activationObserver = NotificationCenter.default.addObserver(
         forName: NSApplication.didBecomeActiveNotification,
         object: NSApp,
         queue: .main
     ) { _ in
-        finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+        finishBrokerGrantApplicationActivation(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
+    activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { _ in
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
     }
     NSApp.activate()
-    finishApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    finishBrokerGrantApplicationActivation(
+        accountIdentifier: accountIdentifier,
+        brokerToken: brokerToken,
+        token: token
+    )
 }
-func finishApplicationActivation(accountIdentifier: Data, oauthSession: OAuthSessionID) {
+func finishBrokerGrantApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
     guard activationPending else { return }
     clearApplicationActivation()
-    connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)
+    syncWorker.storeBrokerSubject(
+        accountIdentifier: accountIdentifier,
+        subject: brokerToken.subject
+    ) { persisted in
+        connectWithBrokerGrant(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
 }
 func clearApplicationActivation() {}
-func connectWithGrant(accountIdentifier: Data, oauthSession: OAuthSessionID) {}
-";
-        let direct_connect = valid.replace(
-            "connectAfterApplicationActivation(accountIdentifier: accountIdentifier, oauthSession: oauthSession)",
-            "connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession)",
+func cleanupFreshBrokerGrant(subject: String, token: ConnectionOperationToken) {}
+func connectWithBrokerGrant(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {}
+"
+    }
+
+    fn assert_oauth_handoff_drift_rejected(drift: String) {
+        let sources = vec![(
+            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+            drift,
+        )];
+        assert!(
+            !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+            "a background-capable OAuth handoff must fail closed"
         );
+    }
+
+    fn authorize_handoff_bypass_mutations(valid: &str) -> Vec<String> {
+        vec![valid.replace(
+            "    connectBrokerGrantAfterApplicationActivation(\n        accountIdentifier: accountIdentifier,\n        brokerToken: brokerToken,\n        token: token\n    )",
+            "    connectWithBrokerGrant(\n        accountIdentifier: accountIdentifier,\n        brokerToken: brokerToken,\n        token: token\n    )",
+        )]
+    }
+
+    fn activation_handoff_mutations(valid: &str) -> Vec<String> {
         let late_observer = valid.replace(
             "    activationObserver = NotificationCenter.default.addObserver(\n",
             "    NSApp.activate()\n    activationObserver = NotificationCenter.default.addObserver(\n",
         );
-        for drift in [direct_connect, late_observer] {
-            let sources = vec![(
-                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
-                drift,
-            )];
-            assert!(
-                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
-                "a background-capable OAuth handoff must fail closed"
-            );
-        }
+        let background_delivery = valid.replace(
+            "    NSApp.activate()\n    finishBrokerGrantApplicationActivation(",
+            "    NSApp.activate()\n    connectWithBrokerGrant(",
+        );
+        let duplicate_activation = format!(
+            "{valid}\nfunc connectBrokerGrantAfterApplicationActivation(accountIdentifier: Data, brokerToken: TokenBrokerAccessToken, token: ConnectionOperationToken) {{}}\n"
+        );
+        let missing_activation = valid.replace(
+            r"func connectBrokerGrantAfterApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    activationPending = true
+    activationObserver = NotificationCenter.default.addObserver(
+        forName: NSApplication.didBecomeActiveNotification,
+        object: NSApp,
+        queue: .main
+    ) { _ in
+        finishBrokerGrantApplicationActivation(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
+    activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { _ in
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+    }
+    NSApp.activate()
+    finishBrokerGrantApplicationActivation(
+        accountIdentifier: accountIdentifier,
+        brokerToken: brokerToken,
+        token: token
+    )
+}
+",
+            "",
+        );
+        vec![
+            late_observer,
+            background_delivery,
+            duplicate_activation,
+            missing_activation,
+        ]
+    }
+
+    fn finish_handoff_mutations(valid: &str) -> Vec<String> {
+        let missing_finish = valid.replace(
+            r"func finishBrokerGrantApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    guard activationPending else { return }
+    clearApplicationActivation()
+    syncWorker.storeBrokerSubject(
+        accountIdentifier: accountIdentifier,
+        subject: brokerToken.subject
+    ) { persisted in
+        connectWithBrokerGrant(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
+}
+",
+            "",
+        );
+        let reordered_activation = valid.replace(
+            "    clearApplicationActivation()\n    syncWorker.storeBrokerSubject(\n        accountIdentifier: accountIdentifier,\n        subject: brokerToken.subject\n    ) { persisted in\n        connectWithBrokerGrant(",
+            "    syncWorker.storeBrokerSubject(\n        accountIdentifier: accountIdentifier,\n        subject: brokerToken.subject\n    ) { persisted in\n        clearApplicationActivation()\n        connectWithBrokerGrant(",
+        );
+        vec![missing_finish, reordered_activation]
     }
 
     #[test]
@@ -12539,19 +13137,17 @@ func connect() { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(
 enum MailboxBeginStatus { init?(rawValue: Int32) { self = .started } }
 enum MailboxPollStatus { init?(rawValue: Int32) { self = .running } }
 final class MailboxSyncWorker {
-    func connect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.connect(accountIdentifier), completion: completion) }
-    func disconnect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.disconnect(accountIdentifier), completion: completion) }
-    func sync(clientID: String, accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.sync(clientID, accountIdentifier), completion: completion) }
+    func connect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.brokerSync(accountIdentifier), completion: completion) }
+    func disconnect(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.brokerDisconnectFinalize(accountIdentifier), completion: completion) }
+    func sync(accountIdentifier: Data, completion: @escaping @MainActor (MailboxPollStatus) -> Void) { enqueueBegin(.brokerSync(accountIdentifier), completion: completion) }
     private func performBegin(_ request: BeginRequest) -> (status: Int32, sessionID: UInt64) {
         var sessionID: UInt64 = 0
         let status: Int32
         switch request {
-        case .connect(let accountIdentifier):
-            status = tersa_mailbox_macos_connect_begin(accountIdentifier, &sessionID)
-        case .disconnect(let accountIdentifier):
-            status = tersa_mailbox_macos_disconnect_begin(accountIdentifier, &sessionID)
-        case .sync(let clientID, let accountIdentifier):
-            status = tersa_mailbox_macos_sync_begin(clientID, accountIdentifier, &sessionID)
+        case .brokerSync(let accountIdentifier):
+            status = tersa_mailbox_macos_broker_sync_begin(accountIdentifier, &sessionID)
+        case .brokerDisconnectFinalize(let accountIdentifier):
+            status = tersa_mailbox_macos_broker_disconnect_finalize(accountIdentifier, &sessionID)
         }
         return (status, sessionID)
     }
@@ -14533,11 +15129,34 @@ protocol TersaMacTokenBrokerProtocolV1 {
         );
     }
 
+    /// Exact reviewed pair pinned at
+    /// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`: the
+    /// abandoned-session `deinit` cleanup plus the reviewed session `start()`
+    /// admission guard and arm-and-reset sequence the same file must carry.
     fn exact_token_broker_session_resource_bag_deinit_fixture() -> &'static str {
         "\
 final class TokenBrokerSessionResourceBag: @unchecked Sendable {
     func release() {}
     deinit { release() }
+}
+
+@MainActor
+final class TokenBrokerAuthorizationSession {
+    func start(
+        onOutcome: @escaping @MainActor (TokenBrokerAuthorizationOutcome) -> Void
+    ) -> Bool {
+        guard attemptLifecycle.canStart, resources.borrowClient() == nil else {
+            return false
+        }
+        let generation = attemptLifecycle.beginAttempt()
+        hasAcceptedListenerReady = false
+        hasForwardedCallback = false
+        sessionHandle = nil
+        boundLoopbackPort = nil
+        peerRegistry.removeAll()
+        self.onOutcome = onOutcome
+        return true
+    }
 }
 "
     }
@@ -14560,6 +15179,16 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
         );
     }
 
+    fn assert_swift_source_rejects_session_start(path: &Path, code: &str, message: &str) {
+        assert!(
+            swift_source_lexical_violations(path, code)
+                .iter()
+                .any(|violation| violation
+                    .contains("unreviewed TokenBrokerAuthorizationSession.start")),
+            "{message}"
+        );
+    }
+
     #[test]
     fn token_broker_session_resource_bag_deinit_accepts_reviewed_source_and_exact_fixture() {
         let path = reviewed_token_broker_session_resource_bag_deinit_path();
@@ -14575,6 +15204,140 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
             path,
             exact_token_broker_session_resource_bag_deinit_fixture(),
             "exact TokenBrokerSessionResourceBag deinit {{ release() }} fixture must pass",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_wrong_owner_and_signature() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the reviewed form on a renamed owner class fails closed.
+        let wrong_owner = exact.replace(
+            "final class TokenBrokerAuthorizationSession",
+            "final class OtherAuthorizationSession",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &wrong_owner,
+            "session start on a non-reviewed owner class must fail closed",
+        );
+        // Negative: a renamed parameter label fails the pinned signature.
+        let changed_signature = exact.replace("onOutcome:", "outcome:");
+        assert_swift_source_rejects_session_start(
+            path,
+            &changed_signature,
+            "session start with a changed signature must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_is_finished_admission_latch() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the historical `isFinished` admission latch fails closed.
+        let mutated = exact.replace(
+            "guard attemptLifecycle.canStart",
+            "guard !attemptLifecycle.isFinished",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "admission through an `isFinished` latch must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_any_missing_reset() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: dropping any single per-attempt reset fails closed.
+        for reset in [
+            "hasAcceptedListenerReady = false",
+            "hasForwardedCallback = false",
+            "sessionHandle = nil",
+            "boundLoopbackPort = nil",
+            "peerRegistry.removeAll()",
+        ] {
+            let mutated = exact.replace(reset, "");
+            assert_swift_source_rejects_session_start(
+                path,
+                &mutated,
+                &format!("session start missing `{reset}` must fail closed"),
+            );
+        }
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_reordered_resets() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: reordering the first two per-attempt resets fails closed.
+        let mutated = exact.replace(
+            "hasAcceptedListenerReady = false\n        hasForwardedCallback = false",
+            "hasForwardedCallback = false\n        hasAcceptedListenerReady = false",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "reordered per-attempt resets must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_duplicated_arm_and_reset_sequence() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a duplicated contiguous arm/reset/outcome sequence fails closed.
+        let sequence = "        let generation = attemptLifecycle.beginAttempt()\n        hasAcceptedListenerReady = false\n        hasForwardedCallback = false\n        sessionHandle = nil\n        boundLoopbackPort = nil\n        peerRegistry.removeAll()\n        self.onOutcome = onOutcome\n";
+        let mutated = exact.replace(sequence, &format!("{sequence}{sequence}"));
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "duplicated arm-and-reset sequence must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_comment_and_string_decoys() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the real reset flipped to `true` while the reviewed false
+        // form survives only in a comment and a string literal fails closed.
+        let mutated = exact
+            .replace(
+                "hasForwardedCallback = false",
+                "hasForwardedCallback = true",
+            )
+            .replace(
+                "        peerRegistry.removeAll()\n",
+                "        peerRegistry.removeAll()\n        // hasForwardedCallback = false\n        let decoy = \"hasForwardedCallback = false\"\n",
+            );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "comment and string decoys must not satisfy the arm-and-reset pin",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_second_direct_start() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a second direct `start` on the reviewed session class fails closed.
+        let method_start = exact
+            .find("    func start(")
+            .expect("fixture declares start");
+        let method_end = method_start
+            + exact[method_start..]
+                .find("\n    }\n")
+                .expect("fixture start method closes")
+            + "\n    }\n".len();
+        let method = &exact[method_start..method_end];
+        let mutated = format!("{}{method}{}", &exact[..method_end], &exact[method_end..]);
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "a second direct `start` method must fail closed",
         );
     }
 
@@ -14684,6 +15447,186 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
         let with_subscript = format!(
             "{}\nsubscript(index: Int) -> Int {{ index }}\n",
             exact_token_broker_session_resource_bag_deinit_fixture()
+        );
+        assert!(
+            swift_source_lexical_violations(path, &with_subscript)
+                .iter()
+                .any(|violation| violation.contains("must not declare `subscript`")),
+            "subscript must remain unconditionally forbidden"
+        );
+    }
+
+    fn exact_broker_sync_secrets_deinit_fixture() -> &'static str {
+        "\
+final class MailboxSyncWorker: @unchecked Sendable {
+    private final class BrokerSyncSecrets: @unchecked Sendable {
+        private func wipe() {}
+        deinit { wipe() }
+    }
+}
+"
+    }
+
+    fn reviewed_broker_sync_secrets_deinit_path() -> &'static Path {
+        Path::new(REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH)
+    }
+
+    #[test]
+    fn broker_sync_secrets_deinit_accepts_reviewed_source_and_exact_fixture() {
+        let path = reviewed_broker_sync_secrets_deinit_path();
+        // Positive: the reviewed abandoned-request cleanup at the exact path,
+        // direct owner class, and body form is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            include_str!("../../apple/macos/MailboxSyncWorker.swift"),
+            "reviewed MailboxSyncWorker.swift must pass the lexical deinit guard",
+        );
+        // Positive fixture: the exact reviewed form on the exact nested owner
+        // is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            exact_broker_sync_secrets_deinit_fixture(),
+            "exact BrokerSyncSecrets deinit {{ wipe() }} fixture must pass",
+        );
+    }
+
+    #[test]
+    fn broker_sync_secrets_deinit_rejects_wrong_path_and_owner() {
+        let path = reviewed_broker_sync_secrets_deinit_path();
+        let exact = exact_broker_sync_secrets_deinit_fixture();
+        // Negative: wrong path with the exact form fails closed.
+        assert_swift_source_rejects_deinit(
+            Path::new("apple/macos/TokenBrokerAuthorizationSession.swift"),
+            exact,
+            "BrokerSyncSecrets deinit outside MailboxSyncWorker.swift must fail closed",
+        );
+        // Negative: the resource-bag exception does not leak into the reviewed
+        // MailboxSyncWorker.swift path.
+        assert_swift_source_rejects_deinit(
+            path,
+            exact_token_broker_session_resource_bag_deinit_fixture(),
+            "TokenBrokerSessionResourceBag deinit in MailboxSyncWorker.swift must fail closed",
+        );
+        // Negative: wrong direct owner class name at the reviewed path fails.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("class BrokerSyncSecrets", "class OtherSyncSecrets"),
+            "deinit on a non-reviewed owner class must fail closed",
+        );
+        // Negative: the reviewed owner nested in a non-reviewed outer class
+        // fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace(
+                "final class MailboxSyncWorker",
+                "final class OtherSyncWorker",
+            ),
+            "BrokerSyncSecrets nested in a non-reviewed outer class must fail closed",
+        );
+    }
+
+    #[test]
+    fn broker_sync_secrets_deinit_rejects_body_form_mutations() {
+        let path = reviewed_broker_sync_secrets_deinit_path();
+        let exact = exact_broker_sync_secrets_deinit_fixture();
+        // Negative: extra statement before wipe() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { wipe() }", "deinit { _ = 0; wipe() }"),
+            "deinit with a statement before wipe() must fail closed",
+        );
+        // Negative: extra statement after wipe() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { wipe() }", "deinit { wipe(); _ = 1 }"),
+            "deinit with a statement after wipe() must fail closed",
+        );
+        // Negative: alternate call fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { wipe() }", "deinit { self.wipe() }"),
+            "deinit with a different call than wipe() must fail closed",
+        );
+        // Negative: attached modifier fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { wipe() }", "private deinit { wipe() }"),
+            "deinit with an attached modifier must fail closed",
+        );
+        // Negative: parameters fail closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { wipe() }", "deinit(x: Int) { wipe() }"),
+            "deinit with parameters must fail closed",
+        );
+    }
+
+    #[test]
+    fn broker_sync_secrets_deinit_rejects_second_decoy_laundering_and_nested() {
+        let path = reviewed_broker_sync_secrets_deinit_path();
+        let exact = exact_broker_sync_secrets_deinit_fixture();
+        // Negative: a second deinit fails closed even when both match the form.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace(
+                "deinit { wipe() }",
+                "deinit { wipe() }\n        deinit { wipe() }",
+            ),
+            "a second deinit declaration must fail closed",
+        );
+        // Negative: comment/string decoys of the reviewed form must not satisfy
+        // the exception when the executable deinit is mutated.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class MailboxSyncWorker: @unchecked Sendable {
+    private final class BrokerSyncSecrets: @unchecked Sendable {
+        private func wipe() {}
+        // deinit { wipe() }
+        let decoy = \"deinit { wipe() }\"
+        deinit { cancel() }
+    }
+}
+",
+            "comment/string deinit decoys must not satisfy the reviewed exception",
+        );
+        // Negative: deinit nested inside a further type in the reviewed owner
+        // class fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class MailboxSyncWorker: @unchecked Sendable {
+    private final class BrokerSyncSecrets: @unchecked Sendable {
+        final class Nested {
+            deinit { wipe() }
+        }
+        private func wipe() {}
+    }
+}
+",
+            "deinit nested inside another type must fail closed",
+        );
+        // Negative: a file-scope BrokerSyncSecrets decoy that is not nested in
+        // MailboxSyncWorker fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class BrokerSyncSecrets: @unchecked Sendable {
+    private func wipe() {}
+    deinit { wipe() }
+}
+",
+            "file-scope BrokerSyncSecrets decoy must fail closed",
+        );
+    }
+
+    #[test]
+    fn broker_sync_secrets_deinit_keeps_subscript_unconditionally_forbidden() {
+        let path = reviewed_broker_sync_secrets_deinit_path();
+        // subscript remains unconditionally forbidden alongside the deinit exception.
+        let with_subscript = format!(
+            "{}\nsubscript(index: Int) -> Int {{ index }}\n",
+            exact_broker_sync_secrets_deinit_fixture()
         );
         assert!(
             swift_source_lexical_violations(path, &with_subscript)

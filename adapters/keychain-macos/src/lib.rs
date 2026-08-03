@@ -31,6 +31,11 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "macos")]
 pub mod mailbox_read;
 /// Per-account OAuth refresh-token Keychain surface (add / rotate / delete).
+///
+/// Compiled only under the `oauth-token` feature (or in this crate's own
+/// tests): the XPC token broker is the production owner of refresh-token
+/// Keychain access.
+#[cfg(any(feature = "oauth-token", test))]
 pub mod oauth_token;
 
 /// Closed, redacted failure returned by the trusted read-only composition.
@@ -1813,7 +1818,7 @@ fn configured_group(group: Option<&'static str>) -> Result<&'static str, KeyStor
 
 /// Resolves the signing-time App Group so the token store need not read the
 /// environment itself (keeping its source free of construction intrinsics).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "oauth-token", test)))]
 fn configured_app_group() -> Result<&'static str, KeyStorageError> {
     configured_group(option_env!("TERSA_MACOS_APP_GROUP"))
 }
@@ -1822,7 +1827,7 @@ fn configured_app_group() -> Result<&'static str, KeyStorageError> {
 /// store need not read the environment itself (keeping the token mutation
 /// file free of construction intrinsics). Never the installation-root/store
 /// group.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "oauth-token", test)))]
 fn configured_token_group() -> Result<&'static str, KeyStorageError> {
     configured_group(option_env!("TERSA_MACOS_TOKEN_GROUP"))
 }

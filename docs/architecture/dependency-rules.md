@@ -101,8 +101,38 @@ on `tersa-token-broker-core`, `tersa-gmail-rest-macos`, `tersa-keychain-macos`,
 depend on the main app's mailbox-sync FFI or the Apple bootstrap bridge. It
 binds the core to the production Google transport and the broker-only token
 Keychain store and exposes only the five closed protocol operations through a
-redacted C ABI. Production cutover of the main app off the legacy in-process
-token path remains later work.
+redacted C ABI.
+
+The point-4 production cutover is complete: the main app no longer carries
+the legacy in-process token path. The main app links only the
+`tersa-mailbox-sync-ffi-macos` static archive, whose production dependency
+edge to `tersa-apple-bridge` sets `default-features = false`, disabling the
+bridge's `legacy-oauth` feature; the Keychain `oauth-token` feature is never
+enabled on the main app's graph and is enabled only by the broker FFI. The
+mailbox-sync FFI declares no legacy feature in its production dependency set
+and exports no legacy C symbols: the shipped archive surface is exactly its
+own seven reviewed broker exports (`tersa_mailbox_macos_broker_sync_begin`,
+`tersa_mailbox_macos_broker_disconnect_prepare`,
+`tersa_mailbox_macos_broker_disconnect_finalize`,
+`tersa_mailbox_macos_broker_subject_store`,
+`tersa_mailbox_macos_broker_subject_get`,
+`tersa_mailbox_macos_lifecycle_get`, and `tersa_mailbox_macos_sync_poll`)
+plus the bridge's five reviewed safe reexports
+(`tersa_apple_bridge_version`, `tersa_macos_bootstrap_default_account`,
+`tersa_macos_mailbox_read_inbox`, `tersa_macos_mailbox_read_thread`, and
+`tersa_macos_mailbox_search`), twelve symbols total. `tersa-apple-bridge`'s
+`legacy-oauth` remains available for the direct/iOS bridge composition and
+dev tests; `tersa-oauth-sync-macos`'s `legacy-token-lifecycle` remains
+opt-in only for legacy/test compositions and is not enabled by the
+production main-app graph. xtask source guards and the CI
+archive checks fail closed on any `_tersa_oauth_macos_*` global symbol, any
+of the three retired mailbox begins (`_tersa_mailbox_macos_sync_begin`,
+`_tersa_mailbox_macos_connect_begin`,
+`_tersa_mailbox_macos_disconnect_begin`), and the embedded strings
+`oauth_token` and `DataProtectionRefreshTokenStore`. This is a source,
+dependency, and ABI contract only: it proves no signed runtime separation,
+group registration, notarization, or release readiness, all of which remain
+pending under ADR 0024's required evidence.
 
 ## Bounded sync and cache orchestration
 

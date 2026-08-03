@@ -1,6 +1,9 @@
+-- broker_subject is the encrypted account-identifying broker routing key:
+-- it is never logged or displayed, and it is not an OAuth credential.
 CREATE TABLE account_binding (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    account_id TEXT NOT NULL
+    account_id TEXT NOT NULL,
+    broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255))
 );
 
 CREATE TABLE messages (

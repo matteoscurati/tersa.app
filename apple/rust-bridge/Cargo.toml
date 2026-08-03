@@ -12,6 +12,10 @@ publish = false
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[features]
+default = ["legacy-oauth"]
+legacy-oauth = []
+
 [dependencies]
 tersa-application.workspace = true
 tersa-presentation.workspace = true

@@ -7589,6 +7589,7 @@ dependencies = [
  "tersa-application",
  "tersa-oauth-sync-macos",
  "url",
+ "zeroize",
 ]
 
 [[package]]

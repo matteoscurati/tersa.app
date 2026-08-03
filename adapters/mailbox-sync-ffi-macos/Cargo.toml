@@ -26,16 +26,28 @@ crate-type = ["rlib", "staticlib"]
 # through the composition), and the bridge's own dependency graph is unchanged.
 [target.'cfg(target_os = "macos")'.dependencies]
 tersa-application = { path = "../../crates/application", version = "=0.0.0" }
-tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0" }
+tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0", default-features = false }
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0" }
 url = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # `test-util` exposes WorkerHandles' test constructor so the session-registry tests
 # can drive poll against fabricated terminal/running handles without spawning a
 # real worker (no Keychain, no network); never enabled by a production dependency.
+# `legacy-token-lifecycle` compiles the legacy begins and the `BridgeConnectSession`
+# the cfg(test) suite exercises; feature unification turns it on only for this
+# crate's own test build — the production dependency edge above stays feature-free.
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0", features = [
+    "legacy-token-lifecycle",
     "test-util",
+] }
+# The cfg(test) `BridgeConnectSession` tests drive the real bridge OAuth registry
+# through its legacy begin/finish/cancel seams; feature unification enables
+# `legacy-oauth` only for this crate's own test build — the production dependency
+# edge above keeps `default-features = false`.
+tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0", default-features = false, features = [
+    "legacy-oauth",
 ] }
 
 [lints]

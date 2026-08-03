@@ -34,7 +34,6 @@ targets:
       path: macos/Info.plist
       properties:
         LSApplicationCategoryType: public.app-category.productivity
-        TersaOAuthClientID: "$(TERSA_OAUTH_CLIENT_ID)"
     entitlements:
       path: macos/TersaMac.entitlements
       properties:

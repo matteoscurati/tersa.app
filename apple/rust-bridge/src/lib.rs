@@ -8,6 +8,7 @@
 
 #[cfg(target_os = "macos")]
 mod mailbox;
+#[cfg(feature = "legacy-oauth")]
 mod oauth;
 
 #[cfg(target_os = "macos")]
@@ -47,6 +48,7 @@ pub unsafe extern "C" fn tersa_macos_bootstrap_default_account(
     tersa_keychain_macos::bootstrap_default_account_bytes(&bytes) as i32
 }
 
+#[cfg(feature = "legacy-oauth")]
 #[doc(inline)]
 pub use oauth::{
     claim_grant, complete_session, is_session_cancelled, tersa_oauth_cancel, tersa_oauth_ios_begin,
@@ -59,7 +61,7 @@ pub use mailbox::{
     tersa_macos_mailbox_read_inbox, tersa_macos_mailbox_read_thread, tersa_macos_mailbox_search,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "legacy-oauth"))]
 #[doc(inline)]
 pub use oauth::{
     tersa_oauth_macos_begin, tersa_oauth_macos_entitlement_probe, tersa_oauth_macos_poll,
