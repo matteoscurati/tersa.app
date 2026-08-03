@@ -682,6 +682,117 @@ final class AccountConnectionViewModel: ObservableObject {
         activationTimeout = nil
     }
 
+    /// The broker-grant twin of `connectAfterApplicationActivation`: after
+    /// browser consent, Tersa must be foreground-active before
+    /// `storeBrokerSubject` opens the root/store Keychain/SQLCipher state —
+    /// the same `WhenUnlockedThisDeviceOnly` interaction constraint the
+    /// legacy grant claim sequences around. The observer-before-`activate()`
+    /// ordering and the post-activate `isActive` check mirror the legacy
+    /// sequencing and close the same two races on the SAME shared
+    /// activationPending/observer/timer state. Every failure path here
+    /// cleans up through `cleanupFreshBrokerGrant` — the legacy OAuth FFI is
+    /// never touched on this rung.
+    private func connectBrokerGrantAfterApplicationActivation(
+        accountIdentifier: Data,
+        brokerToken: TokenBrokerAccessToken,
+        token: ConnectionOperationToken
+    ) {
+        guard operationDeadline.accepts(token), !activationPending else {
+            cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            return
+        }
+        activationPending = true
+
+        if NSApp.isActive {
+            finishBrokerGrantApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                brokerToken: brokerToken,
+                token: token
+            )
+            return
+        }
+
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.finishBrokerGrantApplicationActivation(
+                    accountIdentifier: accountIdentifier,
+                    brokerToken: brokerToken,
+                    token: token
+                )
+            }
+        }
+        activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.activationPending else {
+                    return
+                }
+                self.clearApplicationActivation()
+                // The cleanup must run even when the operation went stale
+                // waiting for activation: the broker grant still exists and
+                // must not be orphaned by a deadline that lapsed first.
+                self.cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            }
+        }
+        NSApp.activate()
+        if NSApp.isActive {
+            finishBrokerGrantApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                brokerToken: brokerToken,
+                token: token
+            )
+        }
+    }
+
+    /// Delivers the freshly-consented broker grant exactly once after AppKit
+    /// confirms Tersa is foreground-active: persist the account's routing
+    /// subject, then feed the access token into the broker sync. Clearing
+    /// observer/timer state before the worker begins makes a duplicate
+    /// activation notification harmless. A subject may remain locally if the
+    /// operation goes stale just after a successful persist; the cleanup
+    /// still deletes the broker-stored tokens, and the next
+    /// stored-credential refresh safely routes the missing token to
+    /// re-consent.
+    private func finishBrokerGrantApplicationActivation(
+        accountIdentifier: Data,
+        brokerToken: TokenBrokerAccessToken,
+        token: ConnectionOperationToken
+    ) {
+        guard activationPending else {
+            return
+        }
+        guard operationDeadline.accepts(token) else {
+            clearApplicationActivation()
+            cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            return
+        }
+        clearApplicationActivation()
+        guard state == .connecting else {
+            cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            return
+        }
+        syncWorker.storeBrokerSubject(
+            accountIdentifier: accountIdentifier,
+            subject: brokerToken.subject
+        ) { [weak self] persisted in
+            guard let self else {
+                return
+            }
+            guard self.operationDeadline.accepts(token), persisted else {
+                self.cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+                return
+            }
+            self.connectWithBrokerGrant(
+                accountIdentifier: accountIdentifier,
+                brokerToken: brokerToken,
+                token: token
+            )
+        }
+    }
+
     /// Installs a new token-broker client as the one this view model owns.
     /// Returns nil WITHOUT constructing when one is already active, so a
     /// re-entrant begin can never leak a second client or orphan the first.
