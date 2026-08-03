@@ -241,6 +241,34 @@ impl fmt::Debug for RefreshRequest {
     }
 }
 
+/// Reports why a broker-supplied subject failed the boundary re-check.
+///
+/// A small closed set that never echoes any part of the subject: the value is
+/// account-identifying and must never be logged or displayed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BrokerSubjectError {
+    /// The subject was empty.
+    Empty,
+    /// The subject exceeded the accepted UTF-8 byte cap.
+    Oversized,
+    /// The subject carried whitespace, control, or non-ASCII characters.
+    InvalidCharacters,
+}
+
+impl fmt::Display for BrokerSubjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Empty => "the broker reply carried an empty account subject",
+            Self::Oversized => "the broker reply carried an oversized account subject",
+            Self::InvalidCharacters => "the broker reply carried a subject with invalid characters",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for BrokerSubjectError {}
+
 /// The immutable `OpenID` Connect subject (`sub`) of the connected account.
 ///
 /// Not a secret, but account-identifying: held in zeroizing memory, redacted in
@@ -252,14 +280,46 @@ pub struct AccountSubject(Zeroizing<String>);
 impl AccountSubject {
     /// Wraps a validated subject.
     ///
-    /// Deliberately crate-private: the only producer is
-    /// [`validate_account_subject`], so an [`AccountSubject`] is proof that the
-    /// `id_token`'s `aud`/`iss`/`sub` were validated. The identity gate must be
-    /// fed a subject only via [`TokenSuccess::subject`] (never a hand-minted one),
-    /// so a caller cannot fabricate an unvalidated identity.
+    /// Deliberately crate-private: the only producers are
+    /// [`validate_account_subject`] and the ADR-0024 broker boundary
+    /// [`Self::from_broker_validated`], so an [`AccountSubject`] is proof the
+    /// subject passed a trusted validation. The identity gate must be fed a
+    /// subject only via [`TokenSuccess::subject`] or that broker boundary (never
+    /// a hand-minted one), so a caller cannot fabricate an unvalidated identity.
     #[must_use]
     pub(crate) fn new(subject: Zeroizing<String>) -> Self {
         Self(subject)
+    }
+
+    /// Wraps a subject already validated by the ADR-0024 token broker.
+    ///
+    /// This is ONLY the trusted broker boundary, not general OIDC validation:
+    /// the separately signed token broker verified the `id_token` (issuer,
+    /// audience, signature) and hands this process the `sub` out of band. This
+    /// constructor re-checks the value's SHAPE conservatively — non-empty, at
+    /// most 255 UTF-8 bytes, printable non-whitespace ASCII
+    /// only — and performs NO OIDC validation, so it must never be fed a
+    /// subject the broker did not validate. A Google `sub` is a short ASCII
+    /// digit string; the printable-ASCII band is deliberately wider than that
+    /// but still rejects whitespace, control, and non-ASCII input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerSubjectError`] naming the failed check without echoing
+    /// any part of the subject.
+    pub fn from_broker_validated(subject: Zeroizing<String>) -> Result<Self, BrokerSubjectError> {
+        if subject.is_empty() {
+            return Err(BrokerSubjectError::Empty);
+        }
+        if subject.len() > MAX_SUBJECT_LEN {
+            return Err(BrokerSubjectError::Oversized);
+        }
+        // Printable ASCII excluding the space (0x20): rejects every control
+        // byte, DEL, every whitespace form, and every non-ASCII byte.
+        if !subject.bytes().all(|byte| (0x21..=0x7E).contains(&byte)) {
+            return Err(BrokerSubjectError::InvalidCharacters);
+        }
+        Ok(Self(subject))
     }
 
     /// Returns the subject without transferring ownership.
@@ -1113,8 +1173,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
-        TokenResponse, TokenTransport, TokenTransportError, exchange_grant, refresh_access_token,
+        AccountSubject, BrokerSubjectError, ExchangeRequest, IdTokenClaims, RefreshRequest,
+        TokenClientConfig, TokenError, TokenResponse, TokenTransport, TokenTransportError,
+        exchange_grant, refresh_access_token,
     };
     use crate::mailbox::BoxFuture;
     use crate::oauth::{
@@ -1965,5 +2026,63 @@ mod tests {
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("super-stored-refresh"));
         assert!(!rendered.contains("super-client-secret"));
+    }
+
+    #[test]
+    fn broker_boundary_accepts_a_conservative_google_subject() {
+        // A Google `sub` is a ~21-digit ASCII string.
+        let subject = AccountSubject::from_broker_validated(Zeroizing::new(
+            "112233445566778899001".to_owned(),
+        ))
+        .unwrap();
+        assert_eq!(subject.as_str(), "112233445566778899001");
+        // The 255-UTF-8-byte cap is inclusive.
+        let maxed = AccountSubject::from_broker_validated(Zeroizing::new("1".repeat(255))).unwrap();
+        assert_eq!(maxed.as_str().len(), 255);
+    }
+
+    #[test]
+    fn broker_boundary_rejects_empty_oversized_and_malformed_subjects() {
+        assert_eq!(
+            AccountSubject::from_broker_validated(Zeroizing::new(String::new())).unwrap_err(),
+            BrokerSubjectError::Empty
+        );
+        assert_eq!(
+            AccountSubject::from_broker_validated(Zeroizing::new("1".repeat(256))).unwrap_err(),
+            BrokerSubjectError::Oversized
+        );
+        for malformed in [
+            "has space".to_owned(),
+            " leading-space".to_owned(),
+            "trailing-space ".to_owned(),
+            "tab\tsubject".to_owned(),
+            "newline\nsubject".to_owned(),
+            "control\u{1}subject".to_owned(),
+            "del\u{7f}subject".to_owned(),
+            "non-ascii-é".to_owned(),
+        ] {
+            assert_eq!(
+                AccountSubject::from_broker_validated(Zeroizing::new(malformed)).unwrap_err(),
+                BrokerSubjectError::InvalidCharacters
+            );
+        }
+    }
+
+    #[test]
+    fn broker_boundary_never_echoes_the_subject() {
+        let probe = "probe-subject-value";
+        let subject =
+            AccountSubject::from_broker_validated(Zeroizing::new(probe.to_owned())).unwrap();
+        let rendered = format!("{subject:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(probe));
+        for error in [
+            BrokerSubjectError::Empty,
+            BrokerSubjectError::Oversized,
+            BrokerSubjectError::InvalidCharacters,
+        ] {
+            assert!(!format!("{error:?}").contains(probe));
+            assert!(!format!("{error}").contains(probe));
+        }
     }
 }

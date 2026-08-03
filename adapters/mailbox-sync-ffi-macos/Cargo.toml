@@ -29,6 +29,7 @@ tersa-application = { path = "../../crates/application", version = "=0.0.0" }
 tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0" }
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0" }
 url = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # `test-util` exposes WorkerHandles' test constructor so the session-registry tests

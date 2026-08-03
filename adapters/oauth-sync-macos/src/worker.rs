@@ -50,6 +50,7 @@ use tersa_keychain_macos::{
     DataProtectionAccountIdentityHasher, open_default_mailbox_store,
     open_default_mailbox_store_if_present,
 };
+use zeroize::Zeroizing;
 
 use crate::permit::{self, WholeCyclePermit};
 use crate::{
@@ -538,6 +539,59 @@ pub fn begin_default_account_sync(account: AccountId, config: TokenClientConfig)
     })
 }
 
+/// Builds the whole gate-to-write cycle for `account` from an ADR-0024 token
+/// broker reply. `access_token` and `subject` are the zeroizing owned strings
+/// from the SAME broker reply, so the identity gate and the mailbox surface are
+/// backed by one principal, exactly as on the [`GmailSession::new`] path — the
+/// subject is re-validated at that trust boundary
+/// ([`GmailSession::from_broker_token`]).
+///
+/// Unlike [`run_default_account_cycle`], NOTHING from the token lifecycle is
+/// constructed or used here — no [`DataProtectionRefreshTokenStore`], no
+/// [`GmailTokenTransport`], no [`TokenClientConfig`], and no refresh, exchange,
+/// or other OAuth API: the separately signed broker owns the token lifecycle
+/// and this cycle only consumes its reply. Both secrets are consumed by the
+/// session build and zeroized when dropped at the end of THIS cycle —
+/// cycle-scoped zeroization, never persisted to the Keychain or the store.
+async fn run_broker_account_cycle(
+    account: &AccountId,
+    access_token: Zeroizing<String>,
+    subject: Zeroizing<String>,
+) -> Result<SyncReport, CycleError> {
+    let hasher = DataProtectionAccountIdentityHasher::new().map_err(|_error| CycleError::Setup)?;
+    let store = open_default_mailbox_store(account).map_err(|_error| CycleError::Setup)?;
+    let wall_clock = SystemWallClock;
+    let policy = default_sync_policy().ok_or(CycleError::Setup)?;
+
+    let session = GmailSession::from_broker_token(account.clone(), &access_token, subject)
+        .map_err(|_error| CycleError::Session)?;
+    let report = gated_sync(account, session, &hasher, &store, policy)
+        .await
+        .map_err(CycleError::Gated)?;
+    finalize_successful_sync(&store, account, &wall_clock).await?;
+    Ok(report)
+}
+
+/// Begins a bounded sync for `account` from an ADR-0024 token broker reply on a
+/// background worker, inside the same whole-cycle permit [`begin_with`] enforces
+/// — so busy, cancellation, and terminal-status semantics are identical to
+/// [`begin_default_account_sync`]. Returns [`BeginOutcome::Busy`] — without
+/// touching the Keychain, the network, or the broker secrets — if a cycle is
+/// already in flight for the slot. `access_token` and `subject` must come from
+/// the SAME broker reply; both are consumed by the worker and zeroized at cycle
+/// end, never persisted.
+#[must_use]
+pub fn begin_broker_account_sync(
+    account: AccountId,
+    access_token: Zeroizing<String>,
+    subject: Zeroizing<String>,
+) -> BeginOutcome {
+    let slot = account.clone();
+    begin_with(&slot, move || async move {
+        status_for_cycle(&run_broker_account_cycle(&account, access_token, subject).await)
+    })
+}
+
 /// Builds the whole gate-to-write cycle for a newly-connected `account`: claim the
 /// just-finished OAuth grant together with its token-client config, then drive
 /// the claimed scope ([`run_claimed_connect_cycle`]: setup, the initial grant
@@ -892,6 +946,56 @@ pub fn lifecycle_metadata(
         .map(Some)
 }
 
+/// Stores the broker routing subject for `account` in the default protected
+/// mailbox store.
+///
+/// The subject is the account-identifying BROKER ROUTING identifier — the
+/// encrypted-at-rest routing key the token broker uses to route to the
+/// account's tokens — never an OAuth credential. It is never logged or
+/// formatted here: the opaque open-failure mapping deliberately discards any
+/// error detail that could carry it.
+///
+/// Synchronous composition helper: callers run off the main thread, except a
+/// bounded launch-time lookup where existing conventions already allow it.
+///
+/// # Errors
+///
+/// Returns an opaque [`MailboxStoreError::Storage`] when the protected-store
+/// open or setup cannot complete; otherwise the `SQLCipher` adapter's own
+/// storage or corruption error.
+pub fn store_broker_subject(account: &AccountId, subject: &str) -> Result<(), MailboxStoreError> {
+    let store = open_default_mailbox_store(account).map_err(|_error| MailboxStoreError::Storage)?;
+    store.store_broker_subject(account, subject)
+}
+
+/// Loads the broker routing subject for `account` from the default protected
+/// mailbox store WITHOUT creating one.
+///
+/// An absent database means this account has never stored local mailbox data,
+/// so it has no stored routing subject and `Ok(None)` is returned. The subject
+/// is the account-identifying BROKER ROUTING identifier — the encrypted-at-rest
+/// routing key the token broker uses to route to the account's tokens — never
+/// an OAuth credential.
+///
+/// Synchronous composition helper: callers run off the main thread, except a
+/// bounded launch-time lookup where existing conventions already allow it.
+///
+/// # Errors
+///
+/// Returns an opaque [`MailboxStoreError::Storage`] when the presence check or
+/// protected-store open cannot complete; otherwise the `SQLCipher` adapter's own
+/// storage or corruption error.
+pub fn load_broker_subject(
+    account: &AccountId,
+) -> Result<Option<Zeroizing<String>>, MailboxStoreError> {
+    let Some(store) = open_default_mailbox_store_if_present(account)
+        .map_err(|_error| MailboxStoreError::Storage)?
+    else {
+        return Ok(None);
+    };
+    store.load_broker_subject(account)
+}
+
 /// Spawns the disconnect worker for `account`: a plain thread that
 /// blocking-acquires the slot's gate — serializing BEHIND any in-flight sync
 /// or connect — then loads the stored refresh token, revokes it best-effort,
@@ -1030,6 +1134,184 @@ where
         // poll terminal immediately, like `spawn_cycle`'s refusal mapping.
         Err(_error) => BeginOutcome::Started(terminal_internal_handles()),
     }
+}
+
+/// The result of asking to PREPARE a broker-coordinated disconnect for an
+/// account slot (ADR-0024). A small closed set: the caller learns only whether
+/// it may proceed to the broker revoke ([`BrokerDisconnectPrepareOutcome::Prepared`]), whether
+/// another disconnect operation owns the slot ([`BrokerDisconnectPrepareOutcome::Busy`]), or
+/// whether the local pre-teardown marker could not be persisted
+/// ([`BrokerDisconnectPrepareOutcome::Failed`]) — which local step failed never leaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerDisconnectPrepareOutcome {
+    /// The fence is set, a running sync was cancel-signaled, and — when a
+    /// mailbox store exists — the durable `mark_disconnect_started` marker is
+    /// persisted. The caller may proceed to the broker revoke; the fence stays
+    /// set until [`begin_broker_disconnect_finalize`] clears it on success.
+    Prepared,
+    /// Another disconnect operation (legacy or broker-coordinated) is active
+    /// on the slot. Nothing was touched: the running operation owns the
+    /// teardown and this request coalesces onto it — do NOT proceed to the
+    /// broker revoke.
+    Busy,
+    /// The fence was set (and a running sync cancel-signaled), but the
+    /// presence-checked store open, the runtime, or the marker write failed.
+    /// The fence STAYS set (fail-closed) and the lease was dropped, so a
+    /// retried prepare is admitted and converges.
+    Failed,
+}
+
+/// ADR-0024 disconnect PREPARE: the `SQLCipher marker` step of the
+/// broker-coordinated disconnect order `outer intent → SQLCipher marker →
+/// broker revoke → broker token delete → main-app purge → marker clear`.
+/// Swift owns the durable OUTER INTENT journal and has already written it
+/// before calling; the separately signed broker owns the `broker revoke →
+/// broker token delete` steps AFTER this returns [`BrokerDisconnectPrepareOutcome::Prepared`];
+/// [`begin_broker_disconnect_finalize`] owns the final `main-app purge →
+/// marker clear`.
+///
+/// Performs NO refresh-token Keychain or network operation: the broker holds
+/// the token lifecycle, so this seam never loads, deletes, or revokes a token
+/// and never constructs a refresh-token store or token transport.
+///
+/// Order and retry semantics:
+///
+/// 1. `permit::begin_disconnect` runs FIRST, synchronously setting the
+///    `disconnecting` fence (no new sync or connect can begin) and
+///    cancel-signaling a running sync BEFORE any return that reports
+///    `Prepared`. If another disconnect operation is already active on the
+///    slot this reports [`BrokerDisconnectPrepareOutcome::Busy`] and touches nothing — the
+///    running operation owns the teardown and a concurrent request coalesces
+///    onto it.
+/// 2. With the admitted lease, the disconnect gate is blocking-acquired —
+///    serializing BEHIND the now-cancelling cycle — and the mailbox store is
+///    opened only IF PRESENT. A present store synchronously records
+///    `mark_disconnect_started` on the existing runtime, inside the held gate.
+/// 3. An ABSENT store is [`BrokerDisconnectPrepareOutcome::Prepared`]: disconnect never
+///    creates a database for an account that has none (disconnect creates no
+///    artifacts), and Swift's durable outer intent journal carries the
+///    recovery evidence instead. The fence remains set.
+/// 4. A store-open, runtime, or marker failure reports
+///    [`BrokerDisconnectPrepareOutcome::Failed`] and KEEPS the fence set (fail-closed): the
+///    slot refuses new begins until a retried prepare converges.
+///
+/// The active lease is dropped on EVERY return — `Prepared`, `Failed`, and
+/// `Busy` (which never took one) alike — so a retry is always admitted; on
+/// `Prepared` the fence stays set until [`begin_broker_disconnect_finalize`]
+/// clears it on its success family.
+///
+/// MUST be called off any `tokio` runtime thread: the gate acquire is a
+/// blocking lock, which panics inside an async context.
+#[must_use = "the outcome decides whether the broker revoke may proceed"]
+pub fn prepare_broker_disconnect(account: &AccountId) -> BrokerDisconnectPrepareOutcome {
+    // Claim the single-worker lease + set the fence + signal the registered
+    // sync cancel FIRST, synchronously, so "`Prepared` ⇒ no new sync can begin"
+    // holds. `None` ⇒ a disconnect operation is already active ⇒ coalesce.
+    let Some(lease) = permit::begin_disconnect(account) else {
+        return BrokerDisconnectPrepareOutcome::Busy;
+    };
+    // Serialize BEHIND the now-cancelling cycle before persisting the marker,
+    // bypassing the disconnecting check (disconnect set that flag itself).
+    let gate = permit::acquire_disconnect_gate(account);
+    let marked = open_default_mailbox_store_if_present(account)
+        .map_err(|_error| ())
+        .and_then(|store| {
+            let Some(store) = store else {
+                // Absent store: Prepared no-op — never create a database; the
+                // outer intent journal owns the recovery evidence.
+                return Ok(());
+            };
+            let runtime = build_sync_runtime().map_err(|_error| ())?;
+            runtime
+                .block_on(store.mark_disconnect_started(account))
+                .map_err(|_error| ())
+        });
+    // Drop the gate and the active lease on EVERY return so a retry is
+    // admitted; the fence stays set on both Prepared (until finalize) and
+    // Failed (fail-closed).
+    drop(gate);
+    drop(lease);
+    match marked {
+        Ok(()) => BrokerDisconnectPrepareOutcome::Prepared,
+        Err(()) => BrokerDisconnectPrepareOutcome::Failed,
+    }
+}
+
+/// The broker-coordinated disconnect FINALIZE operation: the ADR-0024
+/// `main-app purge → marker clear` tail. Opens the mailbox store only IF
+/// PRESENT (disconnect never creates a database); a present store purges the
+/// account FIRST and finalizes the recovery marker SECOND —
+/// `mark_revoke_unconfirmed` when the broker could not confirm the provider
+/// /revoke, `clear_disconnect_recovery` when it could. An ABSENT store is a
+/// success no-op: the account never stored local mailbox data and Swift's
+/// durable outer intent journal owns the recovery evidence. Performs NO token
+/// operation — no load, delete, or revoke, and no refresh store or transport
+/// construction: the broker completed `broker revoke → broker token delete`
+/// before this finalize was requested.
+async fn run_broker_disconnect_finalize(
+    account: &AccountId,
+    revoke_unconfirmed: bool,
+) -> Result<RevokeDisposition, TeardownError> {
+    let store =
+        open_default_mailbox_store_if_present(account).map_err(|_error| TeardownError::Setup)?;
+    if let Some(store) = store {
+        // Purge BEFORE the marker finalization: a failed purge must not clear
+        // (or downgrade) the durable recovery evidence.
+        store
+            .purge_account(account)
+            .await
+            .map_err(|_error| TeardownError::Purge)?;
+        if revoke_unconfirmed {
+            store
+                .mark_revoke_unconfirmed(account)
+                .await
+                .map_err(|_error| TeardownError::Purge)?;
+        } else {
+            store
+                .clear_disconnect_recovery(account)
+                .await
+                .map_err(|_error| TeardownError::Purge)?;
+        }
+    }
+    // The disposition selects the closed status in `begin_disconnect_with`:
+    // `Unconfirmed` ⇒ STATUS_SUCCEEDED_REVOKE_UNCONFIRMED, `NotNeeded` ⇒
+    // STATUS_SUCCEEDED — both in the SUCCESS FAMILY the fence clears on.
+    Ok(if revoke_unconfirmed {
+        RevokeDisposition::Unconfirmed
+    } else {
+        RevokeDisposition::NotNeeded
+    })
+}
+
+/// ADR-0024 disconnect FINALIZE: begins the `main-app purge → marker clear`
+/// tail of a broker-coordinated disconnect on the disconnect worker, reusing
+/// the [`begin_disconnect_with`] machinery so the single-worker lease, the
+/// blocking gate acquire, the panic-safe terminal publication, and the
+/// clear-fence-on-success policy stay centralized with the legacy disconnect.
+/// `revoke_unconfirmed` is the broker's report of whether the provider
+/// /revoke could be confirmed; the broker already ran `broker revoke → broker
+/// token delete`, so this seam performs NO refresh-token Keychain or network
+/// operation.
+///
+/// Fence and retry semantics are the legacy worker's: [`BeginOutcome::Busy`]
+/// coalesces onto an active disconnect operation without spawning; a
+/// store-open, purge, or marker-finalization failure maps to a teardown
+/// failure — reported as the opaque [`STATUS_INTERNAL`] (which STAGE failed
+/// never leaks) with the fence KEPT set (fail-closed) — and the lease is
+/// released on every outcome (success, failure, panic), so a retried finalize
+/// is admitted and converges. Success maps to
+/// [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`] when `revoke_unconfirmed` is true
+/// or [`STATUS_SUCCEEDED`] when false, and clears the fence through the
+/// existing success-family code STRICTLY BEFORE the lease is released, so no
+/// "fence cleared, lease held" window can orphan it.
+#[must_use = "the returned outcome is the only way to poll or coalesce the disconnect"]
+pub fn begin_broker_disconnect_finalize(
+    account: AccountId,
+    revoke_unconfirmed: bool,
+) -> BeginOutcome {
+    begin_disconnect_with(account, move |account| async move {
+        run_broker_disconnect_finalize(&account, revoke_unconfirmed).await
+    })
 }
 
 #[cfg(test)]

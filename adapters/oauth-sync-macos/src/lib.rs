@@ -44,8 +44,8 @@ use tersa_application::oauth::{AuthorizationGrant, MonotonicClock, WallClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
 #[cfg(target_os = "macos")]
 use tersa_application::token::{
-    AccessToken, AccountSubject, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome,
-    TokenTransport, TokenTransportError, exchange_grant_with_scope_outcome,
+    AccessToken, AccountSubject, BrokerSubjectError, IdentityExpiry, TokenClientConfig, TokenError,
+    TokenScopeOutcome, TokenTransport, TokenTransportError, exchange_grant_with_scope_outcome,
     refresh_access_token_with_scope_outcome,
 };
 #[cfg(target_os = "macos")]
@@ -786,6 +786,8 @@ const IDENTITY_SKEW_SECS: u64 = 120;
 pub enum GmailSessionError {
     /// The `id_token` was expired or future-dated — non-destructive, retryable.
     Identity(TokenError),
+    /// The broker reply's subject failed the trust-boundary re-validation.
+    BrokerSubject(BrokerSubjectError),
     /// The mailbox surface could not be constructed from the access token.
     Mailbox(RemoteMailboxError),
 }
@@ -795,6 +797,9 @@ impl core::fmt::Display for GmailSessionError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Identity(_) => formatter.write_str("the id_token failed freshness validation"),
+            Self::BrokerSubject(_) => {
+                formatter.write_str("the broker reply carried an unusable account subject")
+            }
             Self::Mailbox(_) => formatter.write_str("the mailbox surface could not be built"),
         }
     }
@@ -808,11 +813,12 @@ impl std::error::Error for GmailSessionError {}
 ///
 /// The gate hashes the subject and the sync reads the mailbox, both backed by the
 /// one token — so the checked identity and the written identity necessarily
-/// coincide (the type-level guarantee [`gated_sync`] relies on). It is built only
-/// from a [`ConnectedAccount`] whose subject the token layer already validated, so
-/// the gate is never fed a hand-minted subject; construction also validates the
-/// `id_token`'s freshness against a wall clock before the session can drive
-/// anything.
+/// coincide (the type-level guarantee [`gated_sync`] relies on). It is built
+/// either from a [`ConnectedAccount`] whose subject the token layer already
+/// validated (with the `id_token`'s freshness checked against a wall clock at
+/// construction) or via [`GmailSession::from_broker_token`] from the ADR-0024
+/// broker's reply, whose subject is re-validated at that trust boundary — so
+/// the gate is never fed a hand-minted subject.
 #[cfg(target_os = "macos")]
 pub struct GmailSession {
     mailbox: GmailMailbox,
@@ -840,6 +846,41 @@ impl GmailSession {
             .map_err(GmailSessionError::Identity)?;
         let (access_token, subject, _identity_expiry) = connected.into_parts();
         let mailbox = GmailMailbox::new(account, access_token.secret().as_str().to_owned())
+            .map_err(GmailSessionError::Mailbox)?;
+        Ok(Self { mailbox, subject })
+    }
+
+    /// Builds a session from the ADR-0024 token broker's reply.
+    ///
+    /// The `access_token` (borrowed) and `subject` (consumed) are the
+    /// zeroizing strings from the SAME broker reply, so the identity gate and
+    /// the mailbox surface are
+    /// backed by one principal exactly as on the [`ConnectedAccount`] path. The
+    /// subject is re-validated at this trust boundary
+    /// ([`AccountSubject::from_broker_validated`]) and stored for the
+    /// [`AccountProfile`] identity gate. No refresh token, token transport, or
+    /// Keychain store is accepted or constructed: the separately signed broker
+    /// owns the token lifecycle.
+    ///
+    /// The access token is copied exactly once into the Gmail adapter's owned
+    /// `String` constructor parameter — which immediately re-wraps it in
+    /// zeroizing storage — and that transient copy is dropped; no other
+    /// plaintext clone is made, and neither the token nor the subject ever
+    /// reaches a log or `Debug` sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GmailSessionError::BrokerSubject`] when the subject fails the
+    /// boundary re-validation, and [`GmailSessionError::Mailbox`] when the
+    /// access token cannot construct the mailbox surface.
+    pub fn from_broker_token(
+        account: AccountId,
+        access_token: &Zeroizing<String>,
+        subject: Zeroizing<String>,
+    ) -> Result<Self, GmailSessionError> {
+        let subject = AccountSubject::from_broker_validated(subject)
+            .map_err(GmailSessionError::BrokerSubject)?;
+        let mailbox = GmailMailbox::new(account, access_token.as_str().to_owned())
             .map_err(GmailSessionError::Mailbox)?;
         Ok(Self { mailbox, subject })
     }
@@ -1439,8 +1480,8 @@ mod token_lifecycle_tests {
         AuthorizationConfig, AuthorizationGrant, MonotonicClock, WallClock, prepare_authorization,
     };
     use tersa_application::token::{
-        ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig, TokenError,
-        TokenResponse, TokenTransport, TokenTransportError,
+        BrokerSubjectError, ExchangeRequest, IdTokenClaims, RefreshRequest, TokenClientConfig,
+        TokenError, TokenResponse, TokenTransport, TokenTransportError,
     };
     use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
     use url::Url;
@@ -1496,6 +1537,43 @@ mod token_lifecycle_tests {
         let error = GmailSession::new(account(), connect_for_session(), &FakeWallClock(1))
             .expect_err("a future-minted id_token must not build a session");
         assert!(matches!(error, GmailSessionError::Identity(_)));
+    }
+
+    #[test]
+    fn broker_session_feeds_the_identity_gate_subject() {
+        // The broker session's stored subject is exactly what the
+        // `AccountProfile` surface hands to the identity gate.
+        let session = GmailSession::from_broker_token(
+            account(),
+            &Zeroizing::new("ya29.test-broker-access-token".to_owned()),
+            Zeroizing::new("112233445566778899001".to_owned()),
+        )
+        .expect("a valid broker reply builds a session");
+        assert_eq!(
+            AccountProfile::subject(&session).as_str(),
+            "112233445566778899001"
+        );
+        // Neither the subject nor the access token reaches Debug output.
+        let rendered = format!("{session:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("112233445566778899001"));
+        assert!(!rendered.contains("ya29.test-broker-access-token"));
+    }
+
+    #[test]
+    fn broker_session_rejects_an_invalid_subject() {
+        let error = GmailSession::from_broker_token(
+            account(),
+            &Zeroizing::new("ya29.test-broker-access-token".to_owned()),
+            Zeroizing::new("has a space".to_owned()),
+        )
+        .expect_err("an invalid broker subject must not build a session");
+        assert!(matches!(
+            error,
+            GmailSessionError::BrokerSubject(BrokerSubjectError::InvalidCharacters)
+        ));
+        // The error never echoes the rejected subject.
+        assert!(!format!("{error}").contains("has a space"));
     }
 
     const CLIENT_ID: &str = "public-test-client";
