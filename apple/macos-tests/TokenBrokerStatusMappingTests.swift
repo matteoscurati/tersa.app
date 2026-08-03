@@ -472,6 +472,32 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
                 target: "/?error=access_denied&state=redacted"
             )
         )
+        // Illegal raw query bytes must fail closed without Foundation SIGTRAP
+        // on percentEncodedQuery (raw | < [ ^ and non-ASCII).
+        let illegalTargets = [
+            "/?code=a|b",
+            "/?code=a<b",
+            "/?code=a[b",
+            "/?code=a^b",
+            "/?code=x\u{00E9}",
+            "/?code=\u{00E9}",
+            "/?code=a b",
+            "/?code=a`b",
+        ]
+        for target in illegalTargets {
+            XCTAssertFalse(
+                TokenBrokerAuthorizationSession.representsProviderCallbackOutcome(
+                    target: target
+                ),
+                "must reject without trapping: \(target)"
+            )
+            XCTAssertFalse(
+                TokenBrokerAuthorizationSession.percentEncodingIsWellFormed(
+                    String(target.dropFirst(2))
+                ),
+                "query bytes must be rejected: \(target)"
+            )
+        }
 
         // Valid callback after a stray: latch stays free for the first outcome.
         var hasForwardedCallback = false
@@ -545,7 +571,7 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
             ),
             .rejectConnection
         )
-        // Unparseable complete headers must not yield a callback URL.
+        // Unparsable complete headers must not yield a callback URL.
         let badHost = Data("GET /?code=x HTTP/1.1\r\nHost: example.invalid\r\n\r\n".utf8)
         XCTAssertNil(
             TokenBrokerAuthorizationSession.callbackURL(from: badHost, boundPort: 54_321)
@@ -578,6 +604,180 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
                 acceptedConnectionCount: 0
             )
         )
+    }
+
+    func testConcurrentPeerBudgetReleasesSlotsAndRejectsNinth() {
+        // Eight completed/rejected peers must not block a later valid callback.
+        var budget = TokenBrokerLoopbackPeerBudget(maxConcurrent: 8)
+        final class PeerToken: NSObject {}
+        let firstWave = (0..<8).map { _ in PeerToken() }
+        for peer in firstWave {
+            XCTAssertTrue(budget.admit(ObjectIdentifier(peer)))
+        }
+        XCTAssertEqual(budget.liveCount, 8)
+        // Ninth simultaneous peer is rejected while eight are live.
+        let ninthSimultaneous = PeerToken()
+        XCTAssertFalse(budget.admit(ObjectIdentifier(ninthSimultaneous)))
+        XCTAssertEqual(budget.liveCount, 8)
+
+        for peer in firstWave {
+            XCTAssertTrue(budget.release(ObjectIdentifier(peer)))
+        }
+        XCTAssertEqual(budget.liveCount, 0)
+        // Double-release is a no-op (no underflow).
+        XCTAssertFalse(budget.release(ObjectIdentifier(firstWave[0])))
+        XCTAssertEqual(budget.liveCount, 0)
+
+        let laterValid = PeerToken()
+        XCTAssertTrue(budget.admit(ObjectIdentifier(laterValid)))
+        XCTAssertEqual(budget.liveCount, 1)
+
+        // Nine simultaneous admits: only eight succeed.
+        var simultaneous = TokenBrokerLoopbackPeerBudget(maxConcurrent: 8)
+        let nine = (0..<9).map { _ in PeerToken() }
+        var admitted = 0
+        for peer in nine {
+            if simultaneous.admit(ObjectIdentifier(peer)) {
+                admitted += 1
+            }
+        }
+        XCTAssertEqual(admitted, 8)
+        XCTAssertEqual(simultaneous.liveCount, 8)
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: false,
+                hasSessionHandle: true,
+                acceptedConnectionCount: 8
+            )
+        )
+        XCTAssertTrue(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: false,
+                hasSessionHandle: true,
+                acceptedConnectionCount: 7
+            )
+        )
+    }
+
+    func testConnectionReadDeadlineIsTwoSeconds() {
+        XCTAssertEqual(TokenBrokerAuthorizationSession.connectionReadLifetime, 2)
+        XCTAssertEqual(TokenBrokerAuthorizationSession.sessionTimeout, 600)
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 1.999)
+        )
+        XCTAssertTrue(
+            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 2)
+        )
+        XCTAssertTrue(
+            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 2.5)
+        )
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(
+                elapsed: 1,
+                lifetime: 2
+            )
+        )
+    }
+
+    func testLoopbackHTTPResponsesArePinnedStaticBytes() {
+        let successBody = "Authorization received. Return to the tersa.app window."
+        let errorBody = "Authorization rejected. Return to the tersa.app window."
+        XCTAssertEqual(successBody.utf8.count, 55)
+        XCTAssertEqual(errorBody.utf8.count, 55)
+
+        let expectedSuccess = Data(
+            (
+                "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: text/plain; charset=utf-8\r\n"
+                    + "Content-Length: 55\r\n"
+                    + "Connection: close\r\n"
+                    + "Cache-Control: no-store\r\n"
+                    + "\r\n"
+                    + successBody
+            ).utf8
+        )
+        let expectedError = Data(
+            (
+                "HTTP/1.1 400 Bad Request\r\n"
+                    + "Content-Type: text/plain; charset=utf-8\r\n"
+                    + "Content-Length: 55\r\n"
+                    + "Connection: close\r\n"
+                    + "Cache-Control: no-store\r\n"
+                    + "\r\n"
+                    + errorBody
+            ).utf8
+        )
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.httpSuccessResponse,
+            expectedSuccess
+        )
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.httpBadRequestResponse,
+            expectedError
+        )
+        // Pin absolute wire lengths (headers + 55-byte body).
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.httpSuccessResponse.count,
+            expectedSuccess.count
+        )
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.httpBadRequestResponse.count,
+            expectedError.count
+        )
+        XCTAssertEqual(expectedSuccess.count, 179)
+        XCTAssertEqual(expectedError.count, 188)
+
+        let successText = String(
+            decoding: TokenBrokerAuthorizationSession.httpSuccessResponse,
+            as: UTF8.self
+        )
+        let errorText = String(
+            decoding: TokenBrokerAuthorizationSession.httpBadRequestResponse,
+            as: UTF8.self
+        )
+        // No reflected callback/code and fixed close/no-store discipline.
+        XCTAssertFalse(successText.contains("code="))
+        XCTAssertFalse(errorText.contains("code="))
+        XCTAssertTrue(successText.contains("Connection: close"))
+        XCTAssertTrue(errorText.contains("Connection: close"))
+        XCTAssertTrue(successText.contains("Cache-Control: no-store"))
+        XCTAssertTrue(errorText.contains("Cache-Control: no-store"))
+    }
+
+    func testCompletePathCallbackWipeZerosTheSameAllocation() {
+        // Mirrors TokenBrokerService.completePathCallbackWipeLeavesZeros: the
+        // complete path uniquely references callback storage before the FFI
+        // read, then zeros that same allocation. Immutable XPC Strings are
+        // not zeroizable; this proves only the owned byte buffer wipe.
+        let plaintext = Array("callback-secret-code".utf8)
+        var secondaryBytes = plaintext
+        var addressDuringRead: UInt?
+        var snapshotDuringRead: [UInt8] = []
+
+        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
+            if let base = buffer.baseAddress {
+                addressDuringRead = UInt(bitPattern: base)
+                snapshotDuringRead = Array(
+                    UnsafeBufferPointer(start: UnsafePointer(base), count: buffer.count)
+                )
+            }
+        }
+        XCTAssertEqual(snapshotDuringRead, plaintext)
+        XCTAssertNotNil(addressDuringRead)
+
+        var wipedSameAddress = false
+        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+            if let base = buffer.baseAddress,
+               UInt(bitPattern: base) == addressDuringRead
+            {
+                wipedSameAddress = UnsafeBufferPointer(start: base, count: buffer.count)
+                    .allSatisfy { $0 == 0 }
+            }
+        }
+        XCTAssertTrue(wipedSameAddress)
+        XCTAssertTrue(secondaryBytes.allSatisfy { $0 == 0 })
+        XCTAssertEqual(secondaryBytes.count, plaintext.count)
     }
 
     func testDuplicateCallbackLatchIsSingleShot() {

@@ -28,18 +28,53 @@ enum TokenBrokerLoopbackReceiveDecision: Equatable, Sendable {
     case rejectConnection
 }
 
+/// Concurrent live-peer admission for one loopback authorization session.
+///
+/// Counts concurrent live peers, not cumulative lifetime accepts. Each admit
+/// pairs with exactly one successful `release`; double-release is a no-op so
+/// timeout/send/error races cannot underflow.
+struct TokenBrokerLoopbackPeerBudget: Equatable, Sendable {
+    private(set) var livePeerIDs: Set<ObjectIdentifier>
+    let maxConcurrent: Int
+
+    var liveCount: Int { livePeerIDs.count }
+
+    init(maxConcurrent: Int = TokenBrokerAuthorizationSession.maxAcceptedConnections) {
+        self.livePeerIDs = []
+        self.maxConcurrent = maxConcurrent
+    }
+
+    /// Admits a peer when under budget and not already live.
+    mutating func admit(_ id: ObjectIdentifier) -> Bool {
+        guard !livePeerIDs.contains(id), livePeerIDs.count < maxConcurrent else {
+            return false
+        }
+        livePeerIDs.insert(id)
+        return true
+    }
+
+    /// Idempotent release. Returns `true` only on the first release of `id`.
+    @discardableResult
+    mutating func release(_ id: ObjectIdentifier) -> Bool {
+        livePeerIDs.remove(id) != nil
+    }
+}
+
 /// Holds cancelable loopback/XPC resources for MainActor-safe abandoned cleanup.
 ///
 /// `TokenBrokerAuthorizationSession` is `@MainActor`; `deinit` is not. This bag
-/// is `@unchecked Sendable` and cancels its timer, listener, and XPC client from
-/// `release()` / `deinit` so an abandoned session still tears those endpoints
-/// down without actor-isolated access from `deinit`. `release()` is idempotent
-/// and preserves exactly-once session completion (completion stays in `finish`).
+/// is `@unchecked Sendable` and cancels its deadline source, listener, and XPC
+/// client from `release()` / `deinit` so an abandoned session still tears those
+/// endpoints down without actor-isolated access from `deinit`. `release()` is
+/// idempotent and preserves exactly-once session completion (completion stays
+/// in `finish`). The session deadline uses `DispatchSourceTimer` on `.main` so
+/// cancellation is safe from any thread (unlike Foundation `Timer.invalidate`,
+/// which must run on the scheduling run loop).
 final class TokenBrokerSessionResourceBag: @unchecked Sendable {
     private let lock = NSLock()
     private var client: TokenBrokerClient?
     private var listener: NWListener?
-    private var timer: Timer?
+    private var deadlineSource: DispatchSourceTimer?
 
     func install(client: TokenBrokerClient, listener: NWListener) {
         lock.lock()
@@ -48,11 +83,14 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
         lock.unlock()
     }
 
-    func storeTimer(_ timer: Timer) {
+    /// Stores the session deadline source. Cancels any previous source.
+    /// Caller must `activate()` the source exactly once after this returns.
+    func storeDeadlineSource(_ source: DispatchSourceTimer) {
         lock.lock()
-        self.timer?.invalidate()
-        self.timer = timer
+        let previous = deadlineSource
+        deadlineSource = source
         lock.unlock()
+        previous?.cancel()
     }
 
     func borrowClient() -> TokenBrokerClient? {
@@ -61,17 +99,18 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
         return client
     }
 
-    /// Cancels timer, loopback listener, and XPC client. Idempotent.
+    /// Cancels deadline source, loopback listener, and XPC client. Idempotent.
+    /// `DispatchSource.cancel` is thread-safe; safe from `deinit` or any queue.
     func release() {
         lock.lock()
-        let pendingTimer = timer
+        let pendingSource = deadlineSource
         let pendingListener = listener
         let pendingClient = client
-        timer = nil
+        deadlineSource = nil
         listener = nil
         client = nil
         lock.unlock()
-        pendingTimer?.invalidate()
+        pendingSource?.cancel()
         pendingListener?.cancel()
         pendingClient?.cancel()
     }
@@ -112,13 +151,58 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
 final class TokenBrokerAuthorizationSession {
     /// Maximum HTTP request bytes accepted from one loopback peer (8 KiB).
     nonisolated static let maxRequestBytes = 8_192
-    /// Bounds how many accepted TCP connections one session will process.
-    /// Excess peers are cancelled without completing the session; the session
-    /// deadline still ends a flow that never receives a valid callback.
+    /// Maximum concurrent live TCP peers one session will process at once.
+    /// Excess peers are cancelled without completing the session; finished
+    /// peers release their slot so later callbacks can still be admitted. The
+    /// session deadline still ends a flow that never receives a valid callback.
     nonisolated static let maxAcceptedConnections = 8
+    /// Per-connection read lifetime matching the legacy loopback receiver.
+    /// A silent or partial peer is cancelled individually after this deadline.
+    nonisolated static let connectionReadLifetime: TimeInterval = 2
     /// Hard upper bound for one authorization session (matches broker session
     /// TTL). Prevents stray connections from keeping the flow alive forever.
     nonisolated static let sessionTimeout: TimeInterval = 600
+
+    /// Fixed HTTP 200 for a validated provider callback. Static bytes only —
+    /// never interpolate callback/code. Body length is 55 UTF-8 bytes.
+    nonisolated static let httpSuccessResponse: Data = Data(
+        (
+            "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: 55\r\n"
+                + "Connection: close\r\n"
+                + "Cache-Control: no-store\r\n"
+                + "\r\n"
+                + "Authorization received. Return to the tersa.app window."
+        ).utf8
+    )
+    /// Fixed HTTP 400 for a complete but rejected/malformed request. Static
+    /// bytes only — no reflected input. Body length is 55 UTF-8 bytes.
+    nonisolated static let httpBadRequestResponse: Data = Data(
+        (
+            "HTTP/1.1 400 Bad Request\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: 55\r\n"
+                + "Connection: close\r\n"
+                + "Cache-Control: no-store\r\n"
+                + "\r\n"
+                + "Authorization rejected. Return to the tersa.app window."
+        ).utf8
+    )
+
+    private final class LivePeer {
+        let connection: NWConnection
+        let deadlineWork: DispatchWorkItem
+        /// True once a complete-header finish has begun (HTTP response path).
+        /// Prevents timeout/ready races from double-sending while the peer still
+        /// occupies the concurrent budget until contentProcessed.
+        var isFinishing = false
+
+        init(connection: NWConnection, deadlineWork: DispatchWorkItem) {
+            self.connection = connection
+            self.deadlineWork = deadlineWork
+        }
+    }
 
     private let resources = TokenBrokerSessionResourceBag()
     private var sessionHandle: String?
@@ -135,8 +219,10 @@ final class TokenBrokerAuthorizationSession {
     /// complete. Concurrent or second connections cannot double-complete the
     /// session. Stray parseable peers must never claim this latch.
     private var hasForwardedCallback = false
-    /// Count of accepted TCP connections processed this session.
-    private var acceptedConnectionCount = 0
+    /// Concurrent live peers keyed by `ObjectIdentifier`. Finish removes and
+    /// cancels the per-peer deadline exactly once (reject, parse failure, send
+    /// completion, timeout, session finish, or transport error).
+    private var livePeers: [ObjectIdentifier: LivePeer] = [:]
     private let listenerQueue = DispatchQueue(
         label: "app.tersa.macos.token-broker.loopback"
     )
@@ -165,7 +251,7 @@ final class TokenBrokerAuthorizationSession {
         self.onOutcome = onOutcome
         let client = TokenBrokerClient()
         resources.install(client: client, listener: listener)
-        acceptedConnectionCount = 0
+        livePeers = [:]
         hasForwardedCallback = false
         boundLoopbackPort = nil
         armSessionDeadline()
@@ -203,15 +289,22 @@ final class TokenBrokerAuthorizationSession {
     }
 
     private func armSessionDeadline() {
-        let timer = Timer.scheduledTimer(
-            withTimeInterval: Self.sessionTimeout,
-            repeats: false
-        ) { [weak self] _ in
+        // DispatchSourceTimer on .main: cancel is thread-safe from any queue
+        // (resource-bag deinit / release), unlike Foundation Timer.invalidate.
+        let source = DispatchSource.makeTimerSource(queue: .main)
+        source.schedule(
+            deadline: .now() + Self.sessionTimeout,
+            repeating: .never,
+            leeway: .seconds(1)
+        )
+        source.setEventHandler { [weak self] in
             Task { @MainActor in
                 self?.handleSessionDeadline()
             }
         }
-        resources.storeTimer(timer)
+        // Store before activate so release can cancel; activate exactly once.
+        resources.storeDeadlineSource(source)
+        source.activate()
     }
 
     private func handleSessionDeadline() {
@@ -273,25 +366,42 @@ final class TokenBrokerAuthorizationSession {
             connection.cancel()
             return
         }
-        acceptedConnectionCount += 1
-        guard acceptedConnectionCount <= Self.maxAcceptedConnections else {
-            // Bound accepted work; cancel the excess peer only. The session
-            // deadline still terminates a flow that never gets a valid callback.
+        let id = ObjectIdentifier(connection)
+        // Concurrent live budget: reject only when eight peers are in flight.
+        // Finished peers release their slot so a later valid callback can enter.
+        guard livePeers.count < Self.maxAcceptedConnections, livePeers[id] == nil else {
             connection.cancel()
             return
         }
+        let deadlineWork = DispatchWorkItem { [weak self, weak connection] in
+            guard let connection else {
+                return
+            }
+            Task { @MainActor in
+                self?.handlePeerReadDeadline(connection)
+            }
+        }
+        livePeers[id] = LivePeer(connection: connection, deadlineWork: deadlineWork)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.connectionReadLifetime,
+            execute: deadlineWork
+        )
         connection.start(queue: .main)
         receiveLoopbackBytes(connection: connection, accumulated: Data())
     }
 
     private func receiveLoopbackBytes(connection: NWConnection, accumulated: Data) {
         guard !isFinished else {
-            connection.cancel()
+            releasePeerImmediate(connection)
+            return
+        }
+        // Peer already finished (timeout/session end) — stop receiving.
+        guard livePeers[ObjectIdentifier(connection)] != nil else {
             return
         }
         let remaining = Self.maxRequestBytes - accumulated.count
         guard remaining > 0 else {
-            connection.cancel()
+            releasePeerImmediate(connection)
             return
         }
         connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) {
@@ -305,7 +415,11 @@ final class TokenBrokerAuthorizationSession {
                     return
                 }
                 guard !self.isFinished else {
-                    connection.cancel()
+                    self.releasePeerImmediate(connection)
+                    return
+                }
+                // Drop work for peers already released (timeout race).
+                guard self.livePeers[ObjectIdentifier(connection)] != nil else {
                     return
                 }
                 var buffer = accumulated
@@ -320,31 +434,112 @@ final class TokenBrokerAuthorizationSession {
                     self.receiveLoopbackBytes(connection: connection, accumulated: buffer)
                 case .rejectConnection:
                     // Empty, partial, oversize, or errored peer: drop only this
-                    // connection and leave the listener ready for a real callback.
-                    connection.cancel()
+                    // connection (no HTTP body) and leave the listener ready.
+                    self.releasePeerImmediate(connection)
                 case .ready(let request):
-                    connection.cancel()
-                    guard let boundPort = self.boundLoopbackPort,
-                          let callbackURL = Self.callbackURL(
-                            from: request,
-                            boundPort: boundPort
-                          )
-                    else {
-                        // Stray or non-outcome request: keep the session alive.
-                        return
-                    }
-                    guard Self.claimForwardedCallback(
-                        isFinished: self.isFinished,
-                        hasForwardedCallback: &self.hasForwardedCallback
-                    ) else {
-                        return
-                    }
-                    guard let sessionHandle = self.sessionHandle else {
-                        return
-                    }
-                    self.complete(sessionHandle: sessionHandle, callbackURL: callbackURL)
+                    self.handleReadyLoopbackRequest(connection: connection, request: request)
                 }
             }
+        }
+    }
+
+    /// Handles a complete header block: validated provider outcome claims the
+    /// latch and completes the broker once after queuing a fixed 200; complete
+    /// but rejected/malformed requests get a fixed 400. Incomplete peers never
+    /// reach this path. Budget release and TCP cancel run in contentProcessed.
+    private func handleReadyLoopbackRequest(connection: NWConnection, request: Data) {
+        let id = ObjectIdentifier(connection)
+        // Claim exclusive finish: cancel the read deadline and prevent a second
+        // ready/timeout path from admitting the same peer again.
+        guard let peer = livePeers[id], !peer.isFinishing else {
+            return
+        }
+        peer.deadlineWork.cancel()
+        peer.isFinishing = true
+
+        guard !isFinished else {
+            // Force-release: isFinishing would make releasePeerImmediate a no-op.
+            livePeers.removeValue(forKey: id)
+            connection.cancel()
+            return
+        }
+
+        guard let boundPort = boundLoopbackPort,
+              let callbackURL = Self.callbackURL(from: request, boundPort: boundPort)
+        else {
+            // Complete headers but not a bound-port provider outcome.
+            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            return
+        }
+        guard Self.claimForwardedCallback(
+            isFinished: isFinished,
+            hasForwardedCallback: &hasForwardedCallback
+        ) else {
+            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            return
+        }
+        guard let sessionHandle else {
+            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            return
+        }
+        // Broker complete once; browser gets the fixed 200. Cancel/release of
+        // the TCP peer and concurrent budget slot happen only in contentProcessed.
+        complete(sessionHandle: sessionHandle, callbackURL: callbackURL)
+        sendFixedHTTPResponseAndRelease(connection, response: Self.httpSuccessResponse)
+    }
+
+    /// 2-second per-peer read deadline: cancel only this silent/partial peer.
+    private func handlePeerReadDeadline(_ connection: NWConnection) {
+        releasePeerImmediate(connection)
+    }
+
+    /// Idempotent immediate finish for incomplete/timeout/transport paths:
+    /// cancel deadline, free the concurrent slot, cancel TCP. No HTTP body.
+    /// No-op when the HTTP response path already owns the peer (`isFinishing`);
+    /// that path releases only in `.contentProcessed`. Session teardown still
+    /// drains every peer via `cancelAllLivePeers`.
+    private func releasePeerImmediate(_ connection: NWConnection) {
+        let id = ObjectIdentifier(connection)
+        guard let peer = livePeers[id], !peer.isFinishing else {
+            return
+        }
+        livePeers.removeValue(forKey: id)
+        peer.deadlineWork.cancel()
+        connection.cancel()
+    }
+
+    /// Sends a pinned static HTTP response; releases the concurrent budget and
+    /// cancels the connection only in `.contentProcessed`. Never interpolates
+    /// callback/code.
+    private func sendFixedHTTPResponseAndRelease(_ connection: NWConnection, response: Data) {
+        let id = ObjectIdentifier(connection)
+        // Deadline is already cancelled; registry entry remains until send
+        // completion so the concurrent budget counts this peer as live.
+        livePeers[id]?.deadlineWork.cancel()
+        livePeers[id]?.isFinishing = true
+        connection.send(
+            content: response,
+            contentContext: .defaultMessage,
+            isComplete: true,
+            completion: .contentProcessed { [weak self] _ in
+                Task { @MainActor in
+                    if let peer = self?.livePeers.removeValue(forKey: id) {
+                        peer.deadlineWork.cancel()
+                    }
+                    connection.cancel()
+                }
+            }
+        )
+    }
+
+    /// Cancels every live peer deadline and connection. Idempotent per peer
+    /// because the map is drained once.
+    private func cancelAllLivePeers() {
+        let peers = livePeers
+        livePeers.removeAll()
+        for (_, peer) in peers {
+            peer.deadlineWork.cancel()
+            peer.connection.cancel()
         }
     }
 
@@ -401,7 +596,9 @@ final class TokenBrokerAuthorizationSession {
         let callback = onOutcome
         onOutcome = nil
         sessionHandle = nil
-        // Release listener + XPC client (and timer) before delivering outcome.
+        // Drop live peers (deadline + TCP) before listener/XPC teardown.
+        cancelAllLivePeers()
+        // Release listener + XPC client (and deadline source) before outcome.
         resources.release()
         callback?(outcome)
     }
@@ -423,19 +620,28 @@ final class TokenBrokerAuthorizationSession {
         return true
     }
 
-    /// Whether one more accepted connection may be processed.
+    /// Whether one more concurrent live peer may be admitted.
     ///
-    /// Pure gate used by the accept path and unit tests. Excess peers are
-    /// cancelled without completing the session.
+    /// Pure gate used by the accept path and unit tests. `liveCount` is the
+    /// number of peers currently in flight, not cumulative lifetime accepts.
+    /// Excess simultaneous peers are cancelled without completing the session.
     nonisolated static func shouldProcessAcceptedConnection(
         isFinished: Bool,
         hasSessionHandle: Bool,
-        acceptedConnectionCount: Int,
+        acceptedConnectionCount liveCount: Int,
         maxAcceptedConnections: Int = maxAcceptedConnections
     ) -> Bool {
         !isFinished
             && hasSessionHandle
-            && acceptedConnectionCount < maxAcceptedConnections
+            && liveCount < maxAcceptedConnections
+    }
+
+    /// Pure peer read-deadline check (elapsed >= lifetime).
+    nonisolated static func peerReadDeadlineExpired(
+        elapsed: TimeInterval,
+        lifetime: TimeInterval = connectionReadLifetime
+    ) -> Bool {
+        elapsed >= lifetime
     }
 
     /// Accumulates one receive into the loopback request buffer.
@@ -630,30 +836,71 @@ final class TokenBrokerAuthorizationSession {
         port >= 1024
     }
 
-    /// True when every `%` in `text` is followed by two hexadecimal digits.
+    /// True when every UTF-8 byte is in the RFC 3986 query allowed set and
+    /// every `%` is followed by two hex digits.
+    ///
+    /// Allowed set: ASCII alphanumeric plus `-._~!$&'()*+,;=:@/?`, with `%`
+    /// only as a well-formed percent-escape. Rejects raw `|`, `<`, `[`, `^`,
+    /// spaces, backticks, and every non-ASCII byte so assigning the string to
+    /// `URLComponents.percentEncodedQuery` cannot Foundation-fatalError.
     nonisolated static func percentEncodingIsWellFormed(_ text: String) -> Bool {
-        var index = text.startIndex
-        while index < text.endIndex {
-            if text[index] == "%" {
-                let first = text.index(after: index)
-                guard first < text.endIndex else {
+        let utf8 = text.utf8
+        var index = utf8.startIndex
+        while index < utf8.endIndex {
+            let byte = utf8[index]
+            if byte == UInt8(ascii: "%") {
+                let first = utf8.index(after: index)
+                guard first < utf8.endIndex else {
                     return false
                 }
-                let second = text.index(after: first)
-                guard second < text.endIndex else {
+                let second = utf8.index(after: first)
+                guard second < utf8.endIndex else {
                     return false
                 }
-                let firstByte = text[first].utf8.first ?? 0
-                let secondByte = text[second].utf8.first ?? 0
-                guard isHexDigit(firstByte), isHexDigit(secondByte) else {
+                guard isHexDigit(utf8[first]), isHexDigit(utf8[second]) else {
                     return false
                 }
-                index = text.index(after: second)
+                index = utf8.index(after: second)
+            } else if isAllowedRFC3986QueryByte(byte) {
+                index = utf8.index(after: index)
             } else {
-                index = text.index(after: index)
+                return false
             }
         }
         return true
+    }
+
+    /// RFC 3986 query characters excluding `%` (handled as an escape lead).
+    /// unreserved / sub-delims / ":" / "@" / "/" / "?".
+    nonisolated private static func isAllowedRFC3986QueryByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case UInt8(ascii: "A")...UInt8(ascii: "Z"),
+             UInt8(ascii: "a")...UInt8(ascii: "z"),
+             UInt8(ascii: "0")...UInt8(ascii: "9"):
+            return true
+        case UInt8(ascii: "-"),
+             UInt8(ascii: "."),
+             UInt8(ascii: "_"),
+             UInt8(ascii: "~"),
+             UInt8(ascii: "!"),
+             UInt8(ascii: "$"),
+             UInt8(ascii: "&"),
+             UInt8(ascii: "'"),
+             UInt8(ascii: "("),
+             UInt8(ascii: ")"),
+             UInt8(ascii: "*"),
+             UInt8(ascii: "+"),
+             UInt8(ascii: ","),
+             UInt8(ascii: ";"),
+             UInt8(ascii: "="),
+             UInt8(ascii: ":"),
+             UInt8(ascii: "@"),
+             UInt8(ascii: "/"),
+             UInt8(ascii: "?"):
+            return true
+        default:
+            return false
+        }
     }
 
     nonisolated private static func isHexDigit(_ byte: UInt8) -> Bool {

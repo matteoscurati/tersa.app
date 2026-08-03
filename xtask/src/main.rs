@@ -1647,7 +1647,8 @@ fn expected_token_broker_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
                 "callback_url:*constu8,callback_url_len:usize,",
                 "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
                 "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
-                "expires_out:*muti64,)->i32"
+                "expires_out:*mut",
+                "i64,)->i32"
             ),
         ),
         (
@@ -1657,7 +1658,8 @@ fn expected_token_broker_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
                 "account_subject:*constu8,account_subject_len:usize,",
                 "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
                 "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
-                "expires_out:*muti64,)->i32"
+                "expires_out:*mut",
+                "i64,)->i32"
             ),
         ),
         (
@@ -6746,7 +6748,7 @@ fn token_broker_protocol_mirror_violations(service: &str, client: &str) -> Vec<S
 }
 
 /// Parses `case name = <int>` members from a Swift enum with the given name.
-/// Inheritance, generics, `where` clauses, and unparseable bodies fail closed.
+/// Inheritance, generics, `where` clauses, and unparsable bodies fail closed.
 fn swift_closed_int_enum_cases(code: &str, enum_name: &str) -> Option<BTreeMap<String, i64>> {
     let mut enum_body: Option<&str> = None;
     for (start, _) in code.match_indices("enum") {
