@@ -154,6 +154,21 @@ enum BrokerSubjectReadResult: Equatable {
     case failure
 }
 
+/// Closed result of the synchronous broker disconnect prepare. Raw values
+/// mirror the `tersa_mailbox_macos_broker_disconnect_prepare` return domain:
+/// raw 1 means the Rust fence was set and any in-flight sync was cancelled,
+/// raw 2 means the account slot is busy and nothing was prepared, and every
+/// other value is a failure.
+enum BrokerDisconnectPrepareResult: Equatable {
+    /// The disconnect fence is set and the in-flight sync was cancelled; the
+    /// caller may proceed to the broker revoke.
+    case prepared
+    /// The account slot is busy; nothing was prepared.
+    case busy
+    /// Any other status.
+    case failure
+}
+
 /// Serializes the mailbox connect, disconnect, and sync begins — and their
 /// ONE shared FFI poll loop — away from the AppKit main thread. One active
 /// session at a time: the UI cannot legally run two flows, and the Rust
@@ -235,13 +250,14 @@ final class MailboxSyncWorker: @unchecked Sendable {
         }
     }
 
-    /// One queued begin: a connect, a disconnect, a plain sync, or a
-    /// broker-fed sync.
+    /// One queued begin: a connect, a disconnect, a plain sync, a
+    /// broker-fed sync, or a broker disconnect finalize.
     private enum BeginRequest {
         case connect(Data, OAuthSessionID)
         case disconnect(Data)
         case sync(String, Data)
         case brokerSync(Data, BrokerSyncSecrets)
+        case brokerDisconnectFinalize(Data, Bool)
     }
 
     private let queue = DispatchQueue(label: "app.tersa.macos.mailbox-sync", qos: .utility)
@@ -290,6 +306,47 @@ final class MailboxSyncWorker: @unchecked Sendable {
     ) {
         let secrets = BrokerSyncSecrets(token: token)
         enqueueBegin(.brokerSync(accountIdentifier, secrets), completion: completion)
+    }
+
+    /// Runs the SYNCHRONOUS broker disconnect prepare on the worker queue. It
+    /// is deliberately NOT routed through `enqueueBegin`: the prepare must set
+    /// the Rust disconnect fence and cancel the in-flight sync BEFORE the
+    /// broker revoke, ahead of any queued begin. Raw 1 maps to `.prepared`,
+    /// raw 2 to `.busy`, and every other status to `.failure`; the result is
+    /// delivered on the main actor.
+    func prepareBrokerDisconnect(
+        accountIdentifier: Data,
+        completion: @escaping @MainActor (BrokerDisconnectPrepareResult) -> Void
+    ) {
+        queue.async {
+            let status = Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                tersa_mailbox_macos_broker_disconnect_prepare(
+                    accountBuffer.baseAddress,
+                    accountBuffer.count
+                )
+            }
+            let result: BrokerDisconnectPrepareResult
+            switch status {
+            case 1:
+                result = .prepared
+            case 2:
+                result = .busy
+            default:
+                result = .failure
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// Queues one broker disconnect finalize-begin (local teardown after the
+    /// broker revoke; `revokeUnconfirmed` records whether the revoke could not
+    /// be confirmed). A second queued request is rejected immediately.
+    func beginBrokerDisconnectFinalize(
+        accountIdentifier: Data,
+        revokeUnconfirmed: Bool,
+        completion: @escaping @MainActor (MailboxPollStatus) -> Void
+    ) {
+        enqueueBegin(.brokerDisconnectFinalize(accountIdentifier, revokeUnconfirmed), completion: completion)
     }
 
     /// Reads only disconnect recovery and last-successful-sync metadata on the
@@ -477,6 +534,15 @@ final class MailboxSyncWorker: @unchecked Sendable {
             let result = secrets.begin(accountIdentifier: accountIdentifier)
             status = result.status
             sessionID = result.sessionID
+        case .brokerDisconnectFinalize(let accountIdentifier, let revokeUnconfirmed):
+            status = Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                tersa_mailbox_macos_broker_disconnect_finalize(
+                    accountBuffer.baseAddress,
+                    accountBuffer.count,
+                    revokeUnconfirmed ? 1 : 0,
+                    &sessionID
+                )
+            }
         }
         return (status, sessionID)
     }
