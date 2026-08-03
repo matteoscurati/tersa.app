@@ -367,63 +367,34 @@ final class AccountConnectionViewModel: ObservableObject {
         disconnectConfirmation = nil
     }
 
-    /// The second rung: sync with the STORED credential. ONLY a
-    /// `.needsReconnect` climbs to browser re-consent (the stored credential
-    /// is gone or never existed); a network or gate problem maps straight to
-    /// a failure and never re-prompts OAuth.
+    /// The second rung: sync with the STORED credential through the token
+    /// broker. Reads the account's broker routing subject from local account
+    /// state without opening a mailbox store; ONLY `.absent` (no subject
+    /// persisted — the stored credential is gone or never existed) climbs to
+    /// browser re-consent; a local subject read failure maps straight to
+    /// `.accountStateUnavailable` and never re-prompts OAuth; a found subject
+    /// hands the SAME operation to the broker refresh ladder.
     private func syncWithStoredCredential(
         accountIdentifier: Data,
         token: ConnectionOperationToken
     ) {
-        syncWorker.beginSync(
-            clientID: Self.oauthClientID,
-            accountIdentifier: accountIdentifier
-        ) { [weak self] status in
-            guard let self else {
+        syncWorker.readBrokerSubject(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, self.operationDeadline.accepts(token) else {
                 return
             }
-            guard self.operationDeadline.accepts(token) else {
-                return
-            }
-            switch status {
-            case .succeeded, .succeededRevokeUnconfirmed:
-                self.completeConnected(
-                    accountIdentifier: accountIdentifier,
-                    token: token,
-                    offline: false
-                )
-            case .syncFailed:
-                // A returning user reaches their locally-synced inbox even when
-                // the network refresh can't complete (the offline case: the
-                // stored-credential refresh dies with a transport error ->
-                // SYNC_FAILED, never reaching the gate). Safe on THIS rung not
-                // because the gate passed — SYNC_FAILED means the gate did not
-                // BLOCK, which includes it never running — but because the
-                // mailbox store only ever holds the last-COMMITTED identity's
-                // data: writes happen solely through the post-gate SyncCoordinator,
-                // and a mismatched re-consent clears the store (ClearAndRecord).
-                // The pre-gate SYNC_FAILED sub-cases here (refresh transport,
-                // setup, session) mutate nothing, so they show last-verified
-                // data. No NEW identity can be introduced on this rung (it uses
-                // the STORED credential); the fresh-consent handoff lives on the
-                // connect rung, which deliberately does NOT land connected here.
-                self.completeConnected(
-                    accountIdentifier: accountIdentifier,
-                    token: token,
-                    offline: true
-                )
-            case .needsReconnect, .permissionRequired:
+            switch result {
+            case .absent:
                 _ = self.finishOperation(token)
                 self.authorizeAndConnect(accountIdentifier: accountIdentifier)
-            case .cancelled:
-                // A disconnect dropped the in-flight sync; land neutral —
-                // not a failure, and never rendered as "disconnected".
+            case .failure:
                 _ = self.finishOperation(token)
-                self.state = .notConnected
-            case .gateBlocked, .internalError, .unknownSession, .unrecognized,
-                 .running:
-                _ = self.finishOperation(token)
-                self.state = .failed(Self.terminalFailure(status))
+                self.state = .failed(.accountStateUnavailable)
+            case .found(let subject):
+                self.refreshStoredBrokerCredential(
+                    subject: subject,
+                    accountIdentifier: accountIdentifier,
+                    token: token
+                )
             }
         }
     }
