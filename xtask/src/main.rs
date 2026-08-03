@@ -4236,6 +4236,27 @@ const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH: &str =
 const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS: &str = "TokenBrokerSessionResourceBag";
 /// Whitespace-normalized form of the sole reviewed abandoned-session `deinit`.
 const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT: &str = "deinit{release()}";
+/// Exact owner class of the reviewed broker-backed authorization session whose
+/// production `start()` admission guard and per-attempt reset sequence are
+/// pinned. Same reviewed file as
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`.
+const REVIEWED_TOKEN_BROKER_AUTHORIZATION_SESSION_CLASS: &str = "TokenBrokerAuthorizationSession";
+/// Whitespace-normalized signature of the reviewed session `start()` method.
+/// Renamed parameters, changed labels or attributes, and a changed return type
+/// fail closed.
+const REVIEWED_TOKEN_BROKER_SESSION_START_SIGNATURE: &str =
+    "funcstart(onOutcome:@escaping@MainActor(TokenBrokerAuthorizationOutcome)->Void)->Bool";
+/// Whitespace-normalized admission guard that must be the first statement of
+/// the reviewed session `start()`: `attemptLifecycle.canStart`, never a
+/// session-scoped finished latch, is the sole admission gate.
+const REVIEWED_TOKEN_BROKER_SESSION_START_ADMISSION_GUARD: &str =
+    "guardattemptLifecycle.canStart,resources.borrowClient()==nilelse{returnfalse}";
+/// Whitespace-normalized arm-and-reset sequence that must appear verbatim in
+/// the reviewed session `start()`: the `beginAttempt()` generation bump is
+/// immediately followed by the five per-attempt resets in this exact order and
+/// the outcome-handler install, so no prior-attempt state can leak into a
+/// re-armed session.
+const REVIEWED_TOKEN_BROKER_SESSION_START_ARM_AND_RESETS: &str = "letgeneration=attemptLifecycle.beginAttempt()hasAcceptedListenerReady=falsehasForwardedCallback=falsesessionHandle=nilboundLoopbackPort=nilpeerRegistry.removeAll()self.onOutcome=onOutcome";
 /// Exact path of the sole reviewed abandoned-request `deinit` cleanup. No
 /// directory-wide, filename-prefix, or generic `deinit` exemption exists.
 const REVIEWED_BROKER_SYNC_SECRETS_DEINIT_PATH: &str = "apple/macos/MailboxSyncWorker.swift";
@@ -4464,6 +4485,92 @@ fn swift_is_direct_member_of_nested_class(
         return swift_is_direct_member_of_file_scope_class(code, start, outer_name);
     }
     false
+}
+
+/// Production pin for the reviewed broker-backed session `start()`: exactly
+/// one non-initializer `start` as a direct member of file-scope class
+/// `TokenBrokerAuthorizationSession` in
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`, carrying the exact
+/// reviewed signature, the exact `attemptLifecycle.canStart` admission guard as
+/// its first executable statement (never an `isFinished` latch), and the exact
+/// arm-and-reset sequence exactly once. Zero or multiple candidate methods, a
+/// renamed parameter/label/attribute, a changed return type, a reordered or
+/// duplicated reset, and comment/string decoys all fail closed. Comment/string
+/// regions must already be masked by the caller. Returns `None` for every
+/// other path.
+fn token_broker_session_start_violation(path: &Path, code: &str) -> Option<String> {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH) {
+        return None;
+    }
+    let violation = |reason: &str| -> String {
+        format!(
+            "{} has an unreviewed TokenBrokerAuthorizationSession.start: {reason}",
+            path.display()
+        )
+    };
+    let sites: Vec<(usize, &str)> = swift_function_declaration_sites(code)
+        .into_iter()
+        .filter(|(name, _body, is_initializer, start)| {
+            name == "start"
+                && !*is_initializer
+                && swift_is_direct_member_of_file_scope_class(
+                    code,
+                    *start,
+                    REVIEWED_TOKEN_BROKER_AUTHORIZATION_SESSION_CLASS,
+                )
+        })
+        .map(|(_name, body, _is_initializer, start)| (start, body))
+        .collect();
+    if sites.len() != 1 {
+        return Some(violation(
+            "expected exactly one direct `start` method on the reviewed session class",
+        ));
+    }
+    let (opening, body) = sites[0];
+    // Pin the signature on the source span immediately before the balanced
+    // body, never on a whole-file substring. The declaration keyword is the
+    // last `func` identifier before the body brace; any drift between it and
+    // the brace (renamed parameters, changed labels or attributes, a changed
+    // return type, or a smuggled brace) changes the canonical form and fails.
+    let Some(func_start) = code[..opening]
+        .match_indices("func")
+        .filter(|(start, _)| is_identifier_at(code, *start, "func"))
+        .map(|(start, _)| start)
+        .last()
+    else {
+        return Some(violation(
+            "`start` is missing its `func` declaration keyword",
+        ));
+    };
+    if rust_token_canonical(&code[func_start..opening])
+        != REVIEWED_TOKEN_BROKER_SESSION_START_SIGNATURE
+    {
+        return Some(violation(
+            "signature does not match the reviewed declaration",
+        ));
+    }
+    let canonical_body = rust_token_canonical(body);
+    let Some(statements) = canonical_body.strip_prefix('{') else {
+        return Some(violation("method body is not a balanced brace block"));
+    };
+    if !statements.starts_with(REVIEWED_TOKEN_BROKER_SESSION_START_ADMISSION_GUARD) {
+        return Some(violation(
+            "first statement is not the reviewed `attemptLifecycle.canStart` admission guard",
+        ));
+    }
+    if contains_identifier(body, "isFinished") {
+        return Some(violation("must not admit through an `isFinished` latch"));
+    }
+    if canonical_body
+        .match_indices(REVIEWED_TOKEN_BROKER_SESSION_START_ARM_AND_RESETS)
+        .count()
+        != 1
+    {
+        return Some(violation(
+            "arm-and-reset sequence must appear exactly once as a contiguous sequence",
+        ));
+    }
+    None
 }
 
 /// True when a non-whitespace token other than a declaration boundary (`{`,
@@ -4711,6 +4818,9 @@ fn swift_source_lexical_violations(path: &Path, document: &str) -> Vec<String> {
         }
     }
     if let Some(violation) = swift_forbidden_declaration_violation(path, &code) {
+        return vec![violation];
+    }
+    if let Some(violation) = token_broker_session_start_violation(path, &code) {
         return vec![violation];
     }
     let bytes = document.as_bytes();
@@ -15019,11 +15129,34 @@ protocol TersaMacTokenBrokerProtocolV1 {
         );
     }
 
+    /// Exact reviewed pair pinned at
+    /// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`: the
+    /// abandoned-session `deinit` cleanup plus the reviewed session `start()`
+    /// admission guard and arm-and-reset sequence the same file must carry.
     fn exact_token_broker_session_resource_bag_deinit_fixture() -> &'static str {
         "\
 final class TokenBrokerSessionResourceBag: @unchecked Sendable {
     func release() {}
     deinit { release() }
+}
+
+@MainActor
+final class TokenBrokerAuthorizationSession {
+    func start(
+        onOutcome: @escaping @MainActor (TokenBrokerAuthorizationOutcome) -> Void
+    ) -> Bool {
+        guard attemptLifecycle.canStart, resources.borrowClient() == nil else {
+            return false
+        }
+        let generation = attemptLifecycle.beginAttempt()
+        hasAcceptedListenerReady = false
+        hasForwardedCallback = false
+        sessionHandle = nil
+        boundLoopbackPort = nil
+        peerRegistry.removeAll()
+        self.onOutcome = onOutcome
+        return true
+    }
 }
 "
     }
@@ -15046,6 +15179,16 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
         );
     }
 
+    fn assert_swift_source_rejects_session_start(path: &Path, code: &str, message: &str) {
+        assert!(
+            swift_source_lexical_violations(path, code)
+                .iter()
+                .any(|violation| violation
+                    .contains("unreviewed TokenBrokerAuthorizationSession.start")),
+            "{message}"
+        );
+    }
+
     #[test]
     fn token_broker_session_resource_bag_deinit_accepts_reviewed_source_and_exact_fixture() {
         let path = reviewed_token_broker_session_resource_bag_deinit_path();
@@ -15061,6 +15204,140 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
             path,
             exact_token_broker_session_resource_bag_deinit_fixture(),
             "exact TokenBrokerSessionResourceBag deinit {{ release() }} fixture must pass",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_wrong_owner_and_signature() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the reviewed form on a renamed owner class fails closed.
+        let wrong_owner = exact.replace(
+            "final class TokenBrokerAuthorizationSession",
+            "final class OtherAuthorizationSession",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &wrong_owner,
+            "session start on a non-reviewed owner class must fail closed",
+        );
+        // Negative: a renamed parameter label fails the pinned signature.
+        let changed_signature = exact.replace("onOutcome:", "outcome:");
+        assert_swift_source_rejects_session_start(
+            path,
+            &changed_signature,
+            "session start with a changed signature must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_is_finished_admission_latch() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the historical `isFinished` admission latch fails closed.
+        let mutated = exact.replace(
+            "guard attemptLifecycle.canStart",
+            "guard !attemptLifecycle.isFinished",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "admission through an `isFinished` latch must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_any_missing_reset() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: dropping any single per-attempt reset fails closed.
+        for reset in [
+            "hasAcceptedListenerReady = false",
+            "hasForwardedCallback = false",
+            "sessionHandle = nil",
+            "boundLoopbackPort = nil",
+            "peerRegistry.removeAll()",
+        ] {
+            let mutated = exact.replace(reset, "");
+            assert_swift_source_rejects_session_start(
+                path,
+                &mutated,
+                &format!("session start missing `{reset}` must fail closed"),
+            );
+        }
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_reordered_resets() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: reordering the first two per-attempt resets fails closed.
+        let mutated = exact.replace(
+            "hasAcceptedListenerReady = false\n        hasForwardedCallback = false",
+            "hasForwardedCallback = false\n        hasAcceptedListenerReady = false",
+        );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "reordered per-attempt resets must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_duplicated_arm_and_reset_sequence() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a duplicated contiguous arm/reset/outcome sequence fails closed.
+        let sequence = "        let generation = attemptLifecycle.beginAttempt()\n        hasAcceptedListenerReady = false\n        hasForwardedCallback = false\n        sessionHandle = nil\n        boundLoopbackPort = nil\n        peerRegistry.removeAll()\n        self.onOutcome = onOutcome\n";
+        let mutated = exact.replace(sequence, &format!("{sequence}{sequence}"));
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "duplicated arm-and-reset sequence must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_comment_and_string_decoys() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: the real reset flipped to `true` while the reviewed false
+        // form survives only in a comment and a string literal fails closed.
+        let mutated = exact
+            .replace(
+                "hasForwardedCallback = false",
+                "hasForwardedCallback = true",
+            )
+            .replace(
+                "        peerRegistry.removeAll()\n",
+                "        peerRegistry.removeAll()\n        // hasForwardedCallback = false\n        let decoy = \"hasForwardedCallback = false\"\n",
+            );
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "comment and string decoys must not satisfy the arm-and-reset pin",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_start_rejects_second_direct_start() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a second direct `start` on the reviewed session class fails closed.
+        let method_start = exact
+            .find("    func start(")
+            .expect("fixture declares start");
+        let method_end = method_start
+            + exact[method_start..]
+                .find("\n    }\n")
+                .expect("fixture start method closes")
+            + "\n    }\n".len();
+        let method = &exact[method_start..method_end];
+        let mutated = format!("{}{method}{}", &exact[..method_end], &exact[method_end..]);
+        assert_swift_source_rejects_session_start(
+            path,
+            &mutated,
+            "a second direct `start` method must fail closed",
         );
     }
 

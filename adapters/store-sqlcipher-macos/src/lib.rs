@@ -574,30 +574,6 @@ mod macos {
             })
         }
 
-        /// Clears the account's broker routing subject from the binding row.
-        ///
-        /// Exactly one binding row must match the exact account, otherwise the
-        /// store is corrupt.
-        ///
-        /// # Errors
-        ///
-        /// Returns storage for an account mismatch or backend failure and
-        /// corruption when the binding row is missing or mismatched.
-        pub fn clear_broker_subject(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
-            self.checked_account(account)?;
-            self.with_connection(|connection| {
-                let changed = connection
-                    .execute(
-                        "UPDATE account_binding SET broker_subject = NULL WHERE singleton = 1 AND account_id = ?1",
-                        params![account.as_str()],
-                    )
-                    .map_err(store_error)?;
-                (changed == 1)
-                    .then_some(())
-                    .ok_or(MailboxStoreError::Corrupted)
-            })
-        }
-
         fn upsert(&self, envelopes: &[MessageEnvelope]) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
                 let transaction = connection.transaction().map_err(store_error)?;
@@ -5421,7 +5397,7 @@ mod macos {
         }
 
         #[test]
-        fn broker_subject_round_trips_reopens_and_clears() {
+        fn broker_subject_round_trips_and_survives_reopen() {
             let (database, store) = open("broker-subject-round-trip");
             store
                 .store_broker_subject(&account(), "google-subject-123")
@@ -5443,8 +5419,6 @@ mod macos {
                     .map(|subject| subject.to_string()),
                 Some("google-subject-123".to_string())
             );
-            reopened.clear_broker_subject(&account()).unwrap();
-            assert!(reopened.load_broker_subject(&account()).unwrap().is_none());
         }
 
         #[test]
@@ -5462,10 +5436,6 @@ mod macos {
             ));
             assert!(matches!(
                 store.load_broker_subject(&foreign),
-                Err(MailboxStoreError::Storage)
-            ));
-            assert!(matches!(
-                store.clear_broker_subject(&foreign),
                 Err(MailboxStoreError::Storage)
             ));
 
