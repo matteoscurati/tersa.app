@@ -778,6 +778,58 @@ final class AccountConnectionViewModel: ObservableObject {
         }
     }
 
+    /// The broker-backed fresh-consent rung: feed an access token the broker
+    /// vends for a NEWLY-consented grant straight into the broker sync. The
+    /// terminal semantics match `connectWithGrant` exactly: a `.syncFailed`
+    /// here covers pre-gate failures after a fresh consent, so it must never
+    /// land connected — not even offline, which would show the PREVIOUS
+    /// identity's cached mailbox to the newly-consenting one. A
+    /// `.needsReconnect` means the grant lapsed between consent and claim and
+    /// surfaces as `.signInExpired`, never looping back into another browser
+    /// prompt.
+    private func connectWithBrokerGrant(
+        accountIdentifier: Data,
+        brokerToken: TokenBrokerAccessToken,
+        token: ConnectionOperationToken
+    ) {
+        syncWorker.beginBrokerSync(
+            accountIdentifier: accountIdentifier,
+            token: brokerToken
+        ) { [weak self] status in
+            guard let self else {
+                return
+            }
+            guard self.operationDeadline.accepts(token) else {
+                return
+            }
+            switch status {
+            case .succeeded, .succeededRevokeUnconfirmed:
+                self.completeConnected(
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    offline: false
+                )
+            case .needsReconnect:
+                _ = self.finishOperation(token)
+                self.state = .failed(.signInExpired)
+            case .permissionRequired:
+                _ = self.finishOperation(token)
+                self.state = .failed(.permissionRequired)
+            case .cancelled:
+                _ = self.finishOperation(token)
+                self.state = .notConnected
+            case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
+                 .running:
+                // Fresh consent must NEVER land connected offline: on this
+                // rung .syncFailed covers pre-gate failures (no token stored,
+                // an UNVERIFIED id_token), so it fails closed through the
+                // same terminal mapping as `connectWithGrant`.
+                _ = self.finishOperation(token)
+                self.state = .failed(Self.terminalFailure(status))
+            }
+        }
+    }
+
     /// Restores a durable disconnect warning as soon as the one remembered,
     /// opaque local account alias is available. This reads only the bounded
     /// lifecycle projection; it never starts OAuth or a mailbox sync at launch.
