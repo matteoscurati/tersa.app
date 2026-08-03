@@ -726,6 +726,60 @@ final class AccountConnectionViewModel: ObservableObject {
         client.cancel()
     }
 
+    /// Best-effort cleanup of a broker refresh token that consent already
+    /// persisted but the main app could not safely adopt: revoke the provider
+    /// grant, then ALWAYS delete the broker-stored tokens through the same
+    /// client — the delete attempt is mandatory regardless of the revoke
+    /// result. Neither outcome changes the visible state: the operation
+    /// closes as the requested failure and never claims the cleanup
+    /// succeeded. The revoke completion deliberately captures no self so the
+    /// delete still goes out on the captured client even if the view model
+    /// disappeared in between.
+    private func cleanupFreshBrokerGrant(
+        subject: String,
+        token: ConnectionOperationToken,
+        failure: ConnectionFailure = .unavailable
+    ) {
+        guard let client = installTokenBrokerClient() else {
+            // A broker client is already active: fail closed rather than
+            // racing the cleanup against the owned one.
+            guard operationDeadline.accepts(token) else {
+                return
+            }
+            _ = finishOperation(token)
+            state = .failed(failure)
+            return
+        }
+        client.revokeProviderGrant(accountSubject: subject) { _ in
+            // The revoke result never gates the delete: the stored tokens
+            // must be removed either way, on the SAME client.
+            client.deleteStoredTokens(accountSubject: subject) { _ in
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        // The owner is gone, so no finish path can release
+                        // the client; cancel the captured instance directly,
+                        // exactly once (the completion fires at most once).
+                        client.cancel()
+                        return
+                    }
+                    // Releases the client exactly once; a stale completion
+                    // from an already-released client observes a foreign/
+                    // empty slot and must not touch the state.
+                    guard self.finishTokenBrokerClient(client) else {
+                        return
+                    }
+                    guard self.operationDeadline.accepts(token) else {
+                        return
+                    }
+                    // Delete success and failure land identically: a closed
+                    // failure, never a cleanup-success claim.
+                    _ = self.finishOperation(token)
+                    self.state = .failed(failure)
+                }
+            }
+        }
+    }
+
     /// The final rung: claim the finished OAuth grant with a connect-begin. A
     /// `.needsReconnect` here means the grant lapsed between consent and
     /// claim — the sign-in expired — so it surfaces as a failure and never
