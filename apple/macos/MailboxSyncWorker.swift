@@ -139,6 +139,21 @@ enum MailboxPollStatus {
     }
 }
 
+/// Closed result of the broker routing subject read. The subject is the
+/// account-identifying BROKER ROUTING value — never an OAuth credential and
+/// never mailbox content — and is never logged or displayed. A raw status of
+/// zero with a malformed payload (a length outside 1...255 or invalid UTF-8)
+/// is `.failure`, never `.absent`: `.absent` is reserved for the FFI's
+/// explicit no-subject-stored code (-6).
+enum BrokerSubjectReadResult: Equatable {
+    /// A stored subject was read and validated.
+    case found(String)
+    /// No subject is stored for the account (raw status -6).
+    case absent
+    /// Any other status, or a malformed success payload.
+    case failure
+}
+
 /// Serializes the mailbox connect, disconnect, and sync begins — and their
 /// ONE shared FFI poll loop — away from the AppKit main thread. One active
 /// session at a time: the UI cannot legally run two flows, and the Rust
@@ -148,12 +163,85 @@ enum MailboxPollStatus {
 /// immediately.
 final class MailboxSyncWorker: @unchecked Sendable {
     private static let pollInterval: DispatchTimeInterval = .milliseconds(100)
+    /// The FFI's `MAX_SUBJECT_BYTES`: a broker subject is 1...255 UTF-8 bytes.
+    private static let brokerSubjectCapacity = 255
 
-    /// One queued begin: a connect, a disconnect, or a plain sync.
+    /// Reference-type box holding the two broker-fed secrets of ONE queued
+    /// broker sync begin as mutable UTF-8 byte arrays. Reference semantics are
+    /// the point: a `BeginRequest.brokerSync` payload may be copied (enum
+    /// value semantics), but every copy shares this one box, so an in-place
+    /// wipe here cannot leave a copy-on-write source copy retained by the
+    /// enum. Confinement: the box is created on the caller's thread, handed to
+    /// the worker queue exactly once via `enqueueBegin`, and afterwards
+    /// touched only on that serial queue — never concurrently — hence
+    /// `@unchecked Sendable`. Neither buffer is ever printed, formatted, or
+    /// logged.
+    private final class BrokerSyncSecrets: @unchecked Sendable {
+        private var accessToken: [UInt8]
+        private var subject: [UInt8]
+        private var wiped = false
+
+        init(token: TokenBrokerAccessToken) {
+            accessToken = Array(token.accessToken.utf8)
+            subject = Array(token.subject.utf8)
+        }
+
+        /// Invokes the broker sync begin FFI once, on the worker queue, and
+        /// wipes BOTH secret buffers in a defer immediately after the call
+        /// returns — on the started path AND on every refusal — so no secret
+        /// outlives the FFI hand-off. The account identifier is not a secret
+        /// and is not wiped.
+        func begin(accountIdentifier: Data) -> (status: Int32, sessionID: UInt64) {
+            var sessionID: UInt64 = 0
+            defer { wipe() }
+            let status = accessToken.withUnsafeBufferPointer { tokenBuffer in
+                subject.withUnsafeBufferPointer { subjectBuffer in
+                    Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                        tersa_mailbox_macos_broker_sync_begin(
+                            accountBuffer.baseAddress,
+                            accountBuffer.count,
+                            tokenBuffer.baseAddress,
+                            tokenBuffer.count,
+                            subjectBuffer.baseAddress,
+                            subjectBuffer.count,
+                            &sessionID
+                        )
+                    }
+                }
+            }
+            return (status, sessionID)
+        }
+
+        /// Covers a box that was NEVER begun: a queued request rejected by the
+        /// full pending slot (or otherwise abandoned) releases the box without
+        /// a begin, and deinit guarantees its secrets do not linger in freed
+        /// memory. Idempotent against the post-FFI defer wipe via `wiped`.
+        deinit {
+            wipe()
+        }
+
+        /// In-place zeroing via `withUnsafeMutableBytes`: mutating through
+        /// subscripts could trigger copy-on-write if a buffer were ever
+        /// shared, while this mutates the box-owned storage directly.
+        private func wipe() {
+            guard !wiped else { return }
+            wiped = true
+            accessToken.withUnsafeMutableBytes { bytes in
+                bytes.initializeMemory(as: UInt8.self, repeating: 0)
+            }
+            subject.withUnsafeMutableBytes { bytes in
+                bytes.initializeMemory(as: UInt8.self, repeating: 0)
+            }
+        }
+    }
+
+    /// One queued begin: a connect, a disconnect, a plain sync, or a
+    /// broker-fed sync.
     private enum BeginRequest {
         case connect(Data, OAuthSessionID)
         case disconnect(Data)
         case sync(String, Data)
+        case brokerSync(Data, BrokerSyncSecrets)
     }
 
     private let queue = DispatchQueue(label: "app.tersa.macos.mailbox-sync", qos: .utility)
@@ -190,6 +278,20 @@ final class MailboxSyncWorker: @unchecked Sendable {
         enqueueBegin(.sync(clientID, accountIdentifier), completion: completion)
     }
 
+    /// Queues one broker-fed sync-begin. The token's access token and subject
+    /// are copied into a `BrokerSyncSecrets` box IMMEDIATELY, before any queue
+    /// hop, so the caller may release its `TokenBrokerAccessToken` at once. A
+    /// second queued request is rejected immediately; the rejected box is then
+    /// released without a begin and its deinit wipes both secrets.
+    func beginBrokerSync(
+        accountIdentifier: Data,
+        token: TokenBrokerAccessToken,
+        completion: @escaping @MainActor (MailboxPollStatus) -> Void
+    ) {
+        let secrets = BrokerSyncSecrets(token: token)
+        enqueueBegin(.brokerSync(accountIdentifier, secrets), completion: completion)
+    }
+
     /// Reads only disconnect recovery and last-successful-sync metadata on the
     /// worker queue. It never creates a mailbox store and never returns account
     /// identity, OAuth material, or mailbox content.
@@ -221,6 +323,81 @@ final class MailboxSyncWorker: @unchecked Sendable {
                 ))
             } else {
                 result = .failure
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// Persists the account's broker routing subject on the worker queue. The
+    /// subject is never logged or displayed, and its UTF-8 bytes are wiped
+    /// before the queue closure returns. The completion reports true only for
+    /// raw status 0; every refusal (internal, invalid input, unrecognized) is
+    /// false.
+    func storeBrokerSubject(
+        accountIdentifier: Data,
+        subject: String,
+        completion: @escaping @MainActor (Bool) -> Void
+    ) {
+        queue.async {
+            var subjectBytes = Array(subject.utf8)
+            let status = subjectBytes.withUnsafeMutableBufferPointer { subjectBuffer in
+                Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                    tersa_mailbox_macos_broker_subject_store(
+                        accountBuffer.baseAddress,
+                        accountBuffer.count,
+                        subjectBuffer.baseAddress,
+                        subjectBuffer.count
+                    )
+                }
+            }
+            subjectBytes.withUnsafeMutableBytes { bytes in
+                bytes.initializeMemory(as: UInt8.self, repeating: 0)
+            }
+            DispatchQueue.main.async { completion(status == 0) }
+        }
+    }
+
+    /// Reads the account's broker routing subject on the worker queue without
+    /// ever creating a mailbox store. The subject is never logged or
+    /// displayed, and the full 255-byte output buffer is wiped on every path
+    /// before the queue closure returns. Raw 0 requires a 1...255 byte valid
+    /// UTF-8 payload (`.found`, else `.failure`); raw -6 is `.absent`; every
+    /// other status is `.failure`.
+    func readBrokerSubject(
+        accountIdentifier: Data,
+        completion: @escaping @MainActor (BrokerSubjectReadResult) -> Void
+    ) {
+        queue.async {
+            var output = [UInt8](repeating: 0, count: Self.brokerSubjectCapacity)
+            // Sentinel: a raw-0 return that leaves the length unwritten fails
+            // the 1...255 window below instead of fabricating an empty subject.
+            var outputLength: Int = .max
+            let status = output.withUnsafeMutableBufferPointer { outputBuffer in
+                Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
+                    tersa_mailbox_macos_broker_subject_get(
+                        accountBuffer.baseAddress,
+                        accountBuffer.count,
+                        outputBuffer.baseAddress,
+                        outputBuffer.count,
+                        &outputLength
+                    )
+                }
+            }
+            let result: BrokerSubjectReadResult
+            if status == 0 {
+                if (1...Self.brokerSubjectCapacity).contains(outputLength),
+                   let subject = String(bytes: output.prefix(outputLength), encoding: .utf8) {
+                    result = .found(subject)
+                } else {
+                    result = .failure
+                }
+            } else if status == -6 {
+                result = .absent
+            } else {
+                result = .failure
+            }
+            output.withUnsafeMutableBytes { bytes in
+                bytes.initializeMemory(as: UInt8.self, repeating: 0)
             }
             DispatchQueue.main.async { completion(result) }
         }
@@ -294,6 +471,12 @@ final class MailboxSyncWorker: @unchecked Sendable {
                     )
                 }
             }
+        case .brokerSync(let accountIdentifier, let secrets):
+            // The box wipes both secret buffers in a defer inside `begin`,
+            // before this case returns — started or refused alike.
+            let result = secrets.begin(accountIdentifier: accountIdentifier)
+            status = result.status
+            sessionID = result.sessionID
         }
         return (status, sessionID)
     }
