@@ -281,13 +281,19 @@ final class AccountConnectionViewModel: ObservableObject {
     }
 
     /// Disconnects the connected account (consent withdrawal + local
-    /// teardown). Any in-flight OAuth is cancelled FIRST and unconditionally:
-    /// a pending grant landing within the bridge's authorization lifetime
-    /// after a successful disconnect would silently re-connect the account.
-    /// The content-free outer intent journal is durably verified before the
-    /// destructive Rust begin and cleared only after a successful terminal.
+    /// teardown). Exact stage ordering: FIRST and unconditionally cancel any
+    /// in-flight OAuth authorization and token-broker refresh — a pending
+    /// grant or refresh landing within the bridge's authorization lifetime
+    /// after a successful disconnect would silently re-connect the account;
+    /// durably mark the content-free outer intent journal BEFORE the Rust
+    /// prepare; set the Rust disconnect marker/fence; revoke the broker
+    /// grant; delete the broker-stored tokens; then purge locally and clear
+    /// the marker. A failed stage fails closed as `.disconnectIncomplete`,
+    /// leaving the outer intent and the recovery evidence in place so the
+    /// retry path re-issues the disconnect.
     func disconnect() {
         (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession.cancel()
+        cancelActiveTokenBrokerClient()
         guard let accountIdentifier = connectedAccountIdentifier, state != .disconnecting else {
             return
         }
@@ -303,43 +309,214 @@ final class AccountConnectionViewModel: ObservableObject {
         disconnectConfirmation = nil
         state = .disconnecting
         let token = beginOperation(.disconnect, timeout: Self.disconnectTimeout)
-        syncWorker.beginDisconnect(accountIdentifier: accountIdentifier) { [weak self] status in
-            guard let self else {
+        prepareBrokerDisconnect(accountIdentifier: accountIdentifier, token: token)
+    }
+
+    /// Prepares the Rust side of the broker disconnect before any broker
+    /// routing identity is resolved. The content-free outer intent was
+    /// already written by the caller; prepare sets the Rust disconnect fence
+    /// and the durable marker (and cancels any in-flight sync) BEFORE the
+    /// broker revoke, so a crash between fence and revoke can never leave a
+    /// revoked grant without a recorded teardown. An absent subject fails
+    /// closed: the operation ends as `.disconnectIncomplete` with the marker
+    /// and the outer intent kept for the retry path.
+    private func prepareBrokerDisconnect(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        syncWorker.prepareBrokerDisconnect(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, self.operationDeadline.accepts(token) else {
                 return
             }
-            guard self.operationDeadline.accepts(token) else {
-                return
-            }
-            _ = self.finishOperation(token)
-            switch status {
-            case .succeeded:
-                guard self.disconnectIntentStore.clearPending() else {
-                    self.state = .failed(.disconnectIncomplete)
-                    return
-                }
-                self.state = .notConnected
-                self.disconnectConfirmation = Self.disconnectConfirmed
-                self.connectedAccountIdentifier = nil
-                self.mailboxFreshness = .unknown
-                UserDefaults.standard.removeObject(forKey: Self.lastAccountIdentifierKey)
-            case .succeededRevokeUnconfirmed:
-                guard self.disconnectIntentStore.clearPending() else {
-                    self.state = .failed(.disconnectIncomplete)
-                    return
-                }
-                self.state = .notConnected
-                self.disconnectNotice = Self.revokeUnconfirmedNotice
-                self.connectedAccountIdentifier = nil
-            case .cancelled, .gateBlocked, .syncFailed, .internalError, .needsReconnect,
-                 .permissionRequired, .unknownSession, .unrecognized, .running:
-                // Fail closed: the fence stays set in Rust until a disconnect
-                // converges, so this failure's retry re-issues the DISCONNECT
-                // (see retryAfterFailure) rather than the connect ladder. Only
-                // one disconnect is ever in flight: `disconnect()`'s
-                // `state != .disconnecting` guard and `retryAfterFailure`'s
-                // `case .failed` guard keep the UI single-issue, so the worker's
-                // second-slot behavior is never exercised from here.
+            switch result {
+            case .busy, .failure:
+                _ = self.finishOperation(token)
                 self.state = .failed(.disconnectIncomplete)
+            case .prepared:
+                // The fence/marker are set only now: resolving the broker
+                // routing identity must come after the Rust fence and the
+                // sync cancellation.
+                self.syncWorker.readBrokerSubject(accountIdentifier: accountIdentifier) { [weak self] result in
+                    guard let self, self.operationDeadline.accepts(token) else {
+                        return
+                    }
+                    switch result {
+                    case .found(let subject):
+                        self.revokeBrokerGrantAfterPrepare(
+                            subject: subject,
+                            accountIdentifier: accountIdentifier,
+                            token: token
+                        )
+                    case .absent, .failure:
+                        // Fail closed: never call the broker and never
+                        // finalize/purge; the marker and the outer intent
+                        // stay so the retry path can re-issue the teardown.
+                        _ = self.finishOperation(token)
+                        self.state = .failed(.disconnectIncomplete)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies the broker disconnect terminal for the current operation
+    /// generation. Fail-closed: any non-success status keeps the durable
+    /// outer intent and the connected identifier so the retry path can
+    /// re-issue the teardown.
+    private func completeBrokerDisconnect(
+        status: MailboxPollStatus,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        guard operationDeadline.accepts(token) else {
+            return
+        }
+        _ = finishOperation(token)
+        switch status {
+        case .succeeded:
+            guard disconnectIntentStore.clearPending() else {
+                state = .failed(.disconnectIncomplete)
+                return
+            }
+            state = .notConnected
+            disconnectConfirmation = Self.disconnectConfirmed
+            disconnectNotice = nil
+            connectedAccountIdentifier = nil
+            mailboxFreshness = .unknown
+            UserDefaults.standard.removeObject(forKey: Self.lastAccountIdentifierKey)
+        case .succeededRevokeUnconfirmed:
+            guard disconnectIntentStore.clearPending() else {
+                state = .failed(.disconnectIncomplete)
+                return
+            }
+            state = .notConnected
+            disconnectNotice = Self.revokeUnconfirmedNotice
+            disconnectConfirmation = nil
+            connectedAccountIdentifier = nil
+            mailboxFreshness = .unknown
+            UserDefaults.standard.removeObject(forKey: Self.lastAccountIdentifierKey)
+        case .cancelled, .gateBlocked, .syncFailed, .internalError, .needsReconnect,
+             .permissionRequired, .unknownSession, .unrecognized, .running:
+            state = .failed(.disconnectIncomplete)
+        }
+    }
+
+    /// Begins the main-app purge/marker-clear tail of the broker disconnect.
+    /// Runs only after broker token deletion has completed; operation
+    /// completion is left to the poll terminal (`completeBrokerDisconnect`).
+    private func beginBrokerDisconnectFinalize(
+        accountIdentifier: Data,
+        revokeUnconfirmed: Bool,
+        token: ConnectionOperationToken
+    ) {
+        syncWorker.beginBrokerDisconnectFinalize(
+            accountIdentifier: accountIdentifier,
+            revokeUnconfirmed: revokeUnconfirmed
+        ) { [weak self] status in
+            guard let self, self.operationDeadline.accepts(token) else { return }
+            self.completeBrokerDisconnect(status: status, accountIdentifier: accountIdentifier, token: token)
+        }
+    }
+
+    /// Best-effort revoke of the provider grant for the disconnecting
+    /// account, followed by the MANDATORY delete of the broker-stored tokens:
+    /// the revoke result only feeds `revokeUnconfirmed` (success -> false,
+    /// ANY failure -> true) and never gates the delete. If the view model is
+    /// gone by the time the revoke completes, the delete still goes out on
+    /// the captured client and that client is cancelled in the delete
+    /// completion. The revoke alone never touches the visible state.
+    private func revokeBrokerGrantAfterPrepare(
+        subject: String,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        guard let client = installTokenBrokerClient() else {
+            // A broker client is already active: fail closed rather than
+            // racing a second teardown against the owned one, and leave the
+            // outer intent, the durable marker, and the connected identifier
+            // intact so the retry path can re-issue the teardown.
+            guard operationDeadline.accepts(token) else {
+                return
+            }
+            _ = finishOperation(token)
+            state = .failed(.disconnectIncomplete)
+            return
+        }
+        client.revokeProviderGrant(accountSubject: subject) { result in
+            let revokeUnconfirmed: Bool
+            switch result {
+            case .success:
+                revokeUnconfirmed = false
+            case .failure:
+                revokeUnconfirmed = true
+            }
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    // The owner is gone, so the delete/finalize chain cannot
+                    // run; still attempt the delete on the captured client and
+                    // cancel it in the delete completion, exactly once (the
+                    // completion fires at most once).
+                    client.deleteStoredTokens(accountSubject: subject) { _ in
+                        client.cancel()
+                    }
+                    return
+                }
+                // The revoke result never gates the delete: the stored tokens
+                // must be removed either way, on the SAME client.
+                self.deleteBrokerTokensAfterRevoke(
+                    client: client,
+                    subject: subject,
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    revokeUnconfirmed: revokeUnconfirmed
+                )
+            }
+        }
+    }
+
+    /// Deletes the broker-stored tokens for the disconnecting account. The
+    /// delete is mandatory and gates the local purge: only a successful
+    /// delete climbs to `beginBrokerDisconnectFinalize`, while a failure
+    /// leaves the durable marker and the outer intent intact (fail-closed
+    /// `.disconnectIncomplete`) so the retry path can re-issue the teardown.
+    private func deleteBrokerTokensAfterRevoke(
+        client: TokenBrokerClient,
+        subject: String,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken,
+        revokeUnconfirmed: Bool
+    ) {
+        client.deleteStoredTokens(accountSubject: subject) { result in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    // The owner is gone, so no finish path can release the
+                    // client; cancel the captured instance directly, exactly
+                    // once (the completion fires at most once).
+                    client.cancel()
+                    return
+                }
+                // Releases the client exactly once; a stale completion from an
+                // already-released client observes a foreign/empty slot and
+                // must not touch the state.
+                guard self.finishTokenBrokerClient(client) else {
+                    return
+                }
+                guard self.operationDeadline.accepts(token) else {
+                    return
+                }
+                switch result {
+                case .success:
+                    self.beginBrokerDisconnectFinalize(
+                        accountIdentifier: accountIdentifier,
+                        revokeUnconfirmed: revokeUnconfirmed,
+                        token: token
+                    )
+                case .failure:
+                    // Never finalize on a failed delete: the marker and the
+                    // outer intent stay so a retry re-issues the teardown.
+                    _ = self.finishOperation(token)
+                    self.state = .failed(.disconnectIncomplete)
+                }
             }
         }
     }
