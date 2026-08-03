@@ -662,6 +662,10 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     violations.extend(macos_client_xpc_wiring_violations(&macos_sources));
     let broker_sources = tracked_source_documents(Path::new("."), "apple/macos-token-broker")?;
     violations.extend(token_broker_source_surface_violations(&broker_sources));
+    violations.extend(keychain_isolation_probe_entrypoint_confinement_violations(
+        &macos_sources,
+        &broker_sources,
+    ));
     let keychain_isolation_probe_sources =
         tracked_source_documents(Path::new("."), "apple/keychain-isolation-probe")?;
     violations.extend(keychain_isolation_probe_source_surface_violations(
@@ -6803,13 +6807,31 @@ fn keychain_isolation_probe_source_surface_violations(
     sources: &[(PathBuf, String)],
 ) -> Vec<String> {
     const PROBE_PATH: &str = "apple/keychain-isolation-probe/KeychainIsolationProbe.swift";
-    const FORBIDDEN_CAPABILITIES: [&str; 5] = [
+    // The probe compiles unchanged into the TersaMacTokenBroker target, so it
+    // must honour the token-broker per-file capability policy. This is that
+    // policy with the two capabilities the probe legitimately needs removed: the
+    // single `SecItemCopyMatching` query (audited by the SecItem guard below) and
+    // the `import Security` substrate. `kSecReturnData`/`kSecReturnAttributes`
+    // are retained as the probe's evidence-redaction guard. The probe may expose
+    // no `tersa_` C ABI at all, so the reviewed prefix is `None`.
+    const PROBE_FORBIDDEN_IDENTIFIERS: [&str; 14] = [
+        "processIdentifier",
         "SecItemAdd",
         "SecItemUpdate",
         "SecItemDelete",
+        "URLSession",
+        "URLRequest",
+        "_silgen_name",
+        "refreshToken",
+        "pkceVerifier",
+        "codeVerifier",
+        "genericRPC",
+        "NSXPCListenerEndpoint",
         "kSecReturnData",
         "kSecReturnAttributes",
     ];
+    const PROBE_FORBIDDEN_SUBSTRINGS: [&str; 2] = ["@_cdecl", "NSXPCConnection("];
+    const PROBE_FORBIDDEN_PREFIXES: [&str; 1] = ["SecKeychain"];
     let mut violations = Vec::new();
     let reviewed = BTreeSet::from([PathBuf::from(PROBE_PATH)]);
     let tracked = sources
@@ -6837,13 +6859,15 @@ fn keychain_isolation_probe_source_surface_violations(
         document,
     ));
     let code = strip_swift_non_code(document);
-    for forbidden in FORBIDDEN_CAPABILITIES {
-        if contains_identifier(&code, forbidden) {
-            violations.push(format!(
-                "Keychain isolation probe `{PROBE_PATH}` must not exercise forbidden Keychain mutation or data-return capability `{forbidden}`"
-            ));
-        }
-    }
+    collect_token_broker_file_capability_violations(
+        PROBE_PATH,
+        &code,
+        &PROBE_FORBIDDEN_IDENTIFIERS,
+        &PROBE_FORBIDDEN_SUBSTRINGS,
+        &PROBE_FORBIDDEN_PREFIXES,
+        None,
+        &mut violations,
+    );
     violations.extend(keychain_isolation_probe_secitem_violations(
         &code, PROBE_PATH,
     ));
@@ -6928,6 +6952,100 @@ fn keychain_isolation_probe_required_surface_violations(
                 "Keychain isolation probe `{probe_path}` must contain exactly one executable `{key}` occurrence"
             ));
         }
+    }
+    violations
+}
+
+/// A repo-wide confinement layer over the `apple/macos` and
+/// `apple/macos-token-broker` tracked Swift inventories: the three Keychain
+/// isolation probe entrypoint symbols may appear only inside each inventory's
+/// reviewed entrypoint file (`apple/macos/AppDelegate.swift` and
+/// `apple/macos-token-broker/main.swift`) and in no other Swift source there.
+/// This is an additional layer on top of the byte-exact entrypoint-body checks;
+/// it does not replace them. The `apple/keychain-isolation-probe` target is not
+/// scanned here because it legitimately defines these symbols.
+fn keychain_isolation_probe_entrypoint_confinement_violations(
+    macos_sources: &[(PathBuf, String)],
+    broker_sources: &[(PathBuf, String)],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    violations.extend(keychain_isolation_probe_entrypoint_inventory_violations(
+        macos_sources,
+        "apple/macos/AppDelegate.swift",
+    ));
+    violations.extend(keychain_isolation_probe_entrypoint_inventory_violations(
+        broker_sources,
+        "apple/macos-token-broker/main.swift",
+    ));
+    violations
+}
+
+/// Confines the three Keychain isolation probe entrypoint symbols
+/// (`KeychainIsolationProbe`, `isProbeRequest`, `runAsPrincipal`) to exactly the
+/// reviewed entrypoint file of one tracked Swift inventory. After
+/// `strip_swift_non_code`, the entrypoint must hold the reviewed 2/1/1 shape
+/// (two `KeychainIsolationProbe`, one `isProbeRequest`, one `runAsPrincipal`)
+/// and every other Swift file in the inventory must reference none of the three.
+/// A missing or duplicated entrypoint, a non-UTF-8 tracked path, or any stray
+/// reference fails closed. Counts run over stripped executable code, so comments
+/// and ordinary string literals stay inert.
+fn keychain_isolation_probe_entrypoint_inventory_violations(
+    sources: &[(PathBuf, String)],
+    entrypoint: &str,
+) -> Vec<String> {
+    const CONFINE: &str = "Keychain isolation probe entrypoint confinement";
+    const NAMES: [(&str, usize); 3] = [
+        ("KeychainIsolationProbe", 2),
+        ("isProbeRequest", 1),
+        ("runAsPrincipal", 1),
+    ];
+    let mut violations = Vec::new();
+    let mut entrypoint_documents = 0usize;
+    for (path, document) in sources {
+        let Some(path_str) = path.to_str() else {
+            violations.push(format!(
+                "{CONFINE}: a tracked source path is not valid UTF-8"
+            ));
+            continue;
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
+            continue;
+        }
+        let code = strip_swift_non_code(document);
+        if path_str == entrypoint {
+            entrypoint_documents += 1;
+            if NAMES
+                .iter()
+                .any(|(name, expected)| identifier_occurrence_count(&code, name) != *expected)
+            {
+                violations.push(format!(
+                    "{CONFINE}: `{entrypoint}` must contain exactly two \
+                     `KeychainIsolationProbe`, one `isProbeRequest`, and one \
+                     `runAsPrincipal` executable occurrences"
+                ));
+            }
+        } else {
+            let stray = NAMES
+                .iter()
+                .filter(|(name, _)| identifier_occurrence_count(&code, name) != 0)
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<Vec<_>>()
+                .join("`, `");
+            if !stray.is_empty() {
+                violations.push(format!(
+                    "{CONFINE}: `{path_str}` must not reference probe symbol(s) `{stray}`"
+                ));
+            }
+        }
+    }
+    match entrypoint_documents {
+        0 => violations.push(format!(
+            "{CONFINE}: entrypoint `{entrypoint}` is missing from its tracked inventory"
+        )),
+        1 => {}
+        _ => violations.push(format!(
+            "{CONFINE}: entrypoint `{entrypoint}` is duplicated in its tracked inventory"
+        )),
     }
     violations
 }
@@ -7073,7 +7191,7 @@ fn scan_token_broker_source_files(
             &FORBIDDEN_IDENTIFIERS,
             &FORBIDDEN_SUBSTRINGS,
             &FORBIDDEN_PREFIXES,
-            REVIEWED_C_ABI_PREFIX,
+            Some(REVIEWED_C_ABI_PREFIX),
             violations,
         );
     }
@@ -7090,7 +7208,7 @@ fn collect_token_broker_file_capability_violations(
     forbidden_identifiers: &[&str],
     forbidden_substrings: &[&str],
     forbidden_prefixes: &[&str],
-    reviewed_c_abi_prefix: &str,
+    reviewed_c_abi_prefix: Option<&str>,
     violations: &mut Vec<String>,
 ) {
     for forbidden in forbidden_identifiers {
@@ -7114,12 +7232,13 @@ fn collect_token_broker_file_capability_violations(
             ));
         }
     }
-    // Allow only the reviewed token-broker C ABI prefix; every other `tersa_`
-    // symbol stays out of the XPC service sources.
+    // Allow only an optional reviewed token-broker C ABI prefix; every other
+    // `tersa_` symbol stays out of the XPC service sources. `None` means the file
+    // may expose no `tersa_` C ABI at all (used by the shared isolation probe).
     if code.match_indices("tersa_").any(|(index, _)| {
         let before = code[..index].bytes().next_back();
         let boundary_ok = before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_');
-        boundary_ok && !code[index..].starts_with(reviewed_c_abi_prefix)
+        boundary_ok && reviewed_c_abi_prefix.is_none_or(|prefix| !code[index..].starts_with(prefix))
     }) {
         violations.push(format!(
             "{path_str} must not exercise forbidden broker capability `tersa_` outside the reviewed token-broker C ABI"
@@ -18063,6 +18182,46 @@ mod keychain_isolation_probe_tests {
     }
 
     #[test]
+    fn probe_rejects_each_newly_banned_broker_capability_as_executable_code() {
+        // The probe compiles into the token-broker target, so it inherits the
+        // token-broker per-file capability policy minus the two capabilities it
+        // legitimately needs. Each row injects one newly banned capability as
+        // executable code; the `fragment` pins the asserted violation to the
+        // injected surface. Both legacy SecKeychain examples and both a
+        // token-broker and a non-token-broker `tersa_` symbol are covered.
+        let reviewed = reviewed_document();
+        let mutations = [
+            ("processIdentifier", "let _ = processIdentifier"),
+            ("URLSession", "let _ = URLSession"),
+            ("URLRequest", "let _ = URLRequest"),
+            ("refreshToken", "let _ = refreshToken"),
+            ("pkceVerifier", "let _ = pkceVerifier"),
+            ("codeVerifier", "let _ = codeVerifier"),
+            ("genericRPC", "let _ = genericRPC"),
+            ("NSXPCListenerEndpoint", "let _ = NSXPCListenerEndpoint"),
+            ("_silgen_name", "let _ = _silgen_name"),
+            ("@_cdecl", "@_cdecl(\"x\")"),
+            ("NSXPCConnection", "let _ = NSXPCConnection()"),
+            ("SecKeychain", "let _ = SecKeychainAddGenericPassword"),
+            ("SecKeychain", "let _ = SecKeychainItemDelete"),
+            ("tersa_", "let _ = tersa_token_broker_leak"),
+            ("tersa_", "let _ = tersa_mailbox_sync_leak"),
+        ];
+        for (fragment, injection) in mutations {
+            let mutated = reviewed.replacen(
+                "import Foundation",
+                &format!("{injection}\nimport Foundation"),
+                1,
+            );
+            assert_ne!(
+                mutated, reviewed,
+                "mutation injecting `{injection}` must alter fixture"
+            );
+            expect(&surface_doc(&mutated), fragment);
+        }
+    }
+
+    #[test]
     fn probe_rejects_a_second_secitemcopymatching_call() {
         let reviewed = reviewed_document();
         let mutated = reviewed.replacen(
@@ -18139,7 +18298,13 @@ mod keychain_isolation_probe_tests {
         let mutated = reviewed.replacen(
             "import Foundation",
             "// inert refs: SecItemAdd SecItemDelete kSecReturnData dlopen unsafeBitCast\n\
-             let inertNote = \"SecItemAdd kSecReturnData dlopen\"\nimport Foundation",
+             // inert broker refs: processIdentifier URLSession URLRequest refreshToken\n\
+             // inert broker refs: pkceVerifier codeVerifier genericRPC NSXPCListenerEndpoint\n\
+             // inert broker refs: NSXPCConnection @_cdecl _silgen_name\n\
+             // inert broker refs: SecKeychainAddGenericPassword SecKeychainItemDelete\n\
+             // inert broker refs: tersa_token_broker_leak tersa_mailbox_sync_leak\n\
+             let inertNote = \"SecItemAdd kSecReturnData dlopen tersa_token_broker_leak\"\n\
+             import Foundation",
             1,
         );
         assert_ne!(mutated, reviewed, "inert injection must alter fixture");
@@ -18163,5 +18328,234 @@ mod keychain_isolation_probe_tests {
             "executable dlopen mutation must alter fixture"
         );
         expect(&surface_doc(&mutated), "dlopen");
+    }
+}
+
+#[cfg(test)]
+mod keychain_isolation_probe_entrypoint_confinement_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::keychain_isolation_probe_entrypoint_confinement_violations;
+
+    const APP_DELEGATE_PATH: &str = "apple/macos/AppDelegate.swift";
+    const BROKER_MAIN_PATH: &str = "apple/macos-token-broker/main.swift";
+    const MACOS_SIBLING: &str = "apple/macos/Inert.swift";
+    const BROKER_SIBLING: &str = "apple/macos-token-broker/Inert.swift";
+    const INERT: &str = "struct Inert {}";
+
+    fn reviewed_macos_inventory() -> Vec<(PathBuf, String)> {
+        vec![
+            (
+                PathBuf::from(APP_DELEGATE_PATH),
+                include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
+            ),
+            (PathBuf::from(MACOS_SIBLING), INERT.to_owned()),
+        ]
+    }
+
+    fn reviewed_broker_inventory() -> Vec<(PathBuf, String)> {
+        vec![
+            (
+                PathBuf::from(BROKER_MAIN_PATH),
+                include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
+            ),
+            (PathBuf::from(BROKER_SIBLING), INERT.to_owned()),
+        ]
+    }
+
+    fn confinement(
+        macos_sources: &[(PathBuf, String)],
+        broker_sources: &[(PathBuf, String)],
+    ) -> Vec<String> {
+        keychain_isolation_probe_entrypoint_confinement_violations(macos_sources, broker_sources)
+    }
+
+    fn document_mut<'a>(sources: &'a mut [(PathBuf, String)], path: &str) -> &'a mut String {
+        let index = sources
+            .iter()
+            .position(|(candidate, _)| candidate == Path::new(path))
+            .expect("reviewed source must be present in the inventory");
+        &mut sources[index].1
+    }
+
+    fn expect(violations: &[String], fragment: &str) {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fragment)),
+            "expected a violation containing `{fragment}`, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn confinement_accepts_the_real_reviewed_entrypoints_with_inert_siblings() {
+        let violations = confinement(&reviewed_macos_inventory(), &reviewed_broker_inventory());
+        assert!(
+            violations.is_empty(),
+            "reviewed entrypoints with inert siblings must pass: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn confinement_rejects_a_stray_probe_call_in_a_non_entrypoint_macos_file() {
+        let mut macos = reviewed_macos_inventory();
+        let previous = document_mut(&mut macos, MACOS_SIBLING).clone();
+        let stray =
+            "struct Inert { let x = KeychainIsolationProbe.runAsPrincipal(.mainApp) }".to_owned();
+        assert_ne!(
+            stray, previous,
+            "stray macos probe injection must alter the sibling"
+        );
+        *document_mut(&mut macos, MACOS_SIBLING) = stray;
+        expect(
+            &confinement(&macos, &reviewed_broker_inventory()),
+            MACOS_SIBLING,
+        );
+    }
+
+    #[test]
+    fn confinement_rejects_a_stray_probe_call_in_a_non_entrypoint_broker_file() {
+        let mut broker = reviewed_broker_inventory();
+        let previous = document_mut(&mut broker, BROKER_SIBLING).clone();
+        let stray = "struct Inert { let x = KeychainIsolationProbe.runAsPrincipal(.tokenBroker) }"
+            .to_owned();
+        assert_ne!(
+            stray, previous,
+            "stray broker probe injection must alter the sibling"
+        );
+        *document_mut(&mut broker, BROKER_SIBLING) = stray;
+        expect(
+            &confinement(&reviewed_macos_inventory(), &broker),
+            BROKER_SIBLING,
+        );
+    }
+
+    #[test]
+    fn confinement_fail_closed_for_missing_and_duplicate_entrypoints() {
+        let mut missing_macos = reviewed_macos_inventory();
+        missing_macos.retain(|(path, _)| path != Path::new(APP_DELEGATE_PATH));
+        assert_ne!(
+            missing_macos,
+            reviewed_macos_inventory(),
+            "missing-macos mutation must alter the inventory"
+        );
+        expect(
+            &confinement(&missing_macos, &reviewed_broker_inventory()),
+            "missing",
+        );
+
+        let mut missing_broker = reviewed_broker_inventory();
+        missing_broker.retain(|(path, _)| path != Path::new(BROKER_MAIN_PATH));
+        assert_ne!(
+            missing_broker,
+            reviewed_broker_inventory(),
+            "missing-broker mutation must alter the inventory"
+        );
+        expect(
+            &confinement(&reviewed_macos_inventory(), &missing_broker),
+            "missing",
+        );
+
+        let mut duplicate_macos = reviewed_macos_inventory();
+        duplicate_macos.push((
+            PathBuf::from(APP_DELEGATE_PATH),
+            include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
+        ));
+        assert_ne!(
+            duplicate_macos,
+            reviewed_macos_inventory(),
+            "duplicate-macos mutation must alter the inventory"
+        );
+        expect(
+            &confinement(&duplicate_macos, &reviewed_broker_inventory()),
+            "duplicated",
+        );
+
+        let mut duplicate_broker = reviewed_broker_inventory();
+        duplicate_broker.push((
+            PathBuf::from(BROKER_MAIN_PATH),
+            include_str!("../../apple/macos-token-broker/main.swift").to_owned(),
+        ));
+        assert_ne!(
+            duplicate_broker,
+            reviewed_broker_inventory(),
+            "duplicate-broker mutation must alter the inventory"
+        );
+        expect(
+            &confinement(&reviewed_macos_inventory(), &duplicate_broker),
+            "duplicated",
+        );
+    }
+
+    #[test]
+    fn confinement_fail_closed_for_extra_and_misshapen_references() {
+        for injection in [
+            "struct Inert { let probe = KeychainIsolationProbe.self }",
+            "struct Inert { let probe = isProbeRequest }",
+        ] {
+            let mut macos = reviewed_macos_inventory();
+            let previous = document_mut(&mut macos, MACOS_SIBLING).clone();
+            let injected = injection.to_owned();
+            assert_ne!(
+                injected, previous,
+                "macos extra reference injection `{injection}` must alter the sibling"
+            );
+            *document_mut(&mut macos, MACOS_SIBLING) = injected;
+            expect(
+                &confinement(&macos, &reviewed_broker_inventory()),
+                MACOS_SIBLING,
+            );
+        }
+
+        let mut broker = reviewed_broker_inventory();
+        let previous = document_mut(&mut broker, BROKER_SIBLING).clone();
+        let injected = "struct Inert { let probe = runAsPrincipal }".to_owned();
+        assert_ne!(
+            injected, previous,
+            "broker extra reference injection must alter the sibling"
+        );
+        *document_mut(&mut broker, BROKER_SIBLING) = injected;
+        expect(
+            &confinement(&reviewed_macos_inventory(), &broker),
+            BROKER_SIBLING,
+        );
+
+        let mut macos = reviewed_macos_inventory();
+        let original = document_mut(&mut macos, APP_DELEGATE_PATH).clone();
+        document_mut(&mut macos, APP_DELEGATE_PATH)
+            .push_str("\nlet _misshapen = KeychainIsolationProbe.self\n");
+        assert_ne!(
+            *document_mut(&mut macos, APP_DELEGATE_PATH),
+            original,
+            "misshapen entrypoint mutation must alter AppDelegate"
+        );
+        expect(
+            &confinement(&macos, &reviewed_broker_inventory()),
+            "must contain exactly two",
+        );
+    }
+
+    #[test]
+    fn confinement_keeps_probe_decoys_inert_in_non_entrypoint_files() {
+        let decoy = "struct Decoy {\n    // inert: KeychainIsolationProbe isProbeRequest runAsPrincipal\n    /* inert: KeychainIsolationProbe.runAsPrincipal(.mainApp) */\n    let note = \"KeychainIsolationProbe isProbeRequest runAsPrincipal\"\n}\n";
+        let mut macos = reviewed_macos_inventory();
+        let previous = document_mut(&mut macos, MACOS_SIBLING).clone();
+        assert_ne!(
+            decoy, previous,
+            "macos decoy injection must alter the sibling"
+        );
+        *document_mut(&mut macos, MACOS_SIBLING) = decoy.to_owned();
+        let mut broker = reviewed_broker_inventory();
+        let previous = document_mut(&mut broker, BROKER_SIBLING).clone();
+        assert_ne!(
+            decoy, previous,
+            "broker decoy injection must alter the sibling"
+        );
+        *document_mut(&mut broker, BROKER_SIBLING) = decoy.to_owned();
+        let violations = confinement(&macos, &broker);
+        assert!(
+            violations.is_empty(),
+            "comment/string decoys must stay inert: {violations:?}"
+        );
     }
 }
