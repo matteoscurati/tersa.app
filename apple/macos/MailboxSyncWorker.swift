@@ -4,7 +4,8 @@
 
 import Foundation
 
-/// The `tersa_mailbox_macos_{sync,connect,disconnect}_begin` return domain.
+/// The `tersa_mailbox_macos_broker_sync_begin` and
+/// `tersa_mailbox_macos_broker_disconnect_finalize` return domain.
 /// Raw values mirror `adapters/mailbox-sync-ffi-macos/src/lib.rs`
 /// (`STATUS_STARTED`, `STATUS_SYNC_BUSY`, `STATUS_INTERNAL`,
 /// `STATUS_INVALID_INPUT`).
@@ -64,7 +65,7 @@ enum MailboxBeginStatus {
 }
 
 /// The `tersa_mailbox_macos_sync_poll` terminal domain; the SAME poll serves
-/// sync, connect, AND disconnect sessions. Raw values mirror
+/// broker sync AND broker disconnect finalize sessions. Raw values mirror
 /// `adapters/oauth-sync-macos/src/worker.rs` plus the FFI's own
 /// `STATUS_UNKNOWN_SESSION` (-8).
 enum MailboxPollStatus {
@@ -75,7 +76,7 @@ enum MailboxPollStatus {
     /// The disconnect teardown completed locally but the provider /revoke
     /// could not be confirmed. A SUCCESS — the success family sibling of
     /// `.succeeded`, not a failure — and only ever reported by a DISCONNECT
-    /// poll: a sync or connect poll never reports it.
+    /// poll: a sync poll never reports it.
     case succeededRevokeUnconfirmed
     /// A disconnect dropped the in-flight sync.
     case cancelled
@@ -169,8 +170,8 @@ enum BrokerDisconnectPrepareResult: Equatable {
     case failure
 }
 
-/// Serializes the mailbox connect, disconnect, and sync begins — and their
-/// ONE shared FFI poll loop — away from the AppKit main thread. One active
+/// Serializes the mailbox broker sync and broker disconnect finalize begins
+/// — and their ONE shared FFI poll loop — away from the AppKit main thread. One active
 /// session at a time: the UI cannot legally run two flows, and the Rust
 /// whole-cycle permit and disconnect fence backstop that. The concurrency
 /// guard mirrors the bootstrap worker exactly: an `NSLock`-guarded
@@ -250,12 +251,8 @@ final class MailboxSyncWorker: @unchecked Sendable {
         }
     }
 
-    /// One queued begin: a connect, a disconnect, a plain sync, a
-    /// broker-fed sync, or a broker disconnect finalize.
+    /// One queued begin: a broker-fed sync or a broker disconnect finalize.
     private enum BeginRequest {
-        case connect(Data, OAuthSessionID)
-        case disconnect(Data)
-        case sync(String, Data)
         case brokerSync(Data, BrokerSyncSecrets)
         case brokerDisconnectFinalize(Data, Bool)
     }
@@ -264,35 +261,6 @@ final class MailboxSyncWorker: @unchecked Sendable {
     private let state = NSLock()
     private var running = false
     private var pending: (() -> Void)?
-
-    /// Queues one connect-begin for a finished OAuth session. A second queued
-    /// request is rejected immediately.
-    func beginConnect(
-        accountIdentifier: Data,
-        oauthSession: OAuthSessionID,
-        completion: @escaping @MainActor (MailboxPollStatus) -> Void
-    ) {
-        enqueueBegin(.connect(accountIdentifier, oauthSession), completion: completion)
-    }
-
-    /// Queues one disconnect-begin (consent withdrawal + local teardown). A
-    /// second queued request is rejected immediately.
-    func beginDisconnect(
-        accountIdentifier: Data,
-        completion: @escaping @MainActor (MailboxPollStatus) -> Void
-    ) {
-        enqueueBegin(.disconnect(accountIdentifier), completion: completion)
-    }
-
-    /// Queues one bounded sync-begin. A second queued request is rejected
-    /// immediately.
-    func beginSync(
-        clientID: String,
-        accountIdentifier: Data,
-        completion: @escaping @MainActor (MailboxPollStatus) -> Void
-    ) {
-        enqueueBegin(.sync(clientID, accountIdentifier), completion: completion)
-    }
 
     /// Queues one broker-fed sync-begin. The token's access token and subject
     /// are copied into a `BrokerSyncSecrets` box IMMEDIATELY, before any queue
@@ -498,36 +466,6 @@ final class MailboxSyncWorker: @unchecked Sendable {
         var sessionID: UInt64 = 0
         let status: Int32
         switch request {
-        case .connect(let accountIdentifier, let oauthSession):
-            status = Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
-                tersa_mailbox_macos_connect_begin(
-                    accountBuffer.baseAddress,
-                    accountBuffer.count,
-                    oauthSession.rawValue,
-                    &sessionID
-                )
-            }
-        case .disconnect(let accountIdentifier):
-            status = Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
-                tersa_mailbox_macos_disconnect_begin(
-                    accountBuffer.baseAddress,
-                    accountBuffer.count,
-                    &sessionID
-                )
-            }
-        case .sync(let clientID, let accountIdentifier):
-            let clientIDBytes = Array(clientID.utf8)
-            status = clientIDBytes.withUnsafeBufferPointer { clientBuffer in
-                Array(accountIdentifier).withUnsafeBufferPointer { accountBuffer in
-                    tersa_mailbox_macos_sync_begin(
-                        clientBuffer.baseAddress,
-                        clientBuffer.count,
-                        accountBuffer.baseAddress,
-                        accountBuffer.count,
-                        &sessionID
-                    )
-                }
-            }
         case .brokerSync(let accountIdentifier, let secrets):
             // The box wipes both secret buffers in a defer inside `begin`,
             // before this case returns — started or refused alike.

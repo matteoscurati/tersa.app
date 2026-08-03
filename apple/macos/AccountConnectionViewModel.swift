@@ -102,23 +102,6 @@ final class AccountConnectionViewModel: ObservableObject {
         )
     }
 
-    /// The OAuth client id handed to the sync and connect begins: the SAME
-    /// `TersaOAuthClientID` Info.plist key `OAuthAuthorizationSession` reads,
-    /// so the client_id↔grant pairing holds by construction. `connect()` applies
-    /// the SAME empty/`UNCONFIGURED` pre-flight `start()` does, so a bad id fails
-    /// fast with the configuration message rather than surfacing downstream as a
-    /// misleading "unavailable".
-    private static var oauthClientID: String {
-        Bundle.main.object(forInfoDictionaryKey: "TersaOAuthClientID") as? String ?? ""
-    }
-
-    /// Mirrors `OAuthAuthorizationSession.start()`'s pre-flight: an empty or
-    /// still-`UNCONFIGURED` client id cannot drive the sync/connect begins.
-    private static var oauthClientIDIsUsable: Bool {
-        let id = oauthClientID
-        return !id.isEmpty && id.range(of: "UNCONFIGURED", options: .caseInsensitive) == nil
-    }
-
     var isConnectDisabled: Bool {
         accountIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -763,96 +746,6 @@ final class AccountConnectionViewModel: ObservableObject {
         state = .authorizing
     }
 
-    /// Returns focus from the browser before the connect worker touches the
-    /// `WhenUnlockedThisDeviceOnly` refresh-token item. Registering the
-    /// activation observer before `activate()` closes the synchronous-notice
-    /// race; the post-activate `isActive` check closes the opposite race.
-    private func connectAfterApplicationActivation(
-        accountIdentifier: Data,
-        oauthSession: OAuthSessionID,
-        token: ConnectionOperationToken
-    ) {
-        guard operationDeadline.accepts(token), !activationPending else {
-            _ = tersa_oauth_cancel(oauthSession.rawValue)
-            if operationDeadline.accepts(token) {
-                _ = finishOperation(token)
-                state = .failed(.unavailable)
-            }
-            return
-        }
-        activationPending = true
-
-        if NSApp.isActive {
-            finishApplicationActivation(
-                accountIdentifier: accountIdentifier,
-                oauthSession: oauthSession,
-                token: token
-            )
-            return
-        }
-
-        activationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: NSApp,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.finishApplicationActivation(
-                    accountIdentifier: accountIdentifier,
-                    oauthSession: oauthSession,
-                    token: token
-                )
-            }
-        }
-        activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.activationPending else {
-                    return
-                }
-                self.clearApplicationActivation()
-                guard self.operationDeadline.accepts(token) else {
-                    _ = tersa_oauth_cancel(oauthSession.rawValue)
-                    return
-                }
-                _ = tersa_oauth_cancel(oauthSession.rawValue)
-                _ = self.finishOperation(token)
-                self.state = .failed(.unavailable)
-            }
-        }
-        NSApp.activate()
-        if NSApp.isActive {
-            finishApplicationActivation(
-                accountIdentifier: accountIdentifier,
-                oauthSession: oauthSession,
-                token: token
-            )
-        }
-    }
-
-    /// Delivers the finished grant exactly once after AppKit confirms Tersa is
-    /// foreground-active. Clearing observer/timer state before the worker begins
-    /// makes a duplicate activation notification harmless.
-    private func finishApplicationActivation(
-        accountIdentifier: Data,
-        oauthSession: OAuthSessionID,
-        token: ConnectionOperationToken
-    ) {
-        guard activationPending else {
-            return
-        }
-        guard operationDeadline.accepts(token) else {
-            clearApplicationActivation()
-            _ = tersa_oauth_cancel(oauthSession.rawValue)
-            return
-        }
-        clearApplicationActivation()
-        guard state == .connecting else {
-            _ = tersa_oauth_cancel(oauthSession.rawValue)
-            return
-        }
-        connectWithGrant(accountIdentifier: accountIdentifier, oauthSession: oauthSession, token: token)
-    }
-
     private func clearApplicationActivation() {
         activationPending = false
         if let activationObserver {
@@ -863,16 +756,15 @@ final class AccountConnectionViewModel: ObservableObject {
         activationTimeout = nil
     }
 
-    /// The broker-grant twin of `connectAfterApplicationActivation`: after
-    /// browser consent, Tersa must be foreground-active before
+    /// After browser consent, Tersa must be foreground-active before
     /// `storeBrokerSubject` opens the root/store Keychain/SQLCipher state —
-    /// the same `WhenUnlockedThisDeviceOnly` interaction constraint the
-    /// legacy grant claim sequences around. The observer-before-`activate()`
-    /// ordering and the post-activate `isActive` check mirror the legacy
-    /// sequencing and close the same two races on the SAME shared
-    /// activationPending/observer/timer state. Every failure path here
-    /// cleans up through `cleanupFreshBrokerGrant` — the legacy OAuth FFI is
-    /// never touched on this rung.
+    /// a `WhenUnlockedThisDeviceOnly` Keychain operation can fail with
+    /// `errSecInteractionNotAllowed` while the browser is still the foreground
+    /// app. Registering the activation observer before `activate()` closes the
+    /// synchronous-notice race, and the post-activate `isActive` check closes
+    /// the opposite race; both sequence on the shared
+    /// activationPending/observer/timer state. Every failure path here cleans
+    /// up through `cleanupFreshBrokerGrant`.
     private func connectBrokerGrantAfterApplicationActivation(
         accountIdentifier: Data,
         brokerToken: TokenBrokerAccessToken,
@@ -1072,64 +964,11 @@ final class AccountConnectionViewModel: ObservableObject {
         }
     }
 
-    /// The final rung: claim the finished OAuth grant with a connect-begin. A
-    /// `.needsReconnect` here means the grant lapsed between consent and
-    /// claim — the sign-in expired — so it surfaces as a failure and never
-    /// loops back into another browser prompt.
-    private func connectWithGrant(
-        accountIdentifier: Data,
-        oauthSession: OAuthSessionID,
-        token: ConnectionOperationToken
-    ) {
-        syncWorker.beginConnect(
-            accountIdentifier: accountIdentifier,
-            oauthSession: oauthSession
-        ) { [weak self] status in
-            guard let self else {
-                return
-            }
-            guard self.operationDeadline.accepts(token) else {
-                return
-            }
-            switch status {
-            case .succeeded, .succeededRevokeUnconfirmed:
-                self.completeConnected(
-                    accountIdentifier: accountIdentifier,
-                    token: token,
-                    offline: false
-                )
-            case .needsReconnect:
-                _ = self.finishOperation(token)
-                self.state = .failed(.signInExpired)
-            case .permissionRequired:
-                _ = self.finishOperation(token)
-                self.state = .failed(.permissionRequired)
-            case .cancelled:
-                _ = self.finishOperation(token)
-                self.state = .notConnected
-            case .gateBlocked, .syncFailed, .internalError, .unknownSession, .unrecognized,
-                 .running:
-                // On the CONNECT rung, .syncFailed must NOT land connected: after
-                // a fresh browser consent, SYNC_FAILED covers pre-gate failures
-                // (a bad exchange, an UNVERIFIED id_token, no token stored) where
-                // the gate never ran — landing connected would show the PREVIOUS
-                // identity's cached mailbox to the newly-consenting one, defeating
-                // the identity gate at the account-handoff moment. Recovery is
-                // one tap: retry() -> the stored-credential rung, which is where a
-                // genuinely-stored token gets the gate. (The offline regression is
-                // fully fixed on that rung; this rung is unreachable offline.)
-                _ = self.finishOperation(token)
-                self.state = .failed(Self.terminalFailure(status))
-            }
-        }
-    }
-
     /// The broker-backed fresh-consent rung: feed an access token the broker
-    /// vends for a NEWLY-consented grant straight into the broker sync. The
-    /// terminal semantics match `connectWithGrant` exactly: a `.syncFailed`
-    /// here covers pre-gate failures after a fresh consent, so it must never
-    /// land connected — not even offline, which would show the PREVIOUS
-    /// identity's cached mailbox to the newly-consenting one. A
+    /// vends for a NEWLY-consented grant straight into the broker sync. A
+    /// `.syncFailed` here covers pre-gate failures after a fresh consent, so
+    /// it must never land connected — not even offline, which would show the
+    /// PREVIOUS identity's cached mailbox to the newly-consenting one. A
     /// `.needsReconnect` means the grant lapsed between consent and claim and
     /// surfaces as `.signInExpired`, never looping back into another browser
     /// prompt.
@@ -1169,7 +1008,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 // Fresh consent must NEVER land connected offline: on this
                 // rung .syncFailed covers pre-gate failures (no token stored,
                 // an UNVERIFIED id_token), so it fails closed through the
-                // same terminal mapping as `connectWithGrant`.
+                // terminal failure mapping.
                 _ = self.finishOperation(token)
                 self.state = .failed(Self.terminalFailure(status))
             }
