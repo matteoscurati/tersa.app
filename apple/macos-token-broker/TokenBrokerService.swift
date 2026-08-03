@@ -32,7 +32,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
 
     func beginAuthorizationSession(
         redirectURI: String,
-        withReply reply: @escaping (String?, String?, Int) -> Void
+        withReply reply: @escaping @Sendable (String?, String?, Int) -> Void
     ) {
         let redirectBytes = Array(redirectURI.utf8)
         guard !redirectBytes.isEmpty,
@@ -79,7 +79,13 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
                   sessionHandleLength > 0,
                   sessionHandleLength <= sessionHandleBytes.count
             else {
-                reply(nil, nil, Int(status))
+                // FFI success with an invalid payload shape is not success on
+                // the wire; preserve every non-success FFI status as-is.
+                let wireStatus =
+                    status == TersaTokenBrokerStatusV1.success.rawValue
+                    ? TersaTokenBrokerStatusV1.malformedResponse.rawValue
+                    : Int(status)
+                reply(nil, nil, wireStatus)
                 return
             }
 
@@ -98,7 +104,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
     func completeAuthorizationSession(
         sessionHandle: String,
         callbackURL: String,
-        withReply reply: @escaping (String?, String?, Int, Int) -> Void
+        withReply reply: @escaping @Sendable (String?, String?, Int, Int) -> Void
     ) {
         let handleBytes = Array(sessionHandle.utf8)
         let callbackBytes = Array(callbackURL.utf8)
@@ -121,7 +127,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
 
     func refreshAccessToken(
         accountSubject: String,
-        withReply reply: @escaping (String?, String?, Int, Int) -> Void
+        withReply reply: @escaping @Sendable (String?, String?, Int, Int) -> Void
     ) {
         let subjectBytes = Array(accountSubject.utf8)
         guard !subjectBytes.isEmpty,
@@ -141,7 +147,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
 
     func revokeProviderGrant(
         accountSubject: String,
-        withReply reply: @escaping (Int) -> Void
+        withReply reply: @escaping @Sendable (Int) -> Void
     ) {
         let subjectBytes = Array(accountSubject.utf8)
         guard !subjectBytes.isEmpty,
@@ -160,7 +166,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
 
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (Int) -> Void
+        withReply reply: @escaping @Sendable (Int) -> Void
     ) {
         let subjectBytes = Array(accountSubject.utf8)
         guard !subjectBytes.isEmpty,
@@ -181,7 +187,7 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
         subjectOrHandle: [UInt8],
         secondary: [UInt8],
         isComplete: Bool,
-        reply: @escaping (String?, String?, Int, Int) -> Void
+        reply: @escaping @Sendable (String?, String?, Int, Int) -> Void
     ) {
         Self.workQueue.async {
             var accessTokenBytes = [UInt8](repeating: 0, count: Self.maxAccessTokenBytes)
@@ -241,7 +247,13 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
                   expiresInSeconds > 0,
                   expiresInSeconds <= 86_400
             else {
-                reply(nil, nil, 0, Int(status))
+                // FFI success with an invalid payload shape is not success on
+                // the wire; preserve every non-success FFI status as-is.
+                let wireStatus =
+                    status == TersaTokenBrokerStatusV1.success.rawValue
+                    ? TersaTokenBrokerStatusV1.malformedResponse.rawValue
+                    : Int(status)
+                reply(nil, nil, 0, wireStatus)
                 return
             }
 

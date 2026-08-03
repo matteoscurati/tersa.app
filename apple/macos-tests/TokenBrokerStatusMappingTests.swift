@@ -290,6 +290,139 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
         XCTAssertNil(TokenBrokerAuthorizationSession.callbackURL(from: oversized))
     }
 
+    func testSegmentedLoopbackReceiveAccumulatesUntilHeadersComplete() {
+        var buffer = Data()
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+                buffer: &buffer,
+                chunk: Data("GET /?code=redacted HTTP/1.1\r\n".utf8),
+                isComplete: false,
+                hadError: false
+            ),
+            .needMore
+        )
+        XCTAssertFalse(TokenBrokerAuthorizationSession.requestHeadersAreComplete(buffer))
+        let second = TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+            buffer: &buffer,
+            chunk: Data("Host: 127.0.0.1:54321\r\n\r\n".utf8),
+            isComplete: false,
+            hadError: false
+        )
+        guard case .ready(let request) = second else {
+            XCTFail("segmented receive must become ready after CRLFCRLF")
+            return
+        }
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.callbackURL(from: request),
+            "http://127.0.0.1:54321/?code=redacted"
+        )
+    }
+
+    func testStrayLoopbackConnectionsRejectWithoutSessionCompletionSignal() {
+        // Empty peer close, partial headers, transport error, and oversize all
+        // reject only the connection (no parseable callback URL).
+        var empty = Data()
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+                buffer: &empty,
+                chunk: nil,
+                isComplete: true,
+                hadError: false
+            ),
+            .rejectConnection
+        )
+        var partial = Data()
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+                buffer: &partial,
+                chunk: Data("GET / HTTP/1.1\r\nHost: 127.0.0.1:54321\r\n".utf8),
+                isComplete: true,
+                hadError: false
+            ),
+            .rejectConnection
+        )
+        var errored = Data()
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+                buffer: &errored,
+                chunk: Data("GET / HTTP/1.1\r\n".utf8),
+                isComplete: false,
+                hadError: true
+            ),
+            .rejectConnection
+        )
+        var oversize = Data()
+        let chunk = Data(
+            repeating: 0x41,
+            count: TokenBrokerAuthorizationSession.maxRequestBytes + 1
+        )
+        XCTAssertEqual(
+            TokenBrokerAuthorizationSession.accumulateLoopbackReceive(
+                buffer: &oversize,
+                chunk: chunk,
+                isComplete: false,
+                hadError: false
+            ),
+            .rejectConnection
+        )
+        // Unparseable complete headers must not yield a callback URL.
+        let badHost = Data("GET / HTTP/1.1\r\nHost: example.invalid\r\n\r\n".utf8)
+        XCTAssertNil(TokenBrokerAuthorizationSession.callbackURL(from: badHost))
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: false,
+                hasSessionHandle: true,
+                acceptedConnectionCount: TokenBrokerAuthorizationSession.maxAcceptedConnections
+            )
+        )
+        XCTAssertTrue(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: false,
+                hasSessionHandle: true,
+                acceptedConnectionCount: 0
+            )
+        )
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: true,
+                hasSessionHandle: true,
+                acceptedConnectionCount: 0
+            )
+        )
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
+                isFinished: false,
+                hasSessionHandle: false,
+                acceptedConnectionCount: 0
+            )
+        )
+    }
+
+    func testDuplicateCallbackLatchIsSingleShot() {
+        var hasForwardedCallback = false
+        XCTAssertTrue(
+            TokenBrokerAuthorizationSession.claimForwardedCallback(
+                isFinished: false,
+                hasForwardedCallback: &hasForwardedCallback
+            )
+        )
+        XCTAssertTrue(hasForwardedCallback)
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.claimForwardedCallback(
+                isFinished: false,
+                hasForwardedCallback: &hasForwardedCallback
+            )
+        )
+        var finishedLatch = false
+        XCTAssertFalse(
+            TokenBrokerAuthorizationSession.claimForwardedCallback(
+                isFinished: true,
+                hasForwardedCallback: &finishedLatch
+            )
+        )
+        XCTAssertFalse(finishedLatch)
+    }
+
     func testExactLoopbackHostHeaderContract() {
         XCTAssertTrue(
             TokenBrokerAuthorizationSession.isExactLoopbackHostHeader("127.0.0.1:54321")

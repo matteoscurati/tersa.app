@@ -55,13 +55,13 @@ enum TokenBrokerOperation: Equatable, Sendable {
 protocol TersaMacTokenBrokerProtocolV1 {
     func beginAuthorizationSession(
         redirectURI: String,
-        withReply reply: @escaping (_ authorizationURL: String?, _ sessionHandle: String?, _ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ authorizationURL: String?, _ sessionHandle: String?, _ status: Int) -> Void
     )
 
     func completeAuthorizationSession(
         sessionHandle: String,
         callbackURL: String,
-        withReply reply: @escaping (
+        withReply reply: @escaping @Sendable (
             _ accessToken: String?,
             _ subject: String?,
             _ expiresInSeconds: Int,
@@ -71,7 +71,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
 
     func refreshAccessToken(
         accountSubject: String,
-        withReply reply: @escaping (
+        withReply reply: @escaping @Sendable (
             _ accessToken: String?,
             _ subject: String?,
             _ expiresInSeconds: Int,
@@ -81,11 +81,11 @@ protocol TersaMacTokenBrokerProtocolV1 {
 
     func revokeProviderGrant(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )
 
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )
 }

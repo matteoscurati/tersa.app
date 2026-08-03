@@ -219,6 +219,7 @@ final class TokenBrokerClient: @unchecked Sendable {
               authorizationURL.utf8.count <= maxAuthorizationURLBytes,
               !authorizationURL.isEmpty,
               let url = URL(string: authorizationURL),
+              isAcceptedAuthorizationURL(url),
               let sessionHandle,
               sessionHandle.utf8.count <= maxSessionHandleBytes,
               !sessionHandle.isEmpty
@@ -231,6 +232,22 @@ final class TokenBrokerClient: @unchecked Sendable {
                 sessionHandle: sessionHandle
             )
         )
+    }
+
+    /// Accepts only HTTPS authorization URLs whose host is exactly
+    /// `accounts.google.com` before `NSWorkspace.open`.
+    ///
+    /// Rejects HTTP, file, custom schemes, and any non-exact host (including
+    /// suffix/prefix lookalikes such as `accounts.google.com.evil`).
+    static func isAcceptedAuthorizationURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme,
+              scheme.caseInsensitiveCompare("https") == .orderedSame,
+              let host = url.host,
+              host == "accounts.google.com"
+        else {
+            return false
+        }
+        return true
     }
 
     static func mapTokenReply(

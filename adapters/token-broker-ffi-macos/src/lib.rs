@@ -193,14 +193,23 @@ mod macos {
         }
     }
 
+    /// True when a signing-time client-id value is empty/whitespace or still
+    /// carries the reviewed `UNCONFIGURED` placeholder (case-insensitive).
+    ///
+    /// Shared by `configured_client_id` and unit tests so the preflight is not
+    /// a tautological local predicate.
+    fn is_unconfigured_client_id(raw: &str) -> bool {
+        let trimmed = raw.trim();
+        trimmed.is_empty() || trimmed.to_ascii_uppercase().contains("UNCONFIGURED")
+    }
+
     /// Reads the public OAuth client id from the signing-time build setting.
     fn configured_client_id() -> Result<String, i32> {
         let raw = option_env!("TERSA_OAUTH_CLIENT_ID").ok_or(STATUS_INVALID_CONFIGURATION)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.to_ascii_uppercase().contains("UNCONFIGURED") {
+        if is_unconfigured_client_id(raw) {
             return Err(STATUS_INVALID_CONFIGURATION);
         }
-        Ok(trimmed.to_owned())
+        Ok(raw.trim().to_owned())
     }
 
     /// Reads the optional Desktop-client secret from the signing-time build
@@ -353,6 +362,84 @@ mod macos {
             out_len.write(text.len());
         }
         Ok(())
+    }
+
+    /// Safe test surface for [`read_utf8`] buffer-boundary coverage.
+    ///
+    /// `source == None` exercises the null-pointer rejection path. When
+    /// `source` is `Some`, this wrapper enforces that any `length` which
+    /// would reach the raw read (`1..=MAX_INPUT_BYTES`) is within the live
+    /// slice. Lengths rejected before dereference (`0` is handled by the
+    /// helper; `> MAX_INPUT_BYTES` is allowed to exceed the slice so the real
+    /// helper rejection path stays covered) never enter the audited read.
+    #[cfg(test)]
+    fn test_read_utf8(source: Option<&[u8]>, length: usize) -> Result<String, i32> {
+        // Soundness: a safe function must not create an out-of-bounds raw read
+        // for any safe input. `read_utf8` only dereferences when
+        // `1 <= length <= MAX_INPUT_BYTES`; enforce the slice bound for that
+        // window. Oversized lengths are rejected by the helper before any read.
+        if let Some(bytes) = source
+            && length <= MAX_INPUT_BYTES
+            && length > bytes.len()
+        {
+            return Err(STATUS_INVALID_REQUEST);
+        }
+        // SAFETY: null is rejected before any read. Non-null calls either pass
+        // a length the helper rejects before reading (`0` or
+        // `> MAX_INPUT_BYTES`) or a length within the live slice (enforced
+        // above for the raw-read window).
+        #[expect(
+            unsafe_code,
+            reason = "test-only wrapper keeps buffer-boundary coverage on the real FFI helper"
+        )]
+        unsafe {
+            match source {
+                None => read_utf8(std::ptr::null(), length),
+                Some(bytes) => read_utf8(bytes.as_ptr(), length),
+            }
+        }
+    }
+
+    /// Safe test surface for [`write_utf8`] buffer-boundary coverage.
+    ///
+    /// `buffer == None` or `out_len == None` exercises null rejection. When
+    /// `buffer` is `Some`, this wrapper enforces `capacity <= buffer.len()`
+    /// before any raw write so the helper's writable-capacity contract cannot
+    /// be violated by a safe caller.
+    #[cfg(test)]
+    fn test_write_utf8(
+        text: &str,
+        buffer: Option<&mut [u8]>,
+        capacity: usize,
+        out_len: Option<&mut usize>,
+        max_len: usize,
+    ) -> Result<(), i32> {
+        // Soundness: a safe function must not claim more writable bytes than
+        // the live slice provides. Enforce the capacity relationship before
+        // entering the audited helper.
+        if let Some(bytes) = buffer.as_ref()
+            && capacity > bytes.len()
+        {
+            return Err(STATUS_INVALID_REQUEST);
+        }
+        // SAFETY: null outs are rejected before any write. Non-null buffer
+        // paths pass a writable slice whose length is at least `capacity`
+        // (enforced above) and a live `out_len` reference when present.
+        #[expect(
+            unsafe_code,
+            reason = "test-only wrapper keeps buffer-boundary coverage on the real FFI helper"
+        )]
+        unsafe {
+            let pointer = match buffer {
+                None => std::ptr::null_mut(),
+                Some(bytes) => bytes.as_mut_ptr(),
+            };
+            let out_len_ptr = match out_len {
+                None => std::ptr::null_mut(),
+                Some(len) => len as *mut usize,
+            };
+            write_utf8(text, pointer, capacity, out_len_ptr, max_len)
+        }
     }
 
     /// Caller-owned C ABI success buffers for a closed token write.
@@ -738,17 +825,87 @@ mod macos {
 
         #[test]
         fn client_id_preflight_rejects_unconfigured_shapes() {
-            // The production path uses option_env; this test locks the
-            // preflight predicate used by configured_client_id's filters.
-            for bad in ["", "   ", "UNCONFIGURED", "app.UNCONFIGURED.client"] {
-                let upper = bad.to_ascii_uppercase();
-                let rejected = bad.trim().is_empty() || upper.contains("UNCONFIGURED");
-                assert!(rejected, "{bad}");
+            // Exercises the real helper used by `configured_client_id`.
+            for bad in [
+                "",
+                "   ",
+                "UNCONFIGURED",
+                "app.UNCONFIGURED.client",
+                "unconfigured",
+            ] {
+                assert!(
+                    is_unconfigured_client_id(bad),
+                    "expected unconfigured rejection for {bad:?}"
+                );
             }
-            assert!(!{
-                let good = "1234567890-abc.apps.googleusercontent.com";
-                good.trim().is_empty() || good.to_ascii_uppercase().contains("UNCONFIGURED")
-            });
+            assert!(!is_unconfigured_client_id(
+                "1234567890-abc.apps.googleusercontent.com"
+            ));
+        }
+
+        #[test]
+        fn read_utf8_rejects_null_empty_oversized_and_invalid_bytes() {
+            let bytes = b"abc";
+            assert_eq!(test_read_utf8(None, 3), Err(STATUS_INVALID_REQUEST));
+            assert_eq!(test_read_utf8(Some(bytes), 0), Err(STATUS_INVALID_REQUEST));
+            assert_eq!(
+                test_read_utf8(Some(bytes), MAX_INPUT_BYTES + 1),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            let invalid = [0xff_u8, 0xfe_u8];
+            assert_eq!(
+                test_read_utf8(Some(&invalid), invalid.len()),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            assert_eq!(
+                test_read_utf8(Some(bytes), bytes.len())
+                    .expect("valid UTF-8 within declared length must succeed"),
+                "abc"
+            );
+            // Hostile: declared length in the raw-read window exceeds the live
+            // slice. Must be rejected by the safe wrapper without UB.
+            assert_eq!(
+                test_read_utf8(Some(bytes), bytes.len() + 1),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            assert_eq!(test_read_utf8(Some(&[]), 1), Err(STATUS_INVALID_REQUEST));
+        }
+
+        #[test]
+        fn write_utf8_rejects_null_oversize_and_capacity_bounds() {
+            let text = "ok";
+            let mut out = [0_u8; 8];
+            let mut len = 0_usize;
+            assert_eq!(
+                test_write_utf8(text, None, 8, Some(&mut len), 8),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            assert_eq!(
+                test_write_utf8(text, Some(&mut out), 8, None, 8),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            assert_eq!(
+                test_write_utf8(text, Some(&mut out), 1, Some(&mut len), 8),
+                Err(STATUS_MALFORMED_RESPONSE)
+            );
+            assert_eq!(
+                test_write_utf8(text, Some(&mut out), 8, Some(&mut len), 1),
+                Err(STATUS_MALFORMED_RESPONSE)
+            );
+            assert!(test_write_utf8(text, Some(&mut out), 8, Some(&mut len), 8).is_ok());
+            assert_eq!(len, 2);
+            assert_eq!(&out[..2], b"ok");
+            // Hostile: declared capacity exceeds the live slice. Must be
+            // rejected by the safe wrapper without UB, even when the text
+            // would otherwise fit a successful write.
+            let mut short = [0_u8; 2];
+            let mut short_len = 0_usize;
+            assert_eq!(
+                test_write_utf8(text, Some(&mut short), 8, Some(&mut short_len), 8),
+                Err(STATUS_INVALID_REQUEST)
+            );
+            assert_eq!(short_len, 0);
+            assert_eq!(short, [0_u8; 2]);
         }
     }
 }

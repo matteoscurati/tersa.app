@@ -94,4 +94,43 @@ final class TokenBrokerClientOnceTests: XCTestCase {
             }
         }
     }
+
+    func testAuthorizationURLValidationAcceptsOnlyExactGoogleHTTPS() {
+        let accepted = URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+        XCTAssertTrue(TokenBrokerClient.isAcceptedAuthorizationURL(accepted))
+
+        let rejected: [String] = [
+            "http://accounts.google.com/o/oauth2/v2/auth",
+            "file:///tmp/oauth.html",
+            "tersa://oauth/callback",
+            "https://evil.example/accounts.google.com",
+            "https://accounts.google.com.evil/o/oauth2/v2/auth",
+            "https://attacker.accounts.google.com/o/oauth2/v2/auth",
+            "https://accounts.google.com.attacker/path",
+        ]
+        for raw in rejected {
+            let url = URL(string: raw)!
+            XCTAssertFalse(
+                TokenBrokerClient.isAcceptedAuthorizationURL(url),
+                "must reject \(raw)"
+            )
+            let mapped = TokenBrokerClient.mapBeginReply(
+                authorizationURL: raw,
+                sessionHandle: "ABCDEFGHIJKLMNOPQRSTUV",
+                status: TokenBrokerStatus.success.rawValue
+            )
+            if case .success = mapped {
+                XCTFail("mapBeginReply must reject unauthorized URL \(raw)")
+            }
+        }
+
+        let good = TokenBrokerClient.mapBeginReply(
+            authorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?client_id=public",
+            sessionHandle: "ABCDEFGHIJKLMNOPQRSTUV",
+            status: TokenBrokerStatus.success.rawValue
+        )
+        if case .failure = good {
+            XCTFail("expected Google HTTPS authorization URL must succeed")
+        }
+    }
 }

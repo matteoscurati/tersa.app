@@ -3727,11 +3727,20 @@ const REVIEWED_TOKEN_BROKER_CLIENT_CONNECTION_CONSTRUCTION: &str =
 /// protocol operations. Parameter labels and reply value types are part of the
 /// wire contract; top-level returns and additional methods fail closed.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES: [&str; 5] = [
-    "funcbeginAuthorizationSession(redirectURI:String,withReplyreply:@escaping(_authorizationURL:String?,_sessionHandle:String?,_status:Int)->Void)",
-    "funccompleteAuthorizationSession(sessionHandle:String,callbackURL:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
-    "funcrefreshAccessToken(accountSubject:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
-    "funcrevokeProviderGrant(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
-    "funcdeleteStoredTokens(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
+    "funcbeginAuthorizationSession(redirectURI:String,withReplyreply:@escaping@Sendable(_authorizationURL:String?,_sessionHandle:String?,_status:Int)->Void)",
+    "funccompleteAuthorizationSession(sessionHandle:String,callbackURL:String,withReplyreply:@escaping@Sendable(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrefreshAccessToken(accountSubject:String,withReplyreply:@escaping@Sendable(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrevokeProviderGrant(accountSubject:String,withReplyreply:@escaping@Sendable(_status:Int)->Void)",
+    "funcdeleteStoredTokens(accountSubject:String,withReplyreply:@escaping@Sendable(_status:Int)->Void)",
+];
+/// Exact closed allowlist of reviewed main-app `TokenBroker` client Swift paths.
+/// No `TokenBroker*` filename-prefix or directory wildcard exemption exists:
+/// any other `apple/macos/TokenBroker*.swift` fails closed.
+const REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS: [&str; 4] = [
+    "apple/macos/TokenBrokerAuthorizationSession.swift",
+    "apple/macos/TokenBrokerClient.swift",
+    "apple/macos/TokenBrokerProtocol.swift",
+    "apple/macos/TokenBrokerStatusMapping.swift",
 ];
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
 const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 8] = [
@@ -5771,8 +5780,16 @@ fn macos_client_xpc_wiring_violations(sources: &[(PathBuf, String)]) -> Vec<Stri
             continue;
         };
         let code = strip_swift_non_code(document);
-        let is_reviewed_client =
-            path_str.starts_with("apple/macos/TokenBroker") && extension == Some("swift");
+        // Closed allowlist only — a decoy `TokenBroker*.swift` filename must
+        // not inherit the reviewed client XPC exemption.
+        if path_str.starts_with("apple/macos/TokenBroker")
+            && !REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS.contains(&path_str)
+        {
+            violations.push(format!(
+                "{path_str} is outside the closed reviewed TokenBroker client allowlist"
+            ));
+        }
+        let is_reviewed_client = REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS.contains(&path_str);
         if is_reviewed_client {
             // Server-side listener wiring stays out of the main app.
             if contains_identifier(&code, "NSXPCListener")
@@ -5799,7 +5816,7 @@ fn macos_client_xpc_wiring_violations(sources: &[(PathBuf, String)]) -> Vec<Stri
         for forbidden in FORBIDDEN_OUTSIDE_CLIENT {
             if contains_identifier(&code, forbidden) {
                 violations.push(format!(
-                    "{path_str} must not contain client-side XPC wiring `{forbidden}` outside the reviewed TokenBroker* client surface"
+                    "{path_str} must not contain client-side XPC wiring `{forbidden}` outside the reviewed TokenBroker client allowlist"
                 ));
             }
         }
@@ -13364,7 +13381,7 @@ targets:
             macos_client_xpc_wiring_violations(&macos_client)
                 .iter()
                 .any(|violation| violation.contains("NSXPCConnection")),
-            "XPC wiring outside the reviewed TokenBroker* client surface must fail closed"
+            "XPC wiring outside the reviewed TokenBroker client allowlist must fail closed"
         );
         assert!(
             macos_client_xpc_wiring_violations(&[(
@@ -13373,7 +13390,7 @@ targets:
             )])
             .is_empty()
         );
-        // Reviewed TokenBroker* client files may connect only via the exact
+        // Reviewed allowlisted client files may connect only via the exact
         // pinned constant assignment plus `NSXPCConnection(serviceName:)`.
         let reviewed_client = include_str!("../../apple/macos/TokenBrokerClient.swift");
         assert!(
@@ -13383,6 +13400,26 @@ targets:
             )])
             .is_empty(),
             "reviewed TokenBrokerClient.swift must pass the XPC wiring pin"
+        );
+        // A decoy TokenBroker* filename must not inherit the closed allowlist
+        // exemption even when it mirrors the reviewed connection construction.
+        let decoy_pinned = "static let serviceBundleIdentifier = \"app.tersa.mac.token-broker\"\n\
+             let connection = NSXPCConnection(serviceName: Self.serviceBundleIdentifier)\n";
+        let decoy_violations = macos_client_xpc_wiring_violations(&[(
+            PathBuf::from("apple/macos/TokenBrokerDecoy.swift"),
+            decoy_pinned.to_owned(),
+        )]);
+        assert!(
+            decoy_violations.iter().any(|violation| {
+                violation.contains("outside the closed reviewed TokenBroker client allowlist")
+            }),
+            "decoy TokenBroker*.swift must not inherit the reviewed client allowlist; got {decoy_violations:?}"
+        );
+        assert!(
+            decoy_violations
+                .iter()
+                .any(|violation| violation.contains("NSXPCConnection")),
+            "decoy TokenBroker*.swift must still fail closed on XPC wiring; got {decoy_violations:?}"
         );
         for (label, document) in [
             (
@@ -13633,7 +13670,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
         let delete_tokens_signature = "\
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )";
         // Mutations must stay inside the protocol body: body-scoped parsing is
         // the mirror authority and ignores helper `func` text outside `{...}`.
@@ -13642,7 +13679,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 "client protocol method drift",
                 client.replace(
                     delete_tokens_signature,
-                    "func deleteStoredTokens(\n        accountSubject: String,\n        withReply reply: @escaping (_ status: Int, _ detail: String?) -> Void\n    )",
+                    "func deleteStoredTokens(\n        accountSubject: String,\n        withReply reply: @escaping @Sendable (_ status: Int, _ detail: String?) -> Void\n    )",
                 ),
                 REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
             ),
@@ -13656,7 +13693,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 client.replace(
                     delete_tokens_signature,
                     &format!(
-                        "{delete_tokens_signature}\n    func exportStoredSecret(withReply reply: @escaping (Int) -> Void)"
+                        "{delete_tokens_signature}\n    func exportStoredSecret(withReply reply: @escaping @Sendable (Int) -> Void)"
                     ),
                 ),
                 REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
@@ -13705,7 +13742,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
         let delete_tokens_signature = "\
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )";
         for (label, document) in [
             (

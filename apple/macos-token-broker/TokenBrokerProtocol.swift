@@ -58,7 +58,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
     /// and an opaque session handle. The PKCE verifier remains broker-local.
     func beginAuthorizationSession(
         redirectURI: String,
-        withReply reply: @escaping (_ authorizationURL: String?, _ sessionHandle: String?, _ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ authorizationURL: String?, _ sessionHandle: String?, _ status: Int) -> Void
     )
 
     /// Completes an authorization session after the main app forwards the
@@ -67,7 +67,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
     func completeAuthorizationSession(
         sessionHandle: String,
         callbackURL: String,
-        withReply reply: @escaping (
+        withReply reply: @escaping @Sendable (
             _ accessToken: String?,
             _ subject: String?,
             _ expiresInSeconds: Int,
@@ -79,7 +79,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
     /// A success reply may carry only the access token, subject, and expiry.
     func refreshAccessToken(
         accountSubject: String,
-        withReply reply: @escaping (
+        withReply reply: @escaping @Sendable (
             _ accessToken: String?,
             _ subject: String?,
             _ expiresInSeconds: Int,
@@ -90,13 +90,13 @@ protocol TersaMacTokenBrokerProtocolV1 {
     /// Asks the broker to revoke the provider grant for the account subject.
     func revokeProviderGrant(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )
 
     /// Asks the broker to delete locally stored refresh-token material for the
     /// account subject. Token bytes never cross this interface.
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )
 }
