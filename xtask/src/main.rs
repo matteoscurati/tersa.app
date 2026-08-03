@@ -662,6 +662,11 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     violations.extend(macos_client_xpc_wiring_violations(&macos_sources));
     let broker_sources = tracked_source_documents(Path::new("."), "apple/macos-token-broker")?;
     violations.extend(token_broker_source_surface_violations(&broker_sources));
+    let keychain_isolation_probe_sources =
+        tracked_source_documents(Path::new("."), "apple/keychain-isolation-probe")?;
+    violations.extend(keychain_isolation_probe_source_surface_violations(
+        &keychain_isolation_probe_sources,
+    ));
     let service_protocol = fs::read_to_string(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH)?;
     let client_protocol = fs::read_to_string(REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH)?;
     violations.extend(token_broker_protocol_mirror_violations(
@@ -3020,7 +3025,15 @@ fn swift_has_canonical_application_main(document: &str) -> bool {
     let [body] = bodies.as_slice() else {
         return false;
     };
+    // The probe branch (exact opt-in Keychain isolation probe) must be the very
+    // first statement of the sole `main()` body and must not be duplicated,
+    // reordered after `NSApplication.shared`, wrapped behind a helper, or given
+    // an alternate argument/principal/call. The compact byte-for-byte compare
+    // after whitespace stripping pins that exact ordered shape, while the
+    // exactly-once counts below reject a second occurrence of any fragment.
     let required = [
+        "KeychainIsolationProbe.isProbeRequest(CommandLine.arguments)",
+        "KeychainIsolationProbe.runAsPrincipal(.mainApp)",
         "let application = NSApplication.shared",
         "application.delegate = delegate",
         "application.run()",
@@ -3036,7 +3049,7 @@ fn swift_has_canonical_application_main(document: &str) -> bool {
         .filter(|byte| !is_rust_ascii_whitespace(*byte))
         .collect::<Vec<_>>();
     compact
-        == b"{letapplication=NSApplication.sharedapplication.delegate=delegateapplication.run()}"
+        == b"{ifKeychainIsolationProbe.isProbeRequest(CommandLine.arguments){KeychainIsolationProbe.runAsPrincipal(.mainApp)}letapplication=NSApplication.sharedapplication.delegate=delegateapplication.run()}"
 }
 
 fn swift_bootstrap_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
@@ -5634,6 +5647,11 @@ fn non_owner_entitlement_violations(path: &str, document: &str) -> Vec<String> {
 }
 
 const SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.shared";
+/// Shared read-only Keychain isolation probe source path compiled into the
+/// signed main app, the token broker, and the test bundle from one explicit
+/// source entry. Used by the exact target-source shape validators.
+const KEYCHAIN_ISOLATION_PROBE_SOURCE: &str =
+    "keychain-isolation-probe/KeychainIsolationProbe.swift";
 const BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.shared";
 const TOKEN_SIGNING_GROUP: &str = "${TeamIdentifierPrefix}app.tersa.token";
 const TERSA_MAC_ENTITLEMENTS: &str = "macos/TersaMac.entitlements";
@@ -6077,6 +6095,35 @@ fn validate_tersa_mac_type_settings_and_linkage(
                 .to_owned(),
         );
     }
+    if !tersa_mac_hardened_runtime_intact(settings) {
+        violations.push(
+            "the TersaMac settings must enable ENABLE_HARDENED_RUNTIME (YES) and disable CODE_SIGN_INJECT_BASE_ENTITLEMENTS (NO) with no conditional overrides"
+                .to_owned(),
+        );
+    }
+}
+
+/// Signed-release integrity for the Keychain isolation probe path: the hardened
+/// runtime must be enabled and Xcode's default base-entitlement injection must
+/// be disabled so only the committed entitlements apply, with no debug or
+/// per-config override relaxing either pin.
+fn tersa_mac_hardened_runtime_intact(settings: Option<&StrictYamlValue>) -> bool {
+    matches!(
+        settings,
+        Some(StrictYamlValue::Mapping(settings))
+            if matches!(
+                settings.get("ENABLE_HARDENED_RUNTIME"),
+                Some(StrictYamlValue::String(value)) if value == "YES"
+            )
+                && matches!(
+                    settings.get("CODE_SIGN_INJECT_BASE_ENTITLEMENTS"),
+                    Some(StrictYamlValue::String(value)) if value == "NO"
+                )
+                && !settings.keys().any(|key| {
+                    key.starts_with("ENABLE_HARDENED_RUNTIME[")
+                        || key.starts_with("CODE_SIGN_INJECT_BASE_ENTITLEMENTS[")
+                })
+    )
 }
 
 fn validate_tersa_mac_sources_dependencies_and_execution(
@@ -6186,14 +6233,16 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
         violations
             .push("the TersaMacTests target type must be exactly bundle.unit-test".to_owned());
     }
-    // Exact ordered TersaMacTests sources: macos-tests, the pure client/model
-    // surface under macos/, and the single reviewed shared callback-buffer
-    // helper. No directory wildcard for macos-token-broker; only this path.
+    // Exact ordered TersaMacTests sources: macos-tests, the shared read-only
+    // Keychain isolation probe source, the pure client/model surface under
+    // macos/, and the single reviewed shared callback-buffer helper. No
+    // directory wildcard for macos-token-broker; only this path.
     let valid_sources = matches!(
         body.get("sources"),
         Some(StrictYamlValue::Sequence(sources))
             if matches!(sources.as_slice(), [
                 StrictYamlValue::Mapping(test_sources),
+                StrictYamlValue::Mapping(probe_source),
                 StrictYamlValue::Mapping(deadline_source),
                 StrictYamlValue::Mapping(connection_state_source),
                 StrictYamlValue::Mapping(disconnect_intent_source),
@@ -6205,6 +6254,8 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
                 StrictYamlValue::Mapping(broker_callback_buffer_source),
             ] if test_sources.len() == 1
                 && matches!(test_sources.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-tests")
+                && probe_source.len() == 1
+                && matches!(probe_source.get("path"), Some(StrictYamlValue::String(path)) if path == KEYCHAIN_ISOLATION_PROBE_SOURCE)
                 && deadline_source.len() == 1
                 && matches!(deadline_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionOperationDeadline.swift")
                 && connection_state_source.len() == 1
@@ -6254,9 +6305,11 @@ fn yaml_exact_tersa_mac_sources(value: Option<&StrictYamlValue>) -> bool {
     };
     matches!(
         sources.as_slice(),
-        [StrictYamlValue::Mapping(source), StrictYamlValue::Mapping(resource)]
+        [StrictYamlValue::Mapping(source), StrictYamlValue::Mapping(probe), StrictYamlValue::Mapping(resource)]
             if source.len() == 1
                 && matches!(source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos")
+                && probe.len() == 1
+                && matches!(probe.get("path"), Some(StrictYamlValue::String(path)) if path == KEYCHAIN_ISOLATION_PROBE_SOURCE)
                 && resource.len() == 2
                 && matches!(resource.get("path"), Some(StrictYamlValue::String(path)) if path == "licenses/THIRD_PARTY_NOTICES-bridge-macos.txt")
                 && matches!(resource.get("buildPhase"), Some(StrictYamlValue::String(phase)) if phase == "resources")
@@ -6459,17 +6512,22 @@ fn validate_token_broker_type_and_sources(
         Some(StrictYamlValue::Sequence(sources))
             if matches!(
                 sources.as_slice(),
-                [StrictYamlValue::Mapping(source)]
+                [StrictYamlValue::Mapping(source), StrictYamlValue::Mapping(probe)]
                     if source.len() == 1
                         && matches!(
                             source.get("path"),
                             Some(StrictYamlValue::String(path)) if path == "macos-token-broker"
                         )
+                        && probe.len() == 1
+                        && matches!(
+                            probe.get("path"),
+                            Some(StrictYamlValue::String(path)) if path == KEYCHAIN_ISOLATION_PROBE_SOURCE
+                        )
             )
     );
     if !valid_sources {
         violations.push(
-            "the TersaMacTokenBroker sources must be exactly the macos-token-broker root"
+            "the TersaMacTokenBroker sources must be exactly the macos-token-broker root followed by the shared Keychain isolation probe source"
                 .to_owned(),
         );
     }
@@ -6547,7 +6605,7 @@ fn validate_token_broker_settings_surface(
     });
     if !yaml_exact_token_broker_base_settings(settings) {
         violations.push(
-            "the TersaMacTokenBroker settings must contain only the reviewed operational identity, token group, bridging header, dedicated Rust archive, and SKIP_INSTALL"
+            "the TersaMacTokenBroker settings must contain only the reviewed operational identity, token group, bridging header, dedicated Rust archive, SKIP_INSTALL, hardened runtime, and disabled base-entitlement injection"
                 .to_owned(),
         );
     }
@@ -6557,7 +6615,7 @@ fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> 
     matches!(
         settings,
         Some(StrictYamlValue::Mapping(settings))
-            if settings.len() == 9
+            if settings.len() == 11
                 && matches!(
                     settings.get("PRODUCT_BUNDLE_IDENTIFIER"),
                     Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_BUNDLE_ID
@@ -6584,6 +6642,14 @@ fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> 
                         if value == TERSA_MAC_TOKEN_BROKER_BRIDGING_HEADER
                 )
                 && matches!(
+                    settings.get("ENABLE_HARDENED_RUNTIME"),
+                    Some(StrictYamlValue::String(value)) if value == "YES"
+                )
+                && matches!(
+                    settings.get("CODE_SIGN_INJECT_BASE_ENTITLEMENTS"),
+                    Some(StrictYamlValue::String(value)) if value == "NO"
+                )
+                && matches!(
                     settings.get("TERSA_MACOS_TOKEN_GROUP"),
                     Some(StrictYamlValue::String(value)) if value == TOKEN_BUILD_SETTING_GROUP
                 )
@@ -6604,6 +6670,8 @@ fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> 
                 && !settings.keys().any(|key| {
                     key.starts_with("PRODUCT_BUNDLE_IDENTIFIER[")
                         || key.starts_with("CODE_SIGN_ENTITLEMENTS[")
+                        || key.starts_with("ENABLE_HARDENED_RUNTIME[")
+                        || key.starts_with("CODE_SIGN_INJECT_BASE_ENTITLEMENTS[")
                         || key.starts_with("OTHER_LDFLAGS[")
                         || key.starts_with("TERSA_MACOS_TOKEN_GROUP[")
                         || key.starts_with("ENABLE_USER_SCRIPT_SANDBOXING[")
@@ -6725,6 +6793,145 @@ fn reviewed_token_broker_client_xpc_connection_is_pinned(document: &str, code: &
     rust_token_canonical(code).matches(&construction).count() == 1
 }
 
+/// Fails closed unless the Keychain isolation probe is exactly one reviewed
+/// Swift source exercising only the reviewed, query-only Security framework
+/// surface: one `SecTaskCreateFromSelf`, one `SecTaskCopyValueForEntitlement`,
+/// and one `SecItemCopyMatching` call, against a forbidden-group query that
+/// opts into the Data Protection Keychain. No mutation, no data return, and no
+/// other `SecItem` capability may appear in executable code.
+fn keychain_isolation_probe_source_surface_violations(
+    sources: &[(PathBuf, String)],
+) -> Vec<String> {
+    const PROBE_PATH: &str = "apple/keychain-isolation-probe/KeychainIsolationProbe.swift";
+    const FORBIDDEN_CAPABILITIES: [&str; 5] = [
+        "SecItemAdd",
+        "SecItemUpdate",
+        "SecItemDelete",
+        "kSecReturnData",
+        "kSecReturnAttributes",
+    ];
+    let mut violations = Vec::new();
+    let reviewed = BTreeSet::from([PathBuf::from(PROBE_PATH)]);
+    let tracked = sources
+        .iter()
+        .map(|(path, _document)| path.clone())
+        .collect::<BTreeSet<_>>();
+    // `tracked` is a BTreeSet, so it collapses a duplicated reviewed path and
+    // would silently mask two documents sharing one path. Require the raw source
+    // count to equal the reviewed count as well.
+    if tracked != reviewed || sources.len() != reviewed.len() {
+        violations.push(
+            "the Keychain isolation probe source inventory must be exactly the reviewed KeychainIsolationProbe.swift"
+                .to_owned(),
+        );
+    }
+    let Some(document) = sources
+        .iter()
+        .find(|(path, _document)| path.to_str() == Some(PROBE_PATH))
+        .map(|(_path, document)| document.as_str())
+    else {
+        return violations;
+    };
+    violations.extend(swift_source_lexical_violations(
+        Path::new(PROBE_PATH),
+        document,
+    ));
+    let code = strip_swift_non_code(document);
+    for forbidden in FORBIDDEN_CAPABILITIES {
+        if contains_identifier(&code, forbidden) {
+            violations.push(format!(
+                "Keychain isolation probe `{PROBE_PATH}` must not exercise forbidden Keychain mutation or data-return capability `{forbidden}`"
+            ));
+        }
+    }
+    violations.extend(keychain_isolation_probe_secitem_violations(
+        &code, PROBE_PATH,
+    ));
+    violations.extend(keychain_isolation_probe_required_surface_violations(
+        &code, PROBE_PATH,
+    ));
+    let canonical = rust_token_canonical(&code);
+    if !canonical.contains("kSecAttrAccessGroup:forbiddenGroup") {
+        violations.push(format!(
+            "Keychain isolation probe `{PROBE_PATH}` must bind kSecAttrAccessGroup to the derived forbidden group"
+        ));
+    }
+    if !canonical.contains("kSecUseDataProtectionKeychain:true") {
+        violations.push(format!(
+            "Keychain isolation probe `{PROBE_PATH}` must bind kSecUseDataProtectionKeychain to true"
+        ));
+    }
+    violations
+}
+
+fn keychain_isolation_probe_secitem_violations(code: &str, probe_path: &str) -> Vec<String> {
+    // Reject every SecItem-prefixed identifier except the single query
+    // SecItemCopyMatching. The byte before a genuine identifier start cannot be
+    // an identifier character, so an embedded substring like `mySecItem` is
+    // never mistaken for a probe surface.
+    let mut stray_secitem = BTreeSet::new();
+    for (match_index, _) in code.match_indices("SecItem") {
+        let before = code[..match_index].bytes().next_back();
+        if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            continue;
+        }
+        let mut end = match_index + "SecItem".len();
+        while let Some(byte) = code.as_bytes().get(end) {
+            if byte.is_ascii_alphanumeric() || *byte == b'_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let identifier = &code[match_index..end];
+        if identifier != "SecItemCopyMatching" {
+            stray_secitem.insert(identifier.to_owned());
+        }
+    }
+    let mut violations = Vec::new();
+    for identifier in stray_secitem {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must not exercise SecItem capability `{identifier}`; only SecItemCopyMatching is allowed"
+        ));
+    }
+    violations
+}
+
+fn keychain_isolation_probe_required_surface_violations(
+    code: &str,
+    probe_path: &str,
+) -> Vec<String> {
+    const REQUIRED_CALLS: [&str; 3] = [
+        "SecTaskCreateFromSelf",
+        "SecTaskCopyValueForEntitlement",
+        "SecItemCopyMatching",
+    ];
+    const REQUIRED_QUERY_KEYS: [&str; 6] = [
+        "kSecClassGenericPassword",
+        "kSecAttrService",
+        "kSecAttrAccount",
+        "kSecAttrAccessGroup",
+        "kSecUseDataProtectionKeychain",
+        "kSecMatchLimitOne",
+    ];
+    let mut violations = Vec::new();
+    for call in REQUIRED_CALLS {
+        if swift_call_count(code, call) != 1 {
+            violations.push(format!(
+                "Keychain isolation probe `{probe_path}` must contain exactly one executable `{call}` call"
+            ));
+        }
+    }
+    for key in REQUIRED_QUERY_KEYS {
+        if identifier_occurrence_count(code, key) != 1 {
+            violations.push(format!(
+                "Keychain isolation probe `{probe_path}` must contain exactly one executable `{key}` occurrence"
+            ));
+        }
+    }
+    violations
+}
+
 fn token_broker_source_surface_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
     let mut violations = Vec::new();
     let scan = scan_token_broker_source_files(sources, &mut violations);
@@ -6742,6 +6949,54 @@ struct TokenBrokerSourceScan {
     seen: BTreeSet<String>,
     aggregate: String,
     protocol_file_has_version_assignment: bool,
+}
+
+/// Confines the token-broker `main.swift` entry point to exactly the reviewed
+/// Keychain isolation probe branch. `code` is already `strip_swift_non_code`
+/// output. The probe must be exactly one contiguous branch
+/// `if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {
+/// KeychainIsolationProbe.runAsPrincipal(.tokenBroker) }` with no `else`, no
+/// extra statement between the branch and the normal listener setup, exactly
+/// two `KeychainIsolationProbe` references, one `isProbeRequest` call, one
+/// `runAsPrincipal` call, one `NSXPCListener.service` construction, the probe
+/// branch positioned before the listener is built, and the reviewed normal
+/// listener setup beginning immediately after the branch.
+/// Any extra, wrong, wrapped, or late probe code fails closed.
+fn token_broker_probe_entrypoint_is_canonical(code: &str) -> bool {
+    const PROBE_BRANCH_CANONICAL: &str = "ifKeychainIsolationProbe.isProbeRequest(CommandLine.arguments){KeychainIsolationProbe.runAsPrincipal(.tokenBroker)}";
+    const NORMAL_SETUP_CANONICAL: &str = "lettokenBrokerListenerDelegate=TokenBrokerListenerDelegate()lettokenBrokerListener=NSXPCListener.service()";
+    const LISTENER_CONSTRUCTION_CANONICAL: &str = "lettokenBrokerListener=NSXPCListener.service()";
+
+    let canonical = rust_token_canonical(code);
+    if canonical.matches(PROBE_BRANCH_CANONICAL).count() != 1 {
+        return false;
+    }
+    if identifier_occurrence_count(code, "KeychainIsolationProbe") != 2 {
+        return false;
+    }
+    if identifier_occurrence_count(code, "isProbeRequest") != 1 {
+        return false;
+    }
+    if identifier_occurrence_count(code, "runAsPrincipal") != 1 {
+        return false;
+    }
+    if identifier_occurrence_count(code, "NSXPCListener.service") != 1 {
+        return false;
+    }
+    let Some(probe_index) = canonical.find(PROBE_BRANCH_CANONICAL) else {
+        return false;
+    };
+    let Some(listener_index) = canonical.find(LISTENER_CONSTRUCTION_CANONICAL) else {
+        return false;
+    };
+    if probe_index >= listener_index {
+        return false;
+    }
+    // The immediately following executable canonical sequence must begin with the
+    // reviewed normal listener setup, so an `else` branch, an inserted statement,
+    // or reordered normal setup fails closed.
+    let after_probe = probe_index + PROBE_BRANCH_CANONICAL.len();
+    canonical[after_probe..].starts_with(NORMAL_SETUP_CANONICAL)
 }
 
 fn scan_token_broker_source_files(
@@ -6795,6 +7050,15 @@ fn scan_token_broker_source_files(
             continue;
         }
         let code = strip_swift_non_code(document);
+        if path_str == "apple/macos-token-broker/main.swift"
+            && !token_broker_probe_entrypoint_is_canonical(&code)
+        {
+            violations.push(
+                "apple/macos-token-broker/main.swift must expose only the canonical \
+                 token-broker Keychain isolation probe entrypoint"
+                    .to_owned(),
+            );
+        }
         aggregate.push_str(&code);
         aggregate.push('\n');
         violations.extend(token_broker_type_shadowing_violations(path_str, &code));
@@ -7831,6 +8095,9 @@ fn allowed_tersa_mac_sensitive_configuration(path: &[&str], value: &StrictYamlVa
         ["settings", "base", "CODE_SIGN_ENTITLEMENTS"] => {
             matches!(value, StrictYamlValue::String(value) if value == TERSA_MAC_ENTITLEMENTS)
         }
+        ["settings", "base", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS"] => {
+            matches!(value, StrictYamlValue::String(value) if value == "NO")
+        }
         ["entitlements", "properties", key]
             if *key == "com.apple.security.application-groups"
                 || *key == "keychain-access-groups" =>
@@ -7848,6 +8115,9 @@ fn allowed_token_broker_sensitive_configuration(path: &[&str], value: &StrictYam
                 value,
                 StrictYamlValue::String(value) if value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
             )
+        }
+        ["settings", "base", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS"] => {
+            matches!(value, StrictYamlValue::String(value) if value == "NO")
         }
         ["settings", "base", "TERSA_MACOS_TOKEN_GROUP"] => {
             matches!(value, StrictYamlValue::String(value) if value == TOKEN_BUILD_SETTING_GROUP)
@@ -9873,15 +10143,16 @@ mod tests {
         shipped_direct_dependency_names, signing_configuration_violations,
         source_token_broker_entitlement_violations, sqlcipher_dependency_graph_violations,
         sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_inventory,
-        swift_bootstrap_source_violations, swift_bridge_call_inventory,
-        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
-        swift_source_lexical_violations, target_metadata_options,
-        token_broker_bridge_header_c_abi_violations,
+        strip_swift_non_code, swift_bootstrap_inventory_violations,
+        swift_bootstrap_source_inventory, swift_bootstrap_source_violations,
+        swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
+        swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
+        target_metadata_options, token_broker_bridge_header_c_abi_violations,
         token_broker_code_signing_requirement_violations,
-        token_broker_ffi_source_surface_violations, token_broker_protocol_mirror_violations,
-        token_broker_source_surface_violations, token_broker_wire_status_coherence_violations,
-        tracked_apple_signing_inventory, tracked_project_generation_violations,
+        token_broker_ffi_source_surface_violations, token_broker_probe_entrypoint_is_canonical,
+        token_broker_protocol_mirror_violations, token_broker_source_surface_violations,
+        token_broker_wire_status_coherence_violations, tracked_apple_signing_inventory,
+        tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -9913,6 +10184,7 @@ targets:
     platform: macOS
     sources:
       - path: macos
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
       - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt
         buildPhase: resources
     info: {}
@@ -9934,6 +10206,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
         TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
+        ENABLE_HARDENED_RUNTIME: "YES"
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: "NO"
         OTHER_LDFLAGS:
           - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a"
     preBuildScripts:
@@ -9948,6 +10222,7 @@ targets:
     platform: macOS
     sources:
       - path: macos-token-broker
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
     info:
       path: macos-token-broker/Info.plist
       properties:
@@ -9970,6 +10245,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
         SKIP_INSTALL: "YES"
         SWIFT_OBJC_BRIDGING_HEADER: macos-token-broker/TersaMacTokenBroker-Bridging-Header.h
+        ENABLE_HARDENED_RUNTIME: "YES"
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: "NO"
         TERSA_MACOS_TOKEN_GROUP: "$(TeamIdentifierPrefix)app.tersa.token"
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
         OTHER_LDFLAGS:
@@ -9983,6 +10260,7 @@ targets:
     platform: macOS
     sources:
       - path: macos-tests
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
       - path: macos/ConnectionOperationDeadline.swift
       - path: macos/ConnectionState.swift
       - path: macos/DisconnectIntentStore.swift
@@ -12037,15 +12315,20 @@ if unsafe { write_bounded_output(&encoded, output, output_capacity, output_len) 
         }
     }
 
-    #[test]
-    fn swift_source_guard_rejects_launch_bootstrap_and_unbounded_queues() {
-        let worker = r"
+    struct BootstrapSourceFixture {
+        worker: &'static str,
+        app: &'static str,
+    }
+
+    fn bootstrap_source_fixture() -> BootstrapSourceFixture {
+        BootstrapSourceFixture {
+            worker: r"
 private var running = false
 private var pending: (() -> Void)?
 else if pending == nil {}
 tersa_macos_bootstrap_default_account(pointer, count)
-";
-        let app = r"
+",
+            app: r"
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 func applicationDidFinishLaunching(_ notification: Notification) { _ = version() }
@@ -12056,12 +12339,21 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
 private enum TersaApplication {
     private static let delegate = AppDelegate()
     static func main() {
+        if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {
+            KeychainIsolationProbe.runAsPrincipal(.mainApp)
+        }
         let application = NSApplication.shared
         application.delegate = delegate
         application.run()
     }
 }
-";
+",
+        }
+    }
+
+    #[test]
+    fn swift_source_guard_rejects_launch_bootstrap_and_unbounded_queues() {
+        let BootstrapSourceFixture { worker, app } = bootstrap_source_fixture();
         assert!(swift_bootstrap_source_violations(worker, app).is_empty());
         assert!(
             !swift_bootstrap_source_violations(
@@ -12121,6 +12413,48 @@ private enum TersaApplication {
             assert!(
                 !swift_bootstrap_source_violations(worker, &drift).is_empty(),
                 "an uninstalled or ambiguous AppKit entrypoint must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn swift_source_guard_rejects_drifted_keychain_isolation_probe_branch() {
+        let BootstrapSourceFixture { worker, app } = bootstrap_source_fixture();
+        // The exact opt-in Keychain isolation probe branch is load-bearing: any
+        // mutation of it must fail closed. `concat!` preserves the exact branch
+        // indentation shared with the canonical `app` fixture.
+        let probe_branch: &str = concat!(
+            "        if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {\n",
+            "            KeychainIsolationProbe.runAsPrincipal(.mainApp)\n",
+            "        }",
+        );
+        for drift in [
+            app.replace(probe_branch, ""),
+            app.replace("CommandLine.arguments", "ProcessInfo.processInfo.arguments"),
+            app.replace(".mainApp", ".broker"),
+            app.replace(
+                &format!("{probe_branch}\n        let application = NSApplication.shared"),
+                &format!("        let application = NSApplication.shared\n{probe_branch}"),
+            ),
+            app.replace(
+                "KeychainIsolationProbe.runAsPrincipal(.mainApp)\n        }",
+                "KeychainIsolationProbe.runAsPrincipal(.mainApp)\n            let leak = 1\n        }",
+            ),
+            app.replace(
+                "}\n        let application = NSApplication.shared",
+                "}\n        let noise = 1\n        let application = NSApplication.shared",
+            ),
+            app.replace(
+                "KeychainIsolationProbe.runAsPrincipal(.mainApp)",
+                concat!(
+                    "KeychainIsolationProbe.runAsPrincipal(.mainApp)\n",
+                    "KeychainIsolationProbe.runAsPrincipal(.mainApp)",
+                ),
+            ),
+        ] {
+            assert!(
+                !swift_bootstrap_source_violations(worker, &drift).is_empty(),
+                "a mutated Keychain isolation probe branch must fail closed"
             );
         }
     }
@@ -13893,7 +14227,7 @@ targets:
             (
                 "missing reviewed target key",
                 VALID_SIGNING_PROJECT.replace(
-                    "    sources:\n      - path: macos\n      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n        buildPhase: resources\n",
+                    "    sources:\n      - path: macos\n      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n        buildPhase: resources\n",
                     "",
                 ),
                 "TersaMac target must contain only",
@@ -13964,6 +14298,15 @@ targets:
 
     #[test]
     fn tersa_mac_sources_are_an_exact_ordered_reviewed_sequence() {
+        // The exact TersaMac three-entry source block; anchoring on the full block
+        // scopes every mutation here so it never touches the probe entry reused by
+        // the TersaMacTokenBroker or test targets.
+        const TERSA_MAC_SOURCE_BLOCK: &str = concat!(
+            "      - path: macos\n",
+            "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+            "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+            "        buildPhase: resources",
+        );
         assert!(
             signing_configuration_violations(
                 VALID_ENTITLEMENTS,
@@ -13972,16 +14315,58 @@ targets:
             )
             .is_empty()
         );
-        for project in [
-            VALID_SIGNING_PROJECT.replace(
-                "        buildPhase: resources",
-                "        buildPhase: resources\n      - path: macos/Injected.swift",
+        for (label, mutation) in [
+            (
+                "remove probe path",
+                concat!(
+                    "      - path: macos\n",
+                    "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+                    "        buildPhase: resources",
+                ),
             ),
-            VALID_SIGNING_PROJECT.replace(
-                "      - path: macos\n      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n        buildPhase: resources",
-                "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n        buildPhase: resources\n      - path: macos",
+            (
+                "wrong probe path",
+                concat!(
+                    "      - path: macos\n",
+                    "      - path: keychain-isolation-probe/Unreviewed.swift\n",
+                    "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+                    "        buildPhase: resources",
+                ),
+            ),
+            (
+                "duplicate probe path",
+                concat!(
+                    "      - path: macos\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+                    "        buildPhase: resources",
+                ),
+            ),
+            (
+                "extra macos/Injected.swift",
+                concat!(
+                    "      - path: macos\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+                    "        buildPhase: resources\n      - path: macos/Injected.swift",
+                ),
+            ),
+            (
+                "reorder probe after resource",
+                concat!(
+                    "      - path: macos\n",
+                    "      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt\n",
+                    "        buildPhase: resources\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift",
+                ),
             ),
         ] {
+            let project = VALID_SIGNING_PROJECT.replace(TERSA_MAC_SOURCE_BLOCK, mutation);
+            assert_ne!(
+                project, VALID_SIGNING_PROJECT,
+                "{label} mutation must alter fixture"
+            );
             assert!(
                 signing_configuration_violations(
                     VALID_ENTITLEMENTS,
@@ -13989,10 +14374,78 @@ targets:
                     &project,
                 )
                 .iter()
-                .any(|violation| {
-                    violation.contains("exact reviewed source and resource sequence")
-                }),
-                "source sequence bypass must fail closed"
+                .any(|violation| violation.contains("exact reviewed source and resource sequence")),
+                "{label} source sequence bypass must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn tersa_mac_token_broker_sources_are_an_exact_ordered_reviewed_sequence() {
+        // The exact TersaMacTokenBroker two-entry source block; anchoring on the
+        // full block scopes every mutation here so it never touches the probe
+        // entry reused by the TersaMac or test targets.
+        const BROKER_SOURCE_BLOCK: &str = concat!(
+            "      - path: macos-token-broker\n",
+            "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift",
+        );
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty()
+        );
+        for (label, mutation) in [
+            ("remove probe path", "      - path: macos-token-broker"),
+            (
+                "wrong probe path",
+                concat!(
+                    "      - path: macos-token-broker\n",
+                    "      - path: keychain-isolation-probe/Unreviewed.swift"
+                ),
+            ),
+            (
+                "duplicate probe path",
+                concat!(
+                    "      - path: macos-token-broker\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift"
+                ),
+            ),
+            (
+                "extra macos-token-broker/TokenBrokerService.swift",
+                concat!(
+                    "      - path: macos-token-broker\n",
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: macos-token-broker/TokenBrokerService.swift"
+                ),
+            ),
+            (
+                "reorder probe before broker root",
+                concat!(
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+                    "      - path: macos-token-broker"
+                ),
+            ),
+        ] {
+            let project = VALID_SIGNING_PROJECT.replace(BROKER_SOURCE_BLOCK, mutation);
+            assert_ne!(
+                project, VALID_SIGNING_PROJECT,
+                "{label} mutation must alter fixture"
+            );
+            assert!(
+                signing_configuration_violations(
+                    VALID_ENTITLEMENTS,
+                    VALID_BROKER_ENTITLEMENTS,
+                    &project,
+                )
+                .iter()
+                .any(|violation| violation.contains(
+                    "the TersaMacTokenBroker sources must be exactly the macos-token-broker root followed by the shared Keychain isolation probe source"
+                )),
+                "{label} source sequence bypass must fail closed"
             );
         }
     }
@@ -14057,6 +14510,87 @@ targets:
             ),
         ];
         for (label, project) in cases {
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(EXPECTED)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tersa_mac_tests_sources_pin_shared_probe_once_in_order() {
+        const EXPECTED: &str = "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift client/model surface";
+        // Unique exact three-entry anchor isolating the probe's slot in the
+        // TersaMacTests source list: immediately after `macos-tests` and
+        // before `macos/ConnectionOperationDeadline.swift`.
+        const ANCHOR: &str = concat!(
+            "      - path: macos-tests\n",
+            "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n",
+            "      - path: macos/ConnectionOperationDeadline.swift\n",
+        );
+
+        // Positive: the canonical fixture keeps the shared probe exactly once
+        // and in exact order, so it passes closed.
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty(),
+            "canonical TersaMacTests source list with the shared probe once must pass"
+        );
+
+        let cases = [
+            (
+                "remove probe path",
+                VALID_SIGNING_PROJECT.replace(
+                    ANCHOR,
+                    "      - path: macos-tests\n      - path: macos/ConnectionOperationDeadline.swift\n",
+                ),
+            ),
+            (
+                "wrong probe path",
+                VALID_SIGNING_PROJECT.replace(
+                    ANCHOR,
+                    "      - path: macos-tests\n      - path: keychain-isolation-probe/KeychainIsolationProbeBogus.swift\n      - path: macos/ConnectionOperationDeadline.swift\n",
+                ),
+            ),
+            (
+                "duplicate exact probe path",
+                VALID_SIGNING_PROJECT.replace(
+                    ANCHOR,
+                    "      - path: macos-tests\n      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n      - path: macos/ConnectionOperationDeadline.swift\n",
+                ),
+            ),
+            (
+                "extra source within anchored block",
+                VALID_SIGNING_PROJECT.replace(
+                    ANCHOR,
+                    "      - path: macos-tests\n      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n      - path: macos/ExtraIntruder.swift\n      - path: macos/ConnectionOperationDeadline.swift\n",
+                ),
+            ),
+            (
+                "reorder probe before macos-tests",
+                VALID_SIGNING_PROJECT.replace(
+                    ANCHOR,
+                    "      - path: keychain-isolation-probe/KeychainIsolationProbe.swift\n      - path: macos-tests\n      - path: macos/ConnectionOperationDeadline.swift\n",
+                ),
+            ),
+        ];
+
+        for (label, project) in cases {
+            assert_ne!(
+                project, VALID_SIGNING_PROJECT,
+                "{label} mutation must alter fixture"
+            );
             let violations = signing_configuration_violations(
                 VALID_ENTITLEMENTS,
                 VALID_BROKER_ENTITLEMENTS,
@@ -14233,6 +14767,167 @@ targets:
                     .any(|violation| violation.contains(expected)),
                 "{label} must fail closed; got {violations:?}"
             );
+        }
+    }
+
+    const TERSA_MAC_HARDENED_RUNTIME_VIOLATION: &str = "the TersaMac settings must enable ENABLE_HARDENED_RUNTIME (YES) and disable CODE_SIGN_INJECT_BASE_ENTITLEMENTS (NO) with no conditional overrides";
+    const TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION: &str = "the TersaMacTokenBroker settings must contain only the reviewed operational identity, token group, bridging header, dedicated Rust archive, SKIP_INSTALL, hardened runtime, and disabled base-entitlement injection";
+
+    /// Applies a target-specific mutation to `VALID_SIGNING_PROJECT`, proves the
+    /// fixture actually changed, then asserts the guard fails closed with the
+    /// expected semantic violation fragment. The anchors are unique two- or
+    /// three-line blocks (a target-only neighbour line plus the pinned setting),
+    /// so a single `replace` never mutates the other production target.
+    fn assert_release_signing_pin_fails_closed(
+        anchor: &str,
+        replacement: &str,
+        intact_sentinel: &str,
+        label: &str,
+        expected_fragment: &str,
+    ) {
+        let project = VALID_SIGNING_PROJECT.replace(anchor, replacement);
+        assert_ne!(
+            project, VALID_SIGNING_PROJECT,
+            "{label}: the target-specific mutation must alter the fixture"
+        );
+        assert!(
+            project.contains(intact_sentinel),
+            "{label}: the sibling production target's pinned setting must remain untouched"
+        );
+        let violations = signing_configuration_violations(
+            VALID_ENTITLEMENTS,
+            VALID_BROKER_ENTITLEMENTS,
+            &project,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_fragment)),
+            "{label}: must fail closed with a violation containing `{expected_fragment}`; got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn signing_hardened_runtime_pins_fail_closed() {
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty(),
+            "the canonical signing fixture must have zero violations"
+        );
+
+        let mac_enable = "        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements\n        ENABLE_HARDENED_RUNTIME: \"YES\"";
+        let broker_enable = "        SWIFT_OBJC_BRIDGING_HEADER: macos-token-broker/TersaMacTokenBroker-Bridging-Header.h\n        ENABLE_HARDENED_RUNTIME: \"YES\"";
+
+        for (label, anchor, replacement, sentinel, fragment) in [
+            (
+                "TersaMac missing ENABLE_HARDENED_RUNTIME",
+                mac_enable,
+                mac_enable.replace("\n        ENABLE_HARDENED_RUNTIME: \"YES\"", ""),
+                broker_enable,
+                TERSA_MAC_HARDENED_RUNTIME_VIOLATION,
+            ),
+            (
+                "TersaMac ENABLE_HARDENED_RUNTIME set to NO",
+                mac_enable,
+                mac_enable.replace(
+                    "ENABLE_HARDENED_RUNTIME: \"YES\"",
+                    "ENABLE_HARDENED_RUNTIME: \"NO\"",
+                ),
+                broker_enable,
+                TERSA_MAC_HARDENED_RUNTIME_VIOLATION,
+            ),
+            (
+                "TersaMac conditional ENABLE_HARDENED_RUNTIME override",
+                mac_enable,
+                mac_enable.replace(
+                    "ENABLE_HARDENED_RUNTIME: \"YES\"",
+                    "ENABLE_HARDENED_RUNTIME[sdk=macosx*]: \"NO\"",
+                ),
+                broker_enable,
+                TERSA_MAC_HARDENED_RUNTIME_VIOLATION,
+            ),
+            (
+                "TersaMac conditional ENABLE_HARDENED_RUNTIME addition",
+                mac_enable,
+                format!("{mac_enable}\n        ENABLE_HARDENED_RUNTIME[sdk=macosx*]: \"NO\""),
+                broker_enable,
+                TERSA_MAC_HARDENED_RUNTIME_VIOLATION,
+            ),
+            (
+                "TersaMacTokenBroker missing ENABLE_HARDENED_RUNTIME",
+                broker_enable,
+                broker_enable.replace("\n        ENABLE_HARDENED_RUNTIME: \"YES\"", ""),
+                mac_enable,
+                TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION,
+            ),
+            (
+                "TersaMacTokenBroker ENABLE_HARDENED_RUNTIME set to NO",
+                broker_enable,
+                broker_enable.replace(
+                    "ENABLE_HARDENED_RUNTIME: \"YES\"",
+                    "ENABLE_HARDENED_RUNTIME: \"NO\"",
+                ),
+                mac_enable,
+                TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION,
+            ),
+            (
+                "TersaMacTokenBroker conditional ENABLE_HARDENED_RUNTIME override",
+                broker_enable,
+                broker_enable.replace(
+                    "ENABLE_HARDENED_RUNTIME: \"YES\"",
+                    "ENABLE_HARDENED_RUNTIME[sdk=macosx*]: \"NO\"",
+                ),
+                mac_enable,
+                TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION,
+            ),
+            (
+                "TersaMacTokenBroker conditional ENABLE_HARDENED_RUNTIME addition",
+                broker_enable,
+                format!("{broker_enable}\n        ENABLE_HARDENED_RUNTIME[sdk=macosx*]: \"NO\""),
+                mac_enable,
+                TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION,
+            ),
+        ] {
+            assert_release_signing_pin_fails_closed(
+                anchor,
+                &replacement,
+                sentinel,
+                label,
+                fragment,
+            );
+        }
+    }
+
+    #[test]
+    fn signing_inject_base_entitlements_pins_fail_closed() {
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty(),
+            "the canonical signing fixture must have zero violations"
+        );
+
+        let mac_inject = "        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n        OTHER_LDFLAGS:\n          - \"$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a\"";
+        let broker_inject = "        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n        TERSA_MACOS_TOKEN_GROUP: \"$(TeamIdentifierPrefix)app.tersa.token\"";
+
+        for (label, anchor, replacement, sentinel, fragment) in [
+            ("TersaMac missing CODE_SIGN_INJECT_BASE_ENTITLEMENTS", mac_inject, mac_inject.replace("        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n", ""), broker_inject, TERSA_MAC_HARDENED_RUNTIME_VIOLATION),
+            ("TersaMac CODE_SIGN_INJECT_BASE_ENTITLEMENTS set to YES", mac_inject, mac_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"YES\""), broker_inject, TERSA_MAC_HARDENED_RUNTIME_VIOLATION),
+            ("TersaMac conditional CODE_SIGN_INJECT_BASE_ENTITLEMENTS override", mac_inject, mac_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS[sdk=macosx*]: \"YES\""), broker_inject, TERSA_MAC_HARDENED_RUNTIME_VIOLATION),
+            ("TersaMac conditional CODE_SIGN_INJECT_BASE_ENTITLEMENTS addition", mac_inject, mac_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n        CODE_SIGN_INJECT_BASE_ENTITLEMENTS[sdk=macosx*]: \"YES\""), broker_inject, TERSA_MAC_HARDENED_RUNTIME_VIOLATION),
+            ("TersaMacTokenBroker missing CODE_SIGN_INJECT_BASE_ENTITLEMENTS", broker_inject, broker_inject.replace("        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n", ""), mac_inject, TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION),
+            ("TersaMacTokenBroker CODE_SIGN_INJECT_BASE_ENTITLEMENTS set to YES", broker_inject, broker_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"YES\""), mac_inject, TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION),
+            ("TersaMacTokenBroker conditional CODE_SIGN_INJECT_BASE_ENTITLEMENTS override", broker_inject, broker_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS[sdk=macosx*]: \"YES\""), mac_inject, TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION),
+            ("TersaMacTokenBroker conditional CODE_SIGN_INJECT_BASE_ENTITLEMENTS addition", broker_inject, broker_inject.replace("CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS: \"NO\"\n        CODE_SIGN_INJECT_BASE_ENTITLEMENTS[sdk=macosx*]: \"YES\""), mac_inject, TERSA_MAC_TOKEN_BROKER_SETTINGS_VIOLATION),
+        ] {
+            assert_release_signing_pin_fails_closed(anchor, &replacement, sentinel, label, fragment);
         }
     }
 
@@ -16212,6 +16907,61 @@ final class BrokerSyncSecrets: @unchecked Sendable {
         ]);
     }
 
+    #[test]
+    fn token_broker_probe_entrypoint_passes_only_for_canonical_main() {
+        let reviewed = include_str!("../../apple/macos-token-broker/main.swift").to_owned();
+        let stripped = strip_swift_non_code;
+        // The real stripped fixture passes.
+        assert!(
+            token_broker_probe_entrypoint_is_canonical(&stripped(&reviewed)),
+            "reviewed main.swift must pass the canonical probe entrypoint check"
+        );
+        let probe_run = "    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)\n}";
+        for (label, document) in [
+            // `else` branch: the probe branch stays an exact substring, so only
+            // the immediately-following-setup check rejects it.
+            (
+                "else branch",
+                reviewed.replace(probe_run, &format!("{probe_run} else {{\n    _ = NSObject()\n}}")),
+            ),
+            // Extra executable statement between the branch and the listener.
+            (
+                "extra statement after branch",
+                reviewed.replace(
+                    "}\n\nlet tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()",
+                    "}\n_ = NSObject()\n\nlet tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()",
+                ),
+            ),
+            // Wrong principal: the probe branch no longer matches exactly.
+            ("wrong principal", reviewed.replace(".tokenBroker)", ".app)")),
+            // Duplicate run call inside the branch.
+            (
+                "duplicate run",
+                reviewed.replace(
+                    probe_run,
+                    "    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)\n    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)\n}",
+                ),
+            ),
+            // Probe branch moved after the listener setup.
+            (
+                "branch after listener",
+                reviewed.replace(
+                    "if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {\n    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)\n}\n\nlet tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()\nlet tokenBrokerListener = NSXPCListener.service()",
+                    "let tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()\nlet tokenBrokerListener = NSXPCListener.service()\nif KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {\n    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)\n}",
+                ),
+            ),
+        ] {
+            assert_ne!(
+                document, reviewed,
+                "{label} mutation must alter the reviewed fixture"
+            );
+            assert!(
+                !token_broker_probe_entrypoint_is_canonical(&stripped(&document)),
+                "{label} mutation must fail closed"
+            );
+        }
+    }
+
     /// Fail-closed fixtures for typealias rebinding and local type declarations
     /// that shadow reviewed primitive wire types (`String`, `Int`, `Void`).
     fn primitive_wire_type_shadowing_cases(
@@ -17214,5 +17964,204 @@ final class BrokerSyncSecrets: @unchecked Sendable {
         );
 
         assert!(violations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod keychain_isolation_probe_tests {
+    use std::path::PathBuf;
+
+    use super::{keychain_isolation_probe_source_surface_violations, strip_swift_non_code};
+
+    const PROBE_PATH: &str = "apple/keychain-isolation-probe/KeychainIsolationProbe.swift";
+
+    fn reviewed_document() -> String {
+        include_str!("../../apple/keychain-isolation-probe/KeychainIsolationProbe.swift").to_owned()
+    }
+
+    /// Mutations that rename or remove executable identifiers operate on the
+    /// already-stripped fixture so a doc-comment mention can never be the
+    /// replaced occurrence. `strip_swift_non_code` is idempotent on stripped
+    /// output, so re-stripping inside the guard leaves these mutations intact.
+    fn reviewed_code() -> String {
+        strip_swift_non_code(&reviewed_document())
+    }
+
+    fn fixture() -> (PathBuf, String) {
+        (PathBuf::from(PROBE_PATH), reviewed_document())
+    }
+
+    fn surface(sources: &[(PathBuf, String)]) -> Vec<String> {
+        keychain_isolation_probe_source_surface_violations(sources)
+    }
+
+    fn surface_doc(document: &str) -> Vec<String> {
+        surface(&[(PathBuf::from(PROBE_PATH), document.to_owned())])
+    }
+
+    fn expect(violations: &[String], fragment: &str) {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fragment)),
+            "expected a violation containing `{fragment}`, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn probe_inventory_accepts_only_the_exact_reviewed_fixture() {
+        // The real, committed fixture must itself be clean.
+        assert!(
+            surface(&[fixture()]).is_empty(),
+            "reviewed fixture must have zero violations"
+        );
+
+        // Missing inventory.
+        expect(&surface(&[]), "inventory");
+
+        // Wrong path: one source that is not the reviewed probe.
+        let wrong = vec![(
+            PathBuf::from("apple/keychain-isolation-probe/Other.swift"),
+            reviewed_document(),
+        )];
+        expect(&surface(&wrong), "inventory");
+
+        // Extra file: the reviewed probe plus an unreviewed sibling.
+        let extra = vec![
+            fixture(),
+            (
+                PathBuf::from("apple/keychain-isolation-probe/Extra.swift"),
+                String::new(),
+            ),
+        ];
+        expect(&surface(&extra), "inventory");
+
+        // Duplicate exact path: two documents under one reviewed path must fail
+        // closed. A BTreeSet alone collapses this; the count guard catches it.
+        let duplicate = vec![fixture(), fixture()];
+        expect(&surface(&duplicate), "inventory");
+    }
+
+    #[test]
+    fn probe_rejects_each_forbidden_capability_as_executable_code() {
+        let reviewed = reviewed_document();
+        for forbidden in [
+            "SecItemAdd",
+            "SecItemUpdate",
+            "SecItemDelete",
+            "kSecReturnData",
+            "kSecReturnAttributes",
+        ] {
+            let mutated = reviewed.replacen(
+                "import Foundation",
+                &format!("let _ = {forbidden}\nimport Foundation"),
+                1,
+            );
+            assert_ne!(mutated, reviewed, "{forbidden} mutation must alter fixture");
+            expect(&surface_doc(&mutated), forbidden);
+        }
+    }
+
+    #[test]
+    fn probe_rejects_a_second_secitemcopymatching_call() {
+        let reviewed = reviewed_document();
+        let mutated = reviewed.replacen(
+            "import Foundation",
+            "SecItemCopyMatching(0)\nimport Foundation",
+            1,
+        );
+        assert_ne!(
+            mutated, reviewed,
+            "second SecItemCopyMatching mutation must alter fixture"
+        );
+        expect(&surface_doc(&mutated), "SecItemCopyMatching");
+    }
+
+    #[test]
+    fn probe_requires_each_reviewed_call_exactly_once() {
+        let base = reviewed_code();
+        for call in [
+            "SecTaskCreateFromSelf",
+            "SecTaskCopyValueForEntitlement",
+            "SecItemCopyMatching",
+        ] {
+            let mutated = base.replace(call, "RemovedCall");
+            assert_ne!(mutated, base, "removing {call} must alter fixture");
+            expect(&surface_doc(&mutated), call);
+        }
+    }
+
+    #[test]
+    fn probe_requires_each_query_key_exactly_once() {
+        let base = reviewed_code();
+        for key in [
+            "kSecClassGenericPassword",
+            "kSecAttrService",
+            "kSecAttrAccount",
+            "kSecAttrAccessGroup",
+            "kSecUseDataProtectionKeychain",
+            "kSecMatchLimitOne",
+        ] {
+            let mutated = base.replace(key, &format!("Wrong{key}"));
+            assert_ne!(mutated, base, "renaming {key} must alter fixture");
+            expect(&surface_doc(&mutated), key);
+        }
+    }
+
+    #[test]
+    fn probe_must_bind_access_group_to_the_derived_forbidden_group() {
+        let base = reviewed_code();
+        let mutated = base.replace("forbiddenGroup as CFString", "callerGroup as CFString");
+        assert_ne!(
+            mutated, base,
+            "access-group binding mutation must alter fixture"
+        );
+        expect(&surface_doc(&mutated), "kSecAttrAccessGroup");
+    }
+
+    #[test]
+    fn probe_must_opt_into_the_data_protection_keychain() {
+        let base = reviewed_code();
+        let mutated = base.replace(
+            "kSecUseDataProtectionKeychain: true",
+            "kSecUseDataProtectionKeychain: false",
+        );
+        assert_ne!(
+            mutated, base,
+            "data-protection binding mutation must alter fixture"
+        );
+        expect(&surface_doc(&mutated), "kSecUseDataProtectionKeychain");
+    }
+
+    #[test]
+    fn probe_keeps_forbidden_names_inert_in_comments_and_ordinary_strings() {
+        let reviewed = reviewed_document();
+        let mutated = reviewed.replacen(
+            "import Foundation",
+            "// inert refs: SecItemAdd SecItemDelete kSecReturnData dlopen unsafeBitCast\n\
+             let inertNote = \"SecItemAdd kSecReturnData dlopen\"\nimport Foundation",
+            1,
+        );
+        assert_ne!(mutated, reviewed, "inert injection must alter fixture");
+        let violations = surface_doc(&mutated);
+        assert!(
+            violations.is_empty(),
+            "forbidden names in comments/ordinary strings must stay inert: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_an_executable_forbidden_lexical_identifier() {
+        // Raw strings, interpolation, and compiler conditionals are already
+        // covered by the `swift_source_lexical_violations` test suite; this only
+        // confirms the probe guard inherits executable-identifier rejection.
+        let reviewed = reviewed_document();
+        let mutated =
+            reviewed.replacen("import Foundation", "let _ = dlopen\nimport Foundation", 1);
+        assert_ne!(
+            mutated, reviewed,
+            "executable dlopen mutation must alter fixture"
+        );
+        expect(&surface_doc(&mutated), "dlopen");
     }
 }

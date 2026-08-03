@@ -49,6 +49,12 @@ private enum TersaApplication {
     private static let delegate = AppDelegate()
 
     static func main() {
+        // Exact opt-in Keychain isolation probe: read-only, no bootstrap, exits
+        // before any normal app behavior. Without this single argument the app
+        // launches exactly as before.
+        if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {
+            KeychainIsolationProbe.runAsPrincipal(.mainApp)
+        }
         let application = NSApplication.shared
         application.delegate = delegate
         application.run()

@@ -8,6 +8,14 @@ import Foundation
 // The process exports only TersaMacTokenBrokerProtocolV1 through the reviewed
 // listener delegate and binds the dedicated Rust broker composition. OAuth
 // code exchange, refresh, persistence, revoke, and local delete run only here.
+
+// Exact opt-in Keychain isolation probe: read-only, no listener, exits before
+// any normal broker behavior. Without this single argument the broker launches
+// exactly as before.
+if KeychainIsolationProbe.isProbeRequest(CommandLine.arguments) {
+    KeychainIsolationProbe.runAsPrincipal(.tokenBroker)
+}
+
 let tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()
 let tokenBrokerListener = NSXPCListener.service()
 tokenBrokerListener.delegate = tokenBrokerListenerDelegate

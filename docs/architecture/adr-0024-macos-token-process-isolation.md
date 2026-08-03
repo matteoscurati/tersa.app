@@ -117,16 +117,47 @@ Issue #51 remains open until all of the following are complete:
    release signing posture.
 
 Items 2 through 4 are implemented in source and fail-closed in CI as of the
-point-4 cutover (see *Current packaging status*). Items 1, 5, and 6 remain
-unproved: they require external registration and signed-runtime evidence
-that this repository cannot produce or attest by inspection.
+point-4 cutover (see *Current packaging status*). The fixed-purpose,
+read-only negative probes required by Item 5 are now implemented in source
+as the shared `KeychainIsolationProbe`: one reviewed file compiled unchanged
+into both actual executables (`TersaMac` and `TersaMacTokenBroker`) and the
+`TersaMacTests` bundle, so a later signed run can execute the probe inside
+the real processes. Exact XcodeGen source-path, source-surface, and
+capability guards in `cargo xtask architecture` hold that shape (see
+*Current packaging status*). The probes are fixed-purpose test entries that
+set `kSecUseDataProtectionKeychain` and expose no Keychain mutation or
+generic-query capability.
 
-The probes must be fixed-purpose test entries, set
-`kSecUseDataProtectionKeychain`, and must not expose a generic Keychain mutation
-capability. Only `errSecMissingEntitlement` passes a wrong-group negative
-control; `errSecItemNotFound` is a failed probe. Evidence must be redacted,
-commit-bound, and independently reviewed under the existing distribution
-protocol.
+The probe is opt-in only and changes no production behavior unless the host
+process is launched with the exact single argument
+`--tersa-keychain-isolation-probe-v1`. It then reads its own signed
+`keychain-access-groups` entitlement, derives the one group the principal is
+forbidden from — the other principal's group, produced by keeping the team
+prefix and swapping the suffix between `.app.tersa.shared` and
+`.app.tersa.token` — and issues exactly one query-only `SecItemCopyMatching`
+against that group,
+requesting no item data and no attributes. Only `errSecMissingEntitlement`
+passes (exit `0`); `errSecItemNotFound`, a configuration-invalid entitlement
+(absent, malformed, zero/multiple, or wrong-suffix groups), and any
+unexpected status all exit nonzero.
+
+These deterministic unit, build, and unsigned-entrypoint checks do not prove
+signed runtime isolation. They prove only that the probe is fixed-purpose,
+read-only, and correctly shaped. An unsigned build has no signed entitlement
+context, and an ad-hoc build may embed an entitlement plist but is not Apple
+Development provisioned evidence for these team-scoped groups.
+Unsigned/ad-hoc outcomes are therefore non-authoritative and normally
+configuration-invalid in the documented deterministic path, regardless of
+which status a scratch build happens to report; only the Apple Development
+signed Point-6 procedure can prove Item 5 runtime isolation. Item 5
+therefore remains unproved: normal token operations succeeding and both
+wrong-group probes receiving `errSecMissingEntitlement` must be run in an
+Apple Development signed build.
+Item 6 remains the Developer ID signed and notarized release-candidate tier,
+adding entitlement inspection and debugger/`task_for_pid` failure. Item 1
+remains external registration that this repository cannot produce or attest
+by inspection. Evidence must be redacted, commit-bound, and independently
+reviewed under the existing distribution protocol.
 
 ## Consequences
 
@@ -223,7 +254,25 @@ clean.
 
 Operational binding and the closed client/mapping surface are implemented,
 and point 4 has completed the production cutover described in the next
-subsection. What remains open is strictly the signed-runtime evidence: the
+subsection.
+
+Point 5 packages the shared `KeychainIsolationProbe` source. XcodeGen
+compiles the single reviewed file into `TersaMac`, `TersaMacTokenBroker`,
+and `TersaMacTests` from one explicit source path, and both executable
+targets set `ENABLE_HARDENED_RUNTIME = YES` and
+`CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO` with no conditional overrides, so a
+signed release applies only the committed entitlements. `cargo xtask
+architecture` guards that shape: the probe source inventory must be exactly
+the reviewed file; the code must contain exactly one `SecItemCopyMatching`
+and no `SecItemAdd`, `SecItemUpdate`, `SecItemDelete`, `kSecReturnData`, or
+`kSecReturnAttributes`; the query must bind `kSecAttrAccessGroup` to the
+derived forbidden group and set `kSecUseDataProtectionKeychain`; both
+executable settings blocks must keep the hardened-runtime and
+base-entitlement-injection posture with no conditional override; and each
+executable's entry point must open with the exact, contiguous, unduplicated
+probe branch before any normal startup.
+
+What remains open is strictly the signed-runtime evidence: the
 dedicated token Keychain group is declared for the broker only and, unless
 externally completed, is not yet registered or provisioned under the
 production team — the repository cannot prove external registration;
