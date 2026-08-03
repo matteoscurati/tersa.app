@@ -16,6 +16,20 @@ publish = false
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[features]
+# Default features are empty: the production FFI is broker-fed (ADR-0024) and
+# links neither the direct refresh-token lifecycle nor the legacy Apple OAuth
+# bridge surface.
+default = []
+# Obsolete in-process OAuth/token lifecycle: the plain sync/connect/disconnect
+# begins that compose the refresh-token lifecycle in-process and claim grants
+# from the bridge's legacy OAuth session registry. Kept for legacy and test
+# compositions only; never enabled by a production dependency.
+legacy-token-lifecycle = [
+    "tersa-oauth-sync-macos/legacy-token-lifecycle",
+    "tersa-apple-bridge/legacy-oauth",
+]
+
 # Every dependency is macOS-only: on other targets the crate compiles to an empty
 # library that exports no symbols. The Google token and revoke endpoints are pinned
 # downstream in the Gmail transport; this crate depends on neither the network nor
@@ -35,8 +49,19 @@ zeroize = { workspace = true }
 # `test-util` exposes WorkerHandles' test constructor so the session-registry tests
 # can drive poll against fabricated terminal/running handles without spawning a
 # real worker (no Keychain, no network); never enabled by a production dependency.
+# `legacy-token-lifecycle` compiles the legacy begins and the `BridgeConnectSession`
+# the cfg(test) suite exercises; feature unification turns it on only for this
+# crate's own test build — the production dependency edge above stays feature-free.
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0", features = [
+    "legacy-token-lifecycle",
     "test-util",
+] }
+# The cfg(test) `BridgeConnectSession` tests drive the real bridge OAuth registry
+# through its legacy begin/finish/cancel seams; feature unification enables
+# `legacy-oauth` only for this crate's own test build — the production dependency
+# edge above keeps `default-features = false`.
+tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0", default-features = false, features = [
+    "legacy-oauth",
 ] }
 
 [lints]
