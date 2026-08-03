@@ -54,6 +54,14 @@ final class AccountConnectionViewModel: ObservableObject {
     private var activationTimeout: Timer?
     private var didRestorePersistedLifecycle = false
     private var launchLifecycleRestoreFence = MailboxLifecycleRestoreFence()
+    /// The single token-broker client this view model currently owns, or nil.
+    /// Ownership is exclusive: a client is installed only while this is nil and
+    /// is released (cleared here, then cancelled exactly once) by the same path
+    /// that ends its operation. A completion arriving after release finds this
+    /// nil — or a DIFFERENT instance — and must not touch the slot, so a late
+    /// terminal can never cancel a replacement client. MainActor-confined like
+    /// every property on this class, so install/finish/cancel are race-free.
+    private var activeTokenBrokerClient: TokenBrokerClient?
 
     /// The M2 warning copy for a disconnect that returned
     /// `.succeededRevokeUnconfirmed`: fact → what we can't confirm → the
@@ -420,6 +428,138 @@ final class AccountConnectionViewModel: ObservableObject {
         }
     }
 
+    /// The broker-backed stored-credential rung: refresh the STORED grant
+    /// through the one broker client this view model owns, then feed the
+    /// returned access token into the broker sync. Only a `.needsReconnect`
+    /// climbs to browser re-consent; a transport failure lands connected
+    /// offline (the same offline semantics as the stored-credential rung's
+    /// SYNC_FAILED); every other failure maps to its closed connection
+    /// failure and never re-prompts OAuth.
+    private func refreshStoredBrokerCredential(
+        subject: String,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        guard let client = installTokenBrokerClient() else {
+            // A broker client is already active: fail closed as busy rather
+            // than racing a second refresh against the owned one.
+            _ = finishOperation(token)
+            state = .failed(.busyOrUnavailable)
+            return
+        }
+        client.refreshAccessToken(accountSubject: subject) { [weak self] result in
+            Task { @MainActor in
+                guard let self else {
+                    // The owner is gone, so no finish path can release the
+                    // client; cancel the captured instance directly, exactly
+                    // once (the completion fires at most once).
+                    client.cancel()
+                    return
+                }
+                // Releases the client exactly once; a stale completion from an
+                // already-released client observes a foreign/empty slot and
+                // must not touch the state.
+                guard self.finishTokenBrokerClient(client) else {
+                    return
+                }
+                guard self.operationDeadline.accepts(token) else {
+                    return
+                }
+                switch result {
+                case .success(let refreshedToken):
+                    // The refreshed grant must still belong to the STORED
+                    // identity; a mismatched subject must never feed another
+                    // identity's access token into the sync.
+                    guard refreshedToken.subject == subject else {
+                        _ = self.finishOperation(token)
+                        self.state = .failed(.unavailable)
+                        return
+                    }
+                    self.syncWorker.beginBrokerSync(
+                        accountIdentifier: accountIdentifier,
+                        token: refreshedToken
+                    ) { [weak self] status in
+                        guard let self, self.operationDeadline.accepts(token) else {
+                            return
+                        }
+                        self.finishStoredBrokerSync(
+                            status: status,
+                            accountIdentifier: accountIdentifier,
+                            token: token
+                        )
+                    }
+                case .failure(let error):
+                    let recovery = TokenBrokerStatusMapping.recovery(
+                        for: error,
+                        operation: .refreshAccessToken
+                    )
+                    switch recovery {
+                    case .needsReconnect:
+                        // The stored grant is gone or revoked: climb the ladder.
+                        _ = self.finishOperation(token)
+                        self.authorizeAndConnect(accountIdentifier: accountIdentifier)
+                    case .permissionRequired:
+                        _ = self.finishOperation(token)
+                        self.state = .failed(.permissionRequired)
+                    case .transport:
+                        // The refresh died in transit; land connected on the
+                        // last-committed mailbox, offline — the stored-credential
+                        // rung's SYNC_FAILED semantics.
+                        self.completeConnected(
+                            accountIdentifier: accountIdentifier,
+                            token: token,
+                            offline: true
+                        )
+                    default:
+                        _ = self.finishOperation(token)
+                        self.state = .failed(
+                            TokenBrokerStatusMapping.connectionFailure(for: recovery) ?? .unavailable
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// The terminal mapping for a broker sync begun from
+    /// `refreshStoredBrokerCredential`: identical to the stored-credential
+    /// rung's poll-terminal semantics. The deadline must already have been
+    /// checked by the caller.
+    private func finishStoredBrokerSync(
+        status: MailboxPollStatus,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken
+    ) {
+        switch status {
+        case .succeeded, .succeededRevokeUnconfirmed:
+            completeConnected(
+                accountIdentifier: accountIdentifier,
+                token: token,
+                offline: false
+            )
+        case .syncFailed:
+            // Offline case, as on the stored-credential rung: the gate did not
+            // BLOCK, and the mailbox store only ever holds the last-COMMITTED
+            // identity's data, so last-verified data may be shown.
+            completeConnected(
+                accountIdentifier: accountIdentifier,
+                token: token,
+                offline: true
+            )
+        case .needsReconnect, .permissionRequired:
+            _ = finishOperation(token)
+            authorizeAndConnect(accountIdentifier: accountIdentifier)
+        case .cancelled:
+            // A disconnect dropped the in-flight sync; land neutral.
+            _ = finishOperation(token)
+            state = .notConnected
+        case .gateBlocked, .internalError, .unknownSession, .unrecognized,
+             .running:
+            _ = finishOperation(token)
+            state = .failed(Self.terminalFailure(status))
+        }
+    }
+
     /// The third rung: re-consent in the browser. The state moves to
     /// `.authorizing` only once the session actually started (its Cancel
     /// affordance targets that session); a pre-flight refusal is the
@@ -569,6 +709,50 @@ final class AccountConnectionViewModel: ObservableObject {
         activationObserver = nil
         activationTimeout?.invalidate()
         activationTimeout = nil
+    }
+
+    /// Installs a new token-broker client as the one this view model owns.
+    /// Returns nil WITHOUT constructing when one is already active, so a
+    /// re-entrant begin can never leak a second client or orphan the first.
+    /// The caller owns the returned instance only through this property: it
+    /// must be released via `finishTokenBrokerClient(_:)` or
+    /// `cancelActiveTokenBrokerClient()`, never cancelled directly.
+    private func installTokenBrokerClient() -> TokenBrokerClient? {
+        guard activeTokenBrokerClient == nil else {
+            return nil
+        }
+        let client = TokenBrokerClient()
+        activeTokenBrokerClient = client
+        return client
+    }
+
+    /// Releases `client` if it is STILL the active instance: clears the
+    /// property first, then cancels exactly once, and returns true. Returns
+    /// false — and never cancels — when the slot is empty or holds a different
+    /// instance, so a late completion from an already-released client cannot
+    /// cancel its successor. Clearing before `cancel()` keeps the exact-once
+    /// guarantee even if `cancel()`'s invalidation reenters this actor: the
+    /// reentrant path observes a nil slot and takes the false branch.
+    private func finishTokenBrokerClient(_ client: TokenBrokerClient) -> Bool {
+        guard activeTokenBrokerClient === client else {
+            return false
+        }
+        activeTokenBrokerClient = nil
+        client.cancel()
+        return true
+    }
+
+    /// Releases whatever client is currently active: takes and clears the
+    /// property first, then cancels it exactly once. Repeated calls — and
+    /// calls racing a `finishTokenBrokerClient(_:)` that already released the
+    /// instance — observe a nil slot and no-op, so the owned client can never
+    /// be cancelled twice from this view model.
+    private func cancelActiveTokenBrokerClient() {
+        guard let client = activeTokenBrokerClient else {
+            return
+        }
+        activeTokenBrokerClient = nil
+        client.cancel()
     }
 
     /// The final rung: claim the finished OAuth grant with a connect-begin. A
