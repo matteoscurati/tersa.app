@@ -7,9 +7,9 @@ import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// The app-held OAuth authorization session the reviewed view-model
-    /// drives (start, and the unconditional cancel before a disconnect).
-    let oauthAuthorizationSession = OAuthAuthorizationSession()
+    /// The app-held broker authorization session the view model drives
+    /// (start, and the unconditional cancel before a disconnect).
+    let tokenBrokerAuthorizationSession = TokenBrokerAuthorizationSession()
     private let bootstrapWorker = BootstrapWorker()
     private var mainWindow: NSWindow?
 

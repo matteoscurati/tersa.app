@@ -178,7 +178,7 @@ final class AccountConnectionViewModel: ObservableObject {
         case .authorization:
             guard operationDeadline.timeOut(token, keepAlive: false) else { return }
             operationTimer = nil
-            (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
+            (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession.cancel()
             state = .failed(.authorizationTimedOut)
         case .disconnect:
             guard operationDeadline.timeOut(token, keepAlive: true) else { return }
@@ -206,13 +206,6 @@ final class AccountConnectionViewModel: ObservableObject {
         // durable revoke-unconfirmed warning remains visible until the next
         // disconnect converges or the user dismisses it explicitly.
         disconnectConfirmation = nil
-        // Fail fast on a missing/unconfigured client id with the config-specific
-        // message, rather than letting a bad id reach the sync rung and surface
-        // as a misleading permanent "unavailable".
-        guard Self.oauthClientIDIsUsable else {
-            state = .failed(.signInUnavailable)
-            return
-        }
         state = .connecting
         let accountIdentifierData = Data(trimmedIdentifier.utf8)
         let token = beginOperation(.connectAndSync, timeout: Self.connectAndSyncTimeout)
@@ -294,7 +287,7 @@ final class AccountConnectionViewModel: ObservableObject {
     /// The content-free outer intent journal is durably verified before the
     /// destructive Rust begin and cleared only after a successful terminal.
     func disconnect() {
-        (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
+        (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession.cancel()
         guard let accountIdentifier = connectedAccountIdentifier, state != .disconnecting else {
             return
         }
@@ -357,7 +350,7 @@ final class AccountConnectionViewModel: ObservableObject {
         guard state == .authorizing else {
             return
         }
-        (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession.cancel()
+        (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession.cancel()
     }
 
     /// Dismisses the disconnect banner (the M2 revoke warning or the clean
@@ -531,12 +524,15 @@ final class AccountConnectionViewModel: ObservableObject {
         }
     }
 
-    /// The third rung: re-consent in the browser. The state moves to
-    /// `.authorizing` only once the session actually started (its Cancel
-    /// affordance targets that session); a pre-flight refusal is the
-    /// missing-configuration failure.
+    /// The third rung: re-consent in the browser through the token broker
+    /// authorization session. The state moves to `.authorizing` only once the
+    /// session actually started (its Cancel affordance targets that session).
+    /// A `false` return from `start` is a SYNCHRONOUS local preflight refusal
+    /// — a session already in flight or the loopback listener could not be
+    /// created — and maps to the missing-configuration failure; broker and
+    /// browser failures arrive ASYNCHRONOUSLY through the outcome instead.
     private func authorizeAndConnect(accountIdentifier: Data) {
-        guard let session = (NSApp.delegate as? AppDelegate)?.oauthAuthorizationSession else {
+        guard let session = (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession else {
             state = .failed(.signInUnavailable)
             return
         }
@@ -549,13 +545,18 @@ final class AccountConnectionViewModel: ObservableObject {
                 return
             }
             switch outcome {
-            case .succeeded(let oauthSession):
+            case .succeeded(let accessToken, let subject, let expiresInSeconds):
                 _ = self.finishOperation(token)
                 self.state = .connecting
                 let connectToken = self.beginOperation(.connectAndSync, timeout: Self.connectAndSyncTimeout)
-                self.connectAfterApplicationActivation(
+                let brokerToken = TokenBrokerAccessToken(
+                    accessToken: accessToken,
+                    subject: subject,
+                    expiresInSeconds: expiresInSeconds
+                )
+                self.connectBrokerGrantAfterApplicationActivation(
                     accountIdentifier: accountIdentifier,
-                    oauthSession: oauthSession,
+                    brokerToken: brokerToken,
                     token: connectToken
                 )
             case .cancelled:
@@ -563,18 +564,21 @@ final class AccountConnectionViewModel: ObservableObject {
                 // cancelled re-connect never renders as "disconnected".
                 _ = self.finishOperation(token)
                 self.state = .notConnected
-            case .permissionRequired:
+            case .failed(let recovery):
+                // An ASYNCHRONOUS broker/browser failure delivered through the
+                // outcome — distinct from the synchronous local preflight
+                // `false` below, which is `.signInUnavailable` instead.
                 _ = self.finishOperation(token)
-                self.state = .failed(.permissionRequired)
-            case .failed:
-                _ = self.finishOperation(token)
-                self.state = .failed(.signInFailed)
+                self.state = .failed(
+                    TokenBrokerStatusMapping.connectionFailure(for: recovery) ?? .signInFailed
+                )
             }
         }
         guard started else {
-            // A PRE-FLIGHT refusal — the sign-in page never opened (missing/
-            // unconfigured client id, a session already in flight, or the
-            // browser wouldn't open the URL). NOT a browser sign-in failure.
+            // A SYNCHRONOUS local preflight refusal — the sign-in page never
+            // opened because a session is already in flight or the loopback
+            // listener could not be created. NOT an asynchronous broker/
+            // browser failure; those are delivered through the outcome.
             _ = finishOperation(token)
             state = .failed(.signInUnavailable)
             return
