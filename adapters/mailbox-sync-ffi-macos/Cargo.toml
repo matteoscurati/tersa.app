@@ -26,7 +26,7 @@ crate-type = ["rlib", "staticlib"]
 # through the composition), and the bridge's own dependency graph is unchanged.
 [target.'cfg(target_os = "macos")'.dependencies]
 tersa-application = { path = "../../crates/application", version = "=0.0.0" }
-tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0" }
+tersa-apple-bridge = { path = "../../apple/rust-bridge", version = "=0.0.0", default-features = false }
 tersa-oauth-sync-macos = { path = "../oauth-sync-macos", version = "=0.0.0" }
 url = { workspace = true }
 zeroize = { workspace = true }
