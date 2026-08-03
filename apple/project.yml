@@ -79,6 +79,7 @@ targets:
         CFBundlePackageType: XPC!
         XPCService:
           ServiceType: Application
+        TersaOAuthClientID: "$(TERSA_OAUTH_CLIENT_ID)"
     entitlements:
       path: macos-token-broker/TersaMacTokenBroker.entitlements
       properties:
@@ -93,16 +94,37 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
         SKIP_INSTALL: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: macos-token-broker/TersaMacTokenBroker-Bridging-Header.h
+        TERSA_MACOS_TOKEN_GROUP: "$(TeamIdentifierPrefix)app.tersa.token"
+        # Cargo and rustup read their compiler sysroot outside SRCROOT. Keep
+        # this exception scoped to the target that invokes the locked script.
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_token_broker_ffi_macos.a"
+    preBuildScripts:
+      - name: Build Rust token-broker static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos-token-broker "${CONFIGURATION}"'
   TersaMacTests:
     type: bundle.unit-test
     platform: macOS
     sources:
       - path: macos-tests
-      # Compile the coordinator directly so its deterministic tests do not
-      # invoke the app target's AppKit/FFI bootstrap or live OAuth surface.
+      # Compile the coordinator and broker client mapping directly so
+      # deterministic tests do not invoke the app target's AppKit/FFI bootstrap
+      # or live OAuth/Keychain/network surfaces.
       - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/ConnectionState.swift
       - path: macos/DisconnectIntentStore.swift
       - path: macos/MailboxLifecyclePresentation.swift
+      - path: macos/TokenBrokerProtocol.swift
+      - path: macos/TokenBrokerClient.swift
+      - path: macos/TokenBrokerStatusMapping.swift
+      # Authorization-session loopback helpers only; no live XPC/network begin.
+      - path: macos/TokenBrokerAuthorizationSession.swift
+      # Shared complete-path callback buffer helper (also compiled into the
+      # signed broker target). Tests must exercise this production helper.
+      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests

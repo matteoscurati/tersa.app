@@ -209,13 +209,67 @@ impl DataProtectionRefreshTokenStore {
     /// Group is absent.
     pub fn new() -> Result<Self, RefreshTokenError> {
         Ok(Self {
-            backend: token_keychain::MacosRefreshTokenBackend::new()?,
+            backend: token_keychain::MacosRefreshTokenBackend::for_app_group()?,
         })
     }
 }
 
 #[cfg(target_os = "macos")]
 impl RefreshTokenStore for DataProtectionRefreshTokenStore {
+    fn store(
+        &self,
+        account: &AccountId,
+        token: &Zeroizing<String>,
+    ) -> Result<(), RefreshTokenError> {
+        store_refresh_token(&self.backend, account, token)
+    }
+
+    fn load(&self, account: &AccountId) -> Result<Option<Zeroizing<String>>, RefreshTokenError> {
+        load_refresh_token(&self.backend, account)
+    }
+
+    fn delete(&self, account: &AccountId) -> Result<(), RefreshTokenError> {
+        delete_refresh_token(&self.backend, account)
+    }
+}
+
+/// The broker-only refresh-token store fixed to the dedicated token access group.
+///
+/// ADR-0024: the separately signed token-broker process persists refresh tokens
+/// under the token Keychain group and token service only. The store never accepts
+/// an arbitrary group, service, or query: every operation is fixed by construction
+/// to the token service and the signing-time token group, and is keyed only by a
+/// validated account subject. It never reaches the installation-root/store group
+/// and performs no migration of legacy items.
+#[cfg(target_os = "macos")]
+pub struct BrokerDataProtectionRefreshTokenStore {
+    backend: token_keychain::MacosRefreshTokenBackend,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for BrokerDataProtectionRefreshTokenStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BrokerDataProtectionRefreshTokenStore([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl BrokerDataProtectionRefreshTokenStore {
+    /// Creates the broker-only refresh-token store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefreshTokenError::OperationFailed`] when the signing-time
+    /// dedicated token Keychain group is absent.
+    pub fn new() -> Result<Self, RefreshTokenError> {
+        Ok(Self {
+            backend: token_keychain::MacosRefreshTokenBackend::for_token_group()?,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl RefreshTokenStore for BrokerDataProtectionRefreshTokenStore {
     fn store(
         &self,
         account: &AccountId,
@@ -280,14 +334,28 @@ mod token_keychain {
     }
 
     /// The production Keychain backend, bound to one access group.
+    ///
+    /// The group is chosen at construction (`for_app_group` or
+    /// `for_token_group`); no method accepts a group, service, or query
+    /// override, so a caller cannot retarget the installation root key or the
+    /// other process's group.
     pub(super) struct MacosRefreshTokenBackend {
         group: &'static str,
     }
 
     impl MacosRefreshTokenBackend {
-        pub(super) fn new() -> Result<Self, RefreshTokenError> {
+        /// Binds to the main-app signing-time App Group (legacy in-process path).
+        pub(super) fn for_app_group() -> Result<Self, RefreshTokenError> {
             Ok(Self {
                 group: crate::configured_app_group()
+                    .map_err(|_error| RefreshTokenError::OperationFailed)?,
+            })
+        }
+
+        /// Binds to the dedicated broker token Keychain group (ADR-0024).
+        pub(super) fn for_token_group() -> Result<Self, RefreshTokenError> {
+            Ok(Self {
+                group: crate::configured_token_group()
                     .map_err(|_error| RefreshTokenError::OperationFailed)?,
             })
         }

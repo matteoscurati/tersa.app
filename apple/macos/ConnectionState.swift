@@ -2,6 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+/// Closed product-bootstrap status integers shared with the Rust bridge.
+enum ProductBootstrapStatus: Int32 {
+    case ready = 0
+    case invalidAccountIdentifier = 1
+    case invalidExecutionContext = 2
+    case busyOrUnavailable = 3
+    case rootMissingWithExistingProfile = 4
+    case unavailable = 5
+}
+
 /// A non-ready account-connection outcome, phrased for the person using the
 /// app. Carries no internal identifiers and no secrets.
 enum ConnectionFailure: Equatable {
@@ -20,6 +30,11 @@ enum ConnectionFailure: Equatable {
     /// a browser sign-in failure — a different remedy applies.
     case signInUnavailable
     /// Google sign-in completed without granting Gmail read access.
+    ///
+    /// The first-connect under-scoped grant can be stranded at Google and
+    /// cannot be revoked in-app (ADR-0024). UI recovery must offer
+    /// retain-or-retry and a safe link to Google Account permissions
+    /// (`TokenBrokerStatusMapping.googleAccountPermissionsURL`).
     case permissionRequired
     /// A connect or stored-credential sync did not complete within its bounded
     /// client-side deadline. The non-cancellable original callback remains
@@ -57,7 +72,7 @@ enum ConnectionFailure: Equatable {
         case .signInUnavailable:
             return "Tersa couldn't open the sign-in page in your browser. Check that a default browser is set, then try again."
         case .permissionRequired:
-            return "Gmail read access wasn't granted. Sign in again and allow Tersa to read your email."
+            return "Gmail read access wasn't granted. Sign in again and allow Tersa to read your email — or open your Google Account permissions to remove Tersa if this Mac should not keep access."
         case .connectionTimedOut:
             return "Connection is still finishing. Keep Tersa open; it will update when complete."
         case .authorizationTimedOut:

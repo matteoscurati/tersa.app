@@ -20,6 +20,13 @@ case "$platform" in
     manifest="../adapters/mailbox-sync-ffi-macos/Cargo.toml"
     archive="libtersa_mailbox_sync_ffi_macos.a"
     ;;
+  macos-token-broker)
+    target="aarch64-apple-darwin"
+    # The token-broker XPC service links ONLY this dedicated archive. It must
+    # never share the main app's mailbox-sync FFI archive (ADR-0024).
+    manifest="../adapters/token-broker-ffi-macos/Cargo.toml"
+    archive="libtersa_token_broker_ffi_macos.a"
+    ;;
   ios)
     case "${PLATFORM_NAME:-iphoneos}" in
       iphonesimulator)
@@ -71,11 +78,20 @@ fi
 library="${CARGO_TARGET_DIR}/${target}/${profile}/${archive}"
 test -f "$library"
 
-platform_name="${PLATFORM_NAME:-$platform}"
+# Map script platform names onto the Xcode PLATFORM_NAME directory so both the
+# main app and the token-broker XPC service can share apple/build/rust/macosx
+# without clobbering each other's dedicated archive.
+case "$platform" in
+  macos|macos-token-broker)
+    platform_name="${PLATFORM_NAME:-macosx}"
+    ;;
+  *)
+    platform_name="${PLATFORM_NAME:-$platform}"
+    ;;
+esac
 output_directory="${CARGO_TARGET_DIR}/${platform_name}/${configuration}"
 mkdir -p "$output_directory"
-# Remove any stale Rust archive from a previous build (e.g. a pre-swap
-# libtersa_apple_bridge.a in a warm checkout) so exactly one archive sits at the
-# destination the link line points at — never two next to each other.
-rm -f "${output_directory}"/libtersa_*.a
+# Replace only this target's archive. The main app and token broker each link
+# exactly one dedicated Rust archive; wiping every libtersa_*.a would delete the
+# sibling process's library when both targets build into the same directory.
 cp "$library" "${output_directory}/${archive}"

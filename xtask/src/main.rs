@@ -31,7 +31,7 @@ struct ResolvedDependencyIdentity {
     package_id: PackageId,
 }
 
-const SQLCIPHER_OWNERS: [&str; 7] = [
+const SQLCIPHER_OWNERS: [&str; 8] = [
     "tersa-search-spike",
     "tersa-sqlcipher-spike",
     "tersa-store-sqlcipher-macos",
@@ -42,9 +42,12 @@ const SQLCIPHER_OWNERS: [&str; 7] = [
     // 3d: the mailbox-sync FFI reaches the store only through the composition; its
     // closed direct-dependency set forbids declaring rusqlite directly.
     "tersa-mailbox-sync-ffi-macos",
+    // ADR-0024 point 3: the token-broker FFI reaches Keychain (and thus the
+    // store graph) only through the broker-only token store composition.
+    "tersa-token-broker-ffi-macos",
 ];
 const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const HMAC_OWNERS: [&str; 4] = [
+const HMAC_OWNERS: [&str; 5] = [
     "tersa-blob-spike",
     "tersa-keychain-macos",
     // 3d: reaches HMAC transitively through the Keychain HKDF key derivation.
@@ -52,6 +55,8 @@ const HMAC_OWNERS: [&str; 4] = [
     // 3d: the mailbox-sync FFI reaches HMAC only through the composition's Keychain
     // HKDF; its closed direct-dependency set forbids declaring hmac directly.
     "tersa-mailbox-sync-ffi-macos",
+    // ADR-0024 point 3: broker FFI reaches HMAC only transitively via Keychain.
+    "tersa-token-broker-ffi-macos",
 ];
 const RESERVED_FUTURE_POLICY: [(&str, &[&str]); 0] = [];
 const MACOS_STORE_TARGET: &str = r#"cfg(target_os = "macos")"#;
@@ -338,7 +343,66 @@ fn protected_package_shape_violations(package: &Package, metadata: &Metadata) ->
         ));
         violations.extend(custom_build_target_violations(package));
     }
+    if package_name == "tersa-token-broker-ffi-macos" {
+        violations.extend(token_broker_ffi_direct_dependency_set_violations(
+            &direct_dependencies,
+        ));
+        violations.extend(token_broker_ffi_package_violations(
+            package,
+            metadata
+                .workspace_root
+                .join("adapters/token-broker-ffi-macos/src/lib.rs")
+                .as_str(),
+        ));
+        violations.extend(custom_build_target_violations(package));
+    }
     violations
+}
+
+/// The token-broker FFI's direct dependency set is closed: broker core, Google
+/// transport, broker Keychain store, portable clocks, and a pinned tokio runtime
+/// — and NOTHING else. It must never depend on the main app's mailbox-sync FFI
+/// or the Apple bootstrap bridge.
+fn token_broker_ffi_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<String> {
+    const REQUIRED: [&str; 7] = [
+        "tersa-application",
+        "tersa-domain",
+        "tersa-gmail-rest-macos",
+        "tersa-keychain-macos",
+        "tersa-token-broker-core",
+        "tokio",
+        "zeroize",
+    ];
+    let required = REQUIRED.into_iter().collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for dependency in dependencies.difference(&required) {
+        violations.push(format!(
+            "tersa-token-broker-ffi-macos -> {dependency} (dependency is outside the closed token-broker FFI set)"
+        ));
+    }
+    for dependency in required.difference(dependencies) {
+        violations.push(format!(
+            "tersa-token-broker-ffi-macos is missing required direct dependency {dependency}"
+        ));
+    }
+    violations
+}
+
+/// The token-broker FFI must expose exactly one reviewed library target.
+fn token_broker_ffi_package_violations(package: &Package, canonical_library: &str) -> Vec<String> {
+    let has_exact_library = package.targets.iter().any(|target| {
+        target.name == "tersa_token_broker_ffi_macos"
+            && target.src_path.as_str() == canonical_library
+            && target.kind == [TargetKind::RLib, TargetKind::StaticLib]
+            && target.crate_types == [CrateType::RLib, CrateType::StaticLib]
+    });
+    if package.targets.len() != 1 || !has_exact_library {
+        return vec![
+            "tersa-token-broker-ffi-macos must expose only the reviewed rlib/staticlib library target from its canonical source"
+                .to_owned(),
+        ];
+    }
+    Vec::new()
 }
 
 /// The trusted composition's direct dependency set is closed: it may compose the
@@ -593,6 +657,12 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     violations.extend(macos_client_xpc_wiring_violations(&macos_sources));
     let broker_sources = tracked_source_documents(Path::new("."), "apple/macos-token-broker")?;
     violations.extend(token_broker_source_surface_violations(&broker_sources));
+    let service_protocol = fs::read_to_string(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH)?;
+    let client_protocol = fs::read_to_string(REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH)?;
+    violations.extend(token_broker_protocol_mirror_violations(
+        &service_protocol,
+        &client_protocol,
+    ));
     let project_generation_wrapper = fs::read_to_string("apple/scripts/generate-project.sh")?;
     let ci = fs::read_to_string(".github/workflows/ci.yml")?;
     let development = fs::read_to_string("docs/development.md")?;
@@ -659,6 +729,10 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
     ));
 
+    violations.extend(token_broker_bootstrap_source_surface_violations(
+        repository_root,
+    )?);
+
     for (path, document) in tracked_source_documents(repository_root, "adapters/keychain-macos")? {
         if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
             violations.extend(rust_authority_source_surface_violations(&path, &document));
@@ -711,6 +785,53 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
     }
     violations.extend(swift_ffi_symbol_inventory_violations(&macos_sources));
     violations.extend(swift_oauth_foreground_handoff_violations(&macos_sources));
+    Ok(violations)
+}
+
+/// The token-broker FFI is a dedicated static library with its own five-symbol
+/// C ABI. This source-level guard pins this crate's own five exports, bridge
+/// header, and wire-status inventory exactly, so a sixth local export (for
+/// example refresh-token export) or status renumber cannot land without review.
+/// The built-archive CI assertion closes transitive linked `_tersa_` text
+/// exports in the final static archive.
+fn token_broker_bootstrap_source_surface_violations(
+    repository_root: &Path,
+) -> io::Result<Vec<String>> {
+    let mut violations = Vec::new();
+    let token_broker_ffi_sources =
+        tracked_source_documents(repository_root, REVIEWED_TOKEN_BROKER_FFI_PACKAGE_ROOT)?;
+    violations.extend(token_broker_ffi_source_surface_violations(
+        &token_broker_ffi_sources,
+    ));
+    violations.extend(rust_exported_c_abi_violations(
+        &token_broker_ffi_sources,
+        &expected_token_broker_ffi_c_abi_exports(),
+        TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
+    ));
+    let token_broker_bridge_header =
+        fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH))?;
+    violations.extend(token_broker_bridge_header_c_abi_violations(
+        &token_broker_bridge_header,
+    ));
+    if let Some((_path, rust_ffi_source)) = token_broker_ffi_sources
+        .iter()
+        .find(|(path, _)| path == Path::new("adapters/token-broker-ffi-macos/src/lib.rs"))
+    {
+        let service_protocol =
+            fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH))?;
+        let client_protocol =
+            fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH))?;
+        violations.extend(token_broker_wire_status_coherence_violations(
+            rust_ffi_source,
+            &service_protocol,
+            &client_protocol,
+        ));
+    } else {
+        violations.push(
+            "the token-broker FFI canonical source adapters/token-broker-ffi-macos/src/lib.rs must be tracked"
+                .to_owned(),
+        );
+    }
     Ok(violations)
 }
 
@@ -1259,6 +1380,37 @@ const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production expo
 /// archive the application links carries those four plus the Apple bridge's
 /// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
 const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports (the shipped archive surface is these five plus the Apple bridge's reviewed eleven)";
+/// The exact count message for the token-broker FFI's reviewed C ABI symbol set.
+/// Pins exactly five operations: begin, complete, refresh, revoke, and delete.
+const TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE: &str = "the token-broker FFI production exported C ABI set must match the five reviewed begin, complete, refresh, revoke, and delete no_mangle exports";
+/// Reviewed path of the token-broker C ABI header mirrored into the XPC service.
+const REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH: &str =
+    "apple/macos-token-broker/TersaTokenBrokerBridge.h";
+/// Reviewed Rust package root for the token-broker FFI static archive.
+const REVIEWED_TOKEN_BROKER_FFI_PACKAGE_ROOT: &str = "adapters/token-broker-ffi-macos";
+/// Reviewed closed wire-status name/integer pairs shared by Rust and Swift.
+const REVIEWED_TOKEN_BROKER_WIRE_STATUSES: [(&str, i64); 20] = [
+    ("success", 0),
+    ("notImplemented", 1),
+    ("notProvisioned", 2),
+    ("invalidRequest", 3),
+    ("rejectedClient", 4),
+    ("authorizationCodeRejected", 5),
+    ("providerRejected", 6),
+    ("insufficientScope", 7),
+    ("missingRefreshToken", 8),
+    ("consentRevoked", 9),
+    ("revokeUnconfirmed", 10),
+    ("persistenceFailed", 11),
+    ("invalidConfiguration", 12),
+    ("unavailable", 13),
+    ("busy", 14),
+    ("sessionUnknown", 15),
+    ("transport", 16),
+    ("malformedResponse", 17),
+    ("identityUnverified", 18),
+    ("identityMismatch", 19),
+];
 
 /// Pins a static-library package's exported C ABI to an exact reviewed set: every
 /// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
@@ -1418,6 +1570,311 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
             "pubextern\"C\"fntersa_mailbox_macos_sync_poll(session_id:u64)->i32",
         ),
     ])
+}
+
+/// Closed Rust source inventory for the token-broker FFI package: exactly the
+/// reviewed `Cargo.toml` + `src/lib.rs`, no build script, no extra sources.
+fn token_broker_ffi_source_surface_violations(
+    package_documents: &[(PathBuf, String)],
+) -> Vec<String> {
+    let manifest_path = Path::new("adapters/token-broker-ffi-macos/Cargo.toml");
+    let build_script_path = Path::new("adapters/token-broker-ffi-macos/build.rs");
+    let mut violations = Vec::new();
+    let Some((_path, manifest)) = package_documents
+        .iter()
+        .find(|(path, _document)| path == manifest_path)
+    else {
+        return vec!["the token-broker FFI Cargo.toml must be tracked".to_owned()];
+    };
+    if toml_table_has_key(manifest, "package", "build") {
+        violations
+            .push("the token-broker FFI package must not declare a Cargo build script".to_owned());
+    }
+    if toml_table_has_key(manifest, "lib", "path") {
+        violations.push(
+            "the token-broker FFI library must use the canonical inventoried src/lib.rs entry"
+                .to_owned(),
+        );
+    }
+    if package_documents
+        .iter()
+        .any(|(path, _document)| path == build_script_path)
+    {
+        violations.push("the token-broker FFI must not track a conventional build.rs".to_owned());
+    }
+    let reviewed_rust_sources =
+        BTreeSet::from([PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs")]);
+    let tracked_rust_sources = package_documents
+        .iter()
+        .filter(|(path, _document)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        })
+        .map(|(path, _document)| path.clone())
+        .collect::<BTreeSet<_>>();
+    if tracked_rust_sources != reviewed_rust_sources {
+        violations.push(
+            "the token-broker FFI tracked Rust source inventory must be exactly the reviewed src/lib.rs"
+                .to_owned(),
+        );
+    }
+    for (path, document) in package_documents {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        violations.extend(rust_external_source_expansion_violations(path, document));
+        violations.extend(forbidden_export_mechanism_violations(path, document));
+    }
+    violations
+}
+
+/// Exact reviewed Rust export inventory for the five token-broker C ABI
+/// operations. Signatures are whitespace-normalized.
+fn expected_token_broker_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "tersa_token_broker_begin_authorization",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_begin_authorization(",
+                "redirect_uri:*constu8,redirect_uri_len:usize,",
+                "authorization_url_out:*mutu8,authorization_url_capacity:usize,authorization_url_len:*mutusize,",
+                "session_handle_out:*mutu8,session_handle_capacity:usize,session_handle_len:*mutusize,",
+                ")->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_complete_authorization",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_complete_authorization(",
+                "session_handle:*constu8,session_handle_len:usize,",
+                "callback_url:*constu8,callback_url_len:usize,",
+                "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
+                "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
+                "expires_out:*mut",
+                "i64,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_refresh_access_token",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_refresh_access_token(",
+                "account_subject:*constu8,account_subject_len:usize,",
+                "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
+                "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
+                "expires_out:*mut",
+                "i64,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_revoke_provider_grant",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_revoke_provider_grant(",
+                "account_subject:*constu8,account_subject_len:usize,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_delete_stored_tokens",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_delete_stored_tokens(",
+                "account_subject:*constu8,account_subject_len:usize,)->i32"
+            ),
+        ),
+    ])
+}
+
+/// Pins `TersaTokenBrokerBridge.h` to exactly the five reviewed C ABI symbols.
+/// A sixth declaration (for example `tersa_token_broker_export_refresh_token`)
+/// or a missing/renamed symbol fails closed.
+fn token_broker_bridge_header_c_abi_violations(header: &str) -> Vec<String> {
+    let expected = expected_token_broker_ffi_c_abi_exports()
+        .into_keys()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let actual = c_header_tersa_token_broker_function_symbols(header);
+    let mut violations = Vec::new();
+    if actual != expected {
+        violations.push(format!(
+            "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} must declare exactly the five reviewed token-broker C ABI symbols"
+        ));
+        for missing in expected.difference(&actual) {
+            violations.push(format!(
+                "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} is missing reviewed C ABI symbol `{missing}`"
+            ));
+        }
+        for extra in actual.difference(&expected) {
+            violations.push(format!(
+                "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} declares unreviewed C ABI symbol `{extra}`"
+            ));
+        }
+    }
+    violations
+}
+
+/// Collects `tersa_token_broker_*` function declarators from a C header.
+fn c_header_tersa_token_broker_function_symbols(header: &str) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    let mut search_from = 0;
+    while let Some(relative) = header[search_from..].find("tersa_token_broker_") {
+        let start = search_from + relative;
+        if start > 0 {
+            let before = header.as_bytes()[start - 1];
+            if before.is_ascii_alphanumeric() || before == b'_' {
+                search_from = start + 1;
+                continue;
+            }
+        }
+        let name_length = header[start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        let name = &header[start..start + name_length];
+        let after_name = skip_ascii_whitespace(header, start + name_length);
+        if header.as_bytes().get(after_name) == Some(&b'(') {
+            symbols.insert(name.to_owned());
+        }
+        search_from = start + name_length;
+    }
+    symbols
+}
+
+/// Pins Rust `STATUS_*` constants to the exact reviewed 0..=19 integers and
+/// requires service/client Swift status enums to declare the same closed set.
+/// Renumbering either side fails; self-comparison is not used.
+fn token_broker_wire_status_coherence_violations(
+    rust_source: &str,
+    service_protocol: &str,
+    client_protocol: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let expected = REVIEWED_TOKEN_BROKER_WIRE_STATUSES
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), *value))
+        .collect::<BTreeMap<_, _>>();
+
+    match rust_token_broker_status_constants(rust_source) {
+        Some(rust_cases) => {
+            if rust_cases != expected {
+                violations.push(
+                    "token-broker Rust STATUS_* constants must pin exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+        }
+        None => violations.push(
+            "adapters/token-broker-ffi-macos/src/lib.rs must declare parseable STATUS_* wire constants"
+                .to_owned(),
+        ),
+    }
+
+    let service_status = swift_closed_int_enum_cases(service_protocol, "TersaTokenBrokerStatusV1");
+    let client_status = swift_closed_int_enum_cases(client_protocol, "TokenBrokerStatus");
+    match (service_status, client_status) {
+        (Some(service_cases), Some(client_cases)) => {
+            if service_cases != expected {
+                violations.push(
+                    "service TersaTokenBrokerStatusV1 must declare exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+            if client_cases != expected {
+                violations.push(
+                    "client TokenBrokerStatus must declare exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+        }
+        (None, _) => violations.push(
+            "apple/macos-token-broker/TokenBrokerProtocol.swift must declare closed enum TersaTokenBrokerStatusV1"
+                .to_owned(),
+        ),
+        (_, None) => violations.push(
+            "apple/macos/TokenBrokerProtocol.swift must declare closed enum TokenBrokerStatus"
+                .to_owned(),
+        ),
+    }
+    violations
+}
+
+/// Parses production `const STATUS_*: i32 = N;` bindings into Swift-case names.
+fn rust_token_broker_status_constants(source: &str) -> Option<BTreeMap<String, i64>> {
+    // Comment-mask only: keep whitespace so `: i32 = N` stays parseable without
+    // depending on a full non-code strip.
+    let code = strip_rust_comments(source);
+    let mut cases = BTreeMap::new();
+    let mut search_from = 0;
+    while let Some(relative) = code[search_from..].find("const STATUS_") {
+        let start = search_from + relative;
+        if !is_identifier_at(&code, start, "const") {
+            search_from = start + 1;
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(&code, start + "const".len());
+        if !code[name_start..].starts_with("STATUS_") {
+            search_from = name_start + 1;
+            continue;
+        }
+        let name_length = code[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        let const_name = &code[name_start..name_start + name_length];
+        let after_name = skip_ascii_whitespace(&code, name_start + name_length);
+        if code.as_bytes().get(after_name) != Some(&b':') {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let type_start = skip_ascii_whitespace(&code, after_name + 1);
+        if !code[type_start..].starts_with("i32") || !is_identifier_at(&code, type_start, "i32") {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let after_type = skip_ascii_whitespace(&code, type_start + "i32".len());
+        if code.as_bytes().get(after_type) != Some(&b'=') {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let value_start = skip_ascii_whitespace(&code, after_type + 1);
+        let value_length = code[value_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if value_length == 0 {
+            return None;
+        }
+        let value: i64 = code[value_start..value_start + value_length].parse().ok()?;
+        let swift_name = rust_status_const_to_swift_case(const_name)?;
+        if cases.insert(swift_name, value).is_some() {
+            return None;
+        }
+        search_from = value_start + value_length;
+    }
+    if cases.is_empty() {
+        return None;
+    }
+    Some(cases)
+}
+
+/// `STATUS_AUTHORIZATION_CODE_REJECTED` → `authorizationCodeRejected`.
+fn rust_status_const_to_swift_case(const_name: &str) -> Option<String> {
+    let rest = const_name.strip_prefix("STATUS_")?;
+    let mut result = String::new();
+    for (index, part) in rest.split('_').enumerate() {
+        if part.is_empty() {
+            return None;
+        }
+        if index == 0 {
+            result.push_str(&part.to_ascii_lowercase());
+        } else {
+            let mut chars = part.chars();
+            let first = chars.next()?;
+            result.push(first.to_ascii_uppercase());
+            result.push_str(&chars.as_str().to_ascii_lowercase());
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn expected_apple_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
@@ -3606,10 +4063,26 @@ fn swift_call_argument_is_identifier(
 /// No directory-wide, filename-suffix, or generic `protocol` exemption exists.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_PATH: &str =
     "apple/macos-token-broker/TokenBrokerProtocol.swift";
+/// Exact path of the reviewed main-app client mirror of the closed NSXPC
+/// protocol. Required so the main process can configure `NSXPCInterface`
+/// against the same Objective-C selector surface without inventing a second
+/// wire protocol.
+const REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH: &str = "apple/macos/TokenBrokerProtocol.swift";
 /// Exact path of the reviewed NSXPC listener delegate that pins the peer
 /// code-signing requirement.
 const REVIEWED_TOKEN_BROKER_LISTENER_PATH: &str =
     "apple/macos-token-broker/TokenBrokerListenerDelegate.swift";
+/// Reviewed dedicated Rust archive linked only into the token-broker XPC target.
+const TERSA_MAC_TOKEN_BROKER_OTHER_LDFLAGS: &str =
+    "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_token_broker_ffi_macos.a";
+/// Reviewed build script that produces the token-broker archive.
+const TERSA_MAC_TOKEN_BROKER_BUILD_SCRIPT: &str =
+    "sh \"${SRCROOT}/scripts/build-rust-staticlib.sh\" macos-token-broker \"${CONFIGURATION}\"";
+/// Reviewed bridging header for the token-broker C ABI.
+const TERSA_MAC_TOKEN_BROKER_BRIDGING_HEADER: &str =
+    "macos-token-broker/TersaMacTokenBroker-Bridging-Header.h";
+/// Reviewed token-group build setting value for the broker process.
+const TOKEN_BUILD_SETTING_GROUP: &str = "$(TeamIdentifierPrefix)app.tersa.token";
 /// Objective-C runtime name and Swift protocol identifier for the closed v1
 /// NSXPC interface. Both must match exactly for the lexical exemption.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_NAME: &str = "TersaMacTokenBrokerProtocolV1";
@@ -3630,20 +4103,47 @@ const REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CONSTANT: &str =
 /// Exact call that must apply the reviewed constant (whitespace-normalized).
 const REVIEWED_TOKEN_BROKER_CODE_SIGNING_REQUIREMENT_CALL: &str =
     "newConnection.setCodeSigningRequirement(Self.embeddingAppCodeSigningRequirement)";
+/// Reviewed main-app constant that must hold the embedded token-broker service
+/// bundle identifier for `NSXPCConnection(serviceName:)`.
+const REVIEWED_TOKEN_BROKER_CLIENT_SERVICE_BUNDLE_CONSTANT: &str = "serviceBundleIdentifier";
+/// Exact executable constructor that must open the embedded token-broker XPC
+/// connection (whitespace-normalized). Alternate initializers fail closed.
+const REVIEWED_TOKEN_BROKER_CLIENT_CONNECTION_CONSTRUCTION: &str =
+    "NSXPCConnection(serviceName: Self.serviceBundleIdentifier)";
 /// Whitespace-normalized exact signatures for the five closed v1 broker
 /// protocol operations. Parameter labels and reply value types are part of the
 /// wire contract; top-level returns and additional methods fail closed.
 const REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES: [&str; 5] = [
-    "funcbeginAuthorizationSession(redirectURI:String,withReplyreply:@escaping(_authorizationURL:String?,_sessionHandle:String?,_status:Int)->Void)",
-    "funccompleteAuthorizationSession(sessionHandle:String,callbackURL:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
-    "funcrefreshAccessToken(accountSubject:String,withReplyreply:@escaping(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
-    "funcrevokeProviderGrant(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
-    "funcdeleteStoredTokens(accountSubject:String,withReplyreply:@escaping(_status:Int)->Void)",
+    "funcbeginAuthorizationSession(redirectURI:String,withReplyreply:@escaping@Sendable(_authorizationURL:String?,_sessionHandle:String?,_status:Int)->Void)",
+    "funccompleteAuthorizationSession(sessionHandle:String,callbackURL:String,withReplyreply:@escaping@Sendable(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrefreshAccessToken(accountSubject:String,withReplyreply:@escaping@Sendable(_accessToken:String?,_subject:String?,_expiresInSeconds:Int,_status:Int)->Void)",
+    "funcrevokeProviderGrant(accountSubject:String,withReplyreply:@escaping@Sendable(_status:Int)->Void)",
+    "funcdeleteStoredTokens(accountSubject:String,withReplyreply:@escaping@Sendable(_status:Int)->Void)",
 ];
+/// Exact closed allowlist of reviewed main-app `TokenBroker` client Swift paths.
+/// No `TokenBroker*` filename-prefix or directory wildcard exemption exists:
+/// any other `apple/macos/TokenBroker*.swift` fails closed.
+const REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS: [&str; 4] = [
+    "apple/macos/TokenBrokerAuthorizationSession.swift",
+    "apple/macos/TokenBrokerClient.swift",
+    "apple/macos/TokenBrokerProtocol.swift",
+    "apple/macos/TokenBrokerStatusMapping.swift",
+];
+/// Exact path of the sole reviewed abandoned-session `deinit` cleanup. No
+/// directory-wide, filename-prefix, or generic `deinit` exemption exists.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH: &str =
+    "apple/macos/TokenBrokerAuthorizationSession.swift";
+/// Exact owner class of the sole reviewed abandoned-session `deinit` cleanup.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS: &str = "TokenBrokerSessionResourceBag";
+/// Whitespace-normalized form of the sole reviewed abandoned-session `deinit`.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT: &str = "deinit{release()}";
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
-const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 6] = [
+const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 9] = [
     "apple/macos-token-broker/Info.plist",
+    "apple/macos-token-broker/TersaMacTokenBroker-Bridging-Header.h",
     "apple/macos-token-broker/TersaMacTokenBroker.entitlements",
+    "apple/macos-token-broker/TersaTokenBrokerBridge.h",
+    "apple/macos-token-broker/TokenBrokerCallbackBuffer.swift",
     REVIEWED_TOKEN_BROKER_LISTENER_PATH,
     REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
     "apple/macos-token-broker/TokenBrokerService.swift",
@@ -3660,14 +4160,24 @@ const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 6] = [
 /// `@objc(TersaMacTokenBrokerProtocolV1) protocol TersaMacTokenBrokerProtocolV1`
 /// in `apple/macos-token-broker/TokenBrokerProtocol.swift`. Every other protocol
 /// declaration in inventoried product or broker sources fails closed.
+///
+/// The sole reviewed `deinit` exception is the abandoned-session cleanup
+/// `deinit { release() }` as a direct member of file-scope class
+/// `TokenBrokerSessionResourceBag` in
+/// `apple/macos/TokenBrokerAuthorizationSession.swift`. Exactly one such
+/// declaration is accepted; any second `deinit`, any other path or owner class,
+/// attributes/parameters, extra statements, alternate calls, nested placement,
+/// or comment/string decoys fail closed. `subscript` remains unconditionally
+/// forbidden.
 fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<String> {
-    for forbidden in ["deinit", "subscript"] {
-        if contains_identifier(code, forbidden) {
-            return Some(format!(
-                "{} must not declare `{forbidden}` in inventoried macOS sources",
-                path.display()
-            ));
-        }
+    if let Some(violation) = swift_deinit_declaration_violation(path, code) {
+        return Some(violation);
+    }
+    if contains_identifier(code, "subscript") {
+        return Some(format!(
+            "{} must not declare `subscript` in inventoried macOS sources",
+            path.display()
+        ));
     }
     if let Some(violation) = swift_protocol_declaration_violation(path, code) {
         return Some(violation);
@@ -3685,6 +4195,151 @@ fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<Stri
         }
     }
     None
+}
+
+/// Rejects every `deinit` declaration except the single reviewed abandoned-session
+/// cleanup on `TokenBrokerSessionResourceBag` at
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`.
+fn swift_deinit_declaration_violation(path: &Path, code: &str) -> Option<String> {
+    let mut saw_reviewed = false;
+    for (start, _) in code.match_indices("deinit") {
+        if !is_identifier_at(code, start, "deinit") {
+            continue;
+        }
+        if is_exact_reviewed_token_broker_session_resource_bag_deinit(path, code, start) {
+            if saw_reviewed {
+                return Some(format!(
+                    "{} must not declare `deinit` in inventoried macOS sources",
+                    path.display()
+                ));
+            }
+            saw_reviewed = true;
+            continue;
+        }
+        return Some(format!(
+            "{} must not declare `deinit` in inventoried macOS sources",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// True only for the exact reviewed form `deinit { release() }` as a direct
+/// member of file-scope `class TokenBrokerSessionResourceBag` in
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`. Leading attributes
+/// or modifiers, parameters, body mutations, nested placement, and any other
+/// path or owner fail closed. Comment/string regions are already masked by the
+/// caller, so decoys cannot satisfy the match.
+fn is_exact_reviewed_token_broker_session_resource_bag_deinit(
+    path: &Path,
+    code: &str,
+    deinit_start: usize,
+) -> bool {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH) {
+        return false;
+    }
+    if swift_declaration_has_attached_prefix(code, deinit_start) {
+        return false;
+    }
+    let after_keyword = skip_ascii_whitespace(code, deinit_start + "deinit".len());
+    if code.as_bytes().get(after_keyword) != Some(&b'{') {
+        return false;
+    }
+    let Some(body) = balanced_brace_body(code, after_keyword) else {
+        return false;
+    };
+    let declaration = &code[deinit_start..after_keyword + body.len()];
+    if rust_token_canonical(declaration) != REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT {
+        return false;
+    }
+    swift_is_direct_member_of_file_scope_class(
+        code,
+        deinit_start,
+        REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS,
+    )
+}
+
+/// True when a non-whitespace token other than a declaration boundary (`{`,
+/// `}`, or `;`) immediately precedes `start`. Rejects attributes and modifiers
+/// attached to a declaration while still accepting a type-member after `{` or
+/// a prior member's `}`/`;`.
+fn swift_declaration_has_attached_prefix(code: &str, start: usize) -> bool {
+    let mut index = start;
+    while index > 0 && is_rust_ascii_whitespace(code.as_bytes()[index - 1]) {
+        index -= 1;
+    }
+    if index == 0 {
+        return false;
+    }
+    !matches!(code.as_bytes()[index - 1], b'{' | b'}' | b';')
+}
+
+/// True when `member_start` is a direct member (brace depth 1) of a file-scope
+/// `class <class_name> { ... }` whose balanced body contains it. Nested types,
+/// function/property/closure bodies, and non-class owners fail closed.
+fn swift_is_direct_member_of_file_scope_class(
+    code: &str,
+    member_start: usize,
+    class_name: &str,
+) -> bool {
+    for (start, _) in code.match_indices("class") {
+        if !is_identifier_at(code, start, "class") {
+            continue;
+        }
+        // Nested `class` declarations are not the reviewed file-scope owner.
+        if swift_brace_depth_until(code, start) != 0 {
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(code, start + "class".len());
+        let Some(name) = swift_type_declaration_name_at(code, name_start) else {
+            continue;
+        };
+        if name != class_name {
+            continue;
+        }
+        // Inheritance, generics, and where-clauses may appear between the name
+        // and the body brace; comments/strings are already masked to spaces.
+        let Some(brace_relative) = code[name_start..].find('{') else {
+            continue;
+        };
+        let brace = name_start + brace_relative;
+        let Some(body) = balanced_brace_body(code, brace) else {
+            continue;
+        };
+        let body_end = brace + body.len();
+        if member_start <= brace || member_start >= body_end - 1 {
+            continue;
+        }
+        // Direct member only: depth 1 means inside this class body and not
+        // nested inside any further `{ ... }` (method, nested type, closure).
+        if swift_brace_depth_between(code, brace, member_start) == 1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Brace nesting depth immediately before `until`, scanning from the start of
+/// `code`. Comment/string regions must already be masked.
+fn swift_brace_depth_until(code: &str, until: usize) -> usize {
+    swift_brace_depth_between(code, 0, until)
+}
+
+/// Brace nesting depth immediately before `until` after scanning `[from, until)`.
+/// `from` may point at an opening `{` (counted) so a type body's first member
+/// is depth 1.
+fn swift_brace_depth_between(code: &str, from: usize, until: usize) -> usize {
+    let until = until.min(code.len());
+    let from = from.min(until);
+    let mut depth = 0usize;
+    for byte in &code.as_bytes()[from..until] {
+        match *byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// Rejects every `protocol` declaration except the single reviewed closed NSXPC
@@ -3715,7 +4370,7 @@ fn swift_protocol_declaration_violation(path: &Path, code: &str) -> Option<Strin
 
 /// True only for the exact reviewed form
 /// `@objc(TersaMacTokenBrokerProtocolV1) protocol TersaMacTokenBrokerProtocolV1 {`
-/// in `apple/macos-token-broker/TokenBrokerProtocol.swift`. Inheritance,
+/// in the service protocol file or the main-app client mirror. Inheritance,
 /// `where` clauses, attributes, and any other token between the protocol name
 /// and the opening brace are rejected so inherited selectors cannot bypass the
 /// five-operation allowlist.
@@ -3724,7 +4379,9 @@ fn is_exact_reviewed_token_broker_protocol_declaration(
     code: &str,
     protocol_start: usize,
 ) -> bool {
-    if path != Path::new(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH) {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH)
+        && path != Path::new(REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH)
+    {
         return false;
     }
     let name_start = skip_ascii_whitespace(code, protocol_start + "protocol".len());
@@ -5212,26 +5869,47 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
         violations
             .push("the TersaMacTests target type must be exactly bundle.unit-test".to_owned());
     }
+    // Exact ordered TersaMacTests sources: macos-tests, the pure client/model
+    // surface under macos/, and the single reviewed shared callback-buffer
+    // helper. No directory wildcard for macos-token-broker; only this path.
     let valid_sources = matches!(
         body.get("sources"),
         Some(StrictYamlValue::Sequence(sources))
             if matches!(sources.as_slice(), [
                 StrictYamlValue::Mapping(test_sources),
-                StrictYamlValue::Mapping(coordinator_source),
+                StrictYamlValue::Mapping(deadline_source),
+                StrictYamlValue::Mapping(connection_state_source),
                 StrictYamlValue::Mapping(disconnect_intent_source),
                 StrictYamlValue::Mapping(lifecycle_source),
+                StrictYamlValue::Mapping(broker_protocol_source),
+                StrictYamlValue::Mapping(broker_client_source),
+                StrictYamlValue::Mapping(broker_status_mapping_source),
+                StrictYamlValue::Mapping(broker_authorization_session_source),
+                StrictYamlValue::Mapping(broker_callback_buffer_source),
             ] if test_sources.len() == 1
                 && matches!(test_sources.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-tests")
-                && coordinator_source.len() == 1
-                && matches!(coordinator_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionOperationDeadline.swift")
+                && deadline_source.len() == 1
+                && matches!(deadline_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionOperationDeadline.swift")
+                && connection_state_source.len() == 1
+                && matches!(connection_state_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionState.swift")
                 && disconnect_intent_source.len() == 1
                 && matches!(disconnect_intent_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/DisconnectIntentStore.swift")
                 && lifecycle_source.len() == 1
-                && matches!(lifecycle_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxLifecyclePresentation.swift"))
+                && matches!(lifecycle_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxLifecyclePresentation.swift")
+                && broker_protocol_source.len() == 1
+                && matches!(broker_protocol_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerProtocol.swift")
+                && broker_client_source.len() == 1
+                && matches!(broker_client_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerClient.swift")
+                && broker_status_mapping_source.len() == 1
+                && matches!(broker_status_mapping_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerStatusMapping.swift")
+                && broker_authorization_session_source.len() == 1
+                && matches!(broker_authorization_session_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerAuthorizationSession.swift")
+                && broker_callback_buffer_source.len() == 1
+                && matches!(broker_callback_buffer_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-token-broker/TokenBrokerCallbackBuffer.swift"))
     );
     if !valid_sources {
         violations.push(
-            "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift state models"
+            "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift client/model surface"
                 .to_owned(),
         );
     }
@@ -5402,6 +6080,7 @@ fn validate_token_broker_top_level_keys(
         "entitlements",
         "info",
         "platform",
+        "preBuildScripts",
         "settings",
         "sources",
         "type",
@@ -5411,6 +6090,39 @@ fn validate_token_broker_top_level_keys(
             "the TersaMacTokenBroker target must contain only the exact reviewed top-level XcodeGen keys"
                 .to_owned(),
         );
+    }
+    if !yaml_exact_token_broker_pre_build_script(body.get("preBuildScripts")) {
+        violations.push(
+            "the TersaMacTokenBroker preBuildScripts must be exactly the reviewed token-broker Rust archive build"
+                .to_owned(),
+        );
+    }
+}
+
+fn yaml_exact_token_broker_pre_build_script(value: Option<&StrictYamlValue>) -> bool {
+    match value {
+        Some(StrictYamlValue::Sequence(scripts)) if scripts.len() == 1 => match &scripts[0] {
+            StrictYamlValue::Mapping(script) => {
+                let expected_keys = BTreeSet::from(["basedOnDependencyAnalysis", "name", "script"]);
+                script.keys().map(String::as_str).collect::<BTreeSet<_>>() == expected_keys
+                    && matches!(
+                        script.get("name"),
+                        Some(StrictYamlValue::String(value))
+                            if value == "Build Rust token-broker static library"
+                    )
+                    && matches!(
+                        script.get("basedOnDependencyAnalysis"),
+                        Some(StrictYamlValue::Bool(false))
+                    )
+                    && matches!(
+                        script.get("script"),
+                        Some(StrictYamlValue::String(value))
+                            if value == TERSA_MAC_TOKEN_BROKER_BUILD_SCRIPT
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -5456,7 +6168,7 @@ fn validate_token_broker_info_surface(body: &StrictYamlValue, violations: &mut V
     let valid_info_properties = matches!(
         yaml_path(body, &["info", "properties"]),
         Some(StrictYamlValue::Mapping(properties))
-            if properties.len() == 2
+            if properties.len() == 3
                 && matches!(
                     properties.get("CFBundlePackageType"),
                     Some(StrictYamlValue::String(value)) if value == "XPC!"
@@ -5470,10 +6182,14 @@ fn validate_token_broker_info_surface(body: &StrictYamlValue, violations: &mut V
                                 Some(StrictYamlValue::String(value)) if value == "Application"
                             )
                 )
+                && matches!(
+                    properties.get("TersaOAuthClientID"),
+                    Some(StrictYamlValue::String(value)) if value == "$(TERSA_OAUTH_CLIENT_ID)"
+                )
     );
     if !valid_info_properties {
         violations.push(
-            "the TersaMacTokenBroker info properties must declare only the reviewed XPC package type and Application service type"
+            "the TersaMacTokenBroker info properties must declare only the reviewed XPC package type, Application service type, and OAuth client id build setting"
                 .to_owned(),
         );
     }
@@ -5514,7 +6230,7 @@ fn validate_token_broker_settings_surface(
     });
     if !yaml_exact_token_broker_base_settings(settings) {
         violations.push(
-            "the TersaMacTokenBroker settings must contain only the reviewed bundle identity, deployment target, entitlement path, and SKIP_INSTALL"
+            "the TersaMacTokenBroker settings must contain only the reviewed operational identity, token group, bridging header, dedicated Rust archive, and SKIP_INSTALL"
                 .to_owned(),
         );
     }
@@ -5524,7 +6240,7 @@ fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> 
     matches!(
         settings,
         Some(StrictYamlValue::Mapping(settings))
-            if settings.len() == 5
+            if settings.len() == 9
                 && matches!(
                     settings.get("PRODUCT_BUNDLE_IDENTIFIER"),
                     Some(StrictYamlValue::String(value)) if value == TERSA_MAC_TOKEN_BROKER_BUNDLE_ID
@@ -5545,11 +6261,35 @@ fn yaml_exact_token_broker_base_settings(settings: Option<&StrictYamlValue>) -> 
                     settings.get("SKIP_INSTALL"),
                     Some(StrictYamlValue::String(value)) if value == "YES"
                 )
+                && matches!(
+                    settings.get("SWIFT_OBJC_BRIDGING_HEADER"),
+                    Some(StrictYamlValue::String(value))
+                        if value == TERSA_MAC_TOKEN_BROKER_BRIDGING_HEADER
+                )
+                && matches!(
+                    settings.get("TERSA_MACOS_TOKEN_GROUP"),
+                    Some(StrictYamlValue::String(value)) if value == TOKEN_BUILD_SETTING_GROUP
+                )
+                && matches!(
+                    settings.get("ENABLE_USER_SCRIPT_SANDBOXING"),
+                    Some(StrictYamlValue::String(value)) if value == "NO"
+                )
+                && matches!(
+                    settings.get("OTHER_LDFLAGS"),
+                    Some(StrictYamlValue::Sequence(flags))
+                        if flags.len() == 1
+                            && matches!(
+                                &flags[0],
+                                StrictYamlValue::String(value)
+                                    if value == TERSA_MAC_TOKEN_BROKER_OTHER_LDFLAGS
+                            )
+                )
                 && !settings.keys().any(|key| {
                     key.starts_with("PRODUCT_BUNDLE_IDENTIFIER[")
                         || key.starts_with("CODE_SIGN_ENTITLEMENTS[")
-                        || key.starts_with("OTHER_LDFLAGS")
-                        || key.contains("ENABLE_USER_SCRIPT_SANDBOXING")
+                        || key.starts_with("OTHER_LDFLAGS[")
+                        || key.starts_with("TERSA_MACOS_TOKEN_GROUP[")
+                        || key.starts_with("ENABLE_USER_SCRIPT_SANDBOXING[")
                 })
     )
 }
@@ -5559,7 +6299,6 @@ fn validate_token_broker_forbidden_surfaces(
     violations: &mut Vec<String>,
 ) {
     for key in [
-        "preBuildScripts",
         "postBuildScripts",
         "preCompileScripts",
         "postCompileScripts",
@@ -5581,7 +6320,7 @@ fn validate_token_broker_forbidden_surfaces(
 }
 
 fn macos_client_xpc_wiring_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
-    const FORBIDDEN: [&str; 5] = [
+    const FORBIDDEN_OUTSIDE_CLIENT: [&str; 5] = [
         "NSXPCConnection",
         "NSXPCInterface",
         "NSXPCListener",
@@ -5590,20 +6329,83 @@ fn macos_client_xpc_wiring_violations(sources: &[(PathBuf, String)]) -> Vec<Stri
     ];
     let mut violations = Vec::new();
     for (path, document) in sources {
-        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if extension != Some("swift") {
             continue;
         }
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
         let code = strip_swift_non_code(document);
-        for forbidden in FORBIDDEN {
+        // Closed allowlist only — a decoy `TokenBroker*.swift` filename must
+        // not inherit the reviewed client XPC exemption.
+        if path_str.starts_with("apple/macos/TokenBroker")
+            && !REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS.contains(&path_str)
+        {
+            violations.push(format!(
+                "{path_str} is outside the closed reviewed TokenBroker client allowlist"
+            ));
+        }
+        let is_reviewed_client = REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS.contains(&path_str);
+        if is_reviewed_client {
+            // Server-side listener wiring stays out of the main app.
+            if contains_identifier(&code, "NSXPCListener")
+                || contains_identifier(&code, "setCodeSigningRequirement")
+            {
+                violations.push(format!(
+                    "{path_str} must not host token-broker server-side XPC listener wiring"
+                ));
+            }
+            if contains_identifier(&code, "NSXPCConnection")
+                && !reviewed_token_broker_client_xpc_connection_is_pinned(document, &code)
+            {
+                // String literals are masked in `code`, so a bare
+                // `code.contains(bundle id)` check is both a false positive on
+                // the reviewed client and a false negative for comment/string
+                // decoys. Pin the executable constant assignment plus the exact
+                // `NSXPCConnection(serviceName:)` construction instead.
+                violations.push(format!(
+                    "{path_str} must connect only to the embedded token-broker service bundle id"
+                ));
+            }
+            continue;
+        }
+        for forbidden in FORBIDDEN_OUTSIDE_CLIENT {
             if contains_identifier(&code, forbidden) {
                 violations.push(format!(
-                    "{} must not contain client-side XPC wiring `{forbidden}` in this packaging skeleton",
-                    path.display()
+                    "{path_str} must not contain client-side XPC wiring `{forbidden}` outside the reviewed TokenBroker client allowlist"
                 ));
             }
         }
     }
     violations
+}
+
+/// True when executable code pins the embedded broker service bundle id to
+/// `static let serviceBundleIdentifier = "app.tersa.mac.token-broker"` and
+/// constructs exactly one `NSXPCConnection(serviceName: Self.serviceBundleIdentifier)`.
+/// Comment/string decoys, wrong service names, and alternate initializers fail.
+fn reviewed_token_broker_client_xpc_connection_is_pinned(document: &str, code: &str) -> bool {
+    let swift_string = format!("\"{TERSA_MAC_TOKEN_BROKER_BUNDLE_ID}\"");
+    let constant = REVIEWED_TOKEN_BROKER_CLIENT_SERVICE_BUNDLE_CONSTANT;
+    let declaration_starts = executable_static_let_assignment_starts(code, constant);
+    let has_exact_assignment = declaration_starts.len() == 1
+        && exact_token_broker_code_signing_requirement_assignment_at(
+            document,
+            code,
+            declaration_starts[0],
+            constant,
+            &swift_string,
+        );
+    if !has_exact_assignment {
+        return false;
+    }
+    // Exactly one executable constructor, and it must be the reviewed form.
+    if swift_call_count(code, "NSXPCConnection") != 1 {
+        return false;
+    }
+    let construction = rust_token_canonical(REVIEWED_TOKEN_BROKER_CLIENT_CONNECTION_CONSTRUCTION);
+    rust_token_canonical(code).matches(&construction).count() == 1
 }
 
 fn token_broker_source_surface_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
@@ -5629,7 +6431,7 @@ fn scan_token_broker_source_files(
     sources: &[(PathBuf, String)],
     violations: &mut Vec<String>,
 ) -> TokenBrokerSourceScan {
-    const FORBIDDEN_IDENTIFIERS: [&str; 14] = [
+    const FORBIDDEN_IDENTIFIERS: [&str; 13] = [
         "processIdentifier",
         "SecItemAdd",
         "SecItemCopyMatching",
@@ -5637,7 +6439,6 @@ fn scan_token_broker_source_files(
         "SecItemDelete",
         "URLSession",
         "URLRequest",
-        "libtersa",
         "_silgen_name",
         "refreshToken",
         "pkceVerifier",
@@ -5645,14 +6446,11 @@ fn scan_token_broker_source_files(
         "genericRPC",
         "NSXPCListenerEndpoint",
     ];
-    const FORBIDDEN_SUBSTRINGS: [&str; 5] = [
-        "import Security",
-        "@_cdecl",
-        "NSXPCConnection(",
-        "OTHER_LDFLAGS",
-        "ENABLE_USER_SCRIPT_SANDBOXING",
-    ];
-    const FORBIDDEN_PREFIXES: [&str; 2] = ["SecKeychain", "tersa_"];
+    const FORBIDDEN_SUBSTRINGS: [&str; 3] = ["import Security", "@_cdecl", "NSXPCConnection("];
+    // `tersa_` is allowed only as the reviewed `tersa_token_broker_*` C ABI.
+    // Any other `tersa_` prefix (mailbox sync, bridge, generic helpers) fails.
+    const FORBIDDEN_PREFIXES: [&str; 1] = ["SecKeychain"];
+    const REVIEWED_C_ABI_PREFIX: &str = "tersa_token_broker_";
 
     let mut seen = BTreeSet::new();
     let mut aggregate = String::new();
@@ -5694,6 +6492,7 @@ fn scan_token_broker_source_files(
             &FORBIDDEN_IDENTIFIERS,
             &FORBIDDEN_SUBSTRINGS,
             &FORBIDDEN_PREFIXES,
+            REVIEWED_C_ABI_PREFIX,
             violations,
         );
     }
@@ -5710,6 +6509,7 @@ fn collect_token_broker_file_capability_violations(
     forbidden_identifiers: &[&str],
     forbidden_substrings: &[&str],
     forbidden_prefixes: &[&str],
+    reviewed_c_abi_prefix: &str,
     violations: &mut Vec<String>,
 ) {
     for forbidden in forbidden_identifiers {
@@ -5732,6 +6532,17 @@ fn collect_token_broker_file_capability_violations(
                 "{path_str} must not exercise forbidden broker capability `{forbidden}`"
             ));
         }
+    }
+    // Allow only the reviewed token-broker C ABI prefix; every other `tersa_`
+    // symbol stays out of the XPC service sources.
+    if code.match_indices("tersa_").any(|(index, _)| {
+        let before = code[..index].bytes().next_back();
+        let boundary_ok = before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_');
+        boundary_ok && !code[index..].starts_with(reviewed_c_abi_prefix)
+    }) {
+        violations.push(format!(
+            "{path_str} must not exercise forbidden broker capability `tersa_` outside the reviewed token-broker C ABI"
+        ));
     }
 }
 
@@ -5763,7 +6574,15 @@ fn collect_token_broker_required_surface_violations(
         "revokeProviderGrant",
         "deleteStoredTokens",
     ];
-    const REQUIRED_SERVICE_MARKERS: [&str; 2] = ["setCodeSigningRequirement", "notProvisioned"];
+    const REQUIRED_SERVICE_MARKERS: [&str; 7] = [
+        "setCodeSigningRequirement",
+        "tersa_token_broker_begin_authorization",
+        "tersa_token_broker_complete_authorization",
+        "tersa_token_broker_refresh_access_token",
+        "tersa_token_broker_revoke_provider_grant",
+        "tersa_token_broker_delete_stored_tokens",
+        "authorizationCodeRejected",
+    ];
 
     for required in REQUIRED_PROTOCOL_MARKERS {
         if !contains_identifier(aggregate, required) {
@@ -5780,7 +6599,7 @@ fn collect_token_broker_required_surface_violations(
     for required in REQUIRED_SERVICE_MARKERS {
         if !contains_identifier(aggregate, required) {
             violations.push(format!(
-                "the TersaMacTokenBroker sources are missing required fail-closed marker `{required}`"
+                "the TersaMacTokenBroker sources are missing required operational marker `{required}`"
             ));
         }
     }
@@ -5792,15 +6611,60 @@ fn collect_token_broker_required_surface_violations(
     }
 }
 
-/// Fail closed unless the protocol file declares exactly the five reviewed
-/// operation signatures (parameter types `String` and trailing
+/// Fail closed unless the service protocol file declares exactly the five
+/// reviewed operation signatures and hosts no additional `func` declarations
+/// outside that protocol body (parameter types `String` and trailing
 /// `@escaping (...) -> Void` reply values of `String`, `String?`, or `Int`).
 /// Top-level non-Void returns, arrays, Data/NSData/UInt8, aliases, generics,
 /// dictionaries, extra methods, and missing methods all fail.
 fn closed_token_broker_protocol_operation_violations(code: &str) -> Vec<String> {
-    let Some(actual) = swift_func_signature_compacts(code) else {
-        return vec![format!(
+    let mut violations = closed_token_broker_protocol_operation_violations_for(
+        code,
+        REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
+    );
+    // The service protocol file is the inventory authority: no helper `func`
+    // may appear beside the five closed operations.
+    match swift_func_signature_compacts(code) {
+        Some(actual) => {
+            let expected = REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let actual_set = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            if actual.len() != REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES.len()
+                || actual_set != expected
+            {
+                violations.push(format!(
+                    "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must expose only the exact reviewed closed broker protocol operations"
+                ));
+            }
+        }
+        None => violations.push(format!(
             "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must expose only parseable closed broker protocol operations"
+        )),
+    }
+    violations
+}
+
+/// Same closed five-operation pin as
+/// [`closed_token_broker_protocol_operation_violations`], with a path-specific
+/// violation context (service declaration or main-app client mirror).
+fn closed_token_broker_protocol_operation_violations_for(
+    code: &str,
+    context_path: &str,
+) -> Vec<String> {
+    // Mask comments/strings so inter-method doc comments cannot be read as
+    // unexpected trailing tokens after a parameter list, while decoy `func`
+    // text inside comments still cannot satisfy the closed allowlist.
+    let code = strip_swift_non_code(code);
+    let Some(protocol_body) = reviewed_token_broker_protocol_body(&code) else {
+        return vec![format!(
+            "{context_path} must declare the exact reviewed closed broker protocol body"
+        )];
+    };
+    let Some(actual) = swift_func_signature_compacts(protocol_body) else {
+        return vec![format!(
+            "{context_path} must expose only parseable closed broker protocol operations"
         )];
     };
     let expected = REVIEWED_TOKEN_BROKER_PROTOCOL_OPERATION_SIGNATURES
@@ -5812,10 +6676,168 @@ fn closed_token_broker_protocol_operation_violations(code: &str) -> Vec<String> 
         || actual_set != expected
     {
         return vec![format!(
-            "{REVIEWED_TOKEN_BROKER_PROTOCOL_PATH} must expose only the exact reviewed closed broker protocol operations"
+            "{context_path} must expose only the exact reviewed closed broker protocol operations"
         )];
     }
     Vec::new()
+}
+
+/// Body of the reviewed `@objc(TersaMacTokenBrokerProtocolV1) protocol
+/// TersaMacTokenBrokerProtocolV1 { ... }` declaration, if present exactly once
+/// with a balanced brace body and no inheritance/`where` drift.
+fn reviewed_token_broker_protocol_body(code: &str) -> Option<&str> {
+    let mut body: Option<&str> = None;
+    for (start, _) in code.match_indices("protocol") {
+        if !is_identifier_at(code, start, "protocol") {
+            continue;
+        }
+        // Either reviewed path satisfies the path gate; form matching is what
+        // selects the closed v1 declaration inside a document.
+        if !is_exact_reviewed_token_broker_protocol_declaration(
+            Path::new(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH),
+            code,
+            start,
+        ) {
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(code, start + "protocol".len());
+        let after_name =
+            skip_ascii_whitespace(code, name_start + REVIEWED_TOKEN_BROKER_PROTOCOL_NAME.len());
+        if code.as_bytes().get(after_name) != Some(&b'{') {
+            return None;
+        }
+        if body.is_some() {
+            return None;
+        }
+        body = Some(balanced_brace_body(code, after_name)?);
+    }
+    body
+}
+
+/// Pins service and client v1 protocol/status declarations to the same closed
+/// five operations and the same integer status set.
+fn token_broker_protocol_mirror_violations(service: &str, client: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    violations.extend(closed_token_broker_protocol_operation_violations_for(
+        service,
+        REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
+    ));
+    violations.extend(closed_token_broker_protocol_operation_violations_for(
+        client,
+        REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+    ));
+
+    let service_status = swift_closed_int_enum_cases(service, "TersaTokenBrokerStatusV1");
+    let client_status = swift_closed_int_enum_cases(client, "TokenBrokerStatus");
+    match (service_status, client_status) {
+        (Some(service_cases), Some(client_cases)) => {
+            if service_cases != client_cases {
+                violations.push(
+                    "service TersaTokenBrokerStatusV1 and client TokenBrokerStatus must declare the exact same closed raw-value case set"
+                        .to_owned(),
+                );
+            }
+            if service_cases.len() != 20 {
+                violations.push(
+                    "token-broker status enums must declare exactly the 20 reviewed closed cases"
+                        .to_owned(),
+                );
+            }
+        }
+        (None, _) => violations.push(
+            "apple/macos-token-broker/TokenBrokerProtocol.swift must declare closed enum TersaTokenBrokerStatusV1"
+                .to_owned(),
+        ),
+        (_, None) => violations.push(
+            "apple/macos/TokenBrokerProtocol.swift must declare closed enum TokenBrokerStatus"
+                .to_owned(),
+        ),
+    }
+    violations
+}
+
+/// Parses `case name = <int>` members from a Swift enum with the given name.
+/// Inheritance, generics, `where` clauses, and unparsable bodies fail closed.
+fn swift_closed_int_enum_cases(code: &str, enum_name: &str) -> Option<BTreeMap<String, i64>> {
+    let mut enum_body: Option<&str> = None;
+    for (start, _) in code.match_indices("enum") {
+        if !is_identifier_at(code, start, "enum") {
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(code, start + "enum".len());
+        if !code[name_start..].starts_with(enum_name)
+            || !is_identifier_at(code, name_start, enum_name)
+        {
+            continue;
+        }
+        let after_name = skip_ascii_whitespace(code, name_start + enum_name.len());
+        // Allow a single inheritance clause such as `: Int` / `: Int, Equatable`.
+        let brace = if code.as_bytes().get(after_name) == Some(&b'{') {
+            after_name
+        } else if code.as_bytes().get(after_name) == Some(&b':') {
+            let mut index = after_name + 1;
+            while index < code.len() {
+                let byte = code.as_bytes()[index];
+                if byte == b'{' {
+                    break;
+                }
+                if byte == b'<' || byte == b'(' {
+                    return None;
+                }
+                index += 1;
+            }
+            if index >= code.len() || code.as_bytes()[index] != b'{' {
+                return None;
+            }
+            index
+        } else {
+            return None;
+        };
+        if enum_body.is_some() {
+            return None;
+        }
+        enum_body = Some(balanced_brace_body(code, brace)?);
+    }
+    let body = enum_body?;
+    let mut cases = BTreeMap::new();
+    let mut search_from = 0;
+    while let Some(relative) = body[search_from..].find("case") {
+        let start = search_from + relative;
+        if !is_identifier_at(body, start, "case") {
+            search_from = start + "case".len();
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(body, start + "case".len());
+        let name_length = body[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_length == 0 {
+            return None;
+        }
+        let name = body[name_start..name_start + name_length].to_owned();
+        let after_name = skip_ascii_whitespace(body, name_start + name_length);
+        if body.as_bytes().get(after_name) != Some(&b'=') {
+            return None;
+        }
+        let value_start = skip_ascii_whitespace(body, after_name + 1);
+        let value_length = body[value_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if value_length == 0 {
+            return None;
+        }
+        let value: i64 = body[value_start..value_start + value_length].parse().ok()?;
+        if cases.insert(name, value).is_some() {
+            return None;
+        }
+        search_from = value_start + value_length;
+    }
+    if cases.is_empty() {
+        return None;
+    }
+    Some(cases)
 }
 
 /// Compact every `func` signature in `code` by stripping ASCII whitespace.
@@ -5852,8 +6874,13 @@ fn swift_func_signature_compacts(code: &str) -> Option<Vec<String>> {
             return None;
         }
         let paren = after_name;
+        // `balanced_delimited_body` returns the full span including both the
+        // opening `(` and the matching closing `)` (nested parameter types such
+        // as `@escaping (...) -> Void` are depth-tracked). Advance to the index
+        // one past that inclusive span so the closing `)` is not re-read as an
+        // unexpected trailing token.
         let parameters = balanced_delimited_body(code, paren, b'(', b')')?;
-        let after_params = paren + parameters.len();
+        let after_params = paren.checked_add(parameters.len())?;
         let end = consume_swift_func_signature_tail(code, after_params)?;
         signatures.push(rust_token_canonical(&code[start..end]));
         search_from = end;
@@ -6415,6 +7442,7 @@ fn is_sensitive_signing_key(key: &str) -> bool {
         || key.contains("ENTITLEMENT")
         || [
             "TERSA_MACOS_APP_GROUP",
+            "TERSA_MACOS_TOKEN_GROUP",
             "com.apple.security.application-groups",
             "keychain-access-groups",
         ]
@@ -6503,6 +7531,9 @@ fn allowed_token_broker_sensitive_configuration(path: &[&str], value: &StrictYam
                 value,
                 StrictYamlValue::String(value) if value == TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS
             )
+        }
+        ["settings", "base", "TERSA_MACOS_TOKEN_GROUP"] => {
+            matches!(value, StrictYamlValue::String(value) if value == TOKEN_BUILD_SETTING_GROUP)
         }
         ["entitlements", "properties", "keychain-access-groups"] => {
             yaml_exact_string_array(Some(value), TOKEN_SIGNING_GROUP)
@@ -6599,7 +7630,7 @@ fn allowed_protected_value_path(path: &[String]) -> bool {
             "TersaMacTokenBroker",
             "settings",
             "base",
-            "CODE_SIGN_ENTITLEMENTS"
+            "CODE_SIGN_ENTITLEMENTS" | "TERSA_MACOS_TOKEN_GROUP"
         ] | [
             "targets",
             "TersaMacTokenBroker",
@@ -7103,8 +8134,9 @@ fn check_tokio_dependency(
 }
 
 /// tokio (the async runtime) is directly declared only by the trusted
-/// composition; every other crate reaches it transitively through reqwest. The
-/// composition pins an exact, current-thread, macOS-scoped runtime.
+/// composition and the dedicated token-broker FFI; every other crate reaches it
+/// transitively through reqwest. Both owners pin an exact, current-thread,
+/// macOS-scoped runtime.
 fn tokio_manifest_dependency_violations(
     package_name: &str,
     version: &str,
@@ -7112,10 +8144,10 @@ fn tokio_manifest_dependency_violations(
     target: Option<&str>,
     features: &[String],
 ) -> Vec<String> {
-    const OWNER: &str = "tersa-oauth-sync-macos";
-    if package_name != OWNER {
+    const OWNERS: [&str; 2] = ["tersa-oauth-sync-macos", "tersa-token-broker-ffi-macos"];
+    if !OWNERS.contains(&package_name) {
         return vec![format!(
-            "{package_name} -> tokio is outside the trusted composition owner {OWNER}"
+            "{package_name} -> tokio is outside the closed direct-owner set {OWNERS:?}"
         )];
     }
     let mut violations = Vec::new();
@@ -7367,10 +8399,13 @@ fn gmail_dependency_graph_violations(
     // that composition to Swift. tersa-keychain-macos and the retrieval-only
     // tersa-cli-macos are deliberately absent: the check must still fire if either
     // ever reaches reqwest.
-    const OWNERS: [&str; 3] = [
+    const OWNERS: [&str; 4] = [
         "tersa-gmail-rest-macos",
         "tersa-oauth-sync-macos",
         "tersa-mailbox-sync-ffi-macos",
+        // ADR-0024 point 3: the token-broker FFI drives Google's token endpoint
+        // through the Gmail transport for exchange/refresh/revoke only.
+        "tersa-token-broker-ffi-macos",
     ];
     let mut violations = Vec::new();
     for member_id in workspace_members {
@@ -8291,6 +9326,12 @@ fn future_macos_store_dependency_violation(
             // a non-macOS build of the FFI.
             "tersa-mailbox-sync-ffi-macos",
             "tersa-apple-bridge"
+        ) | (
+            // ADR-0024 point 3: the token-broker FFI's capability edges must stay
+            // macOS-scoped so a future un-scoping cannot pull Keychain, Gmail, or
+            // the broker core into a non-macOS build of the service archive.
+            "tersa-token-broker-ffi-macos",
+            "tersa-gmail-rest-macos" | "tersa-keychain-macos" | "tersa-token-broker-core" | "tokio"
         )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
@@ -8389,6 +9430,20 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "tersa-token-broker-core",
             BTreeSet::from(["tersa-application"]),
         ),
+        (
+            // ADR-0024 point 3: the dedicated token-broker XPC static archive.
+            // It composes the portable core with Google transport and the
+            // broker-only Keychain store, and never depends on the main app's
+            // mailbox-sync FFI or Apple bootstrap bridge.
+            "tersa-token-broker-ffi-macos",
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-domain",
+                "tersa-gmail-rest-macos",
+                "tersa-keychain-macos",
+                "tersa-token-broker-core",
+            ]),
+        ),
     ])
 }
 
@@ -8474,18 +9529,22 @@ mod tests {
 
     use super::{
         APPLE_BRIDGE_C_ABI_COUNT_MESSAGE, CANONICAL_TERSA_RUST_BRIDGE_HEADER,
-        MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE, ResolvedDependencyIdentity,
+        MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE, REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+        REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH,
+        REVIEWED_TOKEN_BROKER_WIRE_STATUSES, ResolvedDependencyIdentity,
+        TOKEN_BROKER_ALLOWED_SOURCE_PATHS, TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
         apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
         bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
         check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
         cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
         expected_apple_c_abi_exports, expected_mailbox_sync_ffi_c_abi_exports,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
-        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        macos_client_xpc_wiring_violations, mailbox_sync_ffi_direct_dependency_set_violations,
+        expected_token_broker_ffi_c_abi_exports, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        keychain_mutation_boundary_violations, macos_client_xpc_wiring_violations,
+        mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
@@ -8499,9 +9558,11 @@ mod tests {
         swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
         swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
         swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
-        target_metadata_options, token_broker_code_signing_requirement_violations,
-        token_broker_source_surface_violations, tracked_apple_signing_inventory,
-        tracked_project_generation_violations,
+        target_metadata_options, token_broker_bridge_header_c_abi_violations,
+        token_broker_code_signing_requirement_violations,
+        token_broker_ffi_source_surface_violations, token_broker_protocol_mirror_violations,
+        token_broker_source_surface_violations, token_broker_wire_status_coherence_violations,
+        tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
     const VALID_ENTITLEMENTS: &str = r#"<plist version="1.0"><dict>
@@ -8574,6 +9635,7 @@ targets:
         CFBundlePackageType: XPC!
         XPCService:
           ServiceType: Application
+        TersaOAuthClientID: "$(TERSA_OAUTH_CLIENT_ID)"
     entitlements:
       path: macos-token-broker/TersaMacTokenBroker.entitlements
       properties:
@@ -8588,14 +9650,29 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
         SKIP_INSTALL: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: macos-token-broker/TersaMacTokenBroker-Bridging-Header.h
+        TERSA_MACOS_TOKEN_GROUP: "$(TeamIdentifierPrefix)app.tersa.token"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_token_broker_ffi_macos.a"
+    preBuildScripts:
+      - name: Build Rust token-broker static library
+        basedOnDependencyAnalysis: false
+        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos-token-broker "${CONFIGURATION}"'
   TersaMacTests:
     type: bundle.unit-test
     platform: macOS
     sources:
       - path: macos-tests
       - path: macos/ConnectionOperationDeadline.swift
+      - path: macos/ConnectionState.swift
       - path: macos/DisconnectIntentStore.swift
       - path: macos/MailboxLifecyclePresentation.swift
+      - path: macos/TokenBrokerProtocol.swift
+      - path: macos/TokenBrokerClient.swift
+      - path: macos/TokenBrokerStatusMapping.swift
+      - path: macos/TokenBrokerAuthorizationSession.swift
+      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
@@ -8706,6 +9783,20 @@ targets:
         assert_eq!(
             dependency_policy()["tersa-token-broker-core"],
             BTreeSet::from(["tersa-application"])
+        );
+    }
+
+    #[test]
+    fn activates_the_token_broker_ffi_boundary() {
+        assert_eq!(
+            dependency_policy()["tersa-token-broker-ffi-macos"],
+            BTreeSet::from([
+                "tersa-application",
+                "tersa-domain",
+                "tersa-gmail-rest-macos",
+                "tersa-keychain-macos",
+                "tersa-token-broker-core",
+            ])
         );
     }
 
@@ -9487,6 +10578,241 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
             &expected_mailbox_sync_ffi_c_abi_exports(),
             MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
         )
+    }
+
+    fn reviewed_token_broker_ffi_export_source() -> &'static str {
+        r#"
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_begin_authorization(
+    redirect_uri: *const u8,
+    redirect_uri_len: usize,
+    authorization_url_out: *mut u8,
+    authorization_url_capacity: usize,
+    authorization_url_len: *mut usize,
+    session_handle_out: *mut u8,
+    session_handle_capacity: usize,
+    session_handle_len: *mut usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_complete_authorization(
+    session_handle: *const u8,
+    session_handle_len: usize,
+    callback_url: *const u8,
+    callback_url_len: usize,
+    access_token_out: *mut u8,
+    access_token_capacity: usize,
+    access_token_len: *mut usize,
+    subject_out: *mut u8,
+    subject_capacity: usize,
+    subject_len: *mut usize,
+    expires_out: *mut i64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_refresh_access_token(
+    account_subject: *const u8,
+    account_subject_len: usize,
+    access_token_out: *mut u8,
+    access_token_capacity: usize,
+    access_token_len: *mut usize,
+    subject_out: *mut u8,
+    subject_capacity: usize,
+    subject_len: *mut usize,
+    expires_out: *mut i64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_revoke_provider_grant(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+"#
+    }
+
+    fn reviewed_token_broker_ffi_documents(lib: String) -> Vec<(PathBuf, String)> {
+        vec![(
+            PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs"),
+            lib,
+        )]
+    }
+
+    fn token_broker_ffi_export_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+        rust_exported_c_abi_violations(
+            sources,
+            &expected_token_broker_ffi_c_abi_exports(),
+            TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
+        )
+    }
+
+    #[test]
+    fn token_broker_ffi_export_inventory_pins_every_reviewed_signature() {
+        let lib = reviewed_token_broker_ffi_export_source();
+        assert!(
+            token_broker_ffi_export_violations(&reviewed_token_broker_ffi_documents(
+                lib.to_owned()
+            ))
+            .is_empty()
+        );
+
+        // Widening a parameter, changing the ABI, or renaming a symbol must trip.
+        for mutation in [
+            lib.replace("callback_url_len: usize", "callback_url_len: u32"),
+            lib.replacen("extern \"C\"", "extern \"system\"", 1),
+            lib.replace(
+                "tersa_token_broker_delete_stored_tokens",
+                "tersa_token_broker_delete_all_tokens",
+            ),
+        ] {
+            assert!(
+                !token_broker_ffi_export_violations(&reviewed_token_broker_ffi_documents(mutation))
+                    .is_empty(),
+                "token-broker FFI export name, set, and parameter widths must remain exact"
+            );
+        }
+
+        // A sixth export (refresh-token export) must fail closed.
+        let sixth = reviewed_token_broker_ffi_documents(format!(
+            "{lib}\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn tersa_token_broker_export_refresh_token(account_subject: *const u8, account_subject_len: usize) -> i32 {{}}"
+        ));
+        let violations = token_broker_ffi_export_violations(&sixth);
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("five reviewed begin, complete, refresh, revoke, and delete")),
+            "a sixth token-broker export must trip the reviewed-count message: {violations:?}"
+        );
+
+        // Missing one of the five must fail closed.
+        let missing = reviewed_token_broker_ffi_documents(lib.replace(
+            r#"#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+"#,
+            "",
+        ));
+        assert!(
+            !token_broker_ffi_export_violations(&missing).is_empty(),
+            "missing a reviewed token-broker export must fail closed"
+        );
+    }
+
+    #[test]
+    fn token_broker_ffi_source_inventory_and_header_pin_five_symbols() {
+        let manifest = "[package]\nname = \"tersa-token-broker-ffi-macos\"\n";
+        let clean = vec![
+            (
+                PathBuf::from("adapters/token-broker-ffi-macos/Cargo.toml"),
+                manifest.to_owned(),
+            ),
+            (
+                PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs"),
+                String::new(),
+            ),
+        ];
+        assert!(token_broker_ffi_source_surface_violations(&clean).is_empty());
+
+        let mut with_extra = clean.clone();
+        with_extra.push((
+            PathBuf::from("adapters/token-broker-ffi-macos/src/extra.rs"),
+            String::new(),
+        ));
+        assert!(
+            !token_broker_ffi_source_surface_violations(&with_extra).is_empty(),
+            "an unreviewed extra token-broker FFI source must fail closed"
+        );
+
+        let header = include_str!("../../apple/macos-token-broker/TersaTokenBrokerBridge.h");
+        assert!(
+            token_broker_bridge_header_c_abi_violations(header).is_empty(),
+            "reviewed bridge header must declare exactly the five C ABI symbols"
+        );
+
+        // Sixth header declaration fails closed.
+        let sixth_header = format!(
+            "{header}\nint32_t tersa_token_broker_export_refresh_token(const uint8_t *account_subject, size_t account_subject_len);\n"
+        );
+        let sixth_violations = token_broker_bridge_header_c_abi_violations(&sixth_header);
+        assert!(
+            sixth_violations.iter().any(|violation| {
+                violation.contains("tersa_token_broker_export_refresh_token")
+                    || violation.contains("exactly the five reviewed")
+            }),
+            "sixth header symbol must fail closed: {sixth_violations:?}"
+        );
+
+        // Missing/renamed header symbol fails closed.
+        let renamed = header.replace(
+            "tersa_token_broker_delete_stored_tokens",
+            "tersa_token_broker_delete_all_tokens",
+        );
+        assert!(
+            !token_broker_bridge_header_c_abi_violations(&renamed).is_empty(),
+            "renamed header symbol must fail closed"
+        );
+        let missing = header.replace(
+            "int32_t tersa_token_broker_delete_stored_tokens(\n    const uint8_t *account_subject,\n    size_t account_subject_len\n);\n",
+            "",
+        );
+        assert!(
+            !token_broker_bridge_header_c_abi_violations(&missing).is_empty(),
+            "missing header symbol must fail closed"
+        );
+    }
+
+    #[test]
+    fn token_broker_wire_status_coherence_pins_rust_and_swift() {
+        let rust = include_str!("../../adapters/token-broker-ffi-macos/src/lib.rs");
+        let service = include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let client = include_str!("../../apple/macos/TokenBrokerProtocol.swift");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, service, client).is_empty(),
+            "Rust STATUS_* and Swift status enums must match the reviewed 0..=19 set; got {:?}",
+            token_broker_wire_status_coherence_violations(rust, service, client)
+        );
+
+        // Renumber on the Rust side fails closed (not a self-comparison).
+        let rust_renumbered = rust.replace(
+            "const STATUS_IDENTITY_MISMATCH: i32 = 19;",
+            "const STATUS_IDENTITY_MISMATCH: i32 = 20;",
+        );
+        assert!(
+            token_broker_wire_status_coherence_violations(&rust_renumbered, service, client)
+                .iter()
+                .any(|violation| violation.contains("STATUS_*")),
+            "Rust status renumber must fail closed"
+        );
+
+        // Renumber on the Swift service side fails closed.
+        let service_renumbered =
+            service.replace("case identityMismatch = 19", "case identityMismatch = 20");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, &service_renumbered, client)
+                .iter()
+                .any(|violation| violation.contains("TersaTokenBrokerStatusV1")),
+            "service status renumber must fail closed"
+        );
+
+        // Renumber on the client mirror fails closed.
+        let client_renumbered =
+            client.replace("case identityMismatch = 19", "case identityMismatch = 20");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, service, &client_renumbered)
+                .iter()
+                .any(|violation| violation.contains("TokenBrokerStatus")),
+            "client status renumber must fail closed"
+        );
+
+        // Inventory table itself is exactly twenty closed pairs 0..=19.
+        assert_eq!(REVIEWED_TOKEN_BROKER_WIRE_STATUSES.len(), 20);
+        for (index, (name, value)) in REVIEWED_TOKEN_BROKER_WIRE_STATUSES.iter().enumerate() {
+            let expected = i64::try_from(index)
+                .expect("reviewed wire-status inventory index fits in i64 (table is length 20)");
+            assert_eq!(*value, expected, "{name}");
+        }
     }
 
     #[test]
@@ -11517,93 +12843,23 @@ func establishOwnedAccountProfile(_ bytes: Data, completion: @escaping @MainActo
         );
     }
 
-    fn valid_signing_project_with_interleaved_targets() -> &'static str {
-        r#"name: Tersa
-options:
-  bundleIdPrefix: app.tersa
-  deploymentTarget: { macOS: "15.0", iOS: "18.0" }
-  xcodeVersion: "26.0"
-settings: {}
-targets:
-  FirstIOS:
-    platform: iOS
-  TersaMac:
-    type: application
-    platform: macOS
-    sources:
-      - path: macos
-      - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt
-        buildPhase: resources
-    info: {}
-    entitlements:
-      path: macos/TersaMac.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        com.apple.security.network.server: true
-        com.apple.security.application-groups:
-          - ${TeamIdentifierPrefix}app.tersa.shared
-        keychain-access-groups:
-          - ${TeamIdentifierPrefix}app.tersa.shared
-    dependencies:
-      - target: TersaMacTokenBroker
-        embed: true
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac
-        TERSA_MACOS_APP_GROUP: "$(TeamIdentifierPrefix)app.tersa.shared"
-        CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
-        OTHER_LDFLAGS:
-          - "$(SRCROOT)/build/rust/$(PLATFORM_NAME)/$(CONFIGURATION)/libtersa_mailbox_sync_ffi_macos.a"
-    preBuildScripts:
-      - name: Build Rust static library
-        basedOnDependencyAnalysis: false
-        script: 'sh "${SRCROOT}/scripts/build-rust-staticlib.sh" macos "${CONFIGURATION}"'
-    scheme:
-      testTargets:
-        - TersaMacTests
-  TersaMacTokenBroker:
-    type: xpc-service
-    platform: macOS
-    sources:
-      - path: macos-token-broker
-    info:
-      path: macos-token-broker/Info.plist
-      properties:
-        CFBundlePackageType: XPC!
-        XPCService:
-          ServiceType: Application
-    entitlements:
-      path: macos-token-broker/TersaMacTokenBroker.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        keychain-access-groups:
-          - ${TeamIdentifierPrefix}app.tersa.token
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.token-broker
-        PRODUCT_NAME: TersaMacTokenBroker
-        MACOSX_DEPLOYMENT_TARGET: "15.0"
-        CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
-        SKIP_INSTALL: "YES"
-  TersaMacTests:
-    type: bundle.unit-test
-    platform: macOS
-    sources:
-      - path: macos-tests
-      - path: macos/ConnectionOperationDeadline.swift
-      - path: macos/DisconnectIntentStore.swift
-      - path: macos/MailboxLifecyclePresentation.swift
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
-        MACOSX_DEPLOYMENT_TARGET: "15.0"
-  MiddleMac:
-    platform: macOS
-  LastIOS:
-    platform: iOS
-"#
+    fn valid_signing_project_with_interleaved_targets() -> String {
+        VALID_SIGNING_PROJECT
+            .replacen(
+                "  deploymentTarget:\n    macOS: \"15.0\"\n    iOS: \"18.0\"\n",
+                "  deploymentTarget: { macOS: \"15.0\", iOS: \"18.0\" }\n",
+                1,
+            )
+            .replacen(
+                "targets:\n  TersaMac:",
+                "targets:\n  FirstIOS:\n    platform: iOS\n  TersaMac:",
+                1,
+            )
+            .replacen(
+                "  OtherMac:\n    platform: macOS\n  OtherIOS:\n    platform: iOS\n",
+                "  MiddleMac:\n    platform: macOS\n  LastIOS:\n    platform: iOS\n",
+                1,
+            )
     }
 
     #[test]
@@ -11619,7 +12875,7 @@ targets:
   <array><string>${TeamIdentifierPrefix}app.tersa.shared</string></array>
 </dict></plist>"#;
         let project = valid_signing_project_with_interleaved_targets();
-        let targets = match parse_project_targets(project) {
+        let targets = match parse_project_targets(&project) {
             Ok(targets) => targets,
             Err(error) => panic!("interleaved target fixture must parse: {error}"),
         };
@@ -11638,7 +12894,7 @@ targets:
             ]
         );
         assert!(
-            signing_configuration_violations(entitlements, VALID_BROKER_ENTITLEMENTS, project,)
+            signing_configuration_violations(entitlements, VALID_BROKER_ENTITLEMENTS, &project,)
                 .is_empty()
         );
 
@@ -12141,6 +13397,80 @@ targets:
                     violation.contains("exact reviewed source and resource sequence")
                 }),
                 "source sequence bypass must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn tersa_mac_tests_sources_are_exact_including_reviewed_callback_buffer() {
+        const EXPECTED: &str = "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift client/model surface";
+
+        // Positive: exact ordered list with the single reviewed shared
+        // callback-buffer path passes closed.
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty(),
+            "exact TersaMacTests source list including TokenBrokerCallbackBuffer.swift must pass"
+        );
+
+        let reviewed_callback =
+            "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n";
+        let cases = [
+            (
+                "extra arbitrary broker source",
+                VALID_SIGNING_PROJECT.replace(
+                    reviewed_callback,
+                    "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n      - path: macos-token-broker/TokenBrokerService.swift\n",
+                ),
+            ),
+            (
+                "alternate path spelling (directory root)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos-token-broker",
+                ),
+            ),
+            (
+                "alternate path spelling (case drift)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos-token-broker/TokenBrokerCallbackbuffer.swift",
+                ),
+            ),
+            (
+                "alternate path spelling (underscore separator)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos_token_broker/TokenBrokerCallbackBuffer.swift",
+                ),
+            ),
+            (
+                "removal of reviewed callback buffer source",
+                VALID_SIGNING_PROJECT.replace(reviewed_callback, ""),
+            ),
+            (
+                "order drift (callback buffer before authorization session)",
+                VALID_SIGNING_PROJECT.replace(
+                    "      - path: macos/TokenBrokerAuthorizationSession.swift\n      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n",
+                    "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n      - path: macos/TokenBrokerAuthorizationSession.swift\n",
+                ),
+            ),
+        ];
+        for (label, project) in cases {
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(EXPECTED)),
+                "{label} must fail closed; got {violations:?}"
             );
         }
     }
@@ -12805,31 +14135,34 @@ targets:
             })
         );
 
-        let broker_with_scripts = VALID_SIGNING_PROJECT.replace(
-            "        SKIP_INSTALL: \"YES\"\n",
-            "        SKIP_INSTALL: \"YES\"\n    preBuildScripts:\n      - name: Unreviewed\n        script: sh unreviewed.sh\n",
+        let broker_with_extra_script = VALID_SIGNING_PROJECT.replace(
+            "        script: 'sh \"${SRCROOT}/scripts/build-rust-staticlib.sh\" macos-token-broker \"${CONFIGURATION}\"'\n",
+            "        script: 'sh \"${SRCROOT}/scripts/build-rust-staticlib.sh\" macos-token-broker \"${CONFIGURATION}\"'\n      - name: Unreviewed\n        script: sh unreviewed.sh\n",
         );
         assert!(
             signing_configuration_violations(
                 VALID_ENTITLEMENTS,
                 VALID_BROKER_ENTITLEMENTS,
-                &broker_with_scripts,
+                &broker_with_extra_script,
             )
             .iter()
             .any(|violation| {
-                violation.contains("TersaMacTokenBroker target forbidden surface `preBuildScripts`")
+                violation
+                    .contains("TersaMacTokenBroker preBuildScripts must be exactly the reviewed")
+                    || violation
+                        .contains("TersaMacTokenBroker target must contain only the exact reviewed")
             })
         );
 
-        let broker_with_rust = VALID_SIGNING_PROJECT.replace(
-            "        SKIP_INSTALL: \"YES\"\n",
-            "        SKIP_INSTALL: \"YES\"\n        OTHER_LDFLAGS:\n          - libtersa_apple_bridge.a\n        ENABLE_USER_SCRIPT_SANDBOXING: \"NO\"\n",
+        let broker_with_wrong_archive = VALID_SIGNING_PROJECT.replace(
+            "libtersa_token_broker_ffi_macos.a",
+            "libtersa_mailbox_sync_ffi_macos.a",
         );
         assert!(
             signing_configuration_violations(
                 VALID_ENTITLEMENTS,
                 VALID_BROKER_ENTITLEMENTS,
-                &broker_with_rust,
+                &broker_with_wrong_archive,
             )
             .iter()
             .any(|violation| {
@@ -12854,7 +14187,7 @@ targets:
         );
     }
 
-    fn reviewed_token_broker_sources() -> [(PathBuf, String); 6] {
+    fn reviewed_token_broker_sources() -> [(PathBuf, String); 9] {
         [
             (
                 PathBuf::from("apple/macos-token-broker/main.swift"),
@@ -12869,6 +14202,11 @@ targets:
                 include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned(),
             ),
             (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerCallbackBuffer.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerCallbackBuffer.swift")
+                    .to_owned(),
+            ),
+            (
                 PathBuf::from("apple/macos-token-broker/TokenBrokerListenerDelegate.swift"),
                 include_str!("../../apple/macos-token-broker/TokenBrokerListenerDelegate.swift")
                     .to_owned(),
@@ -12881,6 +14219,17 @@ targets:
                 PathBuf::from("apple/macos-token-broker/TersaMacTokenBroker.entitlements"),
                 include_str!("../../apple/macos-token-broker/TersaMacTokenBroker.entitlements")
                     .to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TersaTokenBrokerBridge.h"),
+                include_str!("../../apple/macos-token-broker/TersaTokenBrokerBridge.h").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TersaMacTokenBroker-Bridging-Header.h"),
+                include_str!(
+                    "../../apple/macos-token-broker/TersaMacTokenBroker-Bridging-Header.h"
+                )
+                .to_owned(),
             ),
         ]
     }
@@ -12897,6 +14246,100 @@ targets:
                 .any(|violation| violation.contains(expected)),
             "{label} must fail closed; got {violations:?}"
         );
+    }
+
+    fn assert_reviewed_token_broker_client_xpc_wiring_is_pinned() {
+        let macos_client = [(
+            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+            "let connection = NSXPCConnection(serviceName: \"app.tersa.mac.token-broker\")\n"
+                .to_owned(),
+        )];
+        assert!(
+            macos_client_xpc_wiring_violations(&macos_client)
+                .iter()
+                .any(|violation| violation.contains("NSXPCConnection")),
+            "XPC wiring outside the reviewed TokenBroker client allowlist must fail closed"
+        );
+        assert!(
+            macos_client_xpc_wiring_violations(&[(
+                PathBuf::from("apple/macos/AppDelegate.swift"),
+                include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
+            )])
+            .is_empty()
+        );
+        // Reviewed allowlisted client files may connect only via the exact
+        // pinned constant assignment plus `NSXPCConnection(serviceName:)`.
+        let reviewed_client = include_str!("../../apple/macos/TokenBrokerClient.swift");
+        assert!(
+            macos_client_xpc_wiring_violations(&[(
+                PathBuf::from("apple/macos/TokenBrokerClient.swift"),
+                reviewed_client.to_owned(),
+            )])
+            .is_empty(),
+            "reviewed TokenBrokerClient.swift must pass the XPC wiring pin"
+        );
+        // A decoy TokenBroker* filename must not inherit the closed allowlist
+        // exemption even when it mirrors the reviewed connection construction.
+        let decoy_pinned = "static let serviceBundleIdentifier = \"app.tersa.mac.token-broker\"\n\
+             let connection = NSXPCConnection(serviceName: Self.serviceBundleIdentifier)\n";
+        let decoy_violations = macos_client_xpc_wiring_violations(&[(
+            PathBuf::from("apple/macos/TokenBrokerDecoy.swift"),
+            decoy_pinned.to_owned(),
+        )]);
+        assert!(
+            decoy_violations.iter().any(|violation| {
+                violation.contains("outside the closed reviewed TokenBroker client allowlist")
+            }),
+            "decoy TokenBroker*.swift must not inherit the reviewed client allowlist; got {decoy_violations:?}"
+        );
+        assert!(
+            decoy_violations
+                .iter()
+                .any(|violation| violation.contains("NSXPCConnection")),
+            "decoy TokenBroker*.swift must still fail closed on XPC wiring; got {decoy_violations:?}"
+        );
+        for (label, document) in [
+            (
+                "wrong service name",
+                "let connection = NSXPCConnection(serviceName: \"app.attacker.broker\")\n"
+                    .to_owned(),
+            ),
+            (
+                "comment decoy with wrong executable service",
+                "// app.tersa.mac.token-broker\n\
+                 // static let serviceBundleIdentifier = \"app.tersa.mac.token-broker\"\n\
+                 let connection = NSXPCConnection(serviceName: \"app.attacker.broker\")\n"
+                    .to_owned(),
+            ),
+            (
+                "unrelated string decoy with wrong executable service",
+                "let decoy = \"app.tersa.mac.token-broker\"\n\
+                 let connection = NSXPCConnection(serviceName: \"app.attacker.broker\")\n"
+                    .to_owned(),
+            ),
+            (
+                "alternate initializer with correct constant",
+                "static let serviceBundleIdentifier = \"app.tersa.mac.token-broker\"\n\
+                 let connection = NSXPCConnection(machServiceName: Self.serviceBundleIdentifier)\n"
+                    .to_owned(),
+            ),
+            (
+                "literal serviceName bypassing the reviewed constant",
+                "static let serviceBundleIdentifier = \"app.tersa.mac.token-broker\"\n\
+                 let connection = NSXPCConnection(serviceName: \"app.tersa.mac.token-broker\")\n"
+                    .to_owned(),
+            ),
+        ] {
+            assert!(
+                macos_client_xpc_wiring_violations(&[(
+                    PathBuf::from("apple/macos/TokenBrokerClient.swift"),
+                    document,
+                )])
+                .iter()
+                .any(|violation| violation.contains("embedded token-broker service bundle id")),
+                "{label} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -12946,28 +14389,17 @@ targets:
             assert_token_broker_surface_contains(&mutated, expected, label);
         }
 
-        let macos_client = [(
-            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
-            "let connection = NSXPCConnection(serviceName: \"app.tersa.mac.token-broker\")\n"
-                .to_owned(),
-        )];
-        assert!(
-            macos_client_xpc_wiring_violations(&macos_client)
-                .iter()
-                .any(|violation| violation.contains("NSXPCConnection"))
-        );
-        assert!(
-            macos_client_xpc_wiring_violations(&[(
-                PathBuf::from("apple/macos/AppDelegate.swift"),
-                include_str!("../../apple/macos/AppDelegate.swift").to_owned(),
-            )])
-            .is_empty()
-        );
+        assert_reviewed_token_broker_client_xpc_wiring_is_pinned();
     }
 
     #[test]
     fn token_broker_source_inventory_and_signing_call_are_fail_closed() {
         let sources = reviewed_token_broker_sources();
+        assert_eq!(
+            sources.len(),
+            TOKEN_BROKER_ALLOWED_SOURCE_PATHS.len(),
+            "reviewed fixture inventory must list exactly the closed nine broker paths"
+        );
 
         let mut with_extra = sources.to_vec();
         with_extra.push((
@@ -12977,7 +14409,7 @@ targets:
         assert_token_broker_surface_contains(
             &with_extra,
             "outside the closed TersaMacTokenBroker source allowlist",
-            "extra seventh broker file",
+            "extra broker file outside the closed nine-path inventory",
         );
 
         let mut missing_required = sources.to_vec();
@@ -13101,6 +14533,244 @@ protocol TersaMacTokenBrokerProtocolV1 {
         );
     }
 
+    fn exact_token_broker_session_resource_bag_deinit_fixture() -> &'static str {
+        "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    deinit { release() }
+}
+"
+    }
+
+    fn reviewed_token_broker_session_resource_bag_deinit_path() -> &'static Path {
+        Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH)
+    }
+
+    fn assert_swift_source_has_no_lexical_violations(path: &Path, code: &str, message: &str) {
+        let violations = swift_source_lexical_violations(path, code);
+        assert!(violations.is_empty(), "{message}; got {violations:?}");
+    }
+
+    fn assert_swift_source_rejects_deinit(path: &Path, code: &str, message: &str) {
+        assert!(
+            swift_source_lexical_violations(path, code)
+                .iter()
+                .any(|violation| violation.contains("must not declare `deinit`")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_accepts_reviewed_source_and_exact_fixture() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        // Positive: the reviewed abandoned-session cleanup at the exact path,
+        // owner class, and body form is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            include_str!("../../apple/macos/TokenBrokerAuthorizationSession.swift"),
+            "reviewed TokenBrokerAuthorizationSession.swift must pass the lexical deinit guard",
+        );
+        // Positive fixture: the exact reviewed form on the exact owner is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            exact_token_broker_session_resource_bag_deinit_fixture(),
+            "exact TokenBrokerSessionResourceBag deinit {{ release() }} fixture must pass",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_wrong_path_and_owner() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: wrong path with the exact form fails closed.
+        assert_swift_source_rejects_deinit(
+            Path::new("apple/macos/TokenBrokerClient.swift"),
+            exact,
+            "deinit outside TokenBrokerAuthorizationSession.swift must fail closed",
+        );
+        // Negative: wrong owner class at the reviewed path fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class OtherSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    deinit { release() }
+}
+",
+            "deinit on a non-reviewed owner class must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_body_form_mutations() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: extra statement before release() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { _ = 0; release() }"),
+            "deinit with a statement before release() must fail closed",
+        );
+        // Negative: extra statement after release() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { release(); _ = 1 }"),
+            "deinit with a statement after release() must fail closed",
+        );
+        // Negative: alternate call fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { self.release() }"),
+            "deinit with a different call than release() must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_second_decoy_laundering_and_nested() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a second deinit fails closed even when both match the form.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace(
+                "deinit { release() }",
+                "deinit { release() }\n    deinit { release() }",
+            ),
+            "a second deinit declaration must fail closed",
+        );
+        // Negative: comment/string decoys of the reviewed form must not satisfy
+        // the exception when the executable deinit is mutated.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    // deinit { release() }
+    let decoy = \"deinit { release() }\"
+    deinit { cancel() }
+}
+",
+            "comment/string deinit decoys must not satisfy the reviewed exception",
+        );
+        // Negative: the historical body-parse laundering fixture still fails.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    deinit { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }
+}
+",
+            "the old deinit body-parse laundering fixture must still fail closed",
+        );
+        // Negative: nested placement inside the reviewed class fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    final class Nested {
+        deinit { release() }
+    }
+    func release() {}
+}
+",
+            "deinit nested inside another type must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_keeps_subscript_unconditionally_forbidden() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        // subscript remains unconditionally forbidden alongside the deinit exception.
+        let with_subscript = format!(
+            "{}\nsubscript(index: Int) -> Int {{ index }}\n",
+            exact_token_broker_session_resource_bag_deinit_fixture()
+        );
+        assert!(
+            swift_source_lexical_violations(path, &with_subscript)
+                .iter()
+                .any(|violation| violation.contains("must not declare `subscript`")),
+            "subscript must remain unconditionally forbidden"
+        );
+    }
+
+    #[test]
+    fn token_broker_protocol_and_status_mirrors_are_coherent() {
+        let service =
+            include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift").to_owned();
+        let client = include_str!("../../apple/macos/TokenBrokerProtocol.swift").to_owned();
+        assert!(
+            token_broker_protocol_mirror_violations(&service, &client).is_empty(),
+            "service and client v1 protocol/status mirrors must match; got {:?}",
+            token_broker_protocol_mirror_violations(&service, &client)
+        );
+
+        let delete_tokens_signature = "\
+    func deleteStoredTokens(
+        accountSubject: String,
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
+    )";
+        // Mutations must stay inside the protocol body: body-scoped parsing is
+        // the mirror authority and ignores helper `func` text outside `{...}`.
+        for (label, mutated_client, expected) in [
+            (
+                "client protocol method drift",
+                client.replace(
+                    delete_tokens_signature,
+                    "func deleteStoredTokens(\n        accountSubject: String,\n        withReply reply: @escaping @Sendable (_ status: Int, _ detail: String?) -> Void\n    )",
+                ),
+                REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+            ),
+            (
+                "missing reviewed operation",
+                client.replace(delete_tokens_signature, ""),
+                REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+            ),
+            (
+                "sixth protocol operation",
+                client.replace(
+                    delete_tokens_signature,
+                    &format!(
+                        "{delete_tokens_signature}\n    func exportStoredSecret(withReply reply: @escaping @Sendable (Int) -> Void)"
+                    ),
+                ),
+                REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+            ),
+            (
+                "async/throws effect on reviewed operation",
+                client.replace(
+                    delete_tokens_signature,
+                    &format!("{delete_tokens_signature} async throws"),
+                ),
+                REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
+            ),
+            (
+                "malformed missing-paren operation",
+                client.replace(
+                    delete_tokens_signature,
+                    &format!("{delete_tokens_signature}\n    func exportStoredSecret"),
+                ),
+                "parseable closed broker protocol operations",
+            ),
+        ] {
+            assert!(
+                token_broker_protocol_mirror_violations(&service, &mutated_client)
+                    .iter()
+                    .any(|violation| violation.contains(expected)),
+                "{label} must fail closed; got {:?}",
+                token_broker_protocol_mirror_violations(&service, &mutated_client)
+            );
+        }
+
+        let drifted_status =
+            client.replace("case identityMismatch = 19", "case identityMismatch = 20");
+        assert!(
+            token_broker_protocol_mirror_violations(&service, &drifted_status)
+                .iter()
+                .any(|violation| violation.contains("same closed raw-value case set")),
+            "client status raw-value drift must fail closed"
+        );
+    }
+
     #[test]
     fn token_broker_protocol_surface_rejects_non_allowlisted_operations() {
         let protocol_path = Path::new("apple/macos-token-broker/TokenBrokerProtocol.swift");
@@ -13109,7 +14779,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
         let delete_tokens_signature = "\
     func deleteStoredTokens(
         accountSubject: String,
-        withReply reply: @escaping (_ status: Int) -> Void
+        withReply reply: @escaping @Sendable (_ status: Int) -> Void
     )";
         for (label, document) in [
             (
@@ -13911,6 +15581,11 @@ protocol TersaMacTokenBrokerProtocolV1 {
             // The FFI's bridge edge (the grant-claim seam and single-archive link)
             // is pinned to macOS for the same reason.
             ("tersa-mailbox-sync-ffi-macos", "tersa-apple-bridge"),
+            // ADR-0024 point 3: token-broker FFI capability edges stay macOS-only.
+            ("tersa-token-broker-ffi-macos", "tersa-gmail-rest-macos"),
+            ("tersa-token-broker-ffi-macos", "tersa-keychain-macos"),
+            ("tersa-token-broker-ffi-macos", "tersa-token-broker-core"),
+            ("tersa-token-broker-ffi-macos", "tokio"),
         ] {
             assert_eq!(
                 future_macos_store_dependency_violation(
@@ -14130,7 +15805,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 "aarch64-apple-darwin",
             ),
             vec![
-                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\"] for aarch64-apple-darwin"
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\", \"tersa-token-broker-ffi-macos\"] for aarch64-apple-darwin"
             ]
         );
         assert_eq!(
@@ -14142,7 +15817,7 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 "aarch64-apple-ios",
             ),
             vec![
-                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\"] for aarch64-apple-ios",
+                "tersa-application reaches reqwest outside the authorized network crates [\"tersa-gmail-rest-macos\", \"tersa-oauth-sync-macos\", \"tersa-mailbox-sync-ffi-macos\", \"tersa-token-broker-ffi-macos\"] for aarch64-apple-ios",
                 "tersa-gmail-rest-macos reaches reqwest on non-macOS target aarch64-apple-ios",
             ]
         );
