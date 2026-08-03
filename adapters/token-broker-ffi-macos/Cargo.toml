@@ -22,7 +22,11 @@ crate-type = ["rlib", "staticlib"]
 tersa-application = { path = "../../crates/application", version = "=0.0.0" }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 tersa-gmail-rest-macos = { path = "../gmail-rest-macos", version = "=0.0.0" }
-tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0" }
+# `oauth-token`: the XPC broker is the production owner of refresh-token
+# Keychain access, so it explicitly enables the keychain's opt-in module.
+tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0", features = [
+    "oauth-token",
+] }
 tersa-token-broker-core = { path = "../token-broker-core", version = "=0.0.0" }
 tokio = { workspace = true }
 zeroize = { workspace = true }

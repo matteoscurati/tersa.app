@@ -13,6 +13,13 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# Default features are empty: the refresh-token Keychain surface is opt-in.
+[features]
+# Exposes the per-account OAuth refresh-token Keychain module. The XPC token
+# broker (`tersa-token-broker-ffi-macos`) is the production owner of that
+# access and is the dependency that enables this feature.
+oauth-token = []
+
 [dependencies]
 hkdf = { workspace = true }
 sha2 = "=0.10.9"

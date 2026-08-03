@@ -31,6 +31,11 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "macos")]
 pub mod mailbox_read;
 /// Per-account OAuth refresh-token Keychain surface (add / rotate / delete).
+///
+/// Compiled only under the `oauth-token` feature (or in this crate's own
+/// tests): the XPC token broker is the production owner of refresh-token
+/// Keychain access.
+#[cfg(any(feature = "oauth-token", test))]
 pub mod oauth_token;
 
 /// Closed, redacted failure returned by the trusted read-only composition.
