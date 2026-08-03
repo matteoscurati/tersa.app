@@ -20,12 +20,16 @@
 //! committed-or-rolled-back transaction, and the coordinator releases its inner
 //! single-flight on drop).
 //!
-//! The disconnect itself runs on a sibling worker ([`begin_disconnect`]) that
-//! INVERTS the begin order: the FFI marks the slot disconnecting up front, the
-//! worker spawns first and then blocking-acquires the gate on its plain thread —
-//! serializing BEHIND the now-cancelling cycle — and only then loads the stored
-//! refresh token, revokes it best-effort, deletes it, and purges the account's
-//! local data. That worker is un-cancellable and clears the disconnecting flag
+//! The disconnect itself runs on a sibling worker (`begin_disconnect_with`)
+//! that INVERTS the begin order: the FFI marks the slot disconnecting up front,
+//! the worker spawns first and then blocking-acquires the gate on its plain
+//! thread — serializing BEHIND the now-cancelling cycle — and only then runs
+//! the teardown. In the default broker composition the teardown is the
+//! broker-coordinated finalize ([`begin_broker_disconnect_finalize`]): a local
+//! purge with NO token access. Under the opt-in `legacy-token-lifecycle`
+//! feature the legacy `begin_disconnect` loads the stored refresh token,
+//! revokes it best-effort, deletes it, and purges the account's local data.
+//! That worker is un-cancellable and clears the disconnecting flag
 //! on the whole teardown SUCCESS FAMILY — a locally-complete teardown, whether
 //! or not the provider /revoke could be confirmed ([`STATUS_SUCCEEDED`] or
 //! [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`]); only a teardown FAILURE leaves the
@@ -41,10 +45,14 @@ use tersa_application::lifecycle::{AccountLifecycleMetadata, AccountLifecycleSto
 use tersa_application::mailbox::{
     AccountId, AccountPurgeStore, MailboxStore, MailboxStoreError, PageSize, StoreLimit,
 };
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_application::oauth::{AuthorizationGrant, SystemMonotonicClock, SystemWallClock};
 use tersa_application::sync::{SyncPolicy, SyncReport};
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_application::token::{TokenClientConfig, TokenError, TokenTransport};
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_gmail_rest_macos::GmailTokenTransport;
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_keychain_macos::oauth_token::{DataProtectionRefreshTokenStore, RefreshTokenStore};
 use tersa_keychain_macos::{
     DataProtectionAccountIdentityHasher, open_default_mailbox_store,
@@ -53,10 +61,12 @@ use tersa_keychain_macos::{
 use zeroize::Zeroizing;
 
 use crate::permit::{self, WholeCyclePermit};
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 use crate::{
-    ConnectSession, GatedSyncError, GmailSession, RevokeOutcome, TokenLifecycleError,
-    build_sync_runtime, connect_account, gated_sync, refresh_account, revoke_best_effort,
+    ConnectSession, RevokeOutcome, TokenLifecycleError, connect_account, refresh_account,
+    revoke_best_effort,
 };
+use crate::{GatedSyncError, GmailSession, build_sync_runtime, gated_sync};
 
 /// The worker thread is live and its cycle is in flight.
 pub const STATUS_RUNNING: i32 = 0;
@@ -354,6 +364,7 @@ where
 /// minted token — connect cancellation flows through the OAuth tombstone/lease
 /// only, and the sync-only registration is what makes a signaled connect
 /// impossible.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 fn begin_connect_with<F, Fut>(account: &AccountId, op: F) -> BeginOutcome
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -399,11 +410,14 @@ enum CycleError {
     /// claim-miss whose session was CANCELLED is not this variant but
     /// `Connect(TokenLifecycleError::Cancelled)`, reported as a cancel rather
     /// than a re-consent prompt.
+    #[cfg(any(feature = "legacy-token-lifecycle", test))]
     ClaimMissing,
     /// The initial grant exchange, the connect cancel fence, or the
     /// refresh-token store failed (the newly-connected account path).
+    #[cfg(any(feature = "legacy-token-lifecycle", test))]
     Connect(TokenLifecycleError),
     /// The stored refresh token could not be exchanged for an access token.
+    #[cfg(any(feature = "legacy-token-lifecycle", test))]
     Refresh(TokenLifecycleError),
     /// The refreshed credential failed session-freshness validation. Its specific
     /// reason is deliberately not carried — it always collapses to one status.
@@ -432,6 +446,7 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
         // the retry code below. Only the CONNECT rung maps it here: the token layer
         // never produces it on refresh, and a refresh/provider failure must never
         // be reported as a lapsed sign-in.
+        #[cfg(any(feature = "legacy-token-lifecycle", test))]
         Err(
             CycleError::ClaimMissing
             | CycleError::Connect(TokenLifecycleError::Token(
@@ -442,6 +457,7 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
                 | TokenLifecycleError::Token(TokenError::ConsentRevoked),
             ),
         ) => STATUS_NEEDS_RECONNECT,
+        #[cfg(any(feature = "legacy-token-lifecycle", test))]
         Err(
             CycleError::Connect(TokenLifecycleError::Token(TokenError::InsufficientScope))
             | CycleError::Refresh(TokenLifecycleError::Token(TokenError::InsufficientScope)),
@@ -457,25 +473,26 @@ fn status_for_cycle<R>(result: &Result<R, CycleError>) -> i32 {
         // pre-existing connection survives — 3e must not render this code as
         // "disconnected". Distinct from the reconnect code (nothing needs
         // re-consent) and from sync-failed (this is not a retryable failure).
+        #[cfg(any(feature = "legacy-token-lifecycle", test))]
         Err(CycleError::Connect(TokenLifecycleError::Cancelled)) => STATUS_CANCELLED,
         // A cancel whose post-store cleanup write failed persistently is NOT a
         // clean cancel: a usable token may still sit in the Keychain, so it
         // surfaces as the internal code — 3e presents "cancelled — please
         // disconnect to be sure" — never the clean cancel code.
+        #[cfg(any(feature = "legacy-token-lifecycle", test))]
         Err(CycleError::Connect(TokenLifecycleError::CancelledCleanupIncomplete)) => {
             STATUS_INTERNAL
         }
-        // Setup, other (retryable, non-destructive) exchange/refresh failures,
-        // session-freshness, and the bounded sync's own failures all collapse to
-        // the opaque "this cycle produced no sync" — none is an identity/presence
-        // block.
+        // Setup, session-freshness, and the bounded sync's own failures all
+        // collapse to the opaque "this cycle produced no sync" — none is an
+        // identity/presence block. The legacy exchange/refresh failures (the
+        // retryable, non-destructive `Connect`/`Refresh` remainder) collapse to
+        // the same code on their own arm below.
         Err(
-            CycleError::Setup
-            | CycleError::Connect(_)
-            | CycleError::Refresh(_)
-            | CycleError::Session
-            | CycleError::Gated(GatedSyncError::Sync(_)),
+            CycleError::Setup | CycleError::Session | CycleError::Gated(GatedSyncError::Sync(_)),
         ) => STATUS_SYNC_FAILED,
+        #[cfg(any(feature = "legacy-token-lifecycle", test))]
+        Err(CycleError::Connect(_) | CycleError::Refresh(_)) => STATUS_SYNC_FAILED,
     }
 }
 
@@ -495,6 +512,7 @@ fn default_sync_policy() -> Option<SyncPolicy> {
 /// `account` and `config` crosses the thread boundary and a busy slot builds none of
 /// them. The permit the worker holds covers the refresh, so a rotated refresh token
 /// is persisted without a parallel-cycle race.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn run_default_account_cycle(
     account: &AccountId,
     config: &TokenClientConfig,
@@ -532,6 +550,7 @@ async fn run_default_account_cycle(
 /// already in flight for the slot. `config` is the validated token-client config the
 /// caller supplies; the composition owns everything else.
 #[must_use]
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 pub fn begin_default_account_sync(account: AccountId, config: TokenClientConfig) -> BeginOutcome {
     let slot = account.clone();
     begin_with(&slot, move || async move {
@@ -546,9 +565,9 @@ pub fn begin_default_account_sync(account: AccountId, config: TokenClientConfig)
 /// subject is re-validated at that trust boundary
 /// ([`GmailSession::from_broker_token`]).
 ///
-/// Unlike [`run_default_account_cycle`], NOTHING from the token lifecycle is
-/// constructed or used here — no [`DataProtectionRefreshTokenStore`], no
-/// [`GmailTokenTransport`], no [`TokenClientConfig`], and no refresh, exchange,
+/// Unlike the legacy default-account cycle, NOTHING from the token lifecycle is
+/// constructed or used here — no `DataProtectionRefreshTokenStore`, no
+/// `GmailTokenTransport`, no `TokenClientConfig`, and no refresh, exchange,
 /// or other OAuth API: the separately signed broker owns the token lifecycle
 /// and this cycle only consumes its reply. Both secrets are consumed by the
 /// session build and zeroized when dropped at the end of THIS cycle —
@@ -560,7 +579,7 @@ async fn run_broker_account_cycle(
 ) -> Result<SyncReport, CycleError> {
     let hasher = DataProtectionAccountIdentityHasher::new().map_err(|_error| CycleError::Setup)?;
     let store = open_default_mailbox_store(account).map_err(|_error| CycleError::Setup)?;
-    let wall_clock = SystemWallClock;
+    let wall_clock = tersa_application::oauth::SystemWallClock;
     let policy = default_sync_policy().ok_or(CycleError::Setup)?;
 
     let session = GmailSession::from_broker_token(account.clone(), &access_token, subject)
@@ -575,7 +594,7 @@ async fn run_broker_account_cycle(
 /// Begins a bounded sync for `account` from an ADR-0024 token broker reply on a
 /// background worker, inside the same whole-cycle permit [`begin_with`] enforces
 /// — so busy, cancellation, and terminal-status semantics are identical to
-/// [`begin_default_account_sync`]. Returns [`BeginOutcome::Busy`] — without
+/// the legacy `begin_default_account_sync`. Returns [`BeginOutcome::Busy`] — without
 /// touching the Keychain, the network, or the broker secrets — if a cycle is
 /// already in flight for the slot. `access_token` and `subject` must come from
 /// the SAME broker reply; both are consumed by the worker and zeroized at cycle
@@ -612,6 +631,7 @@ pub fn begin_broker_account_sync(
 /// actually a cancel (the tombstone made the grant unclaimable between
 /// grant-store and claim) reports [`TokenLifecycleError::Cancelled`], not the
 /// re-consent code.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn run_connect_account_cycle<St: ConnectSession>(
     account: &AccountId,
     session: &St,
@@ -645,6 +665,7 @@ async fn run_connect_account_cycle<St: ConnectSession>(
 /// only lets a resident tombstone resume TTL reaping; it never un-stores a
 /// token. Generic over the operation and its success payload so the
 /// exactly-once release is testable with a fake cycle.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn complete_after<R, St, F, Fut>(session: &St, op: F) -> Result<R, CycleError>
 where
     St: ConnectSession,
@@ -665,6 +686,7 @@ where
 /// begins (a leaked lease would pin the cancel tombstone forever). The held
 /// permit covers the exchange, so the persisted refresh token cannot race a
 /// parallel cycle.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn run_claimed_connect_cycle<St: ConnectSession>(
     account: &AccountId,
     grant: AuthorizationGrant,
@@ -748,6 +770,7 @@ async fn finalize_successful_sync<S: AccountLifecycleStore>(
 /// config alongside the grant because the closed dependency set keeps `url`
 /// (the redirect's type) with the caller, not this composition.
 #[must_use]
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 pub fn begin_connect_account_sync<St>(account: AccountId, session: St) -> BeginOutcome
 where
     St: ConnectSession + Send + 'static,
@@ -770,6 +793,13 @@ enum TeardownError {
     /// transport, or the presence-checked mailbox-store open).
     Setup,
     /// The stored refresh token could not be deleted.
+    #[cfg_attr(
+        not(any(feature = "legacy-token-lifecycle", test)),
+        allow(
+            dead_code,
+            reason = "constructed only by the legacy token teardown; the broker finalize performs no token delete"
+        )
+    )]
     TokenDelete,
     /// The mailbox + identity purge transaction failed.
     Purge,
@@ -785,6 +815,13 @@ enum TeardownError {
 enum RevokeDisposition {
     /// A token was stored and the provider confirmed its revocation (on the
     /// first revoke attempt or the one retry).
+    #[cfg_attr(
+        not(any(feature = "legacy-token-lifecycle", test)),
+        allow(
+            dead_code,
+            reason = "constructed only by the legacy token teardown; the broker finalize yields only Unconfirmed or NotNeeded"
+        )
+    )]
     Confirmed,
     /// Nothing was stored, so there was nothing to revoke.
     NotNeeded,
@@ -801,6 +838,7 @@ enum RevokeDisposition {
 /// disconnect gate, which is what serializes it behind any in-flight cycle.
 /// `store` is `None` when the account has no database file: the purge then
 /// no-ops without creating one.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn run_teardown_with<S, T, P, F, E>(
     account: &AccountId,
     refresh_store: &S,
@@ -903,6 +941,7 @@ where
 /// WITHOUT creating one (disconnect never creates artifacts). On success the
 /// revoke disposition is returned so the worker can report an unconfirmed
 /// /revoke as its own closed status.
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 async fn run_disconnect_teardown(account: &AccountId) -> Result<RevokeDisposition, TeardownError> {
     // The refresh store is the ONLY genuinely-fatal prerequisite: without it the
     // mandatory token delete cannot run.
@@ -1027,6 +1066,7 @@ pub fn load_broker_subject(
 /// is inert — registered nowhere, observed nowhere. The teardown is short,
 /// local, and must run to completion once started.
 #[must_use = "the returned outcome is the only way to poll or coalesce the disconnect"]
+#[cfg(any(feature = "legacy-token-lifecycle", test))]
 pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
     begin_disconnect_with(account, |account| async move {
         run_disconnect_teardown(&account).await
@@ -1036,7 +1076,7 @@ pub fn begin_disconnect(account: AccountId) -> BeginOutcome {
 /// The disconnect worker's spawn-and-run machinery, generic over the teardown
 /// operation — exactly as `begin_with` is generic over the sync op — so the
 /// disposition→status mapping and the fence policy are testable with a fake
-/// teardown (the production [`run_disconnect_teardown`] builds Keychain- and
+/// teardown (the production legacy `run_disconnect_teardown` builds Keychain- and
 /// network-backed objects a test host cannot drive to a successful revoke).
 ///
 /// `op` is HANDED a clone of the FENCED `account` (it does not choose its own),
