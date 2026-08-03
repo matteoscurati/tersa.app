@@ -116,6 +116,11 @@ Issue #51 remains open until all of the following are complete:
    and `task_for_pid` from the main app to the broker fail under the exact
    release signing posture.
 
+Items 2 through 4 are implemented in source and fail-closed in CI as of the
+point-4 cutover (see *Current packaging status*). Items 1, 5, and 6 remain
+unproved: they require external registration and signed-runtime evidence
+that this repository cannot produce or attest by inspection.
+
 The probes must be fixed-purpose test entries, set
 `kSecUseDataProtectionKeychain`, and must not expose a generic Keychain mutation
 capability. Only `errSecMissingEntitlement` passes a wrong-group negative
@@ -156,8 +161,9 @@ store fixed to the dedicated token access group and token service, a narrow
 redacted C ABI, the closed operational `TersaTokenBrokerStatusV1` wire set,
 the main-app `TokenBrokerClient` / status mapping / authorization-session
 surface, and deterministic unit tests for those mappings. The main app still
-links only its mailbox-sync FFI archive and retains the legacy in-process
-token authority until the point-4 production cutover.
+links only its mailbox-sync FFI archive; point 4 (below) has since completed
+the production cutover that moves token authority off the legacy in-process
+path.
 
 Three operational properties of that core remain binding for the service.
 First, Google's revocation endpoint is grant-wide:
@@ -215,12 +221,69 @@ provider rejection or consent revoked. `PersistenceFailed` from
 `delete_stored_tokens` maps to incomplete local teardown and never looks
 clean.
 
-Operational binding and the closed client/mapping surface are implemented.
-Production cutover is NOT complete: the main app still retains the legacy
-in-process token authority; mailbox sync/disconnect are not yet switched to
-XPC; legacy credentials are not migrated or deleted; the dedicated token
-Keychain group is declared for the broker only and is not yet registered or
-provisioned under the production team; builds remain unsigned unless an
-operator configures signing locally. This ADR still implements no signed
-runtime proof, notarization, or distribution evidence. Until those later
-items land, final distribution remains blocked by issue #51.
+Operational binding and the closed client/mapping surface are implemented,
+and point 4 has completed the production cutover described in the next
+subsection. What remains open is strictly the signed-runtime evidence: the
+dedicated token Keychain group is declared for the broker only and, unless
+externally completed, is not yet registered or provisioned under the
+production team — the repository cannot prove external registration;
+development-signed runtime success and both wrong-group
+`errSecMissingEntitlement` fixed-purpose probes are not yet run; and the
+exact Developer ID signed and notarized release-candidate entitlement
+inspection, negative controls, and debugger/`task_for_pid` evidence are not
+yet produced. Builds remain unsigned unless an operator configures signing
+locally; the local unsigned Debug arm64 `TersaMac` build with the embedded
+broker succeeds, but an unsigned build proves no process-isolation property.
+This ADR still implements no signed runtime proof, notarization, or
+distribution evidence. Until the remaining required-evidence items land,
+final distribution remains blocked by issue #51.
+
+### Point-4 production cutover and legacy credential disposition
+
+Point 4 has moved the main macOS production flow onto the broker.
+`TokenBrokerAuthorizationSession` / `TokenBrokerClient` now drive consent,
+exchange completion, stored-token refresh, revoke, and delete through the
+embedded XPC service over the closed version-1 protocol. The main process
+keeps Gmail access-token sync and SQLCipher ownership: a successful exchange
+or refresh returns only the bounded short-lived access token and the
+validated subject. The subject is stored in the encrypted mailbox database
+through `tersa_mailbox_macos_broker_subject_store`; the access token is
+memory-only, handed to `tersa_mailbox_macos_broker_sync_begin`, and wiped
+in place immediately after that FFI call returns (and on box deinit if a
+queued begin never runs). It is never persisted or logged.
+
+Disconnect runs the decided ordering: outer intent journal, then the Rust
+prepare marker/fence, then broker revoke, then the mandatory broker token
+delete, then the Rust finalize purge and marker clear. Revoke-unconfirmed
+stays visibly distinct from a clean teardown, and a failed delete gates the
+local purge — the finalize never runs on a delete failure, so the marker
+and the recovery evidence survive for the retry path.
+
+The production dependency and ABI contract now matches that flow. The
+mailbox-sync FFI's production edge to `tersa-apple-bridge` sets
+`default-features = false`, disabling the bridge's `legacy-oauth` feature,
+and the main app's graph never enables the Keychain `oauth-token` feature;
+the mailbox-sync FFI declares no legacy feature and exports no legacy C
+symbols in production. Its shipped static archive surface is exactly the
+seven reviewed broker mailbox exports plus the bridge's five reviewed safe
+reexports — twelve symbols total. `tersa-apple-bridge`'s `legacy-oauth`
+remains available for the direct/iOS bridge composition and dev tests;
+`tersa-oauth-sync-macos`'s `legacy-token-lifecycle` remains opt-in only
+for legacy/test compositions and is not enabled by the production main-app
+graph. xtask source
+guards and the CI archive symbol/string checks fail closed on any
+`_tersa_oauth_macos_*` global symbol, on the three retired mailbox begins
+(`_tersa_mailbox_macos_sync_begin`, `_tersa_mailbox_macos_connect_begin`,
+`_tersa_mailbox_macos_disconnect_begin`), and on the embedded strings
+`oauth_token` and `DataProtectionRefreshTokenStore`. `cargo xtask
+architecture` passes with these fail-closed source, dependency, ABI,
+header, Swift-call, handoff, and deinit guards in place.
+
+The legacy development credential is disposed. Before the cutover the owner
+completed a live legacy disconnect and observed the confirmed
+disconnected / local-mail-purged outcome. On 2026-08-03 the non-secret query
+`security find-generic-password -s app.tersa.mac.oauth-refresh-token.v1 -a primary-gmail`
+returned exit 44 (item not found), which is explicit evidence that the
+legacy development refresh-token item is absent. This is
+development-item absence evidence only; it is not signed process-isolation
+proof and does not discharge any pending required-evidence item above.
