@@ -260,6 +260,29 @@ jobs:
               exit 1
             }
           done
+      - name: Verify macOS token-broker FFI archive symbols
+        run: |
+          set -euo pipefail
+          # Source-level xtask guards pin this crate's own five exports; the
+          # linked static archive must still reject any sixth `_tersa_` text
+          # export pulled in transitively from dependencies.
+          archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
+          test -f "$archive"
+          symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
+          printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
+          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 5
+          for expected in \
+            _tersa_token_broker_begin_authorization \
+            _tersa_token_broker_complete_authorization \
+            _tersa_token_broker_refresh_access_token \
+            _tersa_token_broker_revoke_provider_grant \
+            _tersa_token_broker_delete_stored_tokens
+          do
+            printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
+              echo "missing defined text symbol: $expected" >&2
+              exit 1
+            }
+          done
       - name: Link and execute the mailbox-sync FFI C probe
         run: |
           set -euo pipefail

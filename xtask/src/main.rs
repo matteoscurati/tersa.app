@@ -789,9 +789,11 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
 }
 
 /// The token-broker FFI is a dedicated static library with its own five-symbol
-/// C ABI; pin its reviewed sources, bridge header, and wire-status inventory
-/// exactly, so a sixth export (for example refresh-token export) or status
-/// renumber cannot land without review.
+/// C ABI. This source-level guard pins this crate's own five exports, bridge
+/// header, and wire-status inventory exactly, so a sixth local export (for
+/// example refresh-token export) or status renumber cannot land without review.
+/// The built-archive CI assertion closes transitive linked `_tersa_` text
+/// exports in the final static archive.
 fn token_broker_bootstrap_source_surface_violations(
     repository_root: &Path,
 ) -> io::Result<Vec<String>> {
