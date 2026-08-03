@@ -190,17 +190,11 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
         reply: @escaping @Sendable (String?, String?, Int, Int) -> Void
     ) {
         Self.workQueue.async {
-            // Mutable copy so the complete path can zero the callback/code
-            // bytes after the FFI call. Refresh passes an empty secondary and
-            // does not need that wipe. Immutable Swift `String` values received
-            // over XPC cannot be zeroized; this UTF-8 buffer is the
-            // secret-bearing copy this process owns for the FFI call.
-            //
-            // The complete path uniquely references this storage via
-            // `withUnsafeMutableBufferPointer` before the FFI read so the
-            // defer wipe zeros the same allocation the FFI observed (COW-
-            // safe). Do not use the immutable buffer view for that read.
-            var secondaryBytes = secondary
+            // Complete path: process-owned callback UTF-8 is uniquely referenced
+            // inside TokenBrokerOwnedCallbackUTF8 so the FFI read and post-call
+            // wipe share one allocation (COW-safe). Refresh passes an empty
+            // secondary and does not need that wipe. Immutable XPC String
+            // values cannot be zeroized.
             var accessTokenBytes = [UInt8](repeating: 0, count: Self.maxAccessTokenBytes)
             var accessTokenLength = 0
             var subjectBytes = [UInt8](repeating: 0, count: Self.maxSubjectBytes)
@@ -213,19 +207,18 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
                 subjectBytes.withUnsafeMutableBufferPointer { buffer in
                     buffer.initialize(repeating: 0)
                 }
-                if isComplete {
-                    secondaryBytes.withUnsafeMutableBufferPointer { buffer in
-                        buffer.initialize(repeating: 0)
-                    }
-                }
             }
 
             let status: Int32 = subjectOrHandle.withUnsafeBufferPointer { primaryBuffer in
                 accessTokenBytes.withUnsafeMutableBufferPointer { tokenBuffer in
                     subjectBytes.withUnsafeMutableBufferPointer { subjectBuffer in
                         if isComplete {
-                            return secondaryBytes.withUnsafeMutableBufferPointer { callbackBuffer in
-                                // Pass the uniquely referenced storage as a
+                            // FFI executes inside the shared helper's mutable
+                            // buffer scope; wipe runs on the same allocation.
+                            return TokenBrokerOwnedCallbackUTF8.withMutableBufferWipedAfter(
+                                secondary
+                            ) { callbackBuffer in
+                                // Pass uniquely referenced storage as a
                                 // read-only pointer; no second plaintext copy.
                                 let callbackPointer = callbackBuffer.baseAddress
                                     .map { UnsafePointer($0) }
@@ -292,55 +285,5 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
                 TersaTokenBrokerStatusV1.success.rawValue
             )
         }
-    }
-
-    /// Testable complete-path wipe invariant.
-    ///
-    /// Uniquely references a mutable UTF-8 buffer, performs a simulated const
-    /// FFI read of that storage, zeros the same allocation, and returns whether
-    /// the buffer the read observed is all zeros afterward (same address when
-    /// storage is stable). Immutable XPC `String` values are not zeroizable;
-    /// this models only the process-owned callback byte buffer.
-    static func completePathCallbackWipeLeavesZeros(_ plaintext: [UInt8]) -> Bool {
-        var secondaryBytes = plaintext
-        var addressDuringRead: UInt?
-        var lengthDuringRead = 0
-        var snapshotDuringRead: [UInt8] = []
-
-        // Uniquely reference before the simulated const FFI read.
-        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
-            if let base = buffer.baseAddress {
-                addressDuringRead = UInt(bitPattern: base)
-                lengthDuringRead = buffer.count
-                let constView = UnsafePointer(base)
-                snapshotDuringRead = Array(
-                    UnsafeBufferPointer(start: constView, count: buffer.count)
-                )
-            }
-        }
-
-        guard snapshotDuringRead == plaintext, lengthDuringRead == plaintext.count else {
-            return false
-        }
-
-        // Defer-style wipe of the same uniquely referenced allocation.
-        var wipedSameAddress = false
-        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
-            buffer.initialize(repeating: 0)
-            if let base = buffer.baseAddress,
-               UInt(bitPattern: base) == addressDuringRead,
-               buffer.count == lengthDuringRead
-            {
-                wipedSameAddress = UnsafeBufferPointer(start: base, count: buffer.count)
-                    .allSatisfy { $0 == 0 }
-            }
-        }
-
-        guard secondaryBytes.allSatisfy({ $0 == 0 }),
-              secondaryBytes.count == plaintext.count
-        else {
-            return false
-        }
-        return wipedSameAddress
     }
 }

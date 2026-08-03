@@ -28,35 +28,106 @@ enum TokenBrokerLoopbackReceiveDecision: Equatable, Sendable {
     case rejectConnection
 }
 
-/// Concurrent live-peer admission for one loopback authorization session.
+/// Concurrent live-peer registry and state machine for one loopback session.
+///
+/// Sole source of admission, reading→finishing transition, immediate-release
+/// prohibition while finishing, send-completion / force release, duplicate-ID
+/// rejection, and full drain. Production holds one registry of live TCP peers;
+/// tests exercise the same type with dummy peers so regressions in finishing
+/// guards or duplicate-ID rejection cannot leave unit tests green.
 ///
 /// Counts concurrent live peers, not cumulative lifetime accepts. Each admit
-/// pairs with exactly one successful `release`; double-release is a no-op so
-/// timeout/send/error races cannot underflow.
-struct TokenBrokerLoopbackPeerBudget: Equatable, Sendable {
-    private(set) var livePeerIDs: Set<ObjectIdentifier>
+/// pairs with exactly one successful take (immediate, owned, or drain).
+struct TokenBrokerLoopbackPeerRegistry<Peer> {
+    /// Peer lifecycle while registered.
+    enum Phase: Equatable, Sendable {
+        /// Actively reading; eligible for immediate release (timeout/error).
+        case reading
+        /// HTTP response path owns the peer. Immediate timeout release is a
+        /// no-op; release only via send-completion take, force take, or drain.
+        case finishing
+    }
+
+    private struct Entry {
+        var peer: Peer
+        var phase: Phase
+    }
+
+    private var entries: [ObjectIdentifier: Entry] = [:]
     let maxConcurrent: Int
 
-    var liveCount: Int { livePeerIDs.count }
+    /// Number of peers currently in flight (reading or finishing).
+    var liveCount: Int { entries.count }
 
     init(maxConcurrent: Int = TokenBrokerAuthorizationSession.maxAcceptedConnections) {
-        self.livePeerIDs = []
         self.maxConcurrent = maxConcurrent
     }
 
-    /// Admits a peer when under budget and not already live.
-    mutating func admit(_ id: ObjectIdentifier) -> Bool {
-        guard !livePeerIDs.contains(id), livePeerIDs.count < maxConcurrent else {
+    /// Admits when under budget and `id` is not already live.
+    @discardableResult
+    mutating func admit(_ id: ObjectIdentifier, peer: Peer) -> Bool {
+        guard entries[id] == nil, entries.count < maxConcurrent else {
             return false
         }
-        livePeerIDs.insert(id)
+        entries[id] = Entry(peer: peer, phase: .reading)
         return true
     }
 
-    /// Idempotent release. Returns `true` only on the first release of `id`.
+    /// Whether `id` is still registered (any phase).
+    func contains(_ id: ObjectIdentifier) -> Bool {
+        entries[id] != nil
+    }
+
+    /// Current phase for a live peer, or `nil` if not registered.
+    func phase(of id: ObjectIdentifier) -> Phase? {
+        entries[id]?.phase
+    }
+
+    /// Peer value when still registered.
+    func peer(for id: ObjectIdentifier) -> Peer? {
+        entries[id]?.peer
+    }
+
+    /// Transitions reading → finishing. Returns the peer, or `nil` when missing
+    /// or already finishing (second ready/timeout race).
     @discardableResult
-    mutating func release(_ id: ObjectIdentifier) -> Bool {
-        livePeerIDs.remove(id) != nil
+    mutating func beginFinishing(_ id: ObjectIdentifier) -> Peer? {
+        guard let entry = entries[id], entry.phase == .reading else {
+            return nil
+        }
+        entries[id] = Entry(peer: entry.peer, phase: .finishing)
+        return entry.peer
+    }
+
+    /// Immediate release only from `.reading`. No-op while finishing so the
+    /// HTTP path retains exclusive ownership until send completion.
+    @discardableResult
+    mutating func releaseImmediate(_ id: ObjectIdentifier) -> Peer? {
+        guard let entry = entries[id], entry.phase == .reading else {
+            return nil
+        }
+        entries.removeValue(forKey: id)
+        return entry.peer
+    }
+
+    /// Removes regardless of phase (send completion, session-finished force
+    /// drop after beginFinishing). Idempotent: second take returns `nil`.
+    @discardableResult
+    mutating func take(_ id: ObjectIdentifier) -> Peer? {
+        entries.removeValue(forKey: id)?.peer
+    }
+
+    /// Drains every live peer once for session teardown.
+    @discardableResult
+    mutating func drainAll() -> [Peer] {
+        let peers = Array(entries.values.map(\.peer))
+        entries.removeAll()
+        return peers
+    }
+
+    /// Clears without returning peers (session re-arm).
+    mutating func removeAll() {
+        entries.removeAll()
     }
 }
 
@@ -101,34 +172,52 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
 
     /// Cancels deadline source, loopback listener, and XPC client. Idempotent.
     /// `DispatchSource.cancel` is thread-safe; safe from `deinit` or any queue.
+    /// Uses the same clear-then-cancel helper tests invoke so release order and
+    /// double-release no-op behavior cannot diverge from production.
     func release() {
         lock.lock()
-        let pendingSource = deadlineSource
-        let pendingListener = listener
-        let pendingClient = client
+        var deadlineCancel: (() -> Void)?
+        var listenerCancel: (() -> Void)?
+        var clientCancel: (() -> Void)?
+        if let source = deadlineSource {
+            deadlineCancel = { source.cancel() }
+        }
+        if let listener {
+            listenerCancel = { listener.cancel() }
+        }
+        if let client {
+            clientCancel = { client.cancel() }
+        }
         deadlineSource = nil
         listener = nil
         client = nil
         lock.unlock()
-        pendingSource?.cancel()
-        pendingListener?.cancel()
-        pendingClient?.cancel()
+        Self.releaseCancelClosures(
+            deadlineCancel: &deadlineCancel,
+            listenerCancel: &listenerCancel,
+            clientCancel: &clientCancel
+        )
     }
 
-    /// Testable idempotent release of optional cancel closures (no live XPC/NW).
+    /// Idempotent clear-then-cancel of optional cancel closures.
     ///
-    /// Models the bag's clear-then-cancel order: a second call is a no-op
-    /// because the closures are nilled before invocation.
+    /// Production `release()` and unit tests share this helper: closures are
+    /// nilled before invocation so a second call is a no-op. Order is deadline
+    /// source, listener, then XPC client (matches bag teardown).
     nonisolated static func releaseCancelClosures(
-        clientCancel: inout (() -> Void)?,
-        listenerCancel: inout (() -> Void)?
+        deadlineCancel: inout (() -> Void)?,
+        listenerCancel: inout (() -> Void)?,
+        clientCancel: inout (() -> Void)?
     ) {
-        let client = clientCancel
+        let deadline = deadlineCancel
         let listener = listenerCancel
-        clientCancel = nil
+        let client = clientCancel
+        deadlineCancel = nil
         listenerCancel = nil
-        client?()
+        clientCancel = nil
+        deadline?()
         listener?()
+        client?()
     }
 
     deinit {
@@ -190,18 +279,11 @@ final class TokenBrokerAuthorizationSession {
         ).utf8
     )
 
-    private final class LivePeer {
+    /// One accepted TCP peer plus its per-connection read deadline work item.
+    /// Phase (reading vs finishing) lives only in `peerRegistry`.
+    private struct LivePeer {
         let connection: NWConnection
         let deadlineWork: DispatchWorkItem
-        /// True once a complete-header finish has begun (HTTP response path).
-        /// Prevents timeout/ready races from double-sending while the peer still
-        /// occupies the concurrent budget until contentProcessed.
-        var isFinishing = false
-
-        init(connection: NWConnection, deadlineWork: DispatchWorkItem) {
-            self.connection = connection
-            self.deadlineWork = deadlineWork
-        }
     }
 
     private let resources = TokenBrokerSessionResourceBag()
@@ -219,10 +301,10 @@ final class TokenBrokerAuthorizationSession {
     /// complete. Concurrent or second connections cannot double-complete the
     /// session. Stray parseable peers must never claim this latch.
     private var hasForwardedCallback = false
-    /// Concurrent live peers keyed by `ObjectIdentifier`. Finish removes and
-    /// cancels the per-peer deadline exactly once (reject, parse failure, send
-    /// completion, timeout, session finish, or transport error).
-    private var livePeers: [ObjectIdentifier: LivePeer] = [:]
+    /// Production peer registry: sole source of concurrent budget, reading→
+    /// finishing, immediate-release prohibition while finishing, send-completion
+    /// release, duplicate-ID rejection, and drain.
+    private var peerRegistry = TokenBrokerLoopbackPeerRegistry<LivePeer>()
     private let listenerQueue = DispatchQueue(
         label: "app.tersa.macos.token-broker.loopback"
     )
@@ -251,7 +333,7 @@ final class TokenBrokerAuthorizationSession {
         self.onOutcome = onOutcome
         let client = TokenBrokerClient()
         resources.install(client: client, listener: listener)
-        livePeers = [:]
+        peerRegistry.removeAll()
         hasForwardedCallback = false
         boundLoopbackPort = nil
         armSessionDeadline()
@@ -367,12 +449,6 @@ final class TokenBrokerAuthorizationSession {
             return
         }
         let id = ObjectIdentifier(connection)
-        // Concurrent live budget: reject only when eight peers are in flight.
-        // Finished peers release their slot so a later valid callback can enter.
-        guard livePeers.count < Self.maxAcceptedConnections, livePeers[id] == nil else {
-            connection.cancel()
-            return
-        }
         let deadlineWork = DispatchWorkItem { [weak self, weak connection] in
             guard let connection else {
                 return
@@ -381,7 +457,16 @@ final class TokenBrokerAuthorizationSession {
                 self?.handlePeerReadDeadline(connection)
             }
         }
-        livePeers[id] = LivePeer(connection: connection, deadlineWork: deadlineWork)
+        // Concurrent live budget + duplicate-ID rejection via the production
+        // registry only. Finished peers free their slot for later admits.
+        let admitted = peerRegistry.admit(
+            id,
+            peer: LivePeer(connection: connection, deadlineWork: deadlineWork)
+        )
+        guard admitted else {
+            connection.cancel()
+            return
+        }
         DispatchQueue.main.asyncAfter(
             deadline: .now() + Self.connectionReadLifetime,
             execute: deadlineWork
@@ -396,7 +481,7 @@ final class TokenBrokerAuthorizationSession {
             return
         }
         // Peer already finished (timeout/session end) — stop receiving.
-        guard livePeers[ObjectIdentifier(connection)] != nil else {
+        guard peerRegistry.contains(ObjectIdentifier(connection)) else {
             return
         }
         let remaining = Self.maxRequestBytes - accumulated.count
@@ -419,7 +504,7 @@ final class TokenBrokerAuthorizationSession {
                     return
                 }
                 // Drop work for peers already released (timeout race).
-                guard self.livePeers[ObjectIdentifier(connection)] != nil else {
+                guard self.peerRegistry.contains(ObjectIdentifier(connection)) else {
                     return
                 }
                 var buffer = accumulated
@@ -449,18 +534,21 @@ final class TokenBrokerAuthorizationSession {
     /// reach this path. Budget release and TCP cancel run in contentProcessed.
     private func handleReadyLoopbackRequest(connection: NWConnection, request: Data) {
         let id = ObjectIdentifier(connection)
-        // Claim exclusive finish: cancel the read deadline and prevent a second
-        // ready/timeout path from admitting the same peer again.
-        guard let peer = livePeers[id], !peer.isFinishing else {
+        // Claim exclusive finish via the production registry: cancel the read
+        // deadline and prevent a second ready/timeout path from re-entering.
+        guard let peer = peerRegistry.beginFinishing(id) else {
             return
         }
         peer.deadlineWork.cancel()
-        peer.isFinishing = true
 
         guard !isFinished else {
-            // Force-release: isFinishing would make releasePeerImmediate a no-op.
-            livePeers.removeValue(forKey: id)
-            connection.cancel()
+            // Force-take: finishing peers are not released by releaseImmediate.
+            if let released = peerRegistry.take(id) {
+                released.deadlineWork.cancel()
+                released.connection.cancel()
+            } else {
+                connection.cancel()
+            }
             return
         }
 
@@ -495,35 +583,35 @@ final class TokenBrokerAuthorizationSession {
 
     /// Idempotent immediate finish for incomplete/timeout/transport paths:
     /// cancel deadline, free the concurrent slot, cancel TCP. No HTTP body.
-    /// No-op when the HTTP response path already owns the peer (`isFinishing`);
+    /// No-op when the HTTP response path already owns the peer (finishing);
     /// that path releases only in `.contentProcessed`. Session teardown still
     /// drains every peer via `cancelAllLivePeers`.
     private func releasePeerImmediate(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
-        guard let peer = livePeers[id], !peer.isFinishing else {
+        guard let peer = peerRegistry.releaseImmediate(id) else {
             return
         }
-        livePeers.removeValue(forKey: id)
         peer.deadlineWork.cancel()
-        connection.cancel()
+        peer.connection.cancel()
     }
 
     /// Sends a pinned static HTTP response; releases the concurrent budget and
     /// cancels the connection only in `.contentProcessed`. Never interpolates
-    /// callback/code.
+    /// callback/code. Peer must already be in finishing via `beginFinishing`.
     private func sendFixedHTTPResponseAndRelease(_ connection: NWConnection, response: Data) {
         let id = ObjectIdentifier(connection)
         // Deadline is already cancelled; registry entry remains until send
         // completion so the concurrent budget counts this peer as live.
-        livePeers[id]?.deadlineWork.cancel()
-        livePeers[id]?.isFinishing = true
+        if let peer = peerRegistry.peer(for: id) {
+            peer.deadlineWork.cancel()
+        }
         connection.send(
             content: response,
             contentContext: .defaultMessage,
             isComplete: true,
             completion: .contentProcessed { [weak self] _ in
                 Task { @MainActor in
-                    if let peer = self?.livePeers.removeValue(forKey: id) {
+                    if let peer = self?.peerRegistry.take(id) {
                         peer.deadlineWork.cancel()
                     }
                     connection.cancel()
@@ -533,11 +621,10 @@ final class TokenBrokerAuthorizationSession {
     }
 
     /// Cancels every live peer deadline and connection. Idempotent per peer
-    /// because the map is drained once.
+    /// because the registry is drained once.
     private func cancelAllLivePeers() {
-        let peers = livePeers
-        livePeers.removeAll()
-        for (_, peer) in peers {
+        let peers = peerRegistry.drainAll()
+        for peer in peers {
             peer.deadlineWork.cancel()
             peer.connection.cancel()
         }
@@ -618,30 +705,6 @@ final class TokenBrokerAuthorizationSession {
         }
         hasForwardedCallback = true
         return true
-    }
-
-    /// Whether one more concurrent live peer may be admitted.
-    ///
-    /// Pure gate used by the accept path and unit tests. `liveCount` is the
-    /// number of peers currently in flight, not cumulative lifetime accepts.
-    /// Excess simultaneous peers are cancelled without completing the session.
-    nonisolated static func shouldProcessAcceptedConnection(
-        isFinished: Bool,
-        hasSessionHandle: Bool,
-        acceptedConnectionCount liveCount: Int,
-        maxAcceptedConnections: Int = maxAcceptedConnections
-    ) -> Bool {
-        !isFinished
-            && hasSessionHandle
-            && liveCount < maxAcceptedConnections
-    }
-
-    /// Pure peer read-deadline check (elapsed >= lifetime).
-    nonisolated static func peerReadDeadlineExpired(
-        elapsed: TimeInterval,
-        lifetime: TimeInterval = connectionReadLifetime
-    ) -> Bool {
-        elapsed >= lifetime
     }
 
     /// Accumulates one receive into the loopback request buffer.

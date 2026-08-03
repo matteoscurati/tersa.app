@@ -576,107 +576,93 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
         XCTAssertNil(
             TokenBrokerAuthorizationSession.callbackURL(from: badHost, boundPort: 54_321)
         )
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: false,
-                hasSessionHandle: true,
-                acceptedConnectionCount: TokenBrokerAuthorizationSession.maxAcceptedConnections
-            )
-        )
-        XCTAssertTrue(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: false,
-                hasSessionHandle: true,
-                acceptedConnectionCount: 0
-            )
-        )
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: true,
-                hasSessionHandle: true,
-                acceptedConnectionCount: 0
-            )
-        )
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: false,
-                hasSessionHandle: false,
-                acceptedConnectionCount: 0
-            )
-        )
     }
 
-    func testConcurrentPeerBudgetReleasesSlotsAndRejectsNinth() {
-        // Eight completed/rejected peers must not block a later valid callback.
-        var budget = TokenBrokerLoopbackPeerBudget(maxConcurrent: 8)
+    func testConcurrentPeerRegistryBudgetAndFinishingGuards() {
+        // Production path: admit → (timeout) releaseImmediate OR beginFinishing
+        // → take on send completion / force. Tests must fail if finishing no
+        // longer blocks immediate release or if duplicate IDs are re-admitted.
         final class PeerToken: NSObject {}
-        let firstWave = (0..<8).map { _ in PeerToken() }
-        for peer in firstWave {
-            XCTAssertTrue(budget.admit(ObjectIdentifier(peer)))
+        struct DummyPeer {
+            let label: Int
         }
-        XCTAssertEqual(budget.liveCount, 8)
-        // Ninth simultaneous peer is rejected while eight are live.
-        let ninthSimultaneous = PeerToken()
-        XCTAssertFalse(budget.admit(ObjectIdentifier(ninthSimultaneous)))
-        XCTAssertEqual(budget.liveCount, 8)
 
-        for peer in firstWave {
-            XCTAssertTrue(budget.release(ObjectIdentifier(peer)))
+        var registry = TokenBrokerLoopbackPeerRegistry<DummyPeer>(maxConcurrent: 8)
+        let firstWave = (0..<8).map { index -> (PeerToken, DummyPeer) in
+            (PeerToken(), DummyPeer(label: index))
         }
-        XCTAssertEqual(budget.liveCount, 0)
-        // Double-release is a no-op (no underflow).
-        XCTAssertFalse(budget.release(ObjectIdentifier(firstWave[0])))
-        XCTAssertEqual(budget.liveCount, 0)
+        for (token, peer) in firstWave {
+            XCTAssertTrue(registry.admit(ObjectIdentifier(token), peer: peer))
+        }
+        XCTAssertEqual(registry.liveCount, 8)
+        let ninth = PeerToken()
+        XCTAssertFalse(registry.admit(ObjectIdentifier(ninth), peer: DummyPeer(label: 8)))
+        XCTAssertEqual(registry.liveCount, 8)
 
-        let laterValid = PeerToken()
-        XCTAssertTrue(budget.admit(ObjectIdentifier(laterValid)))
-        XCTAssertEqual(budget.liveCount, 1)
+        // Release all reading peers (timeout/reject path); slots free.
+        for (token, _) in firstWave {
+            let id = ObjectIdentifier(token)
+            XCTAssertNotNil(registry.releaseImmediate(id))
+            // Double immediate release is a no-op (exactly-once).
+            XCTAssertNil(registry.releaseImmediate(id))
+        }
+        XCTAssertEqual(registry.liveCount, 0)
+
+        let later = PeerToken()
+        XCTAssertTrue(registry.admit(ObjectIdentifier(later), peer: DummyPeer(label: 9)))
+        XCTAssertEqual(registry.liveCount, 1)
+
+        // Duplicate-ID rejection while still live.
+        XCTAssertFalse(registry.admit(ObjectIdentifier(later), peer: DummyPeer(label: 10)))
+        XCTAssertEqual(registry.liveCount, 1)
+
+        // beginFinishing: immediate release becomes a no-op; take frees the slot.
+        let finishingToken = PeerToken()
+        let finishingID = ObjectIdentifier(finishingToken)
+        XCTAssertTrue(
+            registry.admit(finishingID, peer: DummyPeer(label: 11))
+        )
+        XCTAssertEqual(registry.phase(of: finishingID), .reading)
+        XCTAssertEqual(registry.beginFinishing(finishingID)?.label, 11)
+        XCTAssertEqual(registry.phase(of: finishingID), .finishing)
+        // Second beginFinishing is rejected (ready/timeout race).
+        XCTAssertNil(registry.beginFinishing(finishingID))
+        // Immediate release prohibited while finishing (HTTP path owns peer).
+        XCTAssertNil(registry.releaseImmediate(finishingID))
+        XCTAssertTrue(registry.contains(finishingID))
+        XCTAssertEqual(registry.liveCount, 2)
+        // Send-completion / force take releases exactly once.
+        XCTAssertEqual(registry.take(finishingID)?.label, 11)
+        XCTAssertNil(registry.take(finishingID))
+        XCTAssertFalse(registry.contains(finishingID))
 
         // Nine simultaneous admits: only eight succeed.
-        var simultaneous = TokenBrokerLoopbackPeerBudget(maxConcurrent: 8)
-        let nine = (0..<9).map { _ in PeerToken() }
+        var simultaneous = TokenBrokerLoopbackPeerRegistry<DummyPeer>(maxConcurrent: 8)
+        let nine = (0..<9).map { index -> (PeerToken, DummyPeer) in
+            (PeerToken(), DummyPeer(label: index))
+        }
         var admitted = 0
-        for peer in nine {
-            if simultaneous.admit(ObjectIdentifier(peer)) {
+        for (token, peer) in nine {
+            if simultaneous.admit(ObjectIdentifier(token), peer: peer) {
                 admitted += 1
             }
         }
         XCTAssertEqual(admitted, 8)
         XCTAssertEqual(simultaneous.liveCount, 8)
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: false,
-                hasSessionHandle: true,
-                acceptedConnectionCount: 8
-            )
-        )
-        XCTAssertTrue(
-            TokenBrokerAuthorizationSession.shouldProcessAcceptedConnection(
-                isFinished: false,
-                hasSessionHandle: true,
-                acceptedConnectionCount: 7
-            )
-        )
+
+        // Drain tears down every remaining peer once (session finish).
+        let drained = simultaneous.drainAll()
+        XCTAssertEqual(drained.count, 8)
+        XCTAssertEqual(simultaneous.liveCount, 0)
+        XCTAssertTrue(simultaneous.drainAll().isEmpty)
     }
 
     func testConnectionReadDeadlineIsTwoSeconds() {
+        // Production schedules DispatchWorkItem with connectionReadLifetime;
+        // pin the constant. No separate pure elapsed helper — deadline expiry
+        // is the work-item firing into releaseImmediate on the registry.
         XCTAssertEqual(TokenBrokerAuthorizationSession.connectionReadLifetime, 2)
         XCTAssertEqual(TokenBrokerAuthorizationSession.sessionTimeout, 600)
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 1.999)
-        )
-        XCTAssertTrue(
-            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 2)
-        )
-        XCTAssertTrue(
-            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(elapsed: 2.5)
-        )
-        XCTAssertFalse(
-            TokenBrokerAuthorizationSession.peerReadDeadlineExpired(
-                elapsed: 1,
-                lifetime: 2
-            )
-        )
     }
 
     func testLoopbackHTTPResponsesArePinnedStaticBytes() {
@@ -745,39 +731,94 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
     }
 
     func testCompletePathCallbackWipeZerosTheSameAllocation() {
-        // Mirrors TokenBrokerService.completePathCallbackWipeLeavesZeros: the
-        // complete path uniquely references callback storage before the FFI
-        // read, then zeros that same allocation. Immutable XPC Strings are
-        // not zeroizable; this proves only the owned byte buffer wipe.
+        // Calls the exact production helper used by deliverTokenOperation's
+        // complete path. Immutable XPC Strings are not zeroizable; this proves
+        // only the process-owned byte buffer wipe on the shared allocation.
         let plaintext = Array("callback-secret-code".utf8)
-        var secondaryBytes = plaintext
         var addressDuringRead: UInt?
         var snapshotDuringRead: [UInt8] = []
+        var addressAfterWipe: UInt?
+        var zerosAfterWipe = false
 
-        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
-            if let base = buffer.baseAddress {
-                addressDuringRead = UInt(bitPattern: base)
-                snapshotDuringRead = Array(
-                    UnsafeBufferPointer(start: UnsafePointer(base), count: buffer.count)
-                )
+        let simulatedStatus = TokenBrokerOwnedCallbackUTF8.withMutableBufferWipedAfter(
+            plaintext,
+            body: { buffer -> Int32 in
+                if let base = buffer.baseAddress {
+                    addressDuringRead = UInt(bitPattern: base)
+                    // Simulated const FFI read of uniquely referenced storage.
+                    snapshotDuringRead = Array(
+                        UnsafeBufferPointer(start: UnsafePointer(base), count: buffer.count)
+                    )
+                }
+                return 0
+            },
+            afterWipe: { buffer in
+                if let base = buffer.baseAddress {
+                    addressAfterWipe = UInt(bitPattern: base)
+                    zerosAfterWipe = UnsafeBufferPointer(start: base, count: buffer.count)
+                        .allSatisfy { $0 == 0 }
+                }
             }
-        }
+        )
+
+        XCTAssertEqual(simulatedStatus, 0)
         XCTAssertEqual(snapshotDuringRead, plaintext)
         XCTAssertNotNil(addressDuringRead)
+        XCTAssertEqual(addressDuringRead, addressAfterWipe)
+        XCTAssertTrue(zerosAfterWipe)
+    }
 
-        var wipedSameAddress = false
-        secondaryBytes.withUnsafeMutableBufferPointer { buffer in
-            buffer.initialize(repeating: 0)
-            if let base = buffer.baseAddress,
-               UInt(bitPattern: base) == addressDuringRead
-            {
-                wipedSameAddress = UnsafeBufferPointer(start: base, count: buffer.count)
-                    .allSatisfy { $0 == 0 }
-            }
+    func testCompletePathCallbackWipeZerosTheSameAllocationOnThrow() {
+        // rethrows must still wipe: a throwing body must not leave plaintext in
+        // the process-owned allocation. afterWipe observes the same base.
+        enum SentinelError: Error {
+            case expected
         }
-        XCTAssertTrue(wipedSameAddress)
-        XCTAssertTrue(secondaryBytes.allSatisfy { $0 == 0 })
-        XCTAssertEqual(secondaryBytes.count, plaintext.count)
+
+        let plaintext = Array("callback-secret-code".utf8)
+        var addressDuringRead: UInt?
+        var snapshotDuringRead: [UInt8] = []
+        var addressAfterWipe: UInt?
+        var zerosAfterWipe = false
+        var observedError: Error?
+
+        do {
+            _ = try TokenBrokerOwnedCallbackUTF8.withMutableBufferWipedAfter(
+                plaintext,
+                body: { buffer -> Int32 in
+                    if let base = buffer.baseAddress {
+                        addressDuringRead = UInt(bitPattern: base)
+                        snapshotDuringRead = Array(
+                            UnsafeBufferPointer(start: UnsafePointer(base), count: buffer.count)
+                        )
+                    }
+                    throw SentinelError.expected
+                },
+                afterWipe: { buffer in
+                    if let base = buffer.baseAddress {
+                        addressAfterWipe = UInt(bitPattern: base)
+                        zerosAfterWipe = UnsafeBufferPointer(start: base, count: buffer.count)
+                            .allSatisfy { $0 == 0 }
+                    }
+                }
+            )
+            XCTFail("expected SentinelError.expected to propagate")
+        } catch {
+            observedError = error
+        }
+
+        XCTAssertEqual(snapshotDuringRead, plaintext)
+        XCTAssertNotNil(addressDuringRead)
+        XCTAssertEqual(addressDuringRead, addressAfterWipe)
+        XCTAssertTrue(zerosAfterWipe)
+        guard let observedError else {
+            XCTFail("sentinel error must propagate after wipe")
+            return
+        }
+        XCTAssertTrue(
+            observedError is SentinelError,
+            "expected SentinelError, got \(observedError)"
+        )
     }
 
     func testDuplicateCallbackLatchIsSingleShot() {
@@ -864,23 +905,32 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
     }
 
     func testAbandonedSessionResourceReleaseIsIdempotent() {
+        // Same clear-then-cancel helper production release() invokes for
+        // deadline source, listener, and XPC client.
+        var deadlineCancels = 0
         var clientCancels = 0
         var listenerCancels = 0
+        var deadlineCancel: (() -> Void)? = { deadlineCancels += 1 }
         var clientCancel: (() -> Void)? = { clientCancels += 1 }
         var listenerCancel: (() -> Void)? = { listenerCancels += 1 }
         TokenBrokerSessionResourceBag.releaseCancelClosures(
-            clientCancel: &clientCancel,
-            listenerCancel: &listenerCancel
+            deadlineCancel: &deadlineCancel,
+            listenerCancel: &listenerCancel,
+            clientCancel: &clientCancel
         )
+        XCTAssertEqual(deadlineCancels, 1)
         XCTAssertEqual(clientCancels, 1)
         XCTAssertEqual(listenerCancels, 1)
+        XCTAssertNil(deadlineCancel)
         XCTAssertNil(clientCancel)
         XCTAssertNil(listenerCancel)
         // Second release must not double-cancel (exactly-once endpoint teardown).
         TokenBrokerSessionResourceBag.releaseCancelClosures(
-            clientCancel: &clientCancel,
-            listenerCancel: &listenerCancel
+            deadlineCancel: &deadlineCancel,
+            listenerCancel: &listenerCancel,
+            clientCancel: &clientCancel
         )
+        XCTAssertEqual(deadlineCancels, 1)
         XCTAssertEqual(clientCancels, 1)
         XCTAssertEqual(listenerCancels, 1)
     }

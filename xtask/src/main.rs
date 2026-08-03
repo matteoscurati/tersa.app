@@ -4136,11 +4136,12 @@ const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS: &str = "TokenBrokerSessi
 /// Whitespace-normalized form of the sole reviewed abandoned-session `deinit`.
 const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT: &str = "deinit{release()}";
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
-const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 8] = [
+const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 9] = [
     "apple/macos-token-broker/Info.plist",
     "apple/macos-token-broker/TersaMacTokenBroker-Bridging-Header.h",
     "apple/macos-token-broker/TersaMacTokenBroker.entitlements",
     "apple/macos-token-broker/TersaTokenBrokerBridge.h",
+    "apple/macos-token-broker/TokenBrokerCallbackBuffer.swift",
     REVIEWED_TOKEN_BROKER_LISTENER_PATH,
     REVIEWED_TOKEN_BROKER_PROTOCOL_PATH,
     "apple/macos-token-broker/TokenBrokerService.swift",
@@ -5866,6 +5867,9 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
         violations
             .push("the TersaMacTests target type must be exactly bundle.unit-test".to_owned());
     }
+    // Exact ordered TersaMacTests sources: macos-tests, the pure client/model
+    // surface under macos/, and the single reviewed shared callback-buffer
+    // helper. No directory wildcard for macos-token-broker; only this path.
     let valid_sources = matches!(
         body.get("sources"),
         Some(StrictYamlValue::Sequence(sources))
@@ -5879,6 +5883,7 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
                 StrictYamlValue::Mapping(broker_client_source),
                 StrictYamlValue::Mapping(broker_status_mapping_source),
                 StrictYamlValue::Mapping(broker_authorization_session_source),
+                StrictYamlValue::Mapping(broker_callback_buffer_source),
             ] if test_sources.len() == 1
                 && matches!(test_sources.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-tests")
                 && deadline_source.len() == 1
@@ -5896,7 +5901,9 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
                 && broker_status_mapping_source.len() == 1
                 && matches!(broker_status_mapping_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerStatusMapping.swift")
                 && broker_authorization_session_source.len() == 1
-                && matches!(broker_authorization_session_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerAuthorizationSession.swift"))
+                && matches!(broker_authorization_session_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/TokenBrokerAuthorizationSession.swift")
+                && broker_callback_buffer_source.len() == 1
+                && matches!(broker_callback_buffer_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos-token-broker/TokenBrokerCallbackBuffer.swift"))
     );
     if !valid_sources {
         violations.push(
@@ -9663,6 +9670,7 @@ targets:
       - path: macos/TokenBrokerClient.swift
       - path: macos/TokenBrokerStatusMapping.swift
       - path: macos/TokenBrokerAuthorizationSession.swift
+      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
@@ -13392,6 +13400,80 @@ targets:
     }
 
     #[test]
+    fn tersa_mac_tests_sources_are_exact_including_reviewed_callback_buffer() {
+        const EXPECTED: &str = "the TersaMacTests sources must be exactly macos-tests and the reviewed pure Swift client/model surface";
+
+        // Positive: exact ordered list with the single reviewed shared
+        // callback-buffer path passes closed.
+        assert!(
+            signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                VALID_SIGNING_PROJECT,
+            )
+            .is_empty(),
+            "exact TersaMacTests source list including TokenBrokerCallbackBuffer.swift must pass"
+        );
+
+        let reviewed_callback =
+            "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n";
+        let cases = [
+            (
+                "extra arbitrary broker source",
+                VALID_SIGNING_PROJECT.replace(
+                    reviewed_callback,
+                    "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n      - path: macos-token-broker/TokenBrokerService.swift\n",
+                ),
+            ),
+            (
+                "alternate path spelling (directory root)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos-token-broker",
+                ),
+            ),
+            (
+                "alternate path spelling (case drift)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos-token-broker/TokenBrokerCallbackbuffer.swift",
+                ),
+            ),
+            (
+                "alternate path spelling (underscore separator)",
+                VALID_SIGNING_PROJECT.replace(
+                    "macos-token-broker/TokenBrokerCallbackBuffer.swift",
+                    "macos_token_broker/TokenBrokerCallbackBuffer.swift",
+                ),
+            ),
+            (
+                "removal of reviewed callback buffer source",
+                VALID_SIGNING_PROJECT.replace(reviewed_callback, ""),
+            ),
+            (
+                "order drift (callback buffer before authorization session)",
+                VALID_SIGNING_PROJECT.replace(
+                    "      - path: macos/TokenBrokerAuthorizationSession.swift\n      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n",
+                    "      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift\n      - path: macos/TokenBrokerAuthorizationSession.swift\n",
+                ),
+            ),
+        ];
+        for (label, project) in cases {
+            let violations = signing_configuration_violations(
+                VALID_ENTITLEMENTS,
+                VALID_BROKER_ENTITLEMENTS,
+                &project,
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains(EXPECTED)),
+                "{label} must fail closed; got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tersa_mac_entitlement_dictionaries_are_exact_five_key_typed_allowlists() {
         let source_cases = [
             VALID_ENTITLEMENTS.replace(
@@ -14103,7 +14185,7 @@ targets:
         );
     }
 
-    fn reviewed_token_broker_sources() -> [(PathBuf, String); 8] {
+    fn reviewed_token_broker_sources() -> [(PathBuf, String); 9] {
         [
             (
                 PathBuf::from("apple/macos-token-broker/main.swift"),
@@ -14116,6 +14198,11 @@ targets:
             (
                 PathBuf::from("apple/macos-token-broker/TokenBrokerService.swift"),
                 include_str!("../../apple/macos-token-broker/TokenBrokerService.swift").to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos-token-broker/TokenBrokerCallbackBuffer.swift"),
+                include_str!("../../apple/macos-token-broker/TokenBrokerCallbackBuffer.swift")
+                    .to_owned(),
             ),
             (
                 PathBuf::from("apple/macos-token-broker/TokenBrokerListenerDelegate.swift"),
@@ -14309,7 +14396,7 @@ targets:
         assert_eq!(
             sources.len(),
             TOKEN_BROKER_ALLOWED_SOURCE_PATHS.len(),
-            "reviewed fixture inventory must list exactly the closed eight broker paths"
+            "reviewed fixture inventory must list exactly the closed nine broker paths"
         );
 
         let mut with_extra = sources.to_vec();
@@ -14320,7 +14407,7 @@ targets:
         assert_token_broker_surface_contains(
             &with_extra,
             "outside the closed TersaMacTokenBroker source allowlist",
-            "extra broker file outside the closed eight-path inventory",
+            "extra broker file outside the closed nine-path inventory",
         );
 
         let mut missing_required = sources.to_vec();

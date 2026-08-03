@@ -122,6 +122,9 @@ targets:
       - path: macos/TokenBrokerStatusMapping.swift
       # Authorization-session loopback helpers only; no live XPC/network begin.
       - path: macos/TokenBrokerAuthorizationSession.swift
+      # Shared complete-path callback buffer helper (also compiled into the
+      # signed broker target). Tests must exercise this production helper.
+      - path: macos-token-broker/TokenBrokerCallbackBuffer.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.tersa.mac.tests
