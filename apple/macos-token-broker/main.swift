@@ -4,10 +4,10 @@
 
 import Foundation
 
-// Fail-closed entry point for the embedded macOS token-broker XPC service.
+// Operational entry point for the embedded macOS token-broker XPC service.
 // The process exports only TersaMacTokenBrokerProtocolV1 through the reviewed
-// listener delegate. It does not perform OAuth, Keychain, network, or Rust FFI
-// work; those remain outside this skeleton.
+// listener delegate and binds the dedicated Rust broker composition. OAuth
+// code exchange, refresh, persistence, revoke, and local delete run only here.
 let tokenBrokerListenerDelegate = TokenBrokerListenerDelegate()
 let tokenBrokerListener = NSXPCListener.service()
 tokenBrokerListener.delegate = tokenBrokerListenerDelegate

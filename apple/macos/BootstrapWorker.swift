@@ -4,15 +4,6 @@
 
 import Foundation
 
-enum ProductBootstrapStatus: Int32 {
-    case ready = 0
-    case invalidAccountIdentifier = 1
-    case invalidExecutionContext = 2
-    case busyOrUnavailable = 3
-    case rootMissingWithExistingProfile = 4
-    case unavailable = 5
-}
-
 /// Serializes the one-shot product bootstrap away from the AppKit main thread.
 final class BootstrapWorker: @unchecked Sendable {
     private let queue = DispatchQueue(label: "app.tersa.macos.bootstrap", qos: .utility)

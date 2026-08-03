@@ -66,21 +66,16 @@ outside `SRCROOT`. The scripts accept fixed platform/configuration values, use
 the workspace lockfile, and write intermediates only below the ignored
 `apple/build` directory. No other target inherits this exception.
 
-`TersaMac` also embeds the `TersaMacTokenBroker` XPC service packaging skeleton
-required by
+`TersaMac` also embeds the `TersaMacTokenBroker` XPC service required by
 [ADR 0024](../docs/architecture/adr-0024-macos-token-process-isolation.md). The
 broker target lives under `macos-token-broker`, declares only App Sandbox,
 outbound network client, and the dedicated token Keychain access group, and
-exports a closed fail-closed version-1 NSXPC protocol. The portable Rust
-lifecycle core the broker will host now exists separately as the
-`tersa-token-broker-core` workspace crate in `adapters/token-broker-core`: it
-owns authorization begin/complete with a bounded PKCE session registry, code
-exchange, refresh, rotation, per-subject serialization, a refresh-token store
-port, and revoke/delete separation over generic ports, and contains no
-Keychain, C ABI, or IPC code. Runtime isolation is **not** active: the core is
-not yet linked into the broker target, there is no production Keychain adapter
-for its store port, OAuth and token authority remain in-process in `TersaMac`,
-the dedicated token group is not provisioned or used, there is no client-side
-XPC wiring in `macos/`, and local builds remain unsigned unless signing is
-configured. The broker target does not disable script sandboxing, link Rust,
-or perform Keychain, network, or OAuth work.
+exports a closed fail-closed version-1 NSXPC protocol with the reviewed
+operational status set. It links the dedicated
+`tersa-token-broker-ffi-macos` archive (broker core + Google transport +
+broker-only Keychain store) and never the main app's mailbox-sync archive.
+The main app hosts the closed `TokenBrokerClient` and authorization-session
+mapping surface, but production cutover is **not** complete: OAuth and token
+authority remain in-process in `TersaMac` until a later point, the dedicated
+token group is not provisioned under the production team, and local builds
+remain unsigned unless signing is configured.

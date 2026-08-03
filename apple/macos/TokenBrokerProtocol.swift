@@ -4,13 +4,11 @@
 
 import Foundation
 
-/// Bounded status codes for the version-1 token-broker protocol.
+/// Client-side mirror of the closed version-1 token-broker wire status set.
 ///
-/// Closed operational set (ADR-0024 point 3). Integer values are stable wire
-/// contracts shared with the Rust FFI; no strings, dictionaries, or generic
-/// error payloads ever ride this enum.
-@objc
-enum TersaTokenBrokerStatusV1: Int {
+/// Integer values must match the service and Rust FFI exactly. No open-ended
+/// string or dictionary error channel exists.
+enum TokenBrokerStatus: Int, Equatable, Sendable {
     case success = 0
     case notImplemented = 1
     case notProvisioned = 2
@@ -31,39 +29,35 @@ enum TersaTokenBrokerStatusV1: Int {
     case malformedResponse = 17
     case identityUnverified = 18
     case identityMismatch = 19
+
+    /// Validates a raw XPC status integer against the closed set.
+    static func validated(_ raw: Int) -> TokenBrokerStatus? {
+        TokenBrokerStatus(rawValue: raw)
+    }
 }
 
-/// Explicit wire version for the closed NSXPC protocol surface.
-///
-/// Always `1` while the exported interface is
-/// `TersaMacTokenBrokerProtocolV1`. A version bump requires a new versioned
-/// Objective-C protocol name and inventory review; it must not widen this
-/// surface in place.
-enum TersaMacTokenBrokerProtocolVersion {
-    static let value: Int = 1
+/// The five closed protocol operations. Mapping is operation-aware so a single
+/// wire `persistenceFailed` retains distinct recovery by call site.
+enum TokenBrokerOperation: Equatable, Sendable {
+    case beginAuthorization
+    case completeAuthorization
+    case refreshAccessToken
+    case revokeProviderGrant
+    case deleteStoredTokens
 }
 
-/// Closed, versioned NSXPC protocol for the macOS token broker (ADR-0024).
+/// Client-side Objective-C protocol matching the embedded XPC service.
 ///
-/// Allowed operations match only the broker's planned authority: begin and
-/// complete authorization, refresh a short-lived access token, provider
-/// revoke, and local token deletion. The protocol never carries refresh
-/// tokens, PKCE verifiers, generic `Data` RPC bodies, or arbitrary Keychain
-/// commands.
+/// Declared only so the main app can configure `NSXPCInterface` against the
+/// exact v1 surface. Parameter labels and reply shapes must stay byte-identical
+/// to the service declaration.
 @objc(TersaMacTokenBrokerProtocolV1)
 protocol TersaMacTokenBrokerProtocolV1 {
-    /// Starts an authorization session for the supplied redirect URI.
-    ///
-    /// On success the broker returns only the provider authorization URL
-    /// and an opaque session handle. The PKCE verifier remains broker-local.
     func beginAuthorizationSession(
         redirectURI: String,
         withReply reply: @escaping (_ authorizationURL: String?, _ sessionHandle: String?, _ status: Int) -> Void
     )
 
-    /// Completes an authorization session after the main app forwards the
-    /// callback URL. A success reply may carry only the short-lived access
-    /// token, validated subject, and expiry; never a refresh token.
     func completeAuthorizationSession(
         sessionHandle: String,
         callbackURL: String,
@@ -75,8 +69,6 @@ protocol TersaMacTokenBrokerProtocolV1 {
         ) -> Void
     )
 
-    /// Refreshes a short-lived access token for the given account subject.
-    /// A success reply may carry only the access token, subject, and expiry.
     func refreshAccessToken(
         accountSubject: String,
         withReply reply: @escaping (
@@ -87,14 +79,11 @@ protocol TersaMacTokenBrokerProtocolV1 {
         ) -> Void
     )
 
-    /// Asks the broker to revoke the provider grant for the account subject.
     func revokeProviderGrant(
         accountSubject: String,
         withReply reply: @escaping (_ status: Int) -> Void
     )
 
-    /// Asks the broker to delete locally stored refresh-token material for the
-    /// account subject. Token bytes never cross this interface.
     func deleteStoredTokens(
         accountSubject: String,
         withReply reply: @escaping (_ status: Int) -> Void

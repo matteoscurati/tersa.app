@@ -1818,6 +1818,15 @@ fn configured_app_group() -> Result<&'static str, KeyStorageError> {
     configured_group(option_env!("TERSA_MACOS_APP_GROUP"))
 }
 
+/// Resolves the dedicated broker token Keychain access group so the broker
+/// store need not read the environment itself (keeping the token mutation
+/// file free of construction intrinsics). Never the installation-root/store
+/// group.
+#[cfg(target_os = "macos")]
+fn configured_token_group() -> Result<&'static str, KeyStorageError> {
+    configured_group(option_env!("TERSA_MACOS_TOKEN_GROUP"))
+}
+
 fn configured_profile_group(
     group: Option<&'static str>,
 ) -> Result<&'static str, ProfileStorageError> {

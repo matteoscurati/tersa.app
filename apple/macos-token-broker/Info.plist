@@ -23,5 +23,7 @@
 		<key>ServiceType</key>
 		<string>Application</string>
 	</dict>
+	<key>TersaOAuthClientID</key>
+	<string>$(TERSA_OAUTH_CLIENT_ID)</string>
 </dict>
 </plist>

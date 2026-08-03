@@ -14,6 +14,7 @@ members = [
     "adapters/oauth-sync-macos",
     "adapters/store-sqlcipher-macos",
     "adapters/token-broker-core",
+    "adapters/token-broker-ffi-macos",
     "apps/cli-macos",
     "crates/application",
     "crates/domain",

@@ -7679,6 +7679,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tersa-token-broker-ffi-macos"
+version = "0.0.0"
+dependencies = [
+ "tersa-application",
+ "tersa-domain",
+ "tersa-gmail-rest-macos",
+ "tersa-keychain-macos",
+ "tersa-token-broker-core",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
