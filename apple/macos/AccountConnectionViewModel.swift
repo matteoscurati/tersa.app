@@ -300,9 +300,17 @@ final class AccountConnectionViewModel: ObservableObject {
     /// already written by the caller; prepare sets the Rust disconnect fence
     /// and the durable marker (and cancels any in-flight sync) BEFORE the
     /// broker revoke, so a crash between fence and revoke can never leave a
-    /// revoked grant without a recorded teardown. An absent subject fails
-    /// closed: the operation ends as `.disconnectIncomplete` with the marker
-    /// and the outer intent kept for the retry path.
+    /// revoked grant without a recorded teardown. The subject read then
+    /// routes three ways: a found subject climbs to the revoke/delete/
+    /// finalize path; a PROVEN-ABSENT subject is crash recovery — a previous
+    /// run finalized the Rust teardown (which purges the subject) but crashed
+    /// before the outer intent was cleared — and converges by finalizing
+    /// directly with revokeUnconfirmed=true (Rust finalization is idempotent
+    /// and its poll terminal clears the outer intent through the existing
+    /// terminal handling); a read FAILURE stays fail-closed as
+    /// `.disconnectIncomplete` with the marker and the outer intent kept for
+    /// the retry path, never conflating transport/storage failure with
+    /// proven absence.
     private func prepareBrokerDisconnect(
         accountIdentifier: Data,
         token: ConnectionOperationToken
@@ -323,17 +331,32 @@ final class AccountConnectionViewModel: ObservableObject {
                     guard let self, self.operationDeadline.accepts(token) else {
                         return
                     }
-                    switch result {
-                    case .found(let subject):
+                    switch TokenBrokerStatusMapping.brokerDisconnectRouting(for: result) {
+                    case .revokeThenDelete(let subject):
                         self.revokeBrokerGrantAfterPrepare(
                             subject: subject,
                             accountIdentifier: accountIdentifier,
                             token: token
                         )
-                    case .absent, .failure:
-                        // Fail closed: never call the broker and never
-                        // finalize/purge; the marker and the outer intent
-                        // stay so the retry path can re-issue the teardown.
+                    case .finalizeCrashRecovery:
+                        // Crash recovery: a previous run finalized the Rust
+                        // teardown (which purged the subject) but crashed
+                        // before the outer intent was cleared. Finalize
+                        // directly — Rust finalization is idempotent and the
+                        // poll terminal clears the outer intent through the
+                        // existing terminal handling. The revoke is
+                        // invariantly unconfirmed: the crashed run's
+                        // provider-revoke outcome is unknowable.
+                        self.beginBrokerDisconnectFinalize(
+                            accountIdentifier: accountIdentifier,
+                            revokeUnconfirmed: true,
+                            token: token
+                        )
+                    case .failClosed:
+                        // The subject read failed (transport/storage): never
+                        // call the broker and never finalize/purge; the
+                        // marker and the outer intent stay so the retry path
+                        // can re-issue the teardown.
                         _ = self.finishOperation(token)
                         self.state = .failed(.disconnectIncomplete)
                     }

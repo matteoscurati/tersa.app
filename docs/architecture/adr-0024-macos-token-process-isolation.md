@@ -279,11 +279,17 @@ guards and the CI archive symbol/string checks fail closed on any
 architecture` passes with these fail-closed source, dependency, ABI,
 header, Swift-call, handoff, and deinit guards in place.
 
-The legacy development credential is disposed. Before the cutover the owner
-completed a live legacy disconnect and observed the confirmed
-disconnected / local-mail-purged outcome. On 2026-08-03 the non-secret query
+The legacy development credential's disposition is not yet complete. Before
+the cutover the owner completed a live legacy disconnect and observed the
+confirmed disconnected / local-mail-purged outcome. On 2026-08-03 the
+non-secret query
 `security find-generic-password -s app.tersa.mac.oauth-refresh-token.v1 -a primary-gmail`
-returned exit 44 (item not found), which is explicit evidence that the
-legacy development refresh-token item is absent. This is
-development-item absence evidence only; it is not signed process-isolation
-proof and does not discharge any pending required-evidence item above.
+returned exit 44 (item not found). The earlier reading of that result as
+absence evidence is retracted: this CLI query targets the ordinary
+file-based keychain and lacks the required access-group entitlement, while
+the legacy adapter stored the item in the Data Protection Keychain under an
+access group, so the command never queries the entitlement-scoped item and
+exit 44 proves nothing about whether it exists. Explicit absence of the
+legacy development refresh-token item is therefore UNPROVED, pending a
+signed fixed-purpose SecItemCopyMatching probe carrying the applicable app
+entitlement and access group. Signed runtime isolation remains deferred.

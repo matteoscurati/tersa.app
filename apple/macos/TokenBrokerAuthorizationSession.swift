@@ -225,6 +225,55 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
     }
 }
 
+/// Pure per-attempt lifecycle for the broker-backed authorization session.
+///
+/// The session instance is app-lifetime and must be reusable after any
+/// terminal outcome (cancel, success, timeout, failure). This value type is
+/// the sole source of the attempt generation and finished flag so re-arm and
+/// stale-callback gating stay deterministic and testable without live
+/// NWListener/XPC. `generation` changes on every armed attempt; asynchronous
+/// callbacks capture it at arm time and must revalidate via `isCurrent`
+/// before mutating session state, so a delayed callback, timer, or listener
+/// event from a prior attempt can never finish or mutate a later attempt.
+struct TokenBrokerSessionAttemptLifecycle: Equatable, Sendable {
+    /// Monotonically increasing identity of the current or most recent
+    /// attempt. Bumped only by `beginAttempt`.
+    private(set) var generation: UInt64 = 0
+    /// True when no attempt is live. Initially true so the first start is
+    /// permitted; cleared by `beginAttempt` and set by `finishAttempt`.
+    private(set) var isFinished = true
+
+    /// A new start is permitted only when no attempt is currently live.
+    var canStart: Bool { isFinished }
+
+    /// Arms the next attempt: bumps the generation so every callback captured
+    /// by a prior attempt is permanently stale, and clears the finished flag.
+    /// Callers must also reset all other per-attempt state before arming the
+    /// next listener.
+    @discardableResult
+    mutating func beginAttempt() -> UInt64 {
+        generation &+= 1
+        isFinished = false
+        return generation
+    }
+
+    /// True when a callback that captured `capturedGeneration` at arm time
+    /// still belongs to the live attempt. Stale generations and finished
+    /// attempts both reject.
+    func isCurrent(_ capturedGeneration: UInt64) -> Bool {
+        !isFinished && capturedGeneration == generation
+    }
+
+    /// Terminates the live attempt. Idempotent: a second finish before the
+    /// next start is a no-op, preserving exactly-once completion.
+    mutating func finishAttempt() {
+        guard !isFinished else {
+            return
+        }
+        isFinished = true
+    }
+}
+
 /// Broker-backed OAuth authorization session owned by the main app.
 ///
 /// The main app binds an IPv4 ephemeral loopback listener, asks the broker to
@@ -235,7 +284,15 @@ final class TokenBrokerSessionResourceBag: @unchecked Sendable {
 ///
 /// Pre-flight never blocks the MainActor: listener bind and broker begin complete
 /// on a private queue / XPC callback, then hop back to MainActor for browser open
-/// and outcome delivery. Completions fire exactly once.
+/// and outcome delivery. Completions fire exactly once per attempt.
+///
+/// The instance is app-lifetime and reusable: after any terminal outcome
+/// (cancel, success, timeout, failure) `start` arms a fresh attempt with all
+/// per-attempt state reset. Every asynchronous callback captures the attempt
+/// generation from `TokenBrokerSessionAttemptLifecycle` and revalidates it, so
+/// delayed callbacks, timers, or listener events from a prior attempt can
+/// never finish or mutate a later attempt. A second `start` while an attempt
+/// is active is still rejected.
 @MainActor
 final class TokenBrokerAuthorizationSession {
     /// Maximum HTTP request bytes accepted from one loopback peer (8 KiB).
@@ -293,7 +350,11 @@ final class TokenBrokerAuthorizationSession {
     /// treated as a stray peer and must not burn the session latch.
     private var boundLoopbackPort: UInt16?
     private var onOutcome: (@MainActor (TokenBrokerAuthorizationOutcome) -> Void)?
-    private var isFinished = false
+    /// Attempt generation and finished flag. Every asynchronous callback
+    /// captures the generation armed by its `start` and revalidates via
+    /// `isCurrent` so prior-attempt work cannot finish or mutate a later
+    /// attempt even after `isFinished` is reset for reuse.
+    private var attemptLifecycle = TokenBrokerSessionAttemptLifecycle()
     /// True after the first `.ready` has been accepted so a repeated ready
     /// notification cannot start a second broker begin.
     private var hasAcceptedListenerReady = false
@@ -311,13 +372,16 @@ final class TokenBrokerAuthorizationSession {
 
     /// Begins one broker-backed authorization session.
     ///
-    /// Returns `false` only when a session is already active or the loopback
-    /// listener cannot be created. Bind, broker begin, and browser-open failures
-    /// after arming deliver `.failed` through `onOutcome` exactly once.
+    /// Returns `false` only while a session is active or when the loopback
+    /// listener cannot be created. After any terminal outcome (cancel,
+    /// success, timeout, failure) the same instance may be started again:
+    /// every per-attempt field is reset before the next listener is armed.
+    /// Bind, broker begin, and browser-open failures after arming deliver
+    /// `.failed` through `onOutcome` exactly once per attempt.
     func start(
         onOutcome: @escaping @MainActor (TokenBrokerAuthorizationOutcome) -> Void
     ) -> Bool {
-        guard resources.borrowClient() == nil, !isFinished else {
+        guard attemptLifecycle.canStart, resources.borrowClient() == nil else {
             return false
         }
 
@@ -330,22 +394,34 @@ final class TokenBrokerAuthorizationSession {
             return false
         }
 
+        // Arm the next attempt first: bumps the generation so callbacks
+        // captured by any prior attempt are permanently stale, then reset
+        // every per-attempt field before arming the listener so a prior
+        // terminal outcome cannot leak state into this attempt.
+        let generation = attemptLifecycle.beginAttempt()
+        hasAcceptedListenerReady = false
+        hasForwardedCallback = false
+        sessionHandle = nil
+        boundLoopbackPort = nil
+        peerRegistry.removeAll()
         self.onOutcome = onOutcome
+
         let client = TokenBrokerClient()
         resources.install(client: client, listener: listener)
-        peerRegistry.removeAll()
-        hasForwardedCallback = false
-        boundLoopbackPort = nil
-        armSessionDeadline()
+        armSessionDeadline(generation: generation)
 
         listener.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
-                guard let self else {
+                guard let self, self.attemptLifecycle.isCurrent(generation) else {
                     return
                 }
                 switch state {
                 case .ready:
-                    self.handleListenerReady(listener: listener, client: client)
+                    self.handleListenerReady(
+                        listener: listener,
+                        client: client,
+                        generation: generation
+                    )
                 case .failed, .cancelled:
                     self.failPreflight(recovery: .unavailable)
                 default:
@@ -355,7 +431,13 @@ final class TokenBrokerAuthorizationSession {
         }
         listener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
-                self?.handleLoopbackConnection(connection)
+                guard let self, self.attemptLifecycle.isCurrent(generation) else {
+                    // Stale event from a prior attempt's listener: drop only
+                    // that connection, never the live attempt's registry.
+                    connection.cancel()
+                    return
+                }
+                self.handleLoopbackConnection(connection, generation: generation)
             }
         }
         listener.start(queue: listenerQueue)
@@ -364,13 +446,13 @@ final class TokenBrokerAuthorizationSession {
 
     /// Cancels the session and delivers `.cancelled` exactly once when live.
     func cancel() {
-        guard !isFinished else {
+        guard !attemptLifecycle.isFinished else {
             return
         }
         finish(.cancelled)
     }
 
-    private func armSessionDeadline() {
+    private func armSessionDeadline(generation: UInt64) {
         // DispatchSourceTimer on .main: cancel is thread-safe from any queue
         // (resource-bag deinit / release), unlike Foundation Timer.invalidate.
         let source = DispatchSource.makeTimerSource(queue: .main)
@@ -381,7 +463,10 @@ final class TokenBrokerAuthorizationSession {
         )
         source.setEventHandler { [weak self] in
             Task { @MainActor in
-                self?.handleSessionDeadline()
+                guard let self, self.attemptLifecycle.isCurrent(generation) else {
+                    return
+                }
+                self.handleSessionDeadline()
             }
         }
         // Store before activate so release can cancel; activate exactly once.
@@ -390,7 +475,7 @@ final class TokenBrokerAuthorizationSession {
     }
 
     private func handleSessionDeadline() {
-        guard !isFinished else {
+        guard !attemptLifecycle.isFinished else {
             return
         }
         finish(
@@ -403,8 +488,12 @@ final class TokenBrokerAuthorizationSession {
         )
     }
 
-    private func handleListenerReady(listener: NWListener, client: TokenBrokerClient) {
-        guard !isFinished, !hasAcceptedListenerReady else {
+    private func handleListenerReady(
+        listener: NWListener,
+        client: TokenBrokerClient,
+        generation: UInt64
+    ) {
+        guard !attemptLifecycle.isFinished, !hasAcceptedListenerReady else {
             return
         }
         hasAcceptedListenerReady = true
@@ -421,7 +510,13 @@ final class TokenBrokerAuthorizationSession {
         let redirectURI = "http://127.0.0.1:" + String(port.rawValue) + "/"
         client.beginAuthorizationSession(redirectURI: redirectURI) { [weak self] result in
             Task { @MainActor in
-                guard let self, !self.isFinished, self.sessionHandle == nil else {
+                // Generation gate: a late begin reply from a prior attempt's
+                // cancelled client must not set the handle or fail the live
+                // attempt.
+                guard let self,
+                      self.attemptLifecycle.isCurrent(generation),
+                      self.sessionHandle == nil
+                else {
                     return
                 }
                 switch result {
@@ -443,8 +538,8 @@ final class TokenBrokerAuthorizationSession {
         }
     }
 
-    private func handleLoopbackConnection(_ connection: NWConnection) {
-        guard !isFinished, sessionHandle != nil else {
+    private func handleLoopbackConnection(_ connection: NWConnection, generation: UInt64) {
+        guard !attemptLifecycle.isFinished, sessionHandle != nil else {
             connection.cancel()
             return
         }
@@ -454,7 +549,14 @@ final class TokenBrokerAuthorizationSession {
                 return
             }
             Task { @MainActor in
-                self?.handlePeerReadDeadline(connection)
+                // Stale read deadline from a prior attempt must not touch the
+                // live attempt's registry (ObjectIdentifier reuse after the
+                // old connection is deallocated could otherwise evict a live
+                // peer).
+                guard let self, self.attemptLifecycle.isCurrent(generation) else {
+                    return
+                }
+                self.handlePeerReadDeadline(connection)
             }
         }
         // Concurrent live budget + duplicate-ID rejection via the production
@@ -472,11 +574,15 @@ final class TokenBrokerAuthorizationSession {
             execute: deadlineWork
         )
         connection.start(queue: .main)
-        receiveLoopbackBytes(connection: connection, accumulated: Data())
+        receiveLoopbackBytes(connection: connection, accumulated: Data(), generation: generation)
     }
 
-    private func receiveLoopbackBytes(connection: NWConnection, accumulated: Data) {
-        guard !isFinished else {
+    private func receiveLoopbackBytes(
+        connection: NWConnection,
+        accumulated: Data,
+        generation: UInt64
+    ) {
+        guard !attemptLifecycle.isFinished else {
             releasePeerImmediate(connection)
             return
         }
@@ -499,8 +605,10 @@ final class TokenBrokerAuthorizationSession {
                     connection.cancel()
                     return
                 }
-                guard !self.isFinished else {
-                    self.releasePeerImmediate(connection)
+                guard self.attemptLifecycle.isCurrent(generation) else {
+                    // Stale completion from a prior attempt: cancel only this
+                    // old connection; never touch the live attempt's registry.
+                    connection.cancel()
                     return
                 }
                 // Drop work for peers already released (timeout race).
@@ -516,13 +624,21 @@ final class TokenBrokerAuthorizationSession {
                 )
                 switch decision {
                 case .needMore:
-                    self.receiveLoopbackBytes(connection: connection, accumulated: buffer)
+                    self.receiveLoopbackBytes(
+                        connection: connection,
+                        accumulated: buffer,
+                        generation: generation
+                    )
                 case .rejectConnection:
                     // Empty, partial, oversize, or errored peer: drop only this
                     // connection (no HTTP body) and leave the listener ready.
                     self.releasePeerImmediate(connection)
                 case .ready(let request):
-                    self.handleReadyLoopbackRequest(connection: connection, request: request)
+                    self.handleReadyLoopbackRequest(
+                        connection: connection,
+                        request: request,
+                        generation: generation
+                    )
                 }
             }
         }
@@ -532,7 +648,11 @@ final class TokenBrokerAuthorizationSession {
     /// latch and completes the broker once after queuing a fixed 200; complete
     /// but rejected/malformed requests get a fixed 400. Incomplete peers never
     /// reach this path. Budget release and TCP cancel run in contentProcessed.
-    private func handleReadyLoopbackRequest(connection: NWConnection, request: Data) {
+    private func handleReadyLoopbackRequest(
+        connection: NWConnection,
+        request: Data,
+        generation: UInt64
+    ) {
         let id = ObjectIdentifier(connection)
         // Claim exclusive finish via the production registry: cancel the read
         // deadline and prevent a second ready/timeout path from re-entering.
@@ -541,7 +661,7 @@ final class TokenBrokerAuthorizationSession {
         }
         peer.deadlineWork.cancel()
 
-        guard !isFinished else {
+        guard !attemptLifecycle.isFinished else {
             // Force-take: finishing peers are not released by releaseImmediate.
             if let released = peerRegistry.take(id) {
                 released.deadlineWork.cancel()
@@ -556,24 +676,40 @@ final class TokenBrokerAuthorizationSession {
               let callbackURL = Self.callbackURL(from: request, boundPort: boundPort)
         else {
             // Complete headers but not a bound-port provider outcome.
-            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            sendFixedHTTPResponseAndRelease(
+                connection,
+                response: Self.httpBadRequestResponse,
+                generation: generation
+            )
             return
         }
         guard Self.claimForwardedCallback(
-            isFinished: isFinished,
+            isFinished: attemptLifecycle.isFinished,
             hasForwardedCallback: &hasForwardedCallback
         ) else {
-            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            sendFixedHTTPResponseAndRelease(
+                connection,
+                response: Self.httpBadRequestResponse,
+                generation: generation
+            )
             return
         }
         guard let sessionHandle else {
-            sendFixedHTTPResponseAndRelease(connection, response: Self.httpBadRequestResponse)
+            sendFixedHTTPResponseAndRelease(
+                connection,
+                response: Self.httpBadRequestResponse,
+                generation: generation
+            )
             return
         }
         // Broker complete once; browser gets the fixed 200. Cancel/release of
         // the TCP peer and concurrent budget slot happen only in contentProcessed.
-        complete(sessionHandle: sessionHandle, callbackURL: callbackURL)
-        sendFixedHTTPResponseAndRelease(connection, response: Self.httpSuccessResponse)
+        complete(sessionHandle: sessionHandle, callbackURL: callbackURL, generation: generation)
+        sendFixedHTTPResponseAndRelease(
+            connection,
+            response: Self.httpSuccessResponse,
+            generation: generation
+        )
     }
 
     /// 2-second per-peer read deadline: cancel only this silent/partial peer.
@@ -598,7 +734,11 @@ final class TokenBrokerAuthorizationSession {
     /// Sends a pinned static HTTP response; releases the concurrent budget and
     /// cancels the connection only in `.contentProcessed`. Never interpolates
     /// callback/code. Peer must already be in finishing via `beginFinishing`.
-    private func sendFixedHTTPResponseAndRelease(_ connection: NWConnection, response: Data) {
+    private func sendFixedHTTPResponseAndRelease(
+        _ connection: NWConnection,
+        response: Data,
+        generation: UInt64
+    ) {
         let id = ObjectIdentifier(connection)
         // Deadline is already cancelled; registry entry remains until send
         // completion so the concurrent budget counts this peer as live.
@@ -611,7 +751,13 @@ final class TokenBrokerAuthorizationSession {
             isComplete: true,
             completion: .contentProcessed { [weak self] _ in
                 Task { @MainActor in
-                    if let peer = self?.peerRegistry.take(id) {
+                    guard let self, self.attemptLifecycle.isCurrent(generation) else {
+                        // Stale send completion from a prior attempt: cancel
+                        // only this old connection, never the live registry.
+                        connection.cancel()
+                        return
+                    }
+                    if let peer = self.peerRegistry.take(id) {
                         peer.deadlineWork.cancel()
                     }
                     connection.cancel()
@@ -630,8 +776,8 @@ final class TokenBrokerAuthorizationSession {
         }
     }
 
-    private func complete(sessionHandle: String, callbackURL: String) {
-        guard let client = resources.borrowClient(), !isFinished else {
+    private func complete(sessionHandle: String, callbackURL: String, generation: UInt64) {
+        guard let client = resources.borrowClient(), !attemptLifecycle.isFinished else {
             return
         }
         client.completeAuthorizationSession(
@@ -639,7 +785,9 @@ final class TokenBrokerAuthorizationSession {
             callbackURL: callbackURL
         ) { [weak self] result in
             Task { @MainActor in
-                guard let self, !self.isFinished else {
+                // Generation gate: a late complete reply from a prior attempt's
+                // cancelled client must not finish the live attempt.
+                guard let self, self.attemptLifecycle.isCurrent(generation) else {
                     return
                 }
                 switch result {
@@ -666,17 +814,20 @@ final class TokenBrokerAuthorizationSession {
     }
 
     private func failPreflight(recovery: TokenBrokerStatusMapping.Recovery) {
-        guard !isFinished else {
+        guard !attemptLifecycle.isFinished else {
             return
         }
         finish(.failed(recovery))
     }
 
     private func finish(_ outcome: TokenBrokerAuthorizationOutcome) {
-        guard !isFinished else {
+        guard !attemptLifecycle.isFinished else {
             return
         }
-        isFinished = true
+        // Terminates the attempt: callbacks that already passed the generation
+        // gate observe `isFinished`, and the next `start` bumps the generation
+        // so anything still in flight from this attempt is permanently stale.
+        attemptLifecycle.finishAttempt()
         hasAcceptedListenerReady = true
         hasForwardedCallback = true
         boundLoopbackPort = nil

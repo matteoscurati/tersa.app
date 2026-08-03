@@ -4,6 +4,21 @@
 
 import Foundation
 
+/// Closed result of the broker routing subject read. The subject is the
+/// account-identifying BROKER ROUTING value — never an OAuth credential and
+/// never mailbox content — and is never logged or displayed. A raw status of
+/// zero with a malformed payload (a length outside 1...255 or invalid UTF-8)
+/// is `.failure`, never `.absent`: `.absent` is reserved for the FFI's
+/// explicit no-subject-stored code (-6).
+enum BrokerSubjectReadResult: Equatable {
+    /// A stored subject was read and validated.
+    case found(String)
+    /// No subject is stored for the account (raw status -6).
+    case absent
+    /// Any other status, or a malformed success payload.
+    case failure
+}
+
 /// Operation-aware mapping from closed broker statuses into existing UI recovery.
 ///
 /// Preserves ADR-0024 recovery invariants:
@@ -16,6 +31,10 @@ import Foundation
 /// - `consentRevoked` / `missingRefreshToken` route to reconnect.
 /// - `persistenceFailed` while loading during revoke is unconfirmed revoke;
 ///   during delete it is incomplete local teardown and never looks clean.
+///
+/// Also owns the disconnect-ladder routing for the post-prepare broker
+/// subject read (`brokerDisconnectRouting`), including the crash-recovery
+/// convergence for a proven-absent subject.
 enum TokenBrokerStatusMapping {
     /// Where the insufficient-scope recovery sends the user to revoke a
     /// stranded first-connect grant manually. Safe, stable, non-secret URL.
@@ -94,6 +113,44 @@ enum TokenBrokerStatusMapping {
             return .notImplemented
         case .notProvisioned:
             return .notProvisioned
+        }
+    }
+
+    /// Routing for the broker disconnect ladder once the Rust prepare has
+    /// succeeded and the broker routing subject read has completed.
+    enum BrokerDisconnectRouting: Equatable, Sendable {
+        /// A stored subject exists: run the revoke → delete → finalize path.
+        case revokeThenDelete(subject: String)
+        /// The subject is proven ABSENT while the durable outer intent still
+        /// stands: a previous run finalized the Rust teardown (which purges
+        /// the subject) but crashed before the Swift outer intent journal was
+        /// cleared. Converge by finalizing directly — Rust finalization is
+        /// idempotent and its poll terminal clears the outer intent through
+        /// the existing terminal handling. This route carries no payload
+        /// because it is invariantly revoke-unconfirmed: the crashed run's
+        /// provider-revoke outcome is unknowable, so the unconfirmed-revoke
+        /// warning must show.
+        case finalizeCrashRecovery
+        /// The subject read FAILED (transport/storage): fail closed as
+        /// `.disconnectIncomplete`; a read failure is never conflated with
+        /// proven absence.
+        case failClosed
+    }
+
+    /// Maps the disconnect-time broker subject read into the ladder routing.
+    /// Only `.absent` (the FFI's explicit no-subject-stored code) converges;
+    /// `.failure` stays fail-closed so a wedged intent is re-issued by the
+    /// retry path rather than silently finalized.
+    static func brokerDisconnectRouting(
+        for result: BrokerSubjectReadResult
+    ) -> BrokerDisconnectRouting {
+        switch result {
+        case .found(let subject):
+            return .revokeThenDelete(subject: subject)
+        case .absent:
+            return .finalizeCrashRecovery
+        case .failure:
+            return .failClosed
         }
     }
 

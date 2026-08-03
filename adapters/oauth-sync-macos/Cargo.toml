@@ -15,9 +15,9 @@ publish = false
 
 [features]
 # Default features are empty: the production composition is broker-fed. The
-default = []
 # ADR-0024 token broker owns the refresh-token lifecycle, so the default build
 # compiles no refresh-token Keychain access at all.
+default = []
 # Opt-in legacy refresh-token lifecycle: the crate itself connects, refreshes,
 # and revokes through the `tersa-keychain-macos` refresh-token store. Kept for
 # direct legacy/test compositions; never enabled by a production dependency.

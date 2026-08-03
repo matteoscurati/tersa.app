@@ -965,6 +965,36 @@ final class TokenBrokerStatusMappingTests: XCTestCase {
         }
     }
 
+    func testBrokerDisconnectSubjectRoutingConvergesCrashRecoveryOnlyForAbsent() {
+        // Crash between Rust disconnect finalization and clearing the Swift
+        // outer intent journal: on relaunch prepare succeeds, but the prior
+        // teardown already purged the broker subject, so the read returns
+        // `.absent`. The policy must converge by finalizing directly — never
+        // by preserving the outer intent forever. The route carries no
+        // payload because it is invariantly revoke-unconfirmed.
+        XCTAssertEqual(
+            TokenBrokerStatusMapping.brokerDisconnectRouting(for: .absent),
+            .finalizeCrashRecovery
+        )
+
+        // A transport/storage read failure stays fail-closed: proven absence
+        // and failure must never be conflated.
+        XCTAssertEqual(
+            TokenBrokerStatusMapping.brokerDisconnectRouting(for: .failure),
+            .failClosed
+        )
+        XCTAssertNotEqual(
+            TokenBrokerStatusMapping.brokerDisconnectRouting(for: .failure),
+            .finalizeCrashRecovery
+        )
+
+        // A found subject still routes to the revoke/delete/finalize path.
+        XCTAssertEqual(
+            TokenBrokerStatusMapping.brokerDisconnectRouting(for: .found("subject")),
+            .revokeThenDelete(subject: "subject")
+        )
+    }
+
     func testPermissionRequiredCopyMentionsManualRevoke() {
         let message = ConnectionFailure.permissionRequired.message
         XCTAssertTrue(message.contains("Gmail read access"))

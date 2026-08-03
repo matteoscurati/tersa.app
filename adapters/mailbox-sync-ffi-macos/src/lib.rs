@@ -1018,10 +1018,14 @@ mod macos {
         use url::Url;
 
         use super::{
-            BridgeConnectSession, MAX_INPUT_BYTES, STATUS_INVALID_INPUT, STATUS_UNKNOWN_SESSION,
-            client_secret_from_build_setting, read_utf8, tersa_mailbox_macos_connect_begin,
-            tersa_mailbox_macos_disconnect_begin, tersa_mailbox_macos_lifecycle_get,
-            tersa_mailbox_macos_sync_begin, tersa_mailbox_macos_sync_poll,
+            BridgeConnectSession, MAX_ACCESS_TOKEN_BYTES, MAX_INPUT_BYTES, MAX_SUBJECT_BYTES,
+            STATUS_INVALID_INPUT, STATUS_UNKNOWN_SESSION, client_secret_from_build_setting,
+            read_secret, read_utf8, tersa_mailbox_macos_broker_disconnect_finalize,
+            tersa_mailbox_macos_broker_disconnect_prepare, tersa_mailbox_macos_broker_subject_get,
+            tersa_mailbox_macos_broker_subject_store, tersa_mailbox_macos_broker_sync_begin,
+            tersa_mailbox_macos_connect_begin, tersa_mailbox_macos_disconnect_begin,
+            tersa_mailbox_macos_lifecycle_get, tersa_mailbox_macos_sync_begin,
+            tersa_mailbox_macos_sync_poll,
         };
 
         fn insert_test_session(status: i32) -> u64 {
@@ -1268,6 +1272,407 @@ mod macos {
             );
         }
 
+        /// The five deliberately-invalid account-buffer cases shared by the
+        /// broker seams: null, empty, oversized, non-UTF-8, and email-shaped.
+        /// Every pointer is either null or borrows `const` data that outlives
+        /// the call; the oversized declared length is rejected by the length
+        /// check before the small buffer could ever be read out of bounds.
+        fn invalid_account_buffers() -> [(*const u8, usize); 5] {
+            const VALID: &[u8] = b"account-123";
+            const INVALID_UTF8: &[u8] = &[0xff_u8, 0xfe_u8];
+            const EMAIL_SHAPED: &[u8] = b"user@example.com";
+            [
+                (ptr::null(), 3),
+                (VALID.as_ptr(), 0),
+                (VALID.as_ptr(), MAX_INPUT_BYTES + 1),
+                (INVALID_UTF8.as_ptr(), INVALID_UTF8.len()),
+                (EMAIL_SHAPED.as_ptr(), EMAIL_SHAPED.len()),
+            ]
+        }
+
+        /// The four deliberately-invalid subject-buffer cases shared by the
+        /// broker sync begin and the broker subject store: null, empty,
+        /// oversized, and non-UTF-8. The same outlives-the-call guarantee and
+        /// oversized-length reasoning as [`invalid_account_buffers`] applies.
+        fn invalid_subject_buffers() -> [(*const u8, usize); 4] {
+            const VALID: &[u8] = b"1234567890";
+            const INVALID_UTF8: &[u8] = &[0xff_u8, 0xfe_u8];
+            [
+                (ptr::null(), 3),
+                (VALID.as_ptr(), 0),
+                (VALID.as_ptr(), MAX_SUBJECT_BYTES + 1),
+                (INVALID_UTF8.as_ptr(), INVALID_UTF8.len()),
+            ]
+        }
+
+        #[test]
+        fn read_secret_rejects_null_empty_oversized_and_non_utf8_buffers() {
+            let bytes = b"ya29.broker-token";
+            let max = MAX_ACCESS_TOKEN_BYTES;
+            // SAFETY: each call passes either a null pointer or a valid slice
+            // pointer with a length the function validates before reading; the
+            // oversized declared length is rejected by the length check before
+            // the small buffer could ever be read out of bounds.
+            unsafe {
+                assert!(read_secret(ptr::null(), 3, max).is_err());
+                assert!(read_secret(bytes.as_ptr(), 0, max).is_err());
+                assert!(read_secret(bytes.as_ptr(), max + 1, max).is_err());
+                let invalid = [0xff_u8, 0xfe_u8];
+                assert!(read_secret(invalid.as_ptr(), invalid.len(), max).is_err());
+                assert_eq!(
+                    read_secret(bytes.as_ptr(), bytes.len(), max)
+                        .unwrap()
+                        .as_str(),
+                    "ya29.broker-token"
+                );
+            }
+        }
+
+        #[test]
+        fn broker_sync_begin_rejects_a_null_output_pointer() {
+            let account = b"account-123";
+            let token = b"ya29.broker-token";
+            let subject = b"1234567890";
+            // SAFETY: the input buffers are valid; the output pointer is null,
+            // which the function rejects before any dereference.
+            let status = unsafe {
+                tersa_mailbox_macos_broker_sync_begin(
+                    account.as_ptr(),
+                    account.len(),
+                    token.as_ptr(),
+                    token.len(),
+                    subject.as_ptr(),
+                    subject.len(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+        }
+
+        #[test]
+        fn broker_sync_begin_rejects_invalid_account_buffers() {
+            let token = b"ya29.broker-token";
+            let subject = b"1234567890";
+            let mut session_id = 0_u64;
+            // SAFETY: the token and subject buffers and the output pointer are
+            // valid; every account case is rejected before any byte is read out
+            // of bounds or any worker is spawned.
+            unsafe {
+                for (account, account_len) in invalid_account_buffers() {
+                    let status = tersa_mailbox_macos_broker_sync_begin(
+                        account,
+                        account_len,
+                        token.as_ptr(),
+                        token.len(),
+                        subject.as_ptr(),
+                        subject.len(),
+                        &raw mut session_id,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                    assert_eq!(
+                        session_id, 0,
+                        "a rejected begin must not write a session id"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn broker_sync_begin_rejects_invalid_access_token_buffers() {
+            let account = b"account-123";
+            let subject = b"1234567890";
+            let valid = b"ya29.broker-token";
+            let invalid_utf8 = [0xff_u8, 0xfe_u8];
+            let cases: [(*const u8, usize); 4] = [
+                (ptr::null(), 3),
+                (valid.as_ptr(), 0),
+                (valid.as_ptr(), MAX_ACCESS_TOKEN_BYTES + 1),
+                (invalid_utf8.as_ptr(), invalid_utf8.len()),
+            ];
+            let mut session_id = 0_u64;
+            // SAFETY: the account and subject buffers and the output pointer are
+            // valid; every token case is rejected before any byte is read out of
+            // bounds (the oversized declared length fails the length check
+            // first) or any worker is spawned.
+            unsafe {
+                for (token, token_len) in cases {
+                    let status = tersa_mailbox_macos_broker_sync_begin(
+                        account.as_ptr(),
+                        account.len(),
+                        token,
+                        token_len,
+                        subject.as_ptr(),
+                        subject.len(),
+                        &raw mut session_id,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                    assert_eq!(
+                        session_id, 0,
+                        "a rejected begin must not write a session id"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn broker_sync_begin_rejects_an_access_token_with_a_control_character() {
+            let account = b"account-123";
+            // The token decodes as UTF-8 but carries an ASCII unit separator, so
+            // the control-character screen rejects it before any spawn.
+            let token = b"ya29.broker\x1ftoken";
+            let subject = b"1234567890";
+            let mut session_id = 0_u64;
+            // SAFETY: all buffers and the output pointer are valid.
+            let status = unsafe {
+                tersa_mailbox_macos_broker_sync_begin(
+                    account.as_ptr(),
+                    account.len(),
+                    token.as_ptr(),
+                    token.len(),
+                    subject.as_ptr(),
+                    subject.len(),
+                    &raw mut session_id,
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+            assert_eq!(
+                session_id, 0,
+                "a rejected begin must not write a session id"
+            );
+        }
+
+        #[test]
+        fn broker_sync_begin_rejects_invalid_subject_buffers() {
+            let account = b"account-123";
+            let token = b"ya29.broker-token";
+            let mut session_id = 0_u64;
+            // SAFETY: the account and token buffers and the output pointer are
+            // valid; every subject case is rejected before any byte is read out
+            // of bounds or any worker is spawned.
+            unsafe {
+                for (subject, subject_len) in invalid_subject_buffers() {
+                    let status = tersa_mailbox_macos_broker_sync_begin(
+                        account.as_ptr(),
+                        account.len(),
+                        token.as_ptr(),
+                        token.len(),
+                        subject,
+                        subject_len,
+                        &raw mut session_id,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                    assert_eq!(
+                        session_id, 0,
+                        "a rejected begin must not write a session id"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn broker_disconnect_prepare_rejects_invalid_account_buffers() {
+            // SAFETY: every account case is rejected before any byte is read out
+            // of bounds or the prepare seam touches a slot or a store.
+            unsafe {
+                for (account, account_len) in invalid_account_buffers() {
+                    let status =
+                        tersa_mailbox_macos_broker_disconnect_prepare(account, account_len);
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                }
+            }
+        }
+
+        #[test]
+        fn broker_disconnect_finalize_rejects_a_null_output_pointer() {
+            let account = b"account-123";
+            // SAFETY: the input buffer is valid; the output pointer is null,
+            // which the function rejects before any dereference.
+            let status = unsafe {
+                tersa_mailbox_macos_broker_disconnect_finalize(
+                    account.as_ptr(),
+                    account.len(),
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_INPUT);
+        }
+
+        #[test]
+        fn broker_disconnect_finalize_rejects_invalid_account_buffers() {
+            let mut session_id = 0_u64;
+            // SAFETY: the output pointer is valid; every account case is
+            // rejected before any byte is read out of bounds or any worker is
+            // spawned.
+            unsafe {
+                for (account, account_len) in invalid_account_buffers() {
+                    let status = tersa_mailbox_macos_broker_disconnect_finalize(
+                        account,
+                        account_len,
+                        0,
+                        &raw mut session_id,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                    assert_eq!(
+                        session_id, 0,
+                        "a rejected finalize must not write a session id"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn broker_disconnect_finalize_rejects_a_disposition_outside_the_closed_set() {
+            let account = b"account-123";
+            let mut session_id = 0_u64;
+            // SAFETY: the account buffer and the output pointer are valid; a
+            // disposition outside {0, 1} is rejected before the registry is
+            // locked or any worker is spawned.
+            unsafe {
+                for revoke_unconfirmed in [-1, 2, i32::MIN, i32::MAX] {
+                    let status = tersa_mailbox_macos_broker_disconnect_finalize(
+                        account.as_ptr(),
+                        account.len(),
+                        revoke_unconfirmed,
+                        &raw mut session_id,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                    assert_eq!(
+                        session_id, 0,
+                        "a rejected finalize must not write a session id"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn broker_subject_store_rejects_invalid_account_buffers() {
+            let subject = b"1234567890";
+            // SAFETY: the subject buffer is valid; every account case is
+            // rejected before any byte is read out of bounds or any store is
+            // opened.
+            unsafe {
+                for (account, account_len) in invalid_account_buffers() {
+                    let status = tersa_mailbox_macos_broker_subject_store(
+                        account,
+                        account_len,
+                        subject.as_ptr(),
+                        subject.len(),
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                }
+            }
+        }
+
+        #[test]
+        fn broker_subject_store_rejects_invalid_subject_buffers() {
+            let account = b"account-123";
+            // SAFETY: the account buffer is valid; every subject case is
+            // rejected before any byte is read out of bounds or any store is
+            // opened.
+            unsafe {
+                for (subject, subject_len) in invalid_subject_buffers() {
+                    let status = tersa_mailbox_macos_broker_subject_store(
+                        account.as_ptr(),
+                        account.len(),
+                        subject,
+                        subject_len,
+                    );
+                    assert_eq!(status, STATUS_INVALID_INPUT);
+                }
+            }
+        }
+
+        #[test]
+        fn broker_subject_get_rejects_null_outputs_and_out_of_range_capacities() {
+            let account = b"account-123";
+            let sentinel = 0xAA_u8;
+            let mut buffer = [sentinel; 16];
+            let mut length = usize::MAX;
+            // SAFETY: the account buffer and each non-null output are valid for
+            // their declared sizes. The null outputs and the out-of-range
+            // capacities are rejected before any account read, store open, or
+            // output write; in particular the capacity above MAX_SUBJECT_BYTES
+            // is rejected by the capacity check before the 16-byte buffer could
+            // ever be written out of bounds.
+            unsafe {
+                assert_eq!(
+                    tersa_mailbox_macos_broker_subject_get(
+                        account.as_ptr(),
+                        account.len(),
+                        ptr::null_mut(),
+                        buffer.len(),
+                        &raw mut length,
+                    ),
+                    STATUS_INVALID_INPUT
+                );
+                assert_eq!(
+                    tersa_mailbox_macos_broker_subject_get(
+                        account.as_ptr(),
+                        account.len(),
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        ptr::null_mut(),
+                    ),
+                    STATUS_INVALID_INPUT
+                );
+                for capacity in [0, MAX_SUBJECT_BYTES + 1] {
+                    assert_eq!(
+                        tersa_mailbox_macos_broker_subject_get(
+                            account.as_ptr(),
+                            account.len(),
+                            buffer.as_mut_ptr(),
+                            capacity,
+                            &raw mut length,
+                        ),
+                        STATUS_INVALID_INPUT
+                    );
+                }
+            }
+            assert_eq!(
+                length,
+                usize::MAX,
+                "a rejected subject get must not write the length"
+            );
+            assert!(
+                buffer.iter().all(|byte| *byte == sentinel),
+                "a rejected subject get must not write the subject buffer"
+            );
+        }
+
+        #[test]
+        fn broker_subject_get_rejects_invalid_account_buffers() {
+            let sentinel = 0xAA_u8;
+            let mut buffer = [sentinel; 16];
+            let mut length = usize::MAX;
+            // SAFETY: the outputs are valid for their declared sizes; every
+            // account case is rejected before any byte is read out of bounds,
+            // any store is opened, or either output is written.
+            unsafe {
+                for (account, account_len) in invalid_account_buffers() {
+                    assert_eq!(
+                        tersa_mailbox_macos_broker_subject_get(
+                            account,
+                            account_len,
+                            buffer.as_mut_ptr(),
+                            buffer.len(),
+                            &raw mut length,
+                        ),
+                        STATUS_INVALID_INPUT
+                    );
+                }
+            }
+            assert_eq!(
+                length,
+                usize::MAX,
+                "a rejected subject get must not write the length"
+            );
+            assert!(
+                buffer.iter().all(|byte| *byte == sentinel),
+                "a rejected subject get must not write the subject buffer"
+            );
+        }
+
         /// Runs one real bridge iOS authorization begin for `client_id`,
         /// returning the bridge-issued OAuth session id and authorization URL.
         fn begin_bridge_oauth_session(client_id: &'static [u8]) -> (u64, Url) {
@@ -1412,10 +1817,14 @@ mod macos {
             super::sync_sessions().lock().unwrap().remove(&id);
         }
 
-        // The STATUS_STARTED and STATUS_SYNC_BUSY begin outcomes — sync, connect,
-        // and disconnect alike — are intentionally not exercised here: each
-        // requires spawning a real worker, which builds Keychain-backed objects
-        // and (on a provisioned host) performs network I/O. The busy mapping is
+        // The STATUS_STARTED and STATUS_SYNC_BUSY begin outcomes — legacy sync,
+        // connect, and disconnect, and the broker sync begin and disconnect
+        // finalize alike — are intentionally not exercised here: each requires
+        // spawning a real worker, which builds Keychain-backed objects and (on a
+        // provisioned host) performs network I/O. The broker disconnect prepare
+        // Prepared path and the broker subject store/get publish paths likewise
+        // open a real protected store, so only their input validation is
+        // exercised above. The busy mapping is
         // proven deterministically by the worker crate's own
         // `begin_default_account_sync_on_a_busy_slot_is_busy_and_builds_nothing`,
         // the disconnect worker's spawn, blocking gate acquire, and fail-closed

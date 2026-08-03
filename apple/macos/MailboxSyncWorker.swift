@@ -140,21 +140,6 @@ enum MailboxPollStatus {
     }
 }
 
-/// Closed result of the broker routing subject read. The subject is the
-/// account-identifying BROKER ROUTING value — never an OAuth credential and
-/// never mailbox content — and is never logged or displayed. A raw status of
-/// zero with a malformed payload (a length outside 1...255 or invalid UTF-8)
-/// is `.failure`, never `.absent`: `.absent` is reserved for the FFI's
-/// explicit no-subject-stored code (-6).
-enum BrokerSubjectReadResult: Equatable {
-    /// A stored subject was read and validated.
-    case found(String)
-    /// No subject is stored for the account (raw status -6).
-    case absent
-    /// Any other status, or a malformed success payload.
-    case failure
-}
-
 /// Closed result of the synchronous broker disconnect prepare. Raw values
 /// mirror the `tersa_mailbox_macos_broker_disconnect_prepare` return domain:
 /// raw 1 means the Rust fence was set and any in-flight sync was cancelled,

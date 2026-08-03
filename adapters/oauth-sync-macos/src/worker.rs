@@ -592,7 +592,7 @@ async fn run_broker_account_cycle(
 }
 
 /// Begins a bounded sync for `account` from an ADR-0024 token broker reply on a
-/// background worker, inside the same whole-cycle permit [`begin_with`] enforces
+/// background worker, inside the same whole-cycle permit `begin_with` enforces
 /// — so busy, cancellation, and terminal-status semantics are identical to
 /// the legacy `begin_default_account_sync`. Returns [`BeginOutcome::Busy`] — without
 /// touching the Keychain, the network, or the broker secrets — if a cycle is
@@ -1244,6 +1244,26 @@ pub enum BrokerDisconnectPrepareOutcome {
 /// blocking lock, which panics inside an async context.
 #[must_use = "the outcome decides whether the broker revoke may proceed"]
 pub fn prepare_broker_disconnect(account: &AccountId) -> BrokerDisconnectPrepareOutcome {
+    prepare_broker_disconnect_with(account, || open_default_mailbox_store_if_present(account))
+}
+
+/// The prepare's fault-injectable core: the whole lease/fence/gate machinery
+/// of [`prepare_broker_disconnect`], generic over the presence-checked
+/// mailbox-store opener — exactly as `run_broker_finalize_with` is generic
+/// over its opener — so the outcome mapping, fence, and single-worker lease
+/// behavior are testable with a fake store. `open_store` yields `None` when
+/// the account has no database file: the marker then no-ops WITHOUT creating
+/// one (disconnect never creates artifacts), and the outcome is
+/// [`BrokerDisconnectPrepareOutcome::Prepared`]. The marker's runtime is
+/// built HERE, on the caller thread, only when a store is present.
+fn prepare_broker_disconnect_with<P, F, E>(
+    account: &AccountId,
+    open_store: F,
+) -> BrokerDisconnectPrepareOutcome
+where
+    P: AccountLifecycleStore,
+    F: FnOnce() -> Result<Option<P>, E>,
+{
     // Claim the single-worker lease + set the fence + signal the registered
     // sync cancel FIRST, synchronously, so "`Prepared` ⇒ no new sync can begin"
     // holds. `None` ⇒ a disconnect operation is already active ⇒ coalesce.
@@ -1253,19 +1273,17 @@ pub fn prepare_broker_disconnect(account: &AccountId) -> BrokerDisconnectPrepare
     // Serialize BEHIND the now-cancelling cycle before persisting the marker,
     // bypassing the disconnecting check (disconnect set that flag itself).
     let gate = permit::acquire_disconnect_gate(account);
-    let marked = open_default_mailbox_store_if_present(account)
-        .map_err(|_error| ())
-        .and_then(|store| {
-            let Some(store) = store else {
-                // Absent store: Prepared no-op — never create a database; the
-                // outer intent journal owns the recovery evidence.
-                return Ok(());
-            };
-            let runtime = build_sync_runtime().map_err(|_error| ())?;
-            runtime
-                .block_on(store.mark_disconnect_started(account))
-                .map_err(|_error| ())
-        });
+    let marked = open_store().map_err(|_error| ()).and_then(|store| {
+        let Some(store) = store else {
+            // Absent store: Prepared no-op — never create a database; the
+            // outer intent journal owns the recovery evidence.
+            return Ok(());
+        };
+        let runtime = build_sync_runtime().map_err(|_error| ())?;
+        runtime
+            .block_on(store.mark_disconnect_started(account))
+            .map_err(|_error| ())
+    });
     // Drop the gate and the active lease on EVERY return so a retry is
     // admitted; the fence stays set on both Prepared (until finalize) and
     // Failed (fail-closed).
@@ -1277,23 +1295,24 @@ pub fn prepare_broker_disconnect(account: &AccountId) -> BrokerDisconnectPrepare
     }
 }
 
-/// The broker-coordinated disconnect FINALIZE operation: the ADR-0024
-/// `main-app purge → marker clear` tail. Opens the mailbox store only IF
-/// PRESENT (disconnect never creates a database); a present store purges the
-/// account FIRST and finalizes the recovery marker SECOND —
-/// `mark_revoke_unconfirmed` when the broker could not confirm the provider
-/// /revoke, `clear_disconnect_recovery` when it could. An ABSENT store is a
-/// success no-op: the account never stored local mailbox data and Swift's
-/// durable outer intent journal owns the recovery evidence. Performs NO token
-/// operation — no load, delete, or revoke, and no refresh store or transport
-/// construction: the broker completed `broker revoke → broker token delete`
-/// before this finalize was requested.
-async fn run_broker_disconnect_finalize(
+/// The broker finalize's fault-injectable core: purge the local account data
+/// FIRST and finalize the recovery marker SECOND — `mark_revoke_unconfirmed`
+/// when the broker could not confirm the provider /revoke,
+/// `clear_disconnect_recovery` when it could — returning the broker-reported
+/// revoke disposition on success. `open_store` is the presence-checked
+/// mailbox-store open: it yields `None` when the account has no database
+/// file, and the purge and marker then no-op WITHOUT creating one
+/// (disconnect never creates artifacts).
+async fn run_broker_finalize_with<P, F, E>(
     account: &AccountId,
     revoke_unconfirmed: bool,
-) -> Result<RevokeDisposition, TeardownError> {
-    let store =
-        open_default_mailbox_store_if_present(account).map_err(|_error| TeardownError::Setup)?;
+    open_store: F,
+) -> Result<RevokeDisposition, TeardownError>
+where
+    P: AccountPurgeStore + AccountLifecycleStore,
+    F: FnOnce() -> Result<Option<P>, E>,
+{
+    let store = open_store().map_err(|_error| TeardownError::Setup)?;
     if let Some(store) = store {
         // Purge BEFORE the marker finalization: a failed purge must not clear
         // (or downgrade) the durable recovery evidence.
@@ -1323,9 +1342,30 @@ async fn run_broker_disconnect_finalize(
     })
 }
 
+/// The broker-coordinated disconnect FINALIZE operation: the ADR-0024
+/// `main-app purge → marker clear` tail. Opens the mailbox store only IF
+/// PRESENT (disconnect never creates a database); a present store purges the
+/// account FIRST and finalizes the recovery marker SECOND —
+/// `mark_revoke_unconfirmed` when the broker could not confirm the provider
+/// /revoke, `clear_disconnect_recovery` when it could. An ABSENT store is a
+/// success no-op: the account never stored local mailbox data and Swift's
+/// durable outer intent journal owns the recovery evidence. Performs NO token
+/// operation — no load, delete, or revoke, and no refresh store or transport
+/// construction: the broker completed `broker revoke → broker token delete`
+/// before this finalize was requested.
+async fn run_broker_disconnect_finalize(
+    account: &AccountId,
+    revoke_unconfirmed: bool,
+) -> Result<RevokeDisposition, TeardownError> {
+    run_broker_finalize_with(account, revoke_unconfirmed, || {
+        open_default_mailbox_store_if_present(account)
+    })
+    .await
+}
+
 /// ADR-0024 disconnect FINALIZE: begins the `main-app purge → marker clear`
 /// tail of a broker-coordinated disconnect on the disconnect worker, reusing
-/// the [`begin_disconnect_with`] machinery so the single-worker lease, the
+/// the `begin_disconnect_with` machinery so the single-worker lease, the
 /// blocking gate acquire, the panic-safe terminal publication, and the
 /// clear-fence-on-success policy stay centralized with the legacy disconnect.
 /// `revoke_unconfirmed` is the broker's report of whether the provider
@@ -2388,6 +2428,40 @@ mod tests {
         ))
     }
 
+    /// Drives the broker finalize's sans-I/O core over an optional fake store,
+    /// mirroring the production call shape: a lazy presence-checked opener
+    /// whose `None` is an absent database file (disconnect never creates one).
+    /// The already-built fake is handed back by reference through the closure.
+    fn drive_broker_finalize<P>(
+        slot: &AccountId,
+        revoke_unconfirmed: bool,
+        store: Option<&P>,
+    ) -> Result<RevokeDisposition, super::TeardownError>
+    where
+        P: tersa_application::mailbox::AccountPurgeStore
+            + tersa_application::lifecycle::AccountLifecycleStore,
+    {
+        test_runtime().block_on(super::run_broker_finalize_with(
+            slot,
+            revoke_unconfirmed,
+            || Ok::<_, super::TeardownError>(store),
+        ))
+    }
+
+    /// Drives the prepare seam's sans-I/O core over an optional fake store,
+    /// mirroring the production call shape: a lazy presence-checked opener
+    /// whose `None` is an absent database file (disconnect never creates one).
+    /// The already-built fake is handed back by reference through the closure.
+    fn drive_broker_prepare<P>(
+        slot: &AccountId,
+        store: Option<&P>,
+    ) -> super::BrokerDisconnectPrepareOutcome
+    where
+        P: tersa_application::lifecycle::AccountLifecycleStore,
+    {
+        super::prepare_broker_disconnect_with(slot, || Ok::<_, super::TeardownError>(store))
+    }
+
     #[test]
     fn begin_disconnect_never_cancels_a_connect_holding_the_slot() {
         use std::sync::Arc;
@@ -2631,6 +2705,202 @@ mod tests {
         let outcome = drive_teardown(&slot, &refresh_store, &transport, None::<&FakePurgeStore>);
         assert!(matches!(outcome, Ok(RevokeDisposition::Confirmed)));
         assert_eq!(log.steps(), vec!["revoke", "delete"]);
+    }
+
+    #[test]
+    fn broker_finalize_purges_then_clears_the_marker_when_the_revoke_was_confirmed() {
+        // The confirmed-revoke tail: the purge runs FIRST, then the durable
+        // recovery marker the prepare persisted is cleared.
+        let slot = account("broker-finalize-clear");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log))
+            .with_lifecycle_log()
+            .with_recovery(
+                tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown,
+            );
+        let outcome = drive_broker_finalize(&slot, false, Some(&store));
+        assert!(matches!(outcome, Ok(RevokeDisposition::NotNeeded)));
+        assert_eq!(log.steps(), vec!["purge", "marker-clear"]);
+        assert_eq!(store.recovery(), None);
+    }
+
+    #[test]
+    fn broker_finalize_purges_then_marks_revoke_unconfirmed_when_the_broker_could_not_confirm() {
+        // The unconfirmed-revoke tail: the purge runs FIRST, then the
+        // revoke-unconfirmed recovery evidence is persisted.
+        let slot = account("broker-finalize-unconfirmed");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log))
+            .with_lifecycle_log()
+            .with_recovery(
+                tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown,
+            );
+        let outcome = drive_broker_finalize(&slot, true, Some(&store));
+        assert!(matches!(outcome, Ok(RevokeDisposition::Unconfirmed)));
+        assert_eq!(log.steps(), vec!["purge", "marker-unconfirmed"]);
+        assert_eq!(
+            store.recovery(),
+            Some(tersa_application::lifecycle::DisconnectRecoveryState::RevokeUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn broker_finalize_without_a_database_file_is_a_success_no_op_when_confirmed() {
+        // A never-connected account has no database file: the store is None,
+        // so the purge and the marker no-op — and none is created (no fake is
+        // even constructed, by construction).
+        let slot = account("broker-finalize-absent-clear");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let outcome = drive_broker_finalize(&slot, false, None::<&FakePurgeStore>);
+        assert!(matches!(outcome, Ok(RevokeDisposition::NotNeeded)));
+        assert!(log.steps().is_empty());
+    }
+
+    #[test]
+    fn broker_finalize_without_a_database_file_is_a_success_no_op_when_unconfirmed() {
+        // The absent-store no-op still reports the broker's unconfirmed
+        // /revoke as its disposition, touching nothing.
+        let slot = account("broker-finalize-absent-unconfirmed");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let outcome = drive_broker_finalize(&slot, true, None::<&FakePurgeStore>);
+        assert!(matches!(outcome, Ok(RevokeDisposition::Unconfirmed)));
+        assert!(log.steps().is_empty());
+    }
+
+    #[test]
+    fn broker_finalize_with_a_failed_purge_runs_no_marker_and_stays_fail_closed() {
+        // A failed purge must not clear OR downgrade the durable recovery
+        // evidence: neither marker action runs, on either disposition, and the
+        // finalize fails at the purge stage.
+        let slot = account("broker-finalize-purge-failure");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let prior = tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown;
+        for revoke_unconfirmed in [false, true] {
+            let store = FakePurgeStore::new(std::sync::Arc::clone(&log))
+                .with_lifecycle_log()
+                .with_recovery(prior)
+                .fail_next_purges(1);
+            let outcome = drive_broker_finalize(&slot, revoke_unconfirmed, Some(&store));
+            assert!(matches!(outcome, Err(super::TeardownError::Purge)));
+            assert_eq!(
+                store.recovery(),
+                Some(prior),
+                "the recovery evidence must survive a failed purge untouched"
+            );
+        }
+        // Both attempts stopped after the failed purge: no marker ran.
+        assert_eq!(log.steps(), vec!["purge", "purge"]);
+    }
+
+    #[test]
+    fn broker_prepare_without_a_database_file_is_prepared_and_releases_the_lease() {
+        // A never-connected account has no database file: the opener yields
+        // None, the marker no-ops WITHOUT creating one, and the outcome is
+        // Prepared.
+        let slot = account("broker-prepare-absent-store");
+        let outcome = drive_broker_prepare(&slot, None::<&FakePurgeStore>);
+        assert_eq!(outcome, super::BrokerDisconnectPrepareOutcome::Prepared);
+        // The fence STAYS set until the broker finalize clears it.
+        assert!(
+            permit::try_acquire(&slot, None).is_none(),
+            "Prepared keeps the disconnecting fence set"
+        );
+        // The single-worker lease was released on the Prepared return: a retry
+        // is admitted far enough to return Prepared again (a held lease would
+        // report Busy instead).
+        let retry = drive_broker_prepare(&slot, None::<&FakePurgeStore>);
+        assert_eq!(retry, super::BrokerDisconnectPrepareOutcome::Prepared);
+        // Clean the fence as a successful finalize would, so the slot is
+        // reusable.
+        permit::clear_disconnecting(&slot);
+        assert!(permit::try_acquire(&slot, None).is_some());
+    }
+
+    #[test]
+    fn broker_prepare_with_a_present_store_persists_the_marker_and_releases_the_lease() {
+        let slot = account("broker-prepare-marker");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let store = FakePurgeStore::new(std::sync::Arc::clone(&log)).with_lifecycle_log();
+        let outcome = drive_broker_prepare(&slot, Some(&store));
+        assert_eq!(outcome, super::BrokerDisconnectPrepareOutcome::Prepared);
+        assert_eq!(log.steps(), vec!["marker-start"]);
+        assert_eq!(
+            store.recovery(),
+            Some(tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown)
+        );
+        assert!(
+            permit::try_acquire(&slot, None).is_none(),
+            "Prepared keeps the disconnecting fence set"
+        );
+        // The lease was released on the Prepared return: a retry is admitted,
+        // and the idempotent marker is simply re-recorded.
+        let retry = drive_broker_prepare(&slot, Some(&store));
+        assert_eq!(retry, super::BrokerDisconnectPrepareOutcome::Prepared);
+        assert_eq!(log.steps(), vec!["marker-start", "marker-start"]);
+        permit::clear_disconnecting(&slot);
+        assert!(permit::try_acquire(&slot, None).is_some());
+    }
+
+    #[test]
+    fn broker_prepare_with_a_failing_marker_is_failed_fail_closed_and_retries() {
+        let slot = account("broker-prepare-marker-failure");
+        let log = std::sync::Arc::new(OrderLog::default());
+        let failing = FakePurgeStore::new(std::sync::Arc::clone(&log))
+            .with_lifecycle_log()
+            .fail_marker();
+        let outcome = drive_broker_prepare(&slot, Some(&failing));
+        assert_eq!(outcome, super::BrokerDisconnectPrepareOutcome::Failed);
+        assert_eq!(
+            failing.recovery(),
+            None,
+            "a failed marker persists no recovery evidence"
+        );
+        // Fail-closed: the fence STAYS set, so the slot refuses new begins.
+        assert!(
+            permit::try_acquire(&slot, None).is_none(),
+            "Failed keeps the disconnecting fence set (fail-closed)"
+        );
+        // The lease was released on the Failed return: an immediate retry with
+        // a healthy store is admitted and converges.
+        let healthy = FakePurgeStore::new(std::sync::Arc::clone(&log)).with_lifecycle_log();
+        let retry = drive_broker_prepare(&slot, Some(&healthy));
+        assert_eq!(retry, super::BrokerDisconnectPrepareOutcome::Prepared);
+        assert_eq!(log.steps(), vec!["marker-start", "marker-start"]);
+        assert_eq!(
+            healthy.recovery(),
+            Some(tersa_application::lifecycle::DisconnectRecoveryState::IncompleteTeardown)
+        );
+        permit::clear_disconnecting(&slot);
+        assert!(permit::try_acquire(&slot, None).is_some());
+    }
+
+    #[test]
+    fn broker_prepare_on_an_active_disconnect_is_busy_and_never_opens_the_store() {
+        // A deliberately-held lease simulates an active disconnect operation
+        // owning the slot: the prepare must coalesce onto it, touching nothing.
+        let slot = account("broker-prepare-busy");
+        let lease =
+            permit::begin_disconnect(&slot).expect("a free slot admits the disconnect lease");
+        let opens = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&opens);
+        let outcome = super::prepare_broker_disconnect_with(&slot, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, super::TeardownError>(None::<&FakePurgeStore>)
+        });
+        assert_eq!(outcome, super::BrokerDisconnectPrepareOutcome::Busy);
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            0,
+            "a busy slot never runs the opener, so the marker never runs"
+        );
+        // The busy prepare never TOOK a lease: the one this setup holds is the
+        // only lease, and it is still held here.
+        drop(lease);
+        permit::clear_disconnecting(&slot);
+        assert!(
+            permit::try_acquire(&slot, None).is_some(),
+            "dropping the deliberately-held lease reopens the slot"
+        );
     }
 
     #[test]
