@@ -50,9 +50,10 @@
 //!
 //! # Single-archive link
 //!
-//! The application links ONLY this crate's static archive: depending on the
-//! bridge with `default-features = false` re-exports its bootstrap and
-//! read-only `tersa_macos_*` C symbols from the same archive, so one `.a`
+//! The application links ONLY this crate's static archive: the crate root
+//! explicitly re-exports the bridge's broker-safe/bootstrap-read C symbols
+//! (`tersa_apple_bridge_version`, `tersa_macos_bootstrap_default_account`,
+//! and the three read-only mailbox reads) from the same archive, so one `.a`
 //! carries both surfaces while the bridge's legacy `tersa_oauth_*` surface
 //! stays out of the default link. Linking the bridge archive as well fails
 //! loudly with duplicate symbols, so 3e wires exactly this one archive into
@@ -61,6 +62,20 @@
 #![deny(unsafe_code)]
 
 // Rust guideline compliant 1.0.
+
+// The application links only this crate's static archive, so the crate root
+// explicitly re-exports the bridge's broker-safe/bootstrap-read C symbols to
+// keep their object code reachable in the default build: without these edges
+// the feature-free bridge rlib contributes nothing and the link fails with
+// undefined symbols. No `tersa_oauth_*`, session, token, exchange, refresh,
+// revoke, or legacy begin symbol is re-exported here — the bridge's legacy
+// OAuth surface stays behind its `legacy-oauth` feature, out of production.
+#[cfg(target_os = "macos")]
+#[doc(inline)]
+pub use tersa_apple_bridge::{
+    tersa_apple_bridge_version, tersa_macos_bootstrap_default_account,
+    tersa_macos_mailbox_read_inbox, tersa_macos_mailbox_read_thread, tersa_macos_mailbox_search,
+};
 
 #[cfg(target_os = "macos")]
 mod macos {
