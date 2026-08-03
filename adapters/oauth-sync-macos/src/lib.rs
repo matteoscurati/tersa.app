@@ -52,16 +52,10 @@ use tersa_application::mailbox::{AccountId, MailboxStore, MailboxStoreError, Rem
 use tersa_application::mailbox::{
     BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize, PageToken, RemoteMailboxError,
 };
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_application::oauth::{AuthorizationGrant, MonotonicClock, WallClock};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_application::token::{
     AccessToken, IdentityExpiry, TokenClientConfig, TokenError, TokenScopeOutcome, TokenTransport,
     TokenTransportError, exchange_grant_with_scope_outcome,
@@ -71,10 +65,7 @@ use tersa_application::token::{
 use tersa_application::token::{AccountSubject, BrokerSubjectError};
 #[cfg(target_os = "macos")]
 use tersa_gmail_rest_macos::GmailMailbox;
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 #[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
@@ -253,10 +244,7 @@ where
 /// response, so the access token and the identity-gate `subject` always share an
 /// origin (the same principal). 3d-3 builds the sync session from both, feeding
 /// the subject to the gate and the access token to the mailbox surface.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 pub struct ConnectedAccount {
     access_token: AccessToken,
@@ -264,10 +252,7 @@ pub struct ConnectedAccount {
     identity_expiry: IdentityExpiry,
 }
 
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl ConnectedAccount {
     /// Returns the short-lived access token with its monotonic expiry.
     #[must_use]
@@ -297,10 +282,7 @@ impl ConnectedAccount {
 }
 
 /// Reports why a token-lifecycle step failed.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TokenLifecycleError {
@@ -335,10 +317,7 @@ pub enum TokenLifecycleError {
     CancelledCleanupIncomplete,
 }
 
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl core::fmt::Display for TokenLifecycleError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let message = match self {
@@ -357,10 +336,7 @@ impl core::fmt::Display for TokenLifecycleError {
     }
 }
 
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 impl std::error::Error for TokenLifecycleError {}
 
 /// One connect-account flow's session: the SINGLE source for both claiming the
@@ -373,10 +349,7 @@ impl std::error::Error for TokenLifecycleError {}
 /// `session_id` and answers [`ConnectSession::claim`] from `claim_grant(id)`
 /// and [`ConnectSession::is_cancelled`] from `is_session_cancelled(id)`, so the
 /// two share the id by construction.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub trait ConnectSession {
     /// Claims the finished grant and its pinned token-client config for this
     /// session, exactly once: a missing, expired, cancelled, or already-claimed
@@ -407,10 +380,7 @@ pub trait ConnectSession {
 /// The connect flow's cancel fences discard it — there the revoke is
 /// fire-and-forget (nothing is stored, or the just-stored copy was deleted
 /// first), so the outcome changes no behavior on that path.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 #[derive(Debug)]
 #[must_use = "the disconnect teardown maps this to the revoke-unconfirmed status; dropping it silently loses the M2 signal"]
 pub(crate) enum RevokeOutcome {
@@ -431,10 +401,7 @@ pub(crate) enum RevokeOutcome {
 /// both CONFIRM the desired end state, so retrying them is pointless. This is
 /// the same already-gone semantics the ADR-0024 broker's
 /// `revoke_provider_grant` applies over this shared transport error enum.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 fn revoke_confirmed(outcome: Result<(), TokenTransportError>) -> bool {
     matches!(
         outcome,
@@ -457,10 +424,7 @@ fn revoke_confirmed(outcome: Result<(), TokenTransportError>) -> bool {
 /// provider with no in-app remedy — the user can only revoke it from their
 /// Google account settings. The single immediate retry shrinks that window to
 /// a persistent network or provider failure; it cannot close it.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub(crate) async fn revoke_best_effort<T: TokenTransport>(
     transport: &T,
     token: &Zeroizing<String>,
@@ -574,10 +538,7 @@ pub(crate) async fn revoke_best_effort<T: TokenTransport>(
 /// [`TokenLifecycleError::Store`] when the Keychain rejects the write (the
 /// minted token is revoked best-effort first IFF the snapshot definitively
 /// read empty).
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub(crate) async fn connect_account<T, S, C, St>(
     account: &AccountId,
     grant: AuthorizationGrant,
@@ -709,10 +670,7 @@ where
 /// may still sit in the Keychain, and disconnect (3d-3d) is the remedy. On
 /// success the cancel is clean and [`TokenLifecycleError::Cancelled`] is
 /// returned.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 async fn finish_cancelled_cleanup<S, T>(
     refresh_store: &S,
     transport: &T,
@@ -750,10 +708,7 @@ where
 /// [`TokenLifecycleError::Token`] when the refresh fails (including a
 /// missing/invalid identity), and [`TokenLifecycleError::Store`] on a Keychain
 /// read or write failure.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub async fn refresh_account<T, S, C>(
     account: &AccountId,
     config: &TokenClientConfig,
@@ -812,10 +767,7 @@ where
 /// # Errors
 ///
 /// Propagates [`refresh_account`]'s errors when a refresh is due and fails.
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 pub async fn refresh_if_due<T, S, C>(
     account: &AccountId,
     access_token: &AccessToken,
@@ -839,10 +791,7 @@ where
 }
 
 /// The maximum accepted clock skew when validating `id_token` freshness (2 min).
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "legacy-token-lifecycle", test)
-))]
+#[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 const IDENTITY_SKEW_SECS: u64 = 120;
 
 /// Reports why a [`GmailSession`] could not be built.

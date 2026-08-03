@@ -16,20 +16,6 @@ publish = false
 [lib]
 crate-type = ["rlib", "staticlib"]
 
-[features]
-# Default features are empty: the production FFI is broker-fed (ADR-0024) and
-# links neither the direct refresh-token lifecycle nor the legacy Apple OAuth
-# bridge surface.
-default = []
-# Obsolete in-process OAuth/token lifecycle: the plain sync/connect/disconnect
-# begins that compose the refresh-token lifecycle in-process and claim grants
-# from the bridge's legacy OAuth session registry. Kept for legacy and test
-# compositions only; never enabled by a production dependency.
-legacy-token-lifecycle = [
-    "tersa-oauth-sync-macos/legacy-token-lifecycle",
-    "tersa-apple-bridge/legacy-oauth",
-]
-
 # Every dependency is macOS-only: on other targets the crate compiles to an empty
 # library that exports no symbols. The Google token and revoke endpoints are pinned
 # downstream in the Gmail transport; this crate depends on neither the network nor

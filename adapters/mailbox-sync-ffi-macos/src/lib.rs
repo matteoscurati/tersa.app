@@ -25,14 +25,16 @@
 //! formatted or logged. Progress is a single closed status integer; no mailbox
 //! content, address, subject, or count ever crosses this boundary.
 //!
-//! # Legacy in-process token lifecycle (opt in, never production)
+//! # Legacy in-process token lifecycle (test-only)
 //!
 //! The obsolete in-process OAuth/token begins — `tersa_mailbox_macos_sync_begin`,
 //! `tersa_mailbox_macos_connect_begin`, and `tersa_mailbox_macos_disconnect_begin`
 //! — plus the optional build-time Desktop-client secret helpers and the
-//! bridge-claiming `BridgeConnectSession` are compiled ONLY under the
-//! `legacy-token-lifecycle` feature or this crate's own `cfg(test)` builds; no
-//! production dependency enables them. On the legacy path Swift supplies only
+//! bridge-claiming `BridgeConnectSession` are compiled ONLY under this crate's
+//! own `cfg(test)` builds; this crate exposes no feature that enables them.
+//! The three begins are legacy test helpers — ordinary unsafe Rust functions,
+//! NOT exported C ABI entrypoints — so every build exposes the one broker-only
+//! C ABI. On the legacy path Swift supplies only
 //! two public strings — the OAuth client identifier and the opaque account
 //! identifier — and never any URL: the Google token and revoke endpoints are
 //! pinned downstream in the Gmail transport, and the registered redirect for a
@@ -86,21 +88,21 @@ mod macos {
     use std::sync::{Mutex, OnceLock};
 
     use tersa_application::mailbox::AccountId;
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     use tersa_application::oauth::AuthorizationGrant;
     use tersa_application::token::AccountSubject;
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     use tersa_application::token::TokenClientConfig;
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     use tersa_oauth_sync_macos::ConnectSession;
     use tersa_oauth_sync_macos::worker::{
         self, BeginOutcome, BrokerDisconnectPrepareOutcome, STATUS_NEEDS_RECONNECT, STATUS_RUNNING,
         STATUS_SUCCEEDED, WorkerHandles, begin_broker_account_sync,
         begin_broker_disconnect_finalize, prepare_broker_disconnect,
     };
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     use tersa_oauth_sync_macos::worker::{begin_connect_account_sync, begin_default_account_sync};
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     use url::Url;
     use zeroize::Zeroizing;
 
@@ -109,13 +111,13 @@ mod macos {
     /// The account slot already has a whole cycle in flight; no worker was spawned
     /// and no session id was written. Positive so it never aliases a poll terminal.
     const STATUS_SYNC_BUSY: i32 = 2;
-    /// The session registry lock was poisoned, or (legacy builds only) the pinned
+    /// The session registry lock was poisoned, or (test builds only) the pinned
     /// configuration could not be constructed — an internal anomaly rather than
     /// caller error. Matches the worker's own internal code so the two never
     /// disagree.
     const STATUS_INTERNAL: i32 = -5;
     /// A begin input was rejected: an unreadable or non-UTF-8 buffer, an invalid
-    /// account identifier, a null output pointer, or (legacy builds only) a blank
+    /// account identifier, a null output pointer, or (test builds only) a blank
     /// client identifier.
     const STATUS_INVALID_INPUT: i32 = -7;
     /// A poll named a session that is not (or is no longer) registered.
@@ -140,7 +142,7 @@ mod macos {
     /// The registered redirect pinned into every legacy configuration. It is a syntactically
     /// valid loopback placeholder that this worker's refresh grant never transmits;
     /// `TokenClientConfig` only requires the field to be a well-formed URL.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     const PLACEHOLDER_REDIRECT_URI: &str = "http://127.0.0.1/";
 
     /// Hands out monotonically increasing, never-reused session identifiers.
@@ -219,12 +221,12 @@ mod macos {
     /// Google documents this value as optional for installed apps, but some
     /// Desktop clients require it at the token endpoint. The value is compiled
     /// into the application and therefore is not treated as confidential.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     fn configured_client_secret() -> Option<&'static str> {
         client_secret_from_build_setting(option_env!("TERSA_OAUTH_CLIENT_SECRET"))
     }
 
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     fn client_secret_from_build_setting(value: Option<&str>) -> Option<&str> {
         value.filter(|secret| {
             !secret.trim().is_empty() && !secret.to_ascii_uppercase().contains("UNCONFIGURED")
@@ -236,7 +238,7 @@ mod macos {
     /// redirect, and the optional build-time Desktop-client secret. A blank
     /// client id is a caller error; the placeholder redirect is a compile-time
     /// constant whose parse failure could only be an internal fault.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     fn pinned_configuration(client_id: String) -> Result<TokenClientConfig, i32> {
         let redirect = Url::parse(PLACEHOLDER_REDIRECT_URI).map_err(|_error| STATUS_INTERNAL)?;
         TokenClientConfig::new_with_optional_client_secret(
@@ -255,12 +257,12 @@ mod macos {
     /// fences provably reference the same session. The client identifier arrives
     /// WITH the claim from the bridge, which validated it at begin and stored it
     /// with the grant, so it cannot disagree with the session by construction.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     struct BridgeConnectSession {
         oauth_session_id: u64,
     }
 
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     impl ConnectSession for BridgeConnectSession {
         fn claim(&self) -> Option<(AuthorizationGrant, TokenClientConfig)> {
             let (grant, redirect, client_id) =
@@ -299,9 +301,9 @@ mod macos {
     /// Begins a bounded sync for the default account of the given OAuth client on a
     /// Rust-owned background worker, writing an opaque session id the caller polls.
     ///
-    /// Legacy in-process token lifecycle: compiled only under the
-    /// `legacy-token-lifecycle` feature or `cfg(test)`, never by the default
-    /// broker-fed production build.
+    /// Test-only helper: an ordinary unsafe Rust function, not an exported FFI
+    /// entrypoint. Compiled only under this crate's own `cfg(test)` builds,
+    /// never by the broker-fed production build.
     ///
     /// Returns [`STATUS_STARTED`] with `output_session_id` written when a worker was
     /// spawned, [`STATUS_SYNC_BUSY`] (nothing written) when the slot already has a
@@ -316,13 +318,12 @@ mod macos {
     /// buffer of the stated length. `output_session_id`, when non-null, must be
     /// writable for one `u64`. Every non-null pointer must remain valid for the
     /// duration of this call and must not alias a mutable output.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     #[expect(
         unsafe_code,
-        reason = "the C ABI validates and copies caller-owned byte buffers"
+        reason = "the legacy boundary validates and copies caller-owned byte buffers"
     )]
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn tersa_mailbox_macos_sync_begin(
+    pub unsafe fn tersa_mailbox_macos_sync_begin(
         client_id: *const u8,
         client_id_len: usize,
         account_id: *const u8,
@@ -372,9 +373,9 @@ mod macos {
     /// session id the caller polls through the SAME [`tersa_mailbox_macos_sync_poll`]
     /// as a plain sync.
     ///
-    /// Legacy in-process token lifecycle: compiled only under the
-    /// `legacy-token-lifecycle` feature or `cfg(test)`, never by the default
-    /// broker-fed production build.
+    /// Test-only helper: an ordinary unsafe Rust function, not an exported FFI
+    /// entrypoint. Compiled only under this crate's own `cfg(test)` builds,
+    /// never by the broker-fed production build.
     ///
     /// `oauth_session_id` is the bridge-issued id of the caller's own finished
     /// authorization: a lookup key, never a capability, and never a value from
@@ -396,13 +397,12 @@ mod macos {
     /// stated length. `output_session_id`, when non-null, must be writable for
     /// one `u64`. Every non-null pointer must remain valid for the duration of
     /// this call and must not alias a mutable output.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     #[expect(
         unsafe_code,
-        reason = "the C ABI validates and copies caller-owned byte buffers"
+        reason = "the legacy boundary validates and copies caller-owned byte buffers"
     )]
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn tersa_mailbox_macos_connect_begin(
+    pub unsafe fn tersa_mailbox_macos_connect_begin(
         account_id: *const u8,
         account_id_len: usize,
         oauth_session_id: u64,
@@ -538,10 +538,10 @@ mod macos {
     /// session id the caller polls through the SAME
     /// [`tersa_mailbox_macos_sync_poll`] as a sync or connect.
     ///
-    /// Legacy in-process token lifecycle: compiled only under the
-    /// `legacy-token-lifecycle` feature or `cfg(test)`, never by the default
-    /// broker-fed production build, whose disconnect is the broker-coordinated
-    /// prepare/finalize pair below.
+    /// Test-only helper: an ordinary unsafe Rust function, not an exported FFI
+    /// entrypoint. Compiled only under this crate's own `cfg(test)` builds,
+    /// never by the broker-fed production build, whose disconnect is the
+    /// broker-coordinated prepare/finalize pair below.
     ///
     /// The slot's `disconnecting` flag is set — and any in-flight sync's
     /// registered cancel flag is signaled — on the CALLER thread BEFORE the
@@ -592,13 +592,12 @@ mod macos {
     /// stated length. `output_session_id`, when non-null, must be writable for
     /// one `u64`. Every non-null pointer must remain valid for the duration of
     /// this call and must not alias a mutable output.
-    #[cfg(any(feature = "legacy-token-lifecycle", test))]
+    #[cfg(test)]
     #[expect(
         unsafe_code,
-        reason = "the C ABI validates and copies caller-owned byte buffers"
+        reason = "the legacy boundary validates and copies caller-owned byte buffers"
     )]
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn tersa_mailbox_macos_disconnect_begin(
+    pub unsafe fn tersa_mailbox_macos_disconnect_begin(
         account_id: *const u8,
         account_id_len: usize,
         output_session_id: *mut u64,
@@ -972,8 +971,8 @@ mod macos {
     /// registry lock is poisoned.
     ///
     /// This one poll serves every begin: the broker sync begin and the broker
-    /// disconnect finalize in the default build, plus the legacy sync, connect,
-    /// AND disconnect begins under `legacy-token-lifecycle`/`cfg(test)`. The
+    /// disconnect finalize in the production build, plus the legacy sync,
+    /// connect, AND disconnect begins in this crate's `cfg(test)` builds. The
     /// terminal codes are NOT all reachable from every session kind: only a
     /// DISCONNECT session can report [`STATUS_SUCCEEDED_REVOKE_UNCONFIRMED`] —
     /// a sync or a connect poll NEVER does. A Swift caller must not surface the
