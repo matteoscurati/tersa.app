@@ -10,7 +10,7 @@
 //! signed ADR-0024 token broker owns the whole OAuth token lifecycle — the
 //! grant exchange, refresh, revocation, and the refresh-token Keychain — and
 //! this crate only consumes the broker's short-lived access-token replies via
-//! [`GmailSession::from_broker_token`], re-validating the reply's subject at
+//! `GmailSession::from_broker_token`, re-validating the reply's subject at
 //! that trust boundary. The default build therefore compiles NO refresh-token
 //! Keychain access: it drives the `tersa-gmail-rest-macos` read adapter and
 //! reconciles through the validated `SQLCipher` write path on a pinned
