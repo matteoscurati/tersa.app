@@ -729,6 +729,10 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
     ));
 
+    violations.extend(token_broker_bootstrap_source_surface_violations(
+        repository_root,
+    )?);
+
     for (path, document) in tracked_source_documents(repository_root, "adapters/keychain-macos")? {
         if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
             violations.extend(rust_authority_source_surface_violations(&path, &document));
@@ -781,6 +785,51 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
     }
     violations.extend(swift_ffi_symbol_inventory_violations(&macos_sources));
     violations.extend(swift_oauth_foreground_handoff_violations(&macos_sources));
+    Ok(violations)
+}
+
+/// The token-broker FFI is a dedicated static library with its own five-symbol
+/// C ABI; pin its reviewed sources, bridge header, and wire-status inventory
+/// exactly, so a sixth export (for example refresh-token export) or status
+/// renumber cannot land without review.
+fn token_broker_bootstrap_source_surface_violations(
+    repository_root: &Path,
+) -> io::Result<Vec<String>> {
+    let mut violations = Vec::new();
+    let token_broker_ffi_sources =
+        tracked_source_documents(repository_root, REVIEWED_TOKEN_BROKER_FFI_PACKAGE_ROOT)?;
+    violations.extend(token_broker_ffi_source_surface_violations(
+        &token_broker_ffi_sources,
+    ));
+    violations.extend(rust_exported_c_abi_violations(
+        &token_broker_ffi_sources,
+        &expected_token_broker_ffi_c_abi_exports(),
+        TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
+    ));
+    let token_broker_bridge_header =
+        fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH))?;
+    violations.extend(token_broker_bridge_header_c_abi_violations(
+        &token_broker_bridge_header,
+    ));
+    if let Some((_path, rust_ffi_source)) = token_broker_ffi_sources
+        .iter()
+        .find(|(path, _)| path == Path::new("adapters/token-broker-ffi-macos/src/lib.rs"))
+    {
+        let service_protocol =
+            fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_PROTOCOL_PATH))?;
+        let client_protocol =
+            fs::read_to_string(repository_root.join(REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH))?;
+        violations.extend(token_broker_wire_status_coherence_violations(
+            rust_ffi_source,
+            &service_protocol,
+            &client_protocol,
+        ));
+    } else {
+        violations.push(
+            "the token-broker FFI canonical source adapters/token-broker-ffi-macos/src/lib.rs must be tracked"
+                .to_owned(),
+        );
+    }
     Ok(violations)
 }
 
@@ -1329,6 +1378,37 @@ const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production expo
 /// archive the application links carries those four plus the Apple bridge's
 /// reviewed eleven (see [`APPLE_BRIDGE_C_ABI_COUNT_MESSAGE`]).
 const MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE: &str = "the mailbox-sync FFI production exported C ABI set must match this crate's own five reviewed begin, connect, disconnect, lifecycle-query, and poll no_mangle exports (the shipped archive surface is these five plus the Apple bridge's reviewed eleven)";
+/// The exact count message for the token-broker FFI's reviewed C ABI symbol set.
+/// Pins exactly five operations: begin, complete, refresh, revoke, and delete.
+const TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE: &str = "the token-broker FFI production exported C ABI set must match the five reviewed begin, complete, refresh, revoke, and delete no_mangle exports";
+/// Reviewed path of the token-broker C ABI header mirrored into the XPC service.
+const REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH: &str =
+    "apple/macos-token-broker/TersaTokenBrokerBridge.h";
+/// Reviewed Rust package root for the token-broker FFI static archive.
+const REVIEWED_TOKEN_BROKER_FFI_PACKAGE_ROOT: &str = "adapters/token-broker-ffi-macos";
+/// Reviewed closed wire-status name/integer pairs shared by Rust and Swift.
+const REVIEWED_TOKEN_BROKER_WIRE_STATUSES: [(&str, i64); 20] = [
+    ("success", 0),
+    ("notImplemented", 1),
+    ("notProvisioned", 2),
+    ("invalidRequest", 3),
+    ("rejectedClient", 4),
+    ("authorizationCodeRejected", 5),
+    ("providerRejected", 6),
+    ("insufficientScope", 7),
+    ("missingRefreshToken", 8),
+    ("consentRevoked", 9),
+    ("revokeUnconfirmed", 10),
+    ("persistenceFailed", 11),
+    ("invalidConfiguration", 12),
+    ("unavailable", 13),
+    ("busy", 14),
+    ("sessionUnknown", 15),
+    ("transport", 16),
+    ("malformedResponse", 17),
+    ("identityUnverified", 18),
+    ("identityMismatch", 19),
+];
 
 /// Pins a static-library package's exported C ABI to an exact reviewed set: every
 /// production `no_mangle` symbol must be one of `expected`, carry its exact reviewed
@@ -1488,6 +1568,309 @@ fn expected_mailbox_sync_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static 
             "pubextern\"C\"fntersa_mailbox_macos_sync_poll(session_id:u64)->i32",
         ),
     ])
+}
+
+/// Closed Rust source inventory for the token-broker FFI package: exactly the
+/// reviewed `Cargo.toml` + `src/lib.rs`, no build script, no extra sources.
+fn token_broker_ffi_source_surface_violations(
+    package_documents: &[(PathBuf, String)],
+) -> Vec<String> {
+    let manifest_path = Path::new("adapters/token-broker-ffi-macos/Cargo.toml");
+    let build_script_path = Path::new("adapters/token-broker-ffi-macos/build.rs");
+    let mut violations = Vec::new();
+    let Some((_path, manifest)) = package_documents
+        .iter()
+        .find(|(path, _document)| path == manifest_path)
+    else {
+        return vec!["the token-broker FFI Cargo.toml must be tracked".to_owned()];
+    };
+    if toml_table_has_key(manifest, "package", "build") {
+        violations
+            .push("the token-broker FFI package must not declare a Cargo build script".to_owned());
+    }
+    if toml_table_has_key(manifest, "lib", "path") {
+        violations.push(
+            "the token-broker FFI library must use the canonical inventoried src/lib.rs entry"
+                .to_owned(),
+        );
+    }
+    if package_documents
+        .iter()
+        .any(|(path, _document)| path == build_script_path)
+    {
+        violations.push("the token-broker FFI must not track a conventional build.rs".to_owned());
+    }
+    let reviewed_rust_sources =
+        BTreeSet::from([PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs")]);
+    let tracked_rust_sources = package_documents
+        .iter()
+        .filter(|(path, _document)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        })
+        .map(|(path, _document)| path.clone())
+        .collect::<BTreeSet<_>>();
+    if tracked_rust_sources != reviewed_rust_sources {
+        violations.push(
+            "the token-broker FFI tracked Rust source inventory must be exactly the reviewed src/lib.rs"
+                .to_owned(),
+        );
+    }
+    for (path, document) in package_documents {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        violations.extend(rust_external_source_expansion_violations(path, document));
+        violations.extend(forbidden_export_mechanism_violations(path, document));
+    }
+    violations
+}
+
+/// Exact reviewed Rust export inventory for the five token-broker C ABI
+/// operations. Signatures are whitespace-normalized.
+fn expected_token_broker_ffi_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "tersa_token_broker_begin_authorization",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_begin_authorization(",
+                "redirect_uri:*constu8,redirect_uri_len:usize,",
+                "authorization_url_out:*mutu8,authorization_url_capacity:usize,authorization_url_len:*mutusize,",
+                "session_handle_out:*mutu8,session_handle_capacity:usize,session_handle_len:*mutusize,",
+                ")->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_complete_authorization",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_complete_authorization(",
+                "session_handle:*constu8,session_handle_len:usize,",
+                "callback_url:*constu8,callback_url_len:usize,",
+                "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
+                "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
+                "expires_out:*muti64,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_refresh_access_token",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_refresh_access_token(",
+                "account_subject:*constu8,account_subject_len:usize,",
+                "access_token_out:*mutu8,access_token_capacity:usize,access_token_len:*mutusize,",
+                "subject_out:*mutu8,subject_capacity:usize,subject_len:*mutusize,",
+                "expires_out:*muti64,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_revoke_provider_grant",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_revoke_provider_grant(",
+                "account_subject:*constu8,account_subject_len:usize,)->i32"
+            ),
+        ),
+        (
+            "tersa_token_broker_delete_stored_tokens",
+            concat!(
+                "pubunsafeextern\"C\"fntersa_token_broker_delete_stored_tokens(",
+                "account_subject:*constu8,account_subject_len:usize,)->i32"
+            ),
+        ),
+    ])
+}
+
+/// Pins `TersaTokenBrokerBridge.h` to exactly the five reviewed C ABI symbols.
+/// A sixth declaration (for example `tersa_token_broker_export_refresh_token`)
+/// or a missing/renamed symbol fails closed.
+fn token_broker_bridge_header_c_abi_violations(header: &str) -> Vec<String> {
+    let expected = expected_token_broker_ffi_c_abi_exports()
+        .into_keys()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let actual = c_header_tersa_token_broker_function_symbols(header);
+    let mut violations = Vec::new();
+    if actual != expected {
+        violations.push(format!(
+            "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} must declare exactly the five reviewed token-broker C ABI symbols"
+        ));
+        for missing in expected.difference(&actual) {
+            violations.push(format!(
+                "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} is missing reviewed C ABI symbol `{missing}`"
+            ));
+        }
+        for extra in actual.difference(&expected) {
+            violations.push(format!(
+                "{REVIEWED_TOKEN_BROKER_BRIDGE_HEADER_PATH} declares unreviewed C ABI symbol `{extra}`"
+            ));
+        }
+    }
+    violations
+}
+
+/// Collects `tersa_token_broker_*` function declarators from a C header.
+fn c_header_tersa_token_broker_function_symbols(header: &str) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    let mut search_from = 0;
+    while let Some(relative) = header[search_from..].find("tersa_token_broker_") {
+        let start = search_from + relative;
+        if start > 0 {
+            let before = header.as_bytes()[start - 1];
+            if before.is_ascii_alphanumeric() || before == b'_' {
+                search_from = start + 1;
+                continue;
+            }
+        }
+        let name_length = header[start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        let name = &header[start..start + name_length];
+        let after_name = skip_ascii_whitespace(header, start + name_length);
+        if header.as_bytes().get(after_name) == Some(&b'(') {
+            symbols.insert(name.to_owned());
+        }
+        search_from = start + name_length;
+    }
+    symbols
+}
+
+/// Pins Rust `STATUS_*` constants to the exact reviewed 0..=19 integers and
+/// requires service/client Swift status enums to declare the same closed set.
+/// Renumbering either side fails; self-comparison is not used.
+fn token_broker_wire_status_coherence_violations(
+    rust_source: &str,
+    service_protocol: &str,
+    client_protocol: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let expected = REVIEWED_TOKEN_BROKER_WIRE_STATUSES
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), *value))
+        .collect::<BTreeMap<_, _>>();
+
+    match rust_token_broker_status_constants(rust_source) {
+        Some(rust_cases) => {
+            if rust_cases != expected {
+                violations.push(
+                    "token-broker Rust STATUS_* constants must pin exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+        }
+        None => violations.push(
+            "adapters/token-broker-ffi-macos/src/lib.rs must declare parseable STATUS_* wire constants"
+                .to_owned(),
+        ),
+    }
+
+    let service_status = swift_closed_int_enum_cases(service_protocol, "TersaTokenBrokerStatusV1");
+    let client_status = swift_closed_int_enum_cases(client_protocol, "TokenBrokerStatus");
+    match (service_status, client_status) {
+        (Some(service_cases), Some(client_cases)) => {
+            if service_cases != expected {
+                violations.push(
+                    "service TersaTokenBrokerStatusV1 must declare exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+            if client_cases != expected {
+                violations.push(
+                    "client TokenBrokerStatus must declare exactly the reviewed 0..=19 wire status set"
+                        .to_owned(),
+                );
+            }
+        }
+        (None, _) => violations.push(
+            "apple/macos-token-broker/TokenBrokerProtocol.swift must declare closed enum TersaTokenBrokerStatusV1"
+                .to_owned(),
+        ),
+        (_, None) => violations.push(
+            "apple/macos/TokenBrokerProtocol.swift must declare closed enum TokenBrokerStatus"
+                .to_owned(),
+        ),
+    }
+    violations
+}
+
+/// Parses production `const STATUS_*: i32 = N;` bindings into Swift-case names.
+fn rust_token_broker_status_constants(source: &str) -> Option<BTreeMap<String, i64>> {
+    // Comment-mask only: keep whitespace so `: i32 = N` stays parseable without
+    // depending on a full non-code strip.
+    let code = strip_rust_comments(source);
+    let mut cases = BTreeMap::new();
+    let mut search_from = 0;
+    while let Some(relative) = code[search_from..].find("const STATUS_") {
+        let start = search_from + relative;
+        if !is_identifier_at(&code, start, "const") {
+            search_from = start + 1;
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(&code, start + "const".len());
+        if !code[name_start..].starts_with("STATUS_") {
+            search_from = name_start + 1;
+            continue;
+        }
+        let name_length = code[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        let const_name = &code[name_start..name_start + name_length];
+        let after_name = skip_ascii_whitespace(&code, name_start + name_length);
+        if code.as_bytes().get(after_name) != Some(&b':') {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let type_start = skip_ascii_whitespace(&code, after_name + 1);
+        if !code[type_start..].starts_with("i32") || !is_identifier_at(&code, type_start, "i32") {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let after_type = skip_ascii_whitespace(&code, type_start + "i32".len());
+        if code.as_bytes().get(after_type) != Some(&b'=') {
+            search_from = name_start + name_length;
+            continue;
+        }
+        let value_start = skip_ascii_whitespace(&code, after_type + 1);
+        let value_length = code[value_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if value_length == 0 {
+            return None;
+        }
+        let value: i64 = code[value_start..value_start + value_length].parse().ok()?;
+        let swift_name = rust_status_const_to_swift_case(const_name)?;
+        if cases.insert(swift_name, value).is_some() {
+            return None;
+        }
+        search_from = value_start + value_length;
+    }
+    if cases.is_empty() {
+        return None;
+    }
+    Some(cases)
+}
+
+/// `STATUS_AUTHORIZATION_CODE_REJECTED` → `authorizationCodeRejected`.
+fn rust_status_const_to_swift_case(const_name: &str) -> Option<String> {
+    let rest = const_name.strip_prefix("STATUS_")?;
+    let mut result = String::new();
+    for (index, part) in rest.split('_').enumerate() {
+        if part.is_empty() {
+            return None;
+        }
+        if index == 0 {
+            result.push_str(&part.to_ascii_lowercase());
+        } else {
+            let mut chars = part.chars();
+            let first = chars.next()?;
+            result.push(first.to_ascii_uppercase());
+            result.push_str(&chars.as_str().to_ascii_lowercase());
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn expected_apple_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
@@ -3742,6 +4125,14 @@ const REVIEWED_TOKEN_BROKER_CLIENT_SWIFT_PATHS: [&str; 4] = [
     "apple/macos/TokenBrokerProtocol.swift",
     "apple/macos/TokenBrokerStatusMapping.swift",
 ];
+/// Exact path of the sole reviewed abandoned-session `deinit` cleanup. No
+/// directory-wide, filename-prefix, or generic `deinit` exemption exists.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH: &str =
+    "apple/macos/TokenBrokerAuthorizationSession.swift";
+/// Exact owner class of the sole reviewed abandoned-session `deinit` cleanup.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS: &str = "TokenBrokerSessionResourceBag";
+/// Whitespace-normalized form of the sole reviewed abandoned-session `deinit`.
+const REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT: &str = "deinit{release()}";
 /// Closed `TersaMacTokenBroker` source inventory. Missing or extra paths fail closed.
 const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 8] = [
     "apple/macos-token-broker/Info.plist",
@@ -3764,14 +4155,24 @@ const TOKEN_BROKER_ALLOWED_SOURCE_PATHS: [&str; 8] = [
 /// `@objc(TersaMacTokenBrokerProtocolV1) protocol TersaMacTokenBrokerProtocolV1`
 /// in `apple/macos-token-broker/TokenBrokerProtocol.swift`. Every other protocol
 /// declaration in inventoried product or broker sources fails closed.
+///
+/// The sole reviewed `deinit` exception is the abandoned-session cleanup
+/// `deinit { release() }` as a direct member of file-scope class
+/// `TokenBrokerSessionResourceBag` in
+/// `apple/macos/TokenBrokerAuthorizationSession.swift`. Exactly one such
+/// declaration is accepted; any second `deinit`, any other path or owner class,
+/// attributes/parameters, extra statements, alternate calls, nested placement,
+/// or comment/string decoys fail closed. `subscript` remains unconditionally
+/// forbidden.
 fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<String> {
-    for forbidden in ["deinit", "subscript"] {
-        if contains_identifier(code, forbidden) {
-            return Some(format!(
-                "{} must not declare `{forbidden}` in inventoried macOS sources",
-                path.display()
-            ));
-        }
+    if let Some(violation) = swift_deinit_declaration_violation(path, code) {
+        return Some(violation);
+    }
+    if contains_identifier(code, "subscript") {
+        return Some(format!(
+            "{} must not declare `subscript` in inventoried macOS sources",
+            path.display()
+        ));
     }
     if let Some(violation) = swift_protocol_declaration_violation(path, code) {
         return Some(violation);
@@ -3789,6 +4190,151 @@ fn swift_forbidden_declaration_violation(path: &Path, code: &str) -> Option<Stri
         }
     }
     None
+}
+
+/// Rejects every `deinit` declaration except the single reviewed abandoned-session
+/// cleanup on `TokenBrokerSessionResourceBag` at
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`.
+fn swift_deinit_declaration_violation(path: &Path, code: &str) -> Option<String> {
+    let mut saw_reviewed = false;
+    for (start, _) in code.match_indices("deinit") {
+        if !is_identifier_at(code, start, "deinit") {
+            continue;
+        }
+        if is_exact_reviewed_token_broker_session_resource_bag_deinit(path, code, start) {
+            if saw_reviewed {
+                return Some(format!(
+                    "{} must not declare `deinit` in inventoried macOS sources",
+                    path.display()
+                ));
+            }
+            saw_reviewed = true;
+            continue;
+        }
+        return Some(format!(
+            "{} must not declare `deinit` in inventoried macOS sources",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// True only for the exact reviewed form `deinit { release() }` as a direct
+/// member of file-scope `class TokenBrokerSessionResourceBag` in
+/// `REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH`. Leading attributes
+/// or modifiers, parameters, body mutations, nested placement, and any other
+/// path or owner fail closed. Comment/string regions are already masked by the
+/// caller, so decoys cannot satisfy the match.
+fn is_exact_reviewed_token_broker_session_resource_bag_deinit(
+    path: &Path,
+    code: &str,
+    deinit_start: usize,
+) -> bool {
+    if path != Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH) {
+        return false;
+    }
+    if swift_declaration_has_attached_prefix(code, deinit_start) {
+        return false;
+    }
+    let after_keyword = skip_ascii_whitespace(code, deinit_start + "deinit".len());
+    if code.as_bytes().get(after_keyword) != Some(&b'{') {
+        return false;
+    }
+    let Some(body) = balanced_brace_body(code, after_keyword) else {
+        return false;
+    };
+    let declaration = &code[deinit_start..after_keyword + body.len()];
+    if rust_token_canonical(declaration) != REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT {
+        return false;
+    }
+    swift_is_direct_member_of_file_scope_class(
+        code,
+        deinit_start,
+        REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_CLASS,
+    )
+}
+
+/// True when a non-whitespace token other than a declaration boundary (`{`,
+/// `}`, or `;`) immediately precedes `start`. Rejects attributes and modifiers
+/// attached to a declaration while still accepting a type-member after `{` or
+/// a prior member's `}`/`;`.
+fn swift_declaration_has_attached_prefix(code: &str, start: usize) -> bool {
+    let mut index = start;
+    while index > 0 && is_rust_ascii_whitespace(code.as_bytes()[index - 1]) {
+        index -= 1;
+    }
+    if index == 0 {
+        return false;
+    }
+    !matches!(code.as_bytes()[index - 1], b'{' | b'}' | b';')
+}
+
+/// True when `member_start` is a direct member (brace depth 1) of a file-scope
+/// `class <class_name> { ... }` whose balanced body contains it. Nested types,
+/// function/property/closure bodies, and non-class owners fail closed.
+fn swift_is_direct_member_of_file_scope_class(
+    code: &str,
+    member_start: usize,
+    class_name: &str,
+) -> bool {
+    for (start, _) in code.match_indices("class") {
+        if !is_identifier_at(code, start, "class") {
+            continue;
+        }
+        // Nested `class` declarations are not the reviewed file-scope owner.
+        if swift_brace_depth_until(code, start) != 0 {
+            continue;
+        }
+        let name_start = skip_ascii_whitespace(code, start + "class".len());
+        let Some(name) = swift_type_declaration_name_at(code, name_start) else {
+            continue;
+        };
+        if name != class_name {
+            continue;
+        }
+        // Inheritance, generics, and where-clauses may appear between the name
+        // and the body brace; comments/strings are already masked to spaces.
+        let Some(brace_relative) = code[name_start..].find('{') else {
+            continue;
+        };
+        let brace = name_start + brace_relative;
+        let Some(body) = balanced_brace_body(code, brace) else {
+            continue;
+        };
+        let body_end = brace + body.len();
+        if member_start <= brace || member_start >= body_end - 1 {
+            continue;
+        }
+        // Direct member only: depth 1 means inside this class body and not
+        // nested inside any further `{ ... }` (method, nested type, closure).
+        if swift_brace_depth_between(code, brace, member_start) == 1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Brace nesting depth immediately before `until`, scanning from the start of
+/// `code`. Comment/string regions must already be masked.
+fn swift_brace_depth_until(code: &str, until: usize) -> usize {
+    swift_brace_depth_between(code, 0, until)
+}
+
+/// Brace nesting depth immediately before `until` after scanning `[from, until)`.
+/// `from` may point at an opening `{` (counted) so a type body's first member
+/// is depth 1.
+fn swift_brace_depth_between(code: &str, from: usize, until: usize) -> usize {
+    let until = until.min(code.len());
+    let from = from.min(until);
+    let mut depth = 0usize;
+    for byte in &code.as_bytes()[from..until] {
+        match *byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// Rejects every `protocol` declaration except the single reviewed closed NSXPC
@@ -8973,18 +9519,21 @@ mod tests {
     use super::{
         APPLE_BRIDGE_C_ABI_COUNT_MESSAGE, CANONICAL_TERSA_RUST_BRIDGE_HEADER,
         MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE, REVIEWED_TOKEN_BROKER_CLIENT_PROTOCOL_PATH,
-        ResolvedDependencyIdentity, TOKEN_BROKER_ALLOWED_SOURCE_PATHS,
+        REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH,
+        REVIEWED_TOKEN_BROKER_WIRE_STATUSES, ResolvedDependencyIdentity,
+        TOKEN_BROKER_ALLOWED_SOURCE_PATHS, TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
         apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
         bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
         check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
         cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
         expected_apple_c_abi_exports, expected_mailbox_sync_ffi_c_abi_exports,
-        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
-        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        is_dioxus_runtime_dependency, is_slint_runtime_dependency,
-        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        macos_client_xpc_wiring_violations, mailbox_sync_ffi_direct_dependency_set_violations,
+        expected_token_broker_ffi_c_abi_exports, future_macos_store_dependency_violation,
+        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
+        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
+        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
+        keychain_mutation_boundary_violations, macos_client_xpc_wiring_violations,
+        mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
@@ -8998,8 +9547,10 @@ mod tests {
         swift_bootstrap_inventory_violations, swift_bootstrap_source_violations,
         swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
         swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
-        target_metadata_options, token_broker_code_signing_requirement_violations,
-        token_broker_protocol_mirror_violations, token_broker_source_surface_violations,
+        target_metadata_options, token_broker_bridge_header_c_abi_violations,
+        token_broker_code_signing_requirement_violations,
+        token_broker_ffi_source_surface_violations, token_broker_protocol_mirror_violations,
+        token_broker_source_surface_violations, token_broker_wire_status_coherence_violations,
         tracked_apple_signing_inventory, tracked_project_generation_violations,
     };
 
@@ -10015,6 +10566,241 @@ pub extern "C" fn tersa_mailbox_macos_sync_poll(session_id: u64) -> i32 {}
             &expected_mailbox_sync_ffi_c_abi_exports(),
             MAILBOX_SYNC_FFI_C_ABI_COUNT_MESSAGE,
         )
+    }
+
+    fn reviewed_token_broker_ffi_export_source() -> &'static str {
+        r#"
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_begin_authorization(
+    redirect_uri: *const u8,
+    redirect_uri_len: usize,
+    authorization_url_out: *mut u8,
+    authorization_url_capacity: usize,
+    authorization_url_len: *mut usize,
+    session_handle_out: *mut u8,
+    session_handle_capacity: usize,
+    session_handle_len: *mut usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_complete_authorization(
+    session_handle: *const u8,
+    session_handle_len: usize,
+    callback_url: *const u8,
+    callback_url_len: usize,
+    access_token_out: *mut u8,
+    access_token_capacity: usize,
+    access_token_len: *mut usize,
+    subject_out: *mut u8,
+    subject_capacity: usize,
+    subject_len: *mut usize,
+    expires_out: *mut i64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_refresh_access_token(
+    account_subject: *const u8,
+    account_subject_len: usize,
+    access_token_out: *mut u8,
+    access_token_capacity: usize,
+    access_token_len: *mut usize,
+    subject_out: *mut u8,
+    subject_capacity: usize,
+    subject_len: *mut usize,
+    expires_out: *mut i64,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_revoke_provider_grant(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+"#
+    }
+
+    fn reviewed_token_broker_ffi_documents(lib: String) -> Vec<(PathBuf, String)> {
+        vec![(
+            PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs"),
+            lib,
+        )]
+    }
+
+    fn token_broker_ffi_export_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+        rust_exported_c_abi_violations(
+            sources,
+            &expected_token_broker_ffi_c_abi_exports(),
+            TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
+        )
+    }
+
+    #[test]
+    fn token_broker_ffi_export_inventory_pins_every_reviewed_signature() {
+        let lib = reviewed_token_broker_ffi_export_source();
+        assert!(
+            token_broker_ffi_export_violations(&reviewed_token_broker_ffi_documents(
+                lib.to_owned()
+            ))
+            .is_empty()
+        );
+
+        // Widening a parameter, changing the ABI, or renaming a symbol must trip.
+        for mutation in [
+            lib.replace("callback_url_len: usize", "callback_url_len: u32"),
+            lib.replacen("extern \"C\"", "extern \"system\"", 1),
+            lib.replace(
+                "tersa_token_broker_delete_stored_tokens",
+                "tersa_token_broker_delete_all_tokens",
+            ),
+        ] {
+            assert!(
+                !token_broker_ffi_export_violations(&reviewed_token_broker_ffi_documents(mutation))
+                    .is_empty(),
+                "token-broker FFI export name, set, and parameter widths must remain exact"
+            );
+        }
+
+        // A sixth export (refresh-token export) must fail closed.
+        let sixth = reviewed_token_broker_ffi_documents(format!(
+            "{lib}\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn tersa_token_broker_export_refresh_token(account_subject: *const u8, account_subject_len: usize) -> i32 {{}}"
+        ));
+        let violations = token_broker_ffi_export_violations(&sixth);
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("five reviewed begin, complete, refresh, revoke, and delete")),
+            "a sixth token-broker export must trip the reviewed-count message: {violations:?}"
+        );
+
+        // Missing one of the five must fail closed.
+        let missing = reviewed_token_broker_ffi_documents(lib.replace(
+            r#"#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tersa_token_broker_delete_stored_tokens(
+    account_subject: *const u8,
+    account_subject_len: usize,
+) -> i32 {}
+"#,
+            "",
+        ));
+        assert!(
+            !token_broker_ffi_export_violations(&missing).is_empty(),
+            "missing a reviewed token-broker export must fail closed"
+        );
+    }
+
+    #[test]
+    fn token_broker_ffi_source_inventory_and_header_pin_five_symbols() {
+        let manifest = "[package]\nname = \"tersa-token-broker-ffi-macos\"\n";
+        let clean = vec![
+            (
+                PathBuf::from("adapters/token-broker-ffi-macos/Cargo.toml"),
+                manifest.to_owned(),
+            ),
+            (
+                PathBuf::from("adapters/token-broker-ffi-macos/src/lib.rs"),
+                String::new(),
+            ),
+        ];
+        assert!(token_broker_ffi_source_surface_violations(&clean).is_empty());
+
+        let mut with_extra = clean.clone();
+        with_extra.push((
+            PathBuf::from("adapters/token-broker-ffi-macos/src/extra.rs"),
+            String::new(),
+        ));
+        assert!(
+            !token_broker_ffi_source_surface_violations(&with_extra).is_empty(),
+            "an unreviewed extra token-broker FFI source must fail closed"
+        );
+
+        let header = include_str!("../../apple/macos-token-broker/TersaTokenBrokerBridge.h");
+        assert!(
+            token_broker_bridge_header_c_abi_violations(header).is_empty(),
+            "reviewed bridge header must declare exactly the five C ABI symbols"
+        );
+
+        // Sixth header declaration fails closed.
+        let sixth_header = format!(
+            "{header}\nint32_t tersa_token_broker_export_refresh_token(const uint8_t *account_subject, size_t account_subject_len);\n"
+        );
+        let sixth_violations = token_broker_bridge_header_c_abi_violations(&sixth_header);
+        assert!(
+            sixth_violations.iter().any(|violation| {
+                violation.contains("tersa_token_broker_export_refresh_token")
+                    || violation.contains("exactly the five reviewed")
+            }),
+            "sixth header symbol must fail closed: {sixth_violations:?}"
+        );
+
+        // Missing/renamed header symbol fails closed.
+        let renamed = header.replace(
+            "tersa_token_broker_delete_stored_tokens",
+            "tersa_token_broker_delete_all_tokens",
+        );
+        assert!(
+            !token_broker_bridge_header_c_abi_violations(&renamed).is_empty(),
+            "renamed header symbol must fail closed"
+        );
+        let missing = header.replace(
+            "int32_t tersa_token_broker_delete_stored_tokens(\n    const uint8_t *account_subject,\n    size_t account_subject_len\n);\n",
+            "",
+        );
+        assert!(
+            !token_broker_bridge_header_c_abi_violations(&missing).is_empty(),
+            "missing header symbol must fail closed"
+        );
+    }
+
+    #[test]
+    fn token_broker_wire_status_coherence_pins_rust_and_swift() {
+        let rust = include_str!("../../adapters/token-broker-ffi-macos/src/lib.rs");
+        let service = include_str!("../../apple/macos-token-broker/TokenBrokerProtocol.swift");
+        let client = include_str!("../../apple/macos/TokenBrokerProtocol.swift");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, service, client).is_empty(),
+            "Rust STATUS_* and Swift status enums must match the reviewed 0..=19 set; got {:?}",
+            token_broker_wire_status_coherence_violations(rust, service, client)
+        );
+
+        // Renumber on the Rust side fails closed (not a self-comparison).
+        let rust_renumbered = rust.replace(
+            "const STATUS_IDENTITY_MISMATCH: i32 = 19;",
+            "const STATUS_IDENTITY_MISMATCH: i32 = 20;",
+        );
+        assert!(
+            token_broker_wire_status_coherence_violations(&rust_renumbered, service, client)
+                .iter()
+                .any(|violation| violation.contains("STATUS_*")),
+            "Rust status renumber must fail closed"
+        );
+
+        // Renumber on the Swift service side fails closed.
+        let service_renumbered =
+            service.replace("case identityMismatch = 19", "case identityMismatch = 20");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, &service_renumbered, client)
+                .iter()
+                .any(|violation| violation.contains("TersaTokenBrokerStatusV1")),
+            "service status renumber must fail closed"
+        );
+
+        // Renumber on the client mirror fails closed.
+        let client_renumbered =
+            client.replace("case identityMismatch = 19", "case identityMismatch = 20");
+        assert!(
+            token_broker_wire_status_coherence_violations(rust, service, &client_renumbered)
+                .iter()
+                .any(|violation| violation.contains("TokenBrokerStatus")),
+            "client status renumber must fail closed"
+        );
+
+        // Inventory table itself is exactly twenty closed pairs 0..=19.
+        assert_eq!(REVIEWED_TOKEN_BROKER_WIRE_STATUSES.len(), 20);
+        for (index, (name, value)) in REVIEWED_TOKEN_BROKER_WIRE_STATUSES.iter().enumerate() {
+            let expected = i64::try_from(index)
+                .expect("reviewed wire-status inventory index fits in i64 (table is length 20)");
+            assert_eq!(*value, expected, "{name}");
+        }
     }
 
     #[test]
@@ -13653,6 +14439,166 @@ protocol TersaMacTokenBrokerProtocolV1 {
                 .iter()
                 .any(|violation| violation.contains("must not declare `protocol`")),
             "multi-byte @objc pin boundary must fail closed without panicking"
+        );
+    }
+
+    fn exact_token_broker_session_resource_bag_deinit_fixture() -> &'static str {
+        "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    deinit { release() }
+}
+"
+    }
+
+    fn reviewed_token_broker_session_resource_bag_deinit_path() -> &'static Path {
+        Path::new(REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH)
+    }
+
+    fn assert_swift_source_has_no_lexical_violations(path: &Path, code: &str, message: &str) {
+        let violations = swift_source_lexical_violations(path, code);
+        assert!(violations.is_empty(), "{message}; got {violations:?}");
+    }
+
+    fn assert_swift_source_rejects_deinit(path: &Path, code: &str, message: &str) {
+        assert!(
+            swift_source_lexical_violations(path, code)
+                .iter()
+                .any(|violation| violation.contains("must not declare `deinit`")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_accepts_reviewed_source_and_exact_fixture() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        // Positive: the reviewed abandoned-session cleanup at the exact path,
+        // owner class, and body form is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            include_str!("../../apple/macos/TokenBrokerAuthorizationSession.swift"),
+            "reviewed TokenBrokerAuthorizationSession.swift must pass the lexical deinit guard",
+        );
+        // Positive fixture: the exact reviewed form on the exact owner is accepted.
+        assert_swift_source_has_no_lexical_violations(
+            path,
+            exact_token_broker_session_resource_bag_deinit_fixture(),
+            "exact TokenBrokerSessionResourceBag deinit {{ release() }} fixture must pass",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_wrong_path_and_owner() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: wrong path with the exact form fails closed.
+        assert_swift_source_rejects_deinit(
+            Path::new("apple/macos/TokenBrokerClient.swift"),
+            exact,
+            "deinit outside TokenBrokerAuthorizationSession.swift must fail closed",
+        );
+        // Negative: wrong owner class at the reviewed path fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class OtherSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    deinit { release() }
+}
+",
+            "deinit on a non-reviewed owner class must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_body_form_mutations() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: extra statement before release() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { _ = 0; release() }"),
+            "deinit with a statement before release() must fail closed",
+        );
+        // Negative: extra statement after release() fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { release(); _ = 1 }"),
+            "deinit with a statement after release() must fail closed",
+        );
+        // Negative: alternate call fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace("deinit { release() }", "deinit { self.release() }"),
+            "deinit with a different call than release() must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_rejects_second_decoy_laundering_and_nested() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        let exact = exact_token_broker_session_resource_bag_deinit_fixture();
+        // Negative: a second deinit fails closed even when both match the form.
+        assert_swift_source_rejects_deinit(
+            path,
+            &exact.replace(
+                "deinit { release() }",
+                "deinit { release() }\n    deinit { release() }",
+            ),
+            "a second deinit declaration must fail closed",
+        );
+        // Negative: comment/string decoys of the reviewed form must not satisfy
+        // the exception when the executable deinit is mutated.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    func release() {}
+    // deinit { release() }
+    let decoy = \"deinit { release() }\"
+    deinit { cancel() }
+}
+",
+            "comment/string deinit decoys must not satisfy the reviewed exception",
+        );
+        // Negative: the historical body-parse laundering fixture still fails.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    deinit { (NSApp.delegate as? AppDelegate)?.establishOwnedAccountProfile(Data(), completion: receive) }
+}
+",
+            "the old deinit body-parse laundering fixture must still fail closed",
+        );
+        // Negative: nested placement inside the reviewed class fails closed.
+        assert_swift_source_rejects_deinit(
+            path,
+            "\
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    final class Nested {
+        deinit { release() }
+    }
+    func release() {}
+}
+",
+            "deinit nested inside another type must fail closed",
+        );
+    }
+
+    #[test]
+    fn token_broker_session_resource_bag_deinit_keeps_subscript_unconditionally_forbidden() {
+        let path = reviewed_token_broker_session_resource_bag_deinit_path();
+        // subscript remains unconditionally forbidden alongside the deinit exception.
+        let with_subscript = format!(
+            "{}\nsubscript(index: Int) -> Int {{ index }}\n",
+            exact_token_broker_session_resource_bag_deinit_fixture()
+        );
+        assert!(
+            swift_source_lexical_violations(path, &with_subscript)
+                .iter()
+                .any(|violation| violation.contains("must not declare `subscript`")),
+            "subscript must remain unconditionally forbidden"
         );
     }
 

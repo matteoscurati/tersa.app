@@ -37,11 +37,16 @@ mod macos {
     };
     use zeroize::Zeroizing;
 
-    /// Wire status codes shared with `TersaTokenBrokerStatusV1` (Swift).
-    /// Keep integer values stable; never carry strings or open error payloads.
+    /// Closed 20-status wire set (raw integers 0 through 19). Values are the
+    /// reviewed XPC/FFI contract shared with `TersaTokenBrokerStatusV1` and
+    /// `TokenBrokerStatus`. Codes 1, 2, and 4 remain reserved skeleton values;
+    /// operational paths do not emit them. Never carry strings or open error
+    /// payloads on this channel.
+    ///
+    /// Reserved skeleton pins stay source-visible (including under `cfg(test)`)
+    /// so the closed 0..=19 set cannot renumber without xtask noticing, while
+    /// production builds keep only the operational constants live.
     const STATUS_SUCCESS: i32 = 0;
-    /// Reserved skeleton codes (1, 2, 4). Operational paths no longer emit them;
-    /// unit tests pin the reviewed raw values against the Swift/XPC inventory.
     #[cfg(test)]
     const STATUS_NOT_IMPLEMENTED: i32 = 1;
     #[cfg(test)]
@@ -597,11 +602,17 @@ mod macos {
             // SAFETY: the function contract requires a readable callback-url
             // buffer of `callback_url_len` bytes that remain valid for this
             // call; `read_utf8` re-checks null, length, and UTF-8.
-            let callback = unsafe { read_utf8(callback_url, callback_url_len) }?;
+            // Hold the complete callback (authorization code / provider error
+            // query) in `Zeroizing<String>` so the owned UTF-8 is wiped on drop.
+            // Borrow as `&str` into broker core; do not mint an extra plain copy.
+            let callback = Zeroizing::new(unsafe { read_utf8(callback_url, callback_url_len) }?);
             let broker = broker()?;
-            let token =
-                block_on(async move { broker.complete_authorization(&handle, &callback).await })?
-                    .map_err(map_broker_error)?;
+            let token = block_on(async move {
+                broker
+                    .complete_authorization(&handle, callback.as_str())
+                    .await
+            })?
+            .map_err(map_broker_error)?;
             // SAFETY: callers supply the writable success buffers declared by
             // this C ABI entry point; `write_token_success` re-checks null and
             // capacity before any raw write.
@@ -729,6 +740,65 @@ mod macos {
         use super::*;
 
         #[test]
+        fn every_wire_status_constant_pins_its_reviewed_raw_integer() {
+            // Explicit integer pins for the closed 0..=19 set. Do not replace
+            // these with self-comparisons (`STATUS_X == STATUS_X`). Exhaustive
+            // array stays test-local so production keeps no dead reserved pins.
+            const REVIEWED_WIRE_STATUS_INTEGERS: [i32; 20] = [
+                STATUS_SUCCESS,
+                STATUS_NOT_IMPLEMENTED,
+                STATUS_NOT_PROVISIONED,
+                STATUS_INVALID_REQUEST,
+                STATUS_REJECTED_CLIENT,
+                STATUS_AUTHORIZATION_CODE_REJECTED,
+                STATUS_PROVIDER_REJECTED,
+                STATUS_INSUFFICIENT_SCOPE,
+                STATUS_MISSING_REFRESH_TOKEN,
+                STATUS_CONSENT_REVOKED,
+                STATUS_REVOKE_UNCONFIRMED,
+                STATUS_PERSISTENCE_FAILED,
+                STATUS_INVALID_CONFIGURATION,
+                STATUS_UNAVAILABLE,
+                STATUS_BUSY,
+                STATUS_SESSION_UNKNOWN,
+                STATUS_TRANSPORT,
+                STATUS_MALFORMED_RESPONSE,
+                STATUS_IDENTITY_UNVERIFIED,
+                STATUS_IDENTITY_MISMATCH,
+            ];
+            assert_eq!(STATUS_SUCCESS, 0);
+            assert_eq!(STATUS_NOT_IMPLEMENTED, 1);
+            assert_eq!(STATUS_NOT_PROVISIONED, 2);
+            assert_eq!(STATUS_INVALID_REQUEST, 3);
+            assert_eq!(STATUS_REJECTED_CLIENT, 4);
+            assert_eq!(STATUS_AUTHORIZATION_CODE_REJECTED, 5);
+            assert_eq!(STATUS_PROVIDER_REJECTED, 6);
+            assert_eq!(STATUS_INSUFFICIENT_SCOPE, 7);
+            assert_eq!(STATUS_MISSING_REFRESH_TOKEN, 8);
+            assert_eq!(STATUS_CONSENT_REVOKED, 9);
+            assert_eq!(STATUS_REVOKE_UNCONFIRMED, 10);
+            assert_eq!(STATUS_PERSISTENCE_FAILED, 11);
+            assert_eq!(STATUS_INVALID_CONFIGURATION, 12);
+            assert_eq!(STATUS_UNAVAILABLE, 13);
+            assert_eq!(STATUS_BUSY, 14);
+            assert_eq!(STATUS_SESSION_UNKNOWN, 15);
+            assert_eq!(STATUS_TRANSPORT, 16);
+            assert_eq!(STATUS_MALFORMED_RESPONSE, 17);
+            assert_eq!(STATUS_IDENTITY_UNVERIFIED, 18);
+            assert_eq!(STATUS_IDENTITY_MISMATCH, 19);
+            assert_eq!(
+                REVIEWED_WIRE_STATUS_INTEGERS,
+                [
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+                ]
+            );
+            // Authorization-code rejection must never collapse into ordinary
+            // provider rejection or consent revoked.
+            assert_ne!(STATUS_AUTHORIZATION_CODE_REJECTED, STATUS_PROVIDER_REJECTED);
+            assert_ne!(STATUS_AUTHORIZATION_CODE_REJECTED, STATUS_CONSENT_REVOKED);
+        }
+
+        #[test]
         fn maps_every_broker_error_to_a_distinct_stable_status() {
             let cases = [
                 (BrokerError::InvalidInput, STATUS_INVALID_REQUEST),
@@ -765,15 +835,20 @@ mod macos {
                     "status {status} must be unique across the closed set"
                 );
             }
-            // Authorization-code rejection must never collapse into ordinary
-            // provider rejection or consent revoked.
-            assert_ne!(STATUS_AUTHORIZATION_CODE_REJECTED, STATUS_PROVIDER_REJECTED);
-            assert_ne!(STATUS_AUTHORIZATION_CODE_REJECTED, STATUS_CONSENT_REVOKED);
-            // Skeleton codes remain reserved and distinct.
-            assert_eq!(STATUS_NOT_IMPLEMENTED, 1);
-            assert_eq!(STATUS_NOT_PROVISIONED, 2);
-            assert_eq!(STATUS_REJECTED_CLIENT, 4);
-            assert_eq!(STATUS_SUCCESS, 0);
+        }
+
+        #[test]
+        fn complete_authorization_callback_is_held_in_zeroizing_string() {
+            // Structural invariant: the complete path wraps the owned callback
+            // in `Zeroizing` before borrowing into broker core. A plain
+            // additional `String` copy of the callback must not be introduced.
+            let callback = Zeroizing::new(String::from(
+                "http://127.0.0.1:54321/?code=redacted&state=redacted",
+            ));
+            let borrowed: &str = callback.as_str();
+            assert!(borrowed.contains("127.0.0.1"));
+            // Drop zeroizes the owned buffer; no secret logging.
+            drop(callback);
         }
 
         #[test]

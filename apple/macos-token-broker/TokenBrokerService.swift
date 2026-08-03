@@ -190,6 +190,12 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
         reply: @escaping @Sendable (String?, String?, Int, Int) -> Void
     ) {
         Self.workQueue.async {
+            // Mutable copy so the complete path can zero the callback/code
+            // bytes after the FFI call. Refresh passes an empty secondary and
+            // does not need that wipe. Immutable Swift `String` values received
+            // over XPC cannot be zeroized; this UTF-8 buffer is the
+            // secret-bearing copy this process owns for the FFI call.
+            var secondaryBytes = secondary
             var accessTokenBytes = [UInt8](repeating: 0, count: Self.maxAccessTokenBytes)
             var accessTokenLength = 0
             var subjectBytes = [UInt8](repeating: 0, count: Self.maxSubjectBytes)
@@ -202,13 +208,18 @@ final class TokenBrokerService: NSObject, TersaMacTokenBrokerProtocolV1 {
                 subjectBytes.withUnsafeMutableBufferPointer { buffer in
                     buffer.initialize(repeating: 0)
                 }
+                if isComplete {
+                    secondaryBytes.withUnsafeMutableBufferPointer { buffer in
+                        buffer.initialize(repeating: 0)
+                    }
+                }
             }
 
             let status: Int32 = subjectOrHandle.withUnsafeBufferPointer { primaryBuffer in
                 accessTokenBytes.withUnsafeMutableBufferPointer { tokenBuffer in
                     subjectBytes.withUnsafeMutableBufferPointer { subjectBuffer in
                         if isComplete {
-                            return secondary.withUnsafeBufferPointer { callbackBuffer in
+                            return secondaryBytes.withUnsafeBufferPointer { callbackBuffer in
                                 tersa_token_broker_complete_authorization(
                                     primaryBuffer.baseAddress,
                                     primaryBuffer.count,

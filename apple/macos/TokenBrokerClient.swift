@@ -33,10 +33,12 @@ enum TokenBrokerClientError: Error, Equatable, Sendable {
 /// Fail-closed on interruption or invalidation. Each completion fires exactly
 /// once. Success reply shapes are validated and bounded before delivery.
 ///
-/// Lifecycle ownership is explicit: there is no `deinit` invalidation. The
-/// owner (for example `TokenBrokerAuthorizationSession.finish`) must call
-/// `cancel()` on every terminal path. Dropping the client without `cancel()`
-/// leaves the XPC connection live until process exit.
+/// Lifecycle ownership is explicit on the client itself: there is no client
+/// `deinit` invalidation. Owners must call `cancel()` on every terminal path.
+/// `TokenBrokerAuthorizationSession` releases its owned client from both
+/// `finish()` and the session resource bag's `deinit` so an abandoned session
+/// still tears the XPC connection down. Dropping a bare client without
+/// `cancel()` leaves the XPC connection live until process exit.
 final class TokenBrokerClient: @unchecked Sendable {
     static let serviceBundleIdentifier = "app.tersa.mac.token-broker"
 

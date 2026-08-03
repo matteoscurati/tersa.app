@@ -28,6 +28,75 @@ enum TokenBrokerLoopbackReceiveDecision: Equatable, Sendable {
     case rejectConnection
 }
 
+/// Holds cancelable loopback/XPC resources for MainActor-safe abandoned cleanup.
+///
+/// `TokenBrokerAuthorizationSession` is `@MainActor`; `deinit` is not. This bag
+/// is `@unchecked Sendable` and cancels its timer, listener, and XPC client from
+/// `release()` / `deinit` so an abandoned session still tears those endpoints
+/// down without actor-isolated access from `deinit`. `release()` is idempotent
+/// and preserves exactly-once session completion (completion stays in `finish`).
+final class TokenBrokerSessionResourceBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var client: TokenBrokerClient?
+    private var listener: NWListener?
+    private var timer: Timer?
+
+    func install(client: TokenBrokerClient, listener: NWListener) {
+        lock.lock()
+        self.client = client
+        self.listener = listener
+        lock.unlock()
+    }
+
+    func storeTimer(_ timer: Timer) {
+        lock.lock()
+        self.timer?.invalidate()
+        self.timer = timer
+        lock.unlock()
+    }
+
+    func borrowClient() -> TokenBrokerClient? {
+        lock.lock()
+        defer { lock.unlock() }
+        return client
+    }
+
+    /// Cancels timer, loopback listener, and XPC client. Idempotent.
+    func release() {
+        lock.lock()
+        let pendingTimer = timer
+        let pendingListener = listener
+        let pendingClient = client
+        timer = nil
+        listener = nil
+        client = nil
+        lock.unlock()
+        pendingTimer?.invalidate()
+        pendingListener?.cancel()
+        pendingClient?.cancel()
+    }
+
+    /// Testable idempotent release of optional cancel closures (no live XPC/NW).
+    ///
+    /// Models the bag's clear-then-cancel order: a second call is a no-op
+    /// because the closures are nilled before invocation.
+    nonisolated static func releaseCancelClosures(
+        clientCancel: inout (() -> Void)?,
+        listenerCancel: inout (() -> Void)?
+    ) {
+        let client = clientCancel
+        let listener = listenerCancel
+        clientCancel = nil
+        listenerCancel = nil
+        client?()
+        listener?()
+    }
+
+    deinit {
+        release()
+    }
+}
+
 /// Broker-backed OAuth authorization session owned by the main app.
 ///
 /// The main app binds an IPv4 ephemeral loopback listener, asks the broker to
@@ -51,20 +120,23 @@ final class TokenBrokerAuthorizationSession {
     /// TTL). Prevents stray connections from keeping the flow alive forever.
     nonisolated static let sessionTimeout: TimeInterval = 600
 
-    private var client: TokenBrokerClient?
-    private var listener: NWListener?
+    private let resources = TokenBrokerSessionResourceBag()
     private var sessionHandle: String?
+    /// Exact IPv4 loopback port bound for this session. Host headers must match
+    /// `127.0.0.1:<boundLoopbackPort>` exactly; any other nonprivileged port is
+    /// treated as a stray peer and must not burn the session latch.
+    private var boundLoopbackPort: UInt16?
     private var onOutcome: (@MainActor (TokenBrokerAuthorizationOutcome) -> Void)?
     private var isFinished = false
     /// True after the first `.ready` has been accepted so a repeated ready
     /// notification cannot start a second broker begin.
     private var hasAcceptedListenerReady = false
-    /// Single-shot latch: only the first parseable callback may call complete.
-    /// Concurrent or second connections cannot double-complete the session.
+    /// Single-shot latch: only the first provider-outcome callback may call
+    /// complete. Concurrent or second connections cannot double-complete the
+    /// session. Stray parseable peers must never claim this latch.
     private var hasForwardedCallback = false
     /// Count of accepted TCP connections processed this session.
     private var acceptedConnectionCount = 0
-    private var sessionDeadlineTimer: Timer?
     private let listenerQueue = DispatchQueue(
         label: "app.tersa.macos.token-broker.loopback"
     )
@@ -77,7 +149,7 @@ final class TokenBrokerAuthorizationSession {
     func start(
         onOutcome: @escaping @MainActor (TokenBrokerAuthorizationOutcome) -> Void
     ) -> Bool {
-        guard client == nil, !isFinished else {
+        guard resources.borrowClient() == nil, !isFinished else {
             return false
         }
 
@@ -91,11 +163,11 @@ final class TokenBrokerAuthorizationSession {
         }
 
         self.onOutcome = onOutcome
-        self.listener = listener
         let client = TokenBrokerClient()
-        self.client = client
+        resources.install(client: client, listener: listener)
         acceptedConnectionCount = 0
         hasForwardedCallback = false
+        boundLoopbackPort = nil
         armSessionDeadline()
 
         listener.stateUpdateHandler = { [weak self] state in
@@ -131,8 +203,7 @@ final class TokenBrokerAuthorizationSession {
     }
 
     private func armSessionDeadline() {
-        sessionDeadlineTimer?.invalidate()
-        sessionDeadlineTimer = Timer.scheduledTimer(
+        let timer = Timer.scheduledTimer(
             withTimeInterval: Self.sessionTimeout,
             repeats: false
         ) { [weak self] _ in
@@ -140,6 +211,7 @@ final class TokenBrokerAuthorizationSession {
                 self?.handleSessionDeadline()
             }
         }
+        resources.storeTimer(timer)
     }
 
     private func handleSessionDeadline() {
@@ -165,6 +237,9 @@ final class TokenBrokerAuthorizationSession {
             failPreflight(recovery: .unavailable)
             return
         }
+        // Capture the actual bound port: Host headers and redirect must match
+        // this exact port, not merely any nonprivileged loopback port.
+        boundLoopbackPort = port.rawValue
 
         // Inventory forbids string interpolation; keep the exact root redirect
         // shape `http://127.0.0.1:<port>/` via concatenation.
@@ -249,8 +324,13 @@ final class TokenBrokerAuthorizationSession {
                     connection.cancel()
                 case .ready(let request):
                     connection.cancel()
-                    guard let callbackURL = Self.callbackURL(from: request) else {
-                        // Unparseable request: keep the session alive.
+                    guard let boundPort = self.boundLoopbackPort,
+                          let callbackURL = Self.callbackURL(
+                            from: request,
+                            boundPort: boundPort
+                          )
+                    else {
+                        // Stray or non-outcome request: keep the session alive.
                         return
                     }
                     guard Self.claimForwardedCallback(
@@ -269,7 +349,7 @@ final class TokenBrokerAuthorizationSession {
     }
 
     private func complete(sessionHandle: String, callbackURL: String) {
-        guard let client, !isFinished else {
+        guard let client = resources.borrowClient(), !isFinished else {
             return
         }
         client.completeAuthorizationSession(
@@ -317,15 +397,12 @@ final class TokenBrokerAuthorizationSession {
         isFinished = true
         hasAcceptedListenerReady = true
         hasForwardedCallback = true
-        sessionDeadlineTimer?.invalidate()
-        sessionDeadlineTimer = nil
+        boundLoopbackPort = nil
         let callback = onOutcome
         onOutcome = nil
-        listener?.cancel()
-        listener = nil
         sessionHandle = nil
-        client?.cancel()
-        client = nil
+        // Release listener + XPC client (and timer) before delivering outcome.
+        resources.release()
         callback?(outcome)
     }
 
@@ -333,7 +410,8 @@ final class TokenBrokerAuthorizationSession {
     ///
     /// Returns `true` only when the session is still live and no prior
     /// connection has already claimed the latch. Concurrent or second
-    /// connections observe `false` and must not call `complete`.
+    /// connections observe `false` and must not call `complete`. Callers must
+    /// only claim after the request is a bound-port provider outcome.
     nonisolated static func claimForwardedCallback(
         isFinished: Bool,
         hasForwardedCallback: inout Bool
@@ -394,34 +472,49 @@ final class TokenBrokerAuthorizationSession {
     }
 
     /// True when the buffer contains the HTTP header terminator CRLFCRLF.
+    ///
+    /// Scans with `withUnsafeBytes` so `Data` slices with a non-zero
+    /// `startIndex` and arbitrary storage are safe. The last legal window
+    /// start is `count - 4` so a buffer ending `CR LF CR` cannot read past
+    /// the end (the prior `count - 3` end allowed `index + 3 == count`).
     nonisolated static func requestHeadersAreComplete(_ buffer: Data) -> Bool {
         guard buffer.count >= 4 else {
             return false
         }
-        let cr: UInt8 = 0x0d
-        let lf: UInt8 = 0x0a
-        var index = 0
-        let bytes = buffer
-        let end = bytes.count - 3
-        while index <= end {
-            if bytes[index] == cr,
-               bytes[index + 1] == lf,
-               bytes[index + 2] == cr,
-               bytes[index + 3] == lf
-            {
-                return true
+        return buffer.withUnsafeBytes { rawBuffer -> Bool in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            let count = bytes.count
+            guard count >= 4 else {
+                return false
             }
-            index += 1
+            let cr: UInt8 = 0x0d
+            let lf: UInt8 = 0x0a
+            // Inclusive last start index for a four-byte window.
+            let lastStart = count - 4
+            var index = 0
+            while index <= lastStart {
+                if bytes[index] == cr,
+                   bytes[index + 1] == lf,
+                   bytes[index + 2] == cr,
+                   bytes[index + 3] == lf
+                {
+                    return true
+                }
+                index += 1
+            }
+            return false
         }
-        return false
     }
 
-    /// Parses a minimal HTTP request line into the exact callback URL the
-    /// loopback peer requested. Rejects oversized or malformed requests.
+    /// Parses a minimal HTTP request into the exact callback URL only when the
+    /// Host matches the bound loopback port and the target represents a
+    /// provider outcome (`code` XOR `error`). Stray peers return `nil` so the
+    /// session latch stays unclaimed.
     ///
     /// The returned string is the exact request target under the loopback host.
     /// Callers must not log it: the query can carry an authorization code.
-    nonisolated static func callbackURL(from request: Data) -> String? {
+    /// State validation remains broker-side.
+    nonisolated static func callbackURL(from request: Data, boundPort: UInt16) -> String? {
         guard request.count <= maxRequestBytes,
               let text = String(data: request, encoding: .utf8)
         else {
@@ -442,7 +535,10 @@ final class TokenBrokerAuthorizationSession {
             return nil
         }
         let host = hostHeader.dropFirst(5).trimmingCharacters(in: .whitespaces)
-        guard isExactLoopbackHostHeader(host) else {
+        guard isExactLoopbackHostHeader(host, boundPort: boundPort) else {
+            return nil
+        }
+        guard representsProviderCallbackOutcome(target: target) else {
             return nil
         }
         // Inventory forbids string interpolation; forward the exact validated
@@ -450,33 +546,119 @@ final class TokenBrokerAuthorizationSession {
         return "http://" + host + target
     }
 
-    /// Accepts only the literal IPv4 loopback host with an explicit decimal
-    /// port that matches the listener/callback contract (`127.0.0.1:<port>`,
-    /// port in `1024...65535`, no leading zeros, no suffix).
+    /// True when the HTTP request-target is a root-path provider outcome
+    /// compatible with the broker core's eventual callback validation:
+    /// unique query parameters, no fragment, and exactly one of a non-empty
+    /// authorization `code` or a provider `error` (never both, never neither).
     ///
-    /// Prefix checks are intentionally rejected: `127.0.0.1.attacker` and
-    /// `127.0.0.1:54321.evil` must not pass.
-    nonisolated static func isExactLoopbackHostHeader(_ host: String) -> Bool {
-        let prefix = "127.0.0.1:"
-        guard host.hasPrefix(prefix) else {
+    /// Bare `/`, irrelevant queries, duplicates, conflicts, and malformed
+    /// encodings return `false` so the peer is dropped without claiming the
+    /// session latch. Does not log the target or code.
+    nonisolated static func representsProviderCallbackOutcome(target: String) -> Bool {
+        // Fragments never appear on a well-formed OAuth loopback target; reject
+        // them before any query work so the broker session cannot be burned by
+        // a fragment-bearing peer.
+        guard !target.contains("#") else {
             return false
         }
-        let portText = String(host.dropFirst(prefix.count))
-        guard !portText.isEmpty,
-              portText.utf8.allSatisfy({ byte in
-                  byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9")
-              }),
-              let port = UInt16(portText),
-              isAcceptedLoopbackPort(port),
-              String(port) == portText
-        else {
+        guard target == "/" || target.hasPrefix("/?") else {
             return false
         }
-        return true
+        if target == "/" {
+            return false
+        }
+        let query = String(target.dropFirst(2))
+        guard !query.isEmpty else {
+            return false
+        }
+        // Malformed percent-encoding must fail closed before any outcome claim.
+        guard percentEncodingIsWellFormed(query) else {
+            return false
+        }
+        // Parse via URLComponents so percent-decoding matches Foundation URL
+        // behavior used elsewhere.
+        var components = URLComponents()
+        components.percentEncodedQuery = query
+        guard let items = components.queryItems, !items.isEmpty else {
+            return false
+        }
+        var seenNames = Set<String>()
+        var codeValue: String?
+        var sawError = false
+        for item in items {
+            // Empty parameter names are not a provider outcome.
+            guard !item.name.isEmpty else {
+                return false
+            }
+            guard seenNames.insert(item.name).inserted else {
+                // Duplicate parameter name: core would reject as
+                // DuplicateParameter and consume the session — drop the peer.
+                return false
+            }
+            if item.name == "code" {
+                codeValue = item.value ?? ""
+            } else if item.name == "error" {
+                sawError = true
+            }
+        }
+        switch (codeValue, sawError) {
+        case (let code?, false):
+            // Non-empty authorization code without a provider error.
+            return !code.isEmpty
+        case (nil, true):
+            // Provider error outcome (value may be empty; core still maps it).
+            return true
+        default:
+            // Both present (conflict), neither present, or empty code alone.
+            return false
+        }
+    }
+
+    /// Accepts only the literal IPv4 loopback host with the session's exact
+    /// bound port (`127.0.0.1:<boundPort>`). Prefix/suffix lookalikes and any
+    /// other port — including other nonprivileged ports — are rejected.
+    nonisolated static func isExactLoopbackHostHeader(
+        _ host: String,
+        boundPort: UInt16
+    ) -> Bool {
+        let expected = "127.0.0.1:" + String(boundPort)
+        return host == expected
     }
 
     /// Ephemeral loopback ports only; matches the listener ready-path gate.
     nonisolated static func isAcceptedLoopbackPort(_ port: UInt16) -> Bool {
         port >= 1024
+    }
+
+    /// True when every `%` in `text` is followed by two hexadecimal digits.
+    nonisolated static func percentEncodingIsWellFormed(_ text: String) -> Bool {
+        var index = text.startIndex
+        while index < text.endIndex {
+            if text[index] == "%" {
+                let first = text.index(after: index)
+                guard first < text.endIndex else {
+                    return false
+                }
+                let second = text.index(after: first)
+                guard second < text.endIndex else {
+                    return false
+                }
+                let firstByte = text[first].utf8.first ?? 0
+                let secondByte = text[second].utf8.first ?? 0
+                guard isHexDigit(firstByte), isHexDigit(secondByte) else {
+                    return false
+                }
+                index = text.index(after: second)
+            } else {
+                index = text.index(after: index)
+            }
+        }
+        return true
+    }
+
+    nonisolated private static func isHexDigit(_ byte: UInt8) -> Bool {
+        (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+            || (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "F"))
+            || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
     }
 }
