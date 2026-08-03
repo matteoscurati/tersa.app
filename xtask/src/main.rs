@@ -3082,13 +3082,48 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     let code = strip_swift_non_code(document);
     let mut violations = Vec::new();
 
-    let authorize = swift_function_bodies(&code, "authorizeAndConnect");
-    let [authorize] = authorize.as_slice() else {
+    let Some(authorize) = swift_single_function_body(&code, "authorizeAndConnect") else {
         return vec![
             "AccountConnectionViewModel must contain exactly one authorizeAndConnect function"
                 .to_owned(),
         ];
     };
+    violations.extend(swift_oauth_authorize_entry_violations(authorize));
+
+    let Some(activation) =
+        swift_single_function_body(&code, "connectBrokerGrantAfterApplicationActivation")
+    else {
+        violations.push(
+            "AccountConnectionViewModel must contain exactly one connectBrokerGrantAfterApplicationActivation function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    violations.extend(swift_oauth_activation_handoff_violations(activation));
+
+    let Some(finish) = swift_single_function_body(&code, "finishBrokerGrantApplicationActivation")
+    else {
+        violations.push(
+            "AccountConnectionViewModel must contain exactly one finishBrokerGrantApplicationActivation function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    violations.extend(swift_oauth_finish_persist_violations(finish));
+
+    violations.extend(swift_oauth_sole_connect_caller_violations(&code));
+    violations
+}
+
+fn swift_single_function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let bodies = swift_function_bodies(code, name);
+    let [body] = bodies.as_slice() else {
+        return None;
+    };
+    Some(body)
+}
+
+fn swift_oauth_authorize_entry_violations(authorize: &str) -> Vec<String> {
     if !authorize.contains("connectBrokerGrantAfterApplicationActivation(")
         || [
             "finishBrokerGrantApplicationActivation(",
@@ -3099,20 +3134,16 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
         .iter()
         .any(|forbidden| authorize.contains(forbidden))
     {
-        violations.push(
+        return vec![
             "a successful OAuth outcome must enter the application-activation handoff, never connect directly"
                 .to_owned(),
-        );
+        ];
     }
+    Vec::new()
+}
 
-    let activation = swift_function_bodies(&code, "connectBrokerGrantAfterApplicationActivation");
-    let [activation] = activation.as_slice() else {
-        violations.push(
-            "AccountConnectionViewModel must contain exactly one connectBrokerGrantAfterApplicationActivation function"
-                .to_owned(),
-        );
-        return violations;
-    };
+fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
+    let mut violations = Vec::new();
     for required in [
         "NSApplication.didBecomeActiveNotification",
         "NSApp.activate()",
@@ -3145,15 +3176,10 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
             "the OAuth activation observer must be installed before NSApp.activate()".to_owned(),
         );
     }
+    violations
+}
 
-    let finish = swift_function_bodies(&code, "finishBrokerGrantApplicationActivation");
-    let [finish] = finish.as_slice() else {
-        violations.push(
-            "AccountConnectionViewModel must contain exactly one finishBrokerGrantApplicationActivation function"
-                .to_owned(),
-        );
-        return violations;
-    };
+fn swift_oauth_finish_persist_violations(finish: &str) -> Vec<String> {
     let clear_position = finish.find("clearApplicationActivation()");
     let store_position = finish.find("syncWorker.storeBrokerSubject(");
     let connect_position = finish.find("connectWithBrokerGrant(");
@@ -3163,20 +3189,23 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
             (Some(clear), Some(store), Some(connect)) if clear < store && store < connect
         )
     {
-        violations.push(
+        return vec![
             "the activation completion must clear its one-shot state before persisting the broker subject and connect only from the subject-store completion"
                 .to_owned(),
-        );
+        ];
     }
+    Vec::new()
+}
 
-    let connect_callers = swift_function_names_with(&code, "connectWithBrokerGrant(");
+fn swift_oauth_sole_connect_caller_violations(code: &str) -> Vec<String> {
+    let connect_callers = swift_function_names_with(code, "connectWithBrokerGrant(");
     if connect_callers != ["finishBrokerGrantApplicationActivation".to_owned()] {
-        violations.push(
+        return vec![
             "finishBrokerGrantApplicationActivation must be the sole caller of connectWithBrokerGrant"
                 .to_owned(),
-        );
+        ];
     }
-    violations
+    Vec::new()
 }
 
 fn swift_bootstrap_source_inventory(
@@ -12091,7 +12120,20 @@ func connectWithBrokerGrant(
 
     #[test]
     fn swift_oauth_foreground_handoff_rejects_unreviewed_handoff_paths() {
-        let valid = r"
+        let valid = valid_oauth_handoff_view_model();
+        let drifts = [
+            authorize_handoff_bypass_mutations(valid),
+            activation_handoff_mutations(valid),
+            finish_handoff_mutations(valid),
+        ]
+        .concat();
+        for drift in drifts {
+            assert_oauth_handoff_drift_rejected(drift);
+        }
+    }
+
+    fn valid_oauth_handoff_view_model() -> &'static str {
+        r"
 func authorizeAndConnect(accountIdentifier: Data) {
     connectBrokerGrantAfterApplicationActivation(
         accountIdentifier: accountIdentifier,
@@ -12151,11 +12193,28 @@ func connectWithBrokerGrant(
     brokerToken: TokenBrokerAccessToken,
     token: ConnectionOperationToken
 ) {}
-";
-        let direct_connect = valid.replace(
+"
+    }
+
+    fn assert_oauth_handoff_drift_rejected(drift: String) {
+        let sources = vec![(
+            PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+            drift,
+        )];
+        assert!(
+            !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+            "a background-capable OAuth handoff must fail closed"
+        );
+    }
+
+    fn authorize_handoff_bypass_mutations(valid: &str) -> Vec<String> {
+        vec![valid.replace(
             "    connectBrokerGrantAfterApplicationActivation(\n        accountIdentifier: accountIdentifier,\n        brokerToken: brokerToken,\n        token: token\n    )",
             "    connectWithBrokerGrant(\n        accountIdentifier: accountIdentifier,\n        brokerToken: brokerToken,\n        token: token\n    )",
-        );
+        )]
+    }
+
+    fn activation_handoff_mutations(valid: &str) -> Vec<String> {
         let late_observer = valid.replace(
             "    activationObserver = NotificationCenter.default.addObserver(\n",
             "    NSApp.activate()\n    activationObserver = NotificationCenter.default.addObserver(\n",
@@ -12198,6 +12257,15 @@ func connectWithBrokerGrant(
 ",
             "",
         );
+        vec![
+            late_observer,
+            background_delivery,
+            duplicate_activation,
+            missing_activation,
+        ]
+    }
+
+    fn finish_handoff_mutations(valid: &str) -> Vec<String> {
         let missing_finish = valid.replace(
             r"func finishBrokerGrantApplicationActivation(
     accountIdentifier: Data,
@@ -12224,24 +12292,7 @@ func connectWithBrokerGrant(
             "    clearApplicationActivation()\n    syncWorker.storeBrokerSubject(\n        accountIdentifier: accountIdentifier,\n        subject: brokerToken.subject\n    ) { persisted in\n        connectWithBrokerGrant(",
             "    syncWorker.storeBrokerSubject(\n        accountIdentifier: accountIdentifier,\n        subject: brokerToken.subject\n    ) { persisted in\n        clearApplicationActivation()\n        connectWithBrokerGrant(",
         );
-        for drift in [
-            direct_connect,
-            late_observer,
-            background_delivery,
-            duplicate_activation,
-            missing_activation,
-            missing_finish,
-            reordered_activation,
-        ] {
-            let sources = vec![(
-                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
-                drift,
-            )];
-            assert!(
-                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
-                "a background-capable OAuth handoff must fail closed"
-            );
-        }
+        vec![missing_finish, reordered_activation]
     }
 
     #[test]
