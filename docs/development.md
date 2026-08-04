@@ -21,23 +21,25 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
-Run the M0 product-gate validator separately before that Rust-only command:
+The xtask architecture check is the enforcement point for direct and transitive
+diagnostic-only Slint and Dioxus dependency isolation on every supported Apple
+target; `cargo deny` alone cannot establish that runtime boundary.
+
+While the frozen M0 gate register remains tracked, keep the product-gate
+validator and its self-test available:
 
 ```sh
 python3 scripts/verify-m0-gates.py
 python3 scripts/verify-m0-gates.py --self-test
 ```
 
-CI runs the validator in its policy job. It remains separate from
-`cargo xtask verify` because the register is a documentation-policy artifact.
-The xtask architecture check is the enforcement point for direct and transitive
-diagnostic-only Slint and Dioxus dependency isolation on every supported Apple
-target; `cargo deny` alone cannot establish that runtime boundary.
-
-The validator self-test is mandatory in CI. Adding a gate, changing a minimum
-evidence tier, or changing the attestation schema requires a matching validator
-update and independent exact-head review; editing the JSON alone fails closed.
-For physical-device or signed-distribution evidence, follow the
+CI runs that cheap self-test in the lightweight change-scope job. The validator
+is not an active product lane; it stays only while the register is still in
+tree and retires with that register in the documentation PR. Adding a gate,
+changing a minimum evidence tier, or changing the attestation schema still
+requires a matching validator update and independent exact-head review; editing
+the JSON alone fails closed. For physical-device or signed-distribution
+evidence, follow the
 [physical-device and distribution protocol](m0/physical-device-and-distribution-protocol.md),
 including its commit-bound locator and review-retention rules.
 
@@ -45,39 +47,35 @@ including its commit-bound locator and review-retention rules.
 
 Open implementation pull requests as drafts. Draft creation and synchronization
 schedule no CI runners; changing the pull request to ready-for-review triggers
-the required path-scoped lane. Subsequent ready pull-request commits supersede
-an older in-progress run through the per-PR concurrency group. Every ready pull
-request runs only the lightweight classifier, its deterministic control-script
-tests, DCO validation, and the final gate. Documentation, workflow, and exact
-self-tested CI-control changes stop there, so their required run normally
+the required path-scoped product CI. Subsequent ready pull-request commits
+supersede an older in-progress run through the per-PR concurrency group. Every
+ready pull request runs the lightweight classifier job (deterministic
+control-script tests, retained-helper self-tests, DCO validation, and change
+scope), then only the path-scoped active lanes that apply, and finally the
+required `CI gate`. Documentation, workflow, and exact self-tested CI-control
+changes stop at the classifier and gate, so their required run normally
 finishes in seconds.
+
+The five path-scoped active lanes are:
+
+- Rust (Linux)
+- Rust (macOS)
+- Policy and supply chain
+- Apple product
+- Third-party notices
 
 Portable Rust or xtask changes add Linux Rust verification and supply-chain
 policy. macOS Rust verification is reserved for platform, adapter, Apple bridge,
-and macOS CLI paths. Apple product paths add the real macOS and iOS-simulator
-build; that build also covers the Rust linked into the application. Root
-manifests, shared build inputs, and unknown paths still fail closed to the full
-baseline. The Apple PR gate builds macOS and the iOS simulator once. Device
-builds, archives, and OAuth feasibility capture belong to explicit evidence
-runs, not the required PR path.
+and macOS CLI paths. Apple product paths add the real macOS test and
+iOS-simulator build; that build also covers the Rust linked into the
+application. Root manifests, shared build inputs, and unknown paths still fail
+closed to the full active baseline.
 
-Merging does not repeat the already-required checks on a `main` push. Merge
-queue runs retain the conservative fast gate. Diagnostic Slint, Dioxus,
-SQLCipher, search, MIME, fuzz, blob, and OAuth evidence runs only through an
-explicit `workflow_dispatch` selection. Use `all` at release or at an
-architecture evidence checkpoint, and select one suite while investigating a
-specific diagnostic. Successful manual evidence remains bound to the selected
-immutable commit and retains the unchanged 90-day protocol lifetime at maximum
-artifact compression. Evidence bind and upload steps are not scheduled after an
-earlier failure or after run cancellation has already begun. If cancellation
-occurs after an upload has started, GitHub Actions does not retroactively delete
-that artifact. GitHub Actions cache restore and save are disabled for every job
-and event, including manual evidence runs. Every run therefore starts without a
-repository cache and cannot recreate the deleted cache inventory. Manual runs
-publish
-`Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
-evidence selection cannot substitute for the real pull-request scope or DCO
-check.
+Merge-group runs fan out conservatively across every active product lane for the
+combined state. There is no `main` push workflow and no manual evidence-suite
+dispatch path. GitHub Actions cache restore and save are disabled for every job
+and event, so each run starts without a repository cache. CI uploads no
+diagnostic artifacts.
 
 The repository is public and uses only standard GitHub-hosted runners, so runner
 execution has no billable minute charge. The policy above still minimizes queue
@@ -86,27 +84,11 @@ time, redundant macOS capacity, and artifact growth.
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
 build paths fan out conservatively, while documentation, workflow, and exact
 self-tested control paths avoid build jobs. xtask-only changes run the portable
-Linux and policy baseline but avoid Apple evidence. The classifier and its own
-tests are an exact control-path allowlist exercised inside the scope job; every
-other unknown `scripts/` path still fans out. Its table-driven tests must change
-with every new scope rule. A single suite can be reproduced without running
-unrelated evidence:
-
-```sh
-gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus
-```
-
-Run the full retained evidence set for a release candidate with:
-
-```sh
-gh workflow run CI --ref <immutable-commit> -f evidence_suite=all
-```
-
-The supported suite names are `all`, `product`, `slint`, `dioxus`, `sqlcipher`,
-`search`, `mime`, `mime-fuzz`, `blob`, and `notices`. A dedicated macOS lane owns
-the single target-specific notice regeneration whenever the selected scope
-requires it; diagnostic jobs still compare the committed notice resources in
-their packaged products.
+Linux and policy baseline but avoid Apple product work. The classifier and its
+own tests are an exact control-path allowlist exercised inside the scope job;
+every other unknown `scripts/` path still fans out. Its table-driven tests must
+change with every new scope rule. A dedicated macOS lane owns the single
+target-specific notice regeneration whenever the selected scope requires it.
 
 ## Dependency changes
 

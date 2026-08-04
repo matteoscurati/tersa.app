@@ -11,7 +11,9 @@ import unittest
 
 
 SCRIPT = Path(__file__).with_name("ci-change-scope.py")
-WORKFLOW = SCRIPT.parent.parent / ".github" / "workflows" / "ci.yml"
+ROOT = SCRIPT.parent.parent
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+DEVELOPMENT_DOC = ROOT / "docs" / "development.md"
 SPEC = importlib.util.spec_from_file_location("ci_change_scope", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -32,6 +34,9 @@ RETIRED_SCOPE_NAMES = (
     "full_evidence",
     "run_full_evidence",
 )
+# Helper script names stay out of this list: the changes job intentionally
+# self-tests the transitional verify-m0-gates and write-evidence-manifest
+# helpers while their tracked consumers remain.
 RETIRED_WORKFLOW_TOKENS = (
     "workflow_dispatch",
     "evidence_suite",
@@ -40,8 +45,6 @@ RETIRED_WORKFLOW_TOKENS = (
     "manual_evidence_gate",
     "Manual evidence gate",
     "actions/upload-artifact@",
-    "write-evidence-manifest.py",
-    "verify-m0-gates.py",
     "ci-change-scope.py --full",
     "ci-change-scope.py --baseline",
     "slint-apple-evidence",
@@ -74,6 +77,12 @@ RETIRED_WORKFLOW_TOKENS = (
     "verify-mime-feasibility.sh",
     "verify-mime-fuzz.sh",
     "verify-blob-feasibility.sh",
+)
+RETIRED_DEVELOPMENT_DOC_TOKENS = (
+    "workflow_dispatch",
+    "evidence_suite",
+    "Manual evidence gate",
+    "gh workflow run CI",
 )
 
 
@@ -291,7 +300,15 @@ class ChangeScopeTests(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py",
             changes_job,
         )
+        self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
+        self.assertIn("python3 scripts/write-evidence-manifest.py --self-test", changes_job)
         self.assertNotIn("cargo run --locked --package xtask -- dco", workflow)
+
+    def test_development_doc_drops_retired_manual_ci_interface(self) -> None:
+        development = DEVELOPMENT_DOC.read_text(encoding="utf-8")
+        for token in RETIRED_DEVELOPMENT_DOC_TOKENS:
+            with self.subTest(token=token):
+                self.assertNotIn(token, development)
 
     def test_optional_baselines_remain_visible_to_the_required_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
