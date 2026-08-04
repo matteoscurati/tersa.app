@@ -4,39 +4,19 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
-  workflow_dispatch:
-    inputs:
-      evidence_suite:
-        description: Evidence suite to run
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - product
-          - slint
-          - dioxus
-          - sqlcipher
-          - search
-          - mime
-          - mime-fuzz
-          - blob
-          - notices
 
 permissions:
   contents: read
 
 concurrency:
-  # Supersede stale commits only within one pull request. Manual evidence runs
-  # use their unique run ID so an explicitly requested capture is never lost.
+  # Supersede stale commits only within one pull request. Merge-group runs keep
+  # their unique run ID so concurrent queue checks do not cancel each other.
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pull request jobs test a synthetic merge commit, but evidence records the immutable source head.
-  EVIDENCE_COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   changes:
@@ -48,15 +28,7 @@ jobs:
       rust_macos: ${{ steps.scope.outputs.rust_macos }}
       policy: ${{ steps.scope.outputs.policy }}
       product_apple: ${{ steps.scope.outputs.product_apple }}
-      slint: ${{ steps.scope.outputs.slint }}
-      dioxus: ${{ steps.scope.outputs.dioxus }}
-      sqlcipher: ${{ steps.scope.outputs.sqlcipher }}
-      search: ${{ steps.scope.outputs.search }}
-      mime: ${{ steps.scope.outputs.mime }}
-      mime_fuzz: ${{ steps.scope.outputs.mime_fuzz }}
-      blob: ${{ steps.scope.outputs.blob }}
       notices: ${{ steps.scope.outputs.notices }}
-      run_full_evidence: ${{ steps.scope.outputs.run_full_evidence }}
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -68,10 +40,6 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py
       - name: Test macOS performance report contract
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py
-      - name: Test policy control scripts
-        run: |
-          python3 scripts/verify-m0-gates.py --self-test
-          python3 scripts/write-evidence-manifest.py --self-test
       - name: Check pull request DCO sign-offs
         if: github.event_name == 'pull_request'
         run: >-
@@ -84,38 +52,13 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EVIDENCE_SUITE: ${{ inputs.evidence_suite }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            workflow_dispatch)
-              case "$EVIDENCE_SUITE" in
-                all)
-                  python3 scripts/ci-change-scope.py --full >> "$GITHUB_OUTPUT"
-                  echo "run_full_evidence=true" >> "$GITHUB_OUTPUT"
-                  ;;
-                product) scope_path='about-bridge.toml' ;;
-                slint) scope_path='about.toml' ;;
-                dioxus) scope_path='about-dioxus.toml' ;;
-                sqlcipher) scope_path='about-sqlcipher.toml' ;;
-                search) scope_path='about-search.toml' ;;
-                mime) scope_path='about-mime.toml' ;;
-                mime-fuzz) scope_path='fuzz/Cargo.lock' ;;
-                blob) scope_path='about-blob.toml' ;;
-                notices) scope_path='apple/licenses/rust-skia-notices.txt' ;;
-                *) echo "Unsupported evidence suite: $EVIDENCE_SUITE" >&2; exit 1 ;;
-              esac
-              if [ "$EVIDENCE_SUITE" != all ]; then
-                python3 scripts/ci-change-scope.py --baseline "$scope_path" >> "$GITHUB_OUTPUT"
-                echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
-              fi
-              ;;
             merge_group)
-              # The merge queue conservatively checks the product and notices
-              # for the combined state. Deep evidence remains an explicit,
-              # commit-selected workflow_dispatch operation.
-              python3 scripts/ci-change-scope.py --full >> "$GITHUB_OUTPUT"
-              echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
+              # The merge queue conservatively checks every active product lane
+              # for the combined state.
+              python3 scripts/ci-change-scope.py >> "$GITHUB_OUTPUT"
               ;;
             pull_request)
               # Diff from the merge base so a branch that is behind main reports
@@ -128,7 +71,6 @@ jobs:
               printf 'changed files:\n%s\n' "$files"
               printf '%s\n' "$files" | python3 scripts/ci-change-scope.py \
                 >> "$GITHUB_OUTPUT"
-              echo "run_full_evidence=false" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "Unsupported GitHub event: $EVENT_NAME" >&2
@@ -184,46 +126,11 @@ jobs:
           -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
           TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
           TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
-      - name: Build unsigned iOS device debug application
-        if: github.event_name == 'workflow_dispatch'
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
-          -configuration Debug -sdk iphoneos
-          -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
-      - name: Archive unsigned macOS debug application
-        if: github.event_name == 'workflow_dispatch'
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
-          -configuration Debug -destination 'generic/platform=macOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" archive
-          -archivePath apple/build/TersaMac.xcarchive
-      - name: Archive unsigned iOS debug application
-        if: github.event_name == 'workflow_dispatch'
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
-          -configuration Debug -sdk iphoneos
-          -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" archive
-          -archivePath apple/build/TersaIOS.xcarchive
       - name: Verify built Rust bridge symbols
         run: |
           nm -gU apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
             | grep -F '_tersa_apple_bridge_version'
           nm -gU apple/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
-            | grep -F '_tersa_apple_bridge_version'
-      - name: Verify archived Rust bridge symbols
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          nm -gU apple/build/TersaMac.xcarchive/Products/Applications/Tersa.app/Contents/MacOS/Tersa \
-            | grep -F '_tersa_apple_bridge_version'
-          nm -gU apple/build/TersaIOS.xcarchive/Products/Applications/Tersa.app/Tersa \
             | grep -F '_tersa_apple_bridge_version'
       - name: Verify macOS mailbox-sync FFI archive symbols
         run: |
@@ -342,432 +249,6 @@ jobs:
             -framework Security -framework Foundation \
             -o "$RUNNER_TEMP/ffi_probe"
           "$RUNNER_TEMP/ffi_probe"
-      - name: Verify OAuth PKCE and sandbox feasibility
-        if: github.event_name == 'workflow_dispatch'
-        run: sh apple/scripts/verify-oauth-feasibility.sh
-      - name: Bind OAuth feasibility evidence to the source commit
-        if: ${{ success() && github.event_name == 'workflow_dispatch' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/oauth-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload OAuth feasibility evidence
-        if: ${{ success() && github.event_name == 'workflow_dispatch' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: oauth-pkce-feasibility-evidence
-          path: apple/build/oauth-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-  slint-apple-evidence:
-    name: Slint Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'slint' }}
-    runs-on: macos-26
-    timeout-minutes: 30
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install XcodeGen 2.45.4
-        env:
-          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
-        run: |
-          curl --fail --location --retry 3 \
-            --output "$RUNNER_TEMP/xcodegen.zip" \
-            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
-          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
-          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
-      - name: Generate Apple project
-        run: sh apple/scripts/generate-project.sh
-      - name: Build and archive unsigned macOS Slint spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac
-          -configuration Release -destination 'generic/platform=macOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaSlintMac.xcarchive
-      - name: Build unsigned iOS simulator Slint spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
-          -configuration Debug -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-      - name: Archive unsigned iOS Slint spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS
-          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaSlintIOS.xcarchive
-      - name: Verify and capture Slint spike evidence
-        run: sh apple/scripts/capture-slint-evidence.sh
-      - name: Bind Slint spike evidence to the source commit
-        if: ${{ success() }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/slint-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload Slint spike screenshots and metrics
-        if: ${{ success() }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: slint-spike-evidence
-          path: apple/build/slint-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  dioxus-apple-evidence:
-    name: Dioxus Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'dioxus' }}
-    runs-on: macos-26
-    timeout-minutes: 60
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install XcodeGen 2.45.4
-        env:
-          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
-        run: |
-          curl --fail --location --retry 3 \
-            --output "$RUNNER_TEMP/xcodegen.zip" \
-            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
-          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
-          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
-      - name: Fetch locked dependencies for offline runtime verification
-        run: cargo fetch --locked
-      - name: Verify Dioxus runtime boundary
-        run: python3 apple/scripts/verify-dioxus-runtime.py
-      - name: Verify device evidence schema and redaction rejection
-        run: |
-          python3 apple/scripts/verify-dioxus-device-evidence.py --self-test
-          sh -n apple/scripts/generate-project.sh
-          sh -n apple/scripts/capture-dioxus-device-evidence.sh
-          sh apple/scripts/capture-dioxus-device-evidence.sh --self-test-contract
-          output=$(sh apple/scripts/capture-dioxus-device-evidence.sh)
-          printf '%s\n' "$output" | grep -Fx 'DIOXUS DEVICE EVIDENCE DRY RUN'
-          printf '%s\n' "$output" | grep -Fx 'No build, signing, installation, launch, or device command was executed.'
-          printf '%s\n' "$output" | grep -Fx 'NOT A DEVICE-GATE RESULT'
-          if sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/opt-in-negative.txt" 2>&1; then
-            exit 1
-          fi
-          grep -Fx 'Execution requires TERSA_DEVICE_EVIDENCE_OPT_IN=YES.' "$RUNNER_TEMP/opt-in-negative.txt"
-          if TERSA_DEVICE_EVIDENCE_OPT_IN=YES \
-            sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/selector-negative.txt" 2>&1; then
-            exit 1
-          fi
-          grep -Fx 'Execution requires a local TERSA_DEVICE_SELECTOR; it is never retained.' "$RUNNER_TEMP/selector-negative.txt"
-          if TERSA_DEVICE_EVIDENCE_OPT_IN=YES TERSA_DEVICE_SELECTOR=synthetic \
-            sh apple/scripts/capture-dioxus-device-evidence.sh --execute >"$RUNNER_TEMP/terminal-negative.txt" 2>&1; then
-            exit 1
-          fi
-          grep -Fx 'Execution requires an interactive terminal.' "$RUNNER_TEMP/terminal-negative.txt"
-          rm "$RUNNER_TEMP/opt-in-negative.txt" "$RUNNER_TEMP/selector-negative.txt" "$RUNNER_TEMP/terminal-negative.txt"
-          cargo test --locked --offline --package tersa-dioxus-spike
-      - name: Test patched Dioxus behavior
-        run: cargo test --locked --offline --package dioxus-desktop --lib
-      - name: Generate Apple project
-        run: sh apple/scripts/generate-project.sh
-      - name: Archive unsigned macOS Dioxus spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusMac
-          -configuration Release -destination 'generic/platform=macOS'
-          -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaDioxusMac.xcarchive
-      - name: Build unsigned iOS simulator Dioxus spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS
-          -configuration Release -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO build
-      - name: Archive unsigned iOS Dioxus spike
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS
-          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaDioxusIOS.xcarchive
-      - name: Verify and capture Dioxus spike evidence
-        run: sh apple/scripts/capture-dioxus-evidence.sh
-      - name: Bind Dioxus spike evidence to the source commit
-        if: ${{ success() }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/dioxus-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload Dioxus spike screenshots and metrics
-        if: ${{ success() }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: dioxus-spike-evidence
-          path: apple/build/dioxus-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  sqlcipher-apple-evidence:
-    name: SQLCipher Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'sqlcipher' }}
-    runs-on: macos-26
-    timeout-minutes: 20
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Build SQLCipher diagnostic for iOS targets
-        run: |
-          cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios
-          cargo build --locked --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
-      - name: Verify SQLCipher storage feasibility
-        run: sh apple/scripts/verify-sqlcipher-feasibility.sh
-      - name: Bind SQLCipher feasibility evidence to the source commit
-        if: ${{ success() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/sqlcipher-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload SQLCipher feasibility evidence
-        if: ${{ success() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: sqlcipher-feasibility-evidence
-          path: apple/build/sqlcipher-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  search-apple-evidence:
-    name: Search Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'search' }}
-    runs-on: macos-26
-    timeout-minutes: 30
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Cross-build encrypted search diagnostic
-        run: |
-          cargo build --locked --release --package tersa-search-spike --target aarch64-apple-darwin
-          cargo build --locked --release --package tersa-search-spike --target aarch64-apple-ios
-          cargo build --locked --release --package tersa-search-spike --target aarch64-apple-ios-sim
-      - name: Verify encrypted search feasibility
-        run: sh apple/scripts/verify-search-feasibility.sh
-      - name: Bind encrypted search evidence to the source commit
-        if: ${{ success() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/search-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload encrypted search evidence
-        if: ${{ success() && hashFiles('apple/build/search-evidence/result.txt') != '' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: encrypted-search-feasibility-evidence
-          path: apple/build/search-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  mime-apple-evidence:
-    name: MIME and HTML Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime' }}
-    runs-on: macos-26
-    timeout-minutes: 30
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Install XcodeGen 2.45.4
-        env:
-          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
-        run: |
-          curl --fail --location --retry 3 \
-            --output "$RUNNER_TEMP/xcodegen.zip" \
-            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
-          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
-          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
-      - name: Cross-build portable MIME diagnostic
-        run: |
-          cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-darwin
-          cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-ios
-          cargo build --locked --release --package tersa-mime-spike --target aarch64-apple-ios-sim
-      - name: Generate Apple project
-        run: sh apple/scripts/generate-project.sh
-      - name: Archive unsigned macOS MIME diagnostic
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeMac
-          -configuration Release -destination 'generic/platform=macOS'
-          -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaMimeMac.xcarchive
-      - name: Build unsigned iOS simulator MIME diagnostic
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeIOS
-          -configuration Release -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO build
-      - name: Archive unsigned iOS MIME diagnostic
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeIOS
-          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
-          -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO archive
-          -archivePath apple/build/TersaMimeIOS.xcarchive
-      - name: Verify hostile MIME and HTML controls
-        run: sh apple/scripts/verify-mime-feasibility.sh
-      - name: Bind MIME feasibility evidence to the source commit
-        if: ${{ success() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/mime-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload MIME feasibility evidence
-        if: ${{ success() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: mime-html-feasibility-evidence
-          path: apple/build/mime-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  mime-parser-fuzz:
-    name: Deterministic MIME parser fuzz regression
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'mime-fuzz' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install exact nightly toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          toolchain: nightly-2026-07-14
-          components: clippy,rust-src,rustfmt
-          cache: false
-      - name: Install exact fuzz and policy tools
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-fuzz@0.13.2,cargo-audit@0.22.1,cargo-deny@0.20.2
-      - name: Verify pinned fuzz tools
-        run: |
-          rustup show active-toolchain | grep -F 'nightly-2026-07-14'
-          cargo fuzz --version | grep -Fx 'cargo-fuzz 0.13.2'
-          cargo-audit --version | grep -Fx 'cargo-audit 0.22.1'
-          cargo-deny --version | grep -Fx 'cargo-deny 0.20.2'
-      - name: Fetch standalone fuzz dependencies
-        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
-      - name: Check standalone fuzz licenses, advisories, and sources
-        run: |
-          cargo deny --locked --manifest-path fuzz/Cargo.toml \
-            --config fuzz/deny.toml check
-          cargo audit --file fuzz/Cargo.lock --deny warnings
-      - name: Check standalone fuzz formatting and lints
-        run: |
-          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-          cargo clippy --locked --manifest-path fuzz/Cargo.toml \
-            --all-targets -- -D warnings
-      - name: Verify fuzz dependencies stay outside application graphs
-        run: |
-          application_tree=$(cargo tree --locked --workspace --edges normal,build)
-          if printf '%s\n' "$application_tree" \
-            | grep -E 'libfuzzer-sys|tersa-mime-fuzz'; then
-            exit 1
-          fi
-      - name: Build, replay seeds, and run finite MIME fuzz regression
-        run: sh scripts/verify-mime-fuzz.sh
-        env:
-          TERSA_FUZZ_TARGET: x86_64-unknown-linux-gnu
-      - name: Bind MIME fuzz evidence to the source commit
-        if: ${{ success() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}
-        run: >-
-          python3 scripts/write-evidence-manifest.py
-          fuzz/target/mime-fuzz-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload MIME parser fuzz evidence
-        if: ${{ success() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: mime-parser-fuzz-evidence
-          path: fuzz/target/mime-fuzz-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
-
-  blob-apple-evidence:
-    name: Crash-safe AEAD blob Apple evidence
-    needs: [changes, manual_evidence_gate]
-    if: ${{ needs.changes.outputs.run_full_evidence == 'true' || inputs.evidence_suite == 'blob' }}
-    runs-on: macos-26
-    timeout-minutes: 30
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-          cache: false
-      - name: Verify Xcode 26
-        run: xcodebuild -version | grep -Fx 'Xcode 26.6'
-      - name: Cross-build portable blob diagnostic for iOS
-        run: |
-          cargo build --locked --release --package tersa-blob-spike --target aarch64-apple-ios
-          cargo build --locked --release --package tersa-blob-spike --target aarch64-apple-ios-sim
-      - name: Verify crash-safe chunked-AEAD blob controls
-        run: sh apple/scripts/verify-blob-feasibility.sh
-      - name: Bind blob feasibility evidence to the source commit
-        if: ${{ success() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}
-        run: python3 scripts/write-evidence-manifest.py apple/build/blob-evidence "$EVIDENCE_COMMIT_SHA"
-      - name: Upload blob feasibility evidence
-        if: ${{ success() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
-        with:
-          name: crash-safe-aead-blob-feasibility-evidence
-          path: apple/build/blob-evidence
-          if-no-files-found: error
-          compression-level: 9
-          retention-days: 90
 
   notices:
     name: Third-party notices
@@ -885,56 +366,11 @@ jobs:
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling
         run: typos
+
   ci_gate:
     name: CI gate
     needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
-    if: ${{ always() && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require the selected validation lane
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
-          NOTICES_RESULT: ${{ needs.notices.result }}
-          RUST_LINUX_RESULT: ${{ needs.rust_linux.result }}
-          RUST_MACOS_RESULT: ${{ needs.rust_macos.result }}
-          POLICY_RESULT: ${{ needs.policy.result }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' \
-            "changes=$CHANGES_RESULT" \
-            "apple_product=$APPLE_PRODUCT_RESULT" \
-            "notices=$NOTICES_RESULT" \
-            "rust_linux=$RUST_LINUX_RESULT" \
-            "rust_macos=$RUST_MACOS_RESULT" \
-            "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
-          test "$CHANGES_RESULT" = success
-          case "$APPLE_PRODUCT_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$NOTICES_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$RUST_LINUX_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$RUST_MACOS_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$POLICY_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-  manual_evidence_gate:
-    # Keep manual evidence isolated from the branch-protection context. A
-    # narrowly selected suite must never satisfy the pull request's `CI gate`.
-    name: Manual evidence gate
-    needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require the selected validation lane

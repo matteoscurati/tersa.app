@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-import re
 import subprocess
 import sys
 import unittest
@@ -21,9 +20,69 @@ SPEC.loader.exec_module(MODULE)
 
 NAMES = tuple(field.name for field in MODULE.fields(MODULE.Scope))
 ALL = set(NAMES)
+ACTIVE_OUTPUTS = ("rust_linux", "rust_macos", "policy", "product_apple", "notices")
+RETIRED_SCOPE_NAMES = (
+    "slint",
+    "dioxus",
+    "sqlcipher",
+    "search",
+    "mime",
+    "mime_fuzz",
+    "blob",
+    "full_evidence",
+    "run_full_evidence",
+)
+RETIRED_WORKFLOW_TOKENS = (
+    "workflow_dispatch",
+    "evidence_suite",
+    "EVIDENCE_COMMIT_SHA",
+    "run_full_evidence",
+    "manual_evidence_gate",
+    "Manual evidence gate",
+    "actions/upload-artifact@",
+    "write-evidence-manifest.py",
+    "verify-m0-gates.py",
+    "ci-change-scope.py --full",
+    "ci-change-scope.py --baseline",
+    "slint-apple-evidence",
+    "dioxus-apple-evidence",
+    "sqlcipher-apple-evidence",
+    "search-apple-evidence",
+    "mime-apple-evidence",
+    "mime-parser-fuzz",
+    "blob-apple-evidence",
+    "Slint Apple evidence",
+    "Dioxus Apple evidence",
+    "SQLCipher Apple evidence",
+    "Search Apple evidence",
+    "MIME and HTML Apple evidence",
+    "Deterministic MIME parser fuzz",
+    "Crash-safe AEAD blob Apple evidence",
+    "oauth-pkce-feasibility-evidence",
+    "slint-spike-evidence",
+    "dioxus-spike-evidence",
+    "sqlcipher-feasibility-evidence",
+    "encrypted-search-feasibility-evidence",
+    "mime-html-feasibility-evidence",
+    "mime-parser-fuzz-evidence",
+    "crash-safe-aead-blob-feasibility-evidence",
+    "verify-oauth-feasibility.sh",
+    "capture-slint-evidence.sh",
+    "capture-dioxus-evidence.sh",
+    "verify-sqlcipher-feasibility.sh",
+    "verify-search-feasibility.sh",
+    "verify-mime-feasibility.sh",
+    "verify-mime-fuzz.sh",
+    "verify-blob-feasibility.sh",
+)
 
 
 class ChangeScopeTests(unittest.TestCase):
+    def test_active_scope_contract(self) -> None:
+        self.assertEqual(NAMES, ACTIVE_OUTPUTS)
+        for retired in RETIRED_SCOPE_NAMES:
+            self.assertNotIn(retired, NAMES)
+
     def test_path_table(self) -> None:
         cases = (
             ("empty input fails closed", [], ALL),
@@ -56,19 +115,9 @@ class ChangeScopeTests(unittest.TestCase):
                 {"rust_linux", "policy", "product_apple"},
             ),
             (
-                "MIME entitlements keep mime lane and enable xtask policy",
+                "retired spike entitlements use generic Apple entitlement routing",
                 ["apple/mime-macos/TersaMimeMac.entitlements"],
-                {"rust_linux", "policy", "product_apple", "mime"},
-            ),
-            (
-                "Dioxus entitlements keep dioxus lane and enable xtask policy",
-                ["apple/dioxus-macos/TersaDioxusMac.entitlements"],
-                {"rust_linux", "policy", "product_apple", "dioxus"},
-            ),
-            (
-                "Slint entitlements keep slint lane and enable xtask policy",
-                ["apple/slint-macos/TersaSlintMac.entitlements"],
-                {"rust_linux", "policy", "product_apple", "slint"},
+                {"rust_linux", "policy", "product_apple"},
             ),
             (
                 "generic Apple entitlements enable xtask policy and product",
@@ -76,27 +125,59 @@ class ChangeScopeTests(unittest.TestCase):
                 {"rust_linux", "policy", "product_apple"},
             ),
             ("shared Apple script fans out", ["apple/scripts/build-rust-staticlib.sh"], ALL),
-            ("Slint component", ["apps/slint-spike/ui/tersa.slint"], {"rust_linux", "policy", "slint"}),
-            ("Slint manifest also checks notices", ["apps/slint-spike/Cargo.toml"], {"rust_linux", "policy", "slint", "notices"}),
-            ("Dioxus component", ["apps/dioxus-spike/src/main.rs"], {"rust_linux", "policy", "dioxus"}),
-            ("SQLCipher component", ["apps/sqlcipher-spike/migrations/global/0001_initial.sql"], {"rust_linux", "policy", "sqlcipher"}),
-            ("search component", ["apps/search-spike/src/main.rs"], {"rust_linux", "policy", "search"}),
-            ("MIME component", ["apps/mime-spike/src/lib.rs"], {"rust_linux", "policy", "mime"}),
-            ("blob component", ["apps/blob-spike/src/format.rs"], {"rust_linux", "policy", "blob"}),
-            ("fuzz requires MIME and fuzz", ["fuzz/fuzz_targets/mime_display.rs"], {"rust_linux", "policy", "mime", "mime_fuzz"}),
-            ("MIME fuzz verifier", ["scripts/verify-mime-fuzz.sh"], {"rust_linux", "policy", "mime", "mime_fuzz"}),
+            (
+                "retired spike source fails closed without a named diagnostic lane",
+                ["apps/slint-spike/ui/tersa.slint"],
+                ALL,
+            ),
+            (
+                "retired spike manifest fails closed without a named diagnostic lane",
+                ["apps/dioxus-spike/Cargo.toml"],
+                ALL,
+            ),
+            (
+                "fuzz paths fail closed without a named diagnostic lane",
+                ["fuzz/fuzz_targets/mime_display.rs"],
+                ALL,
+            ),
             ("notices are isolated", ["apple/licenses/rust-skia-notices.txt"], {"notices"}),
-            ("Slint notice config", ["about.toml"], {"slint", "notices"}),
             ("product notice config", ["about-bridge.toml"], {"product_apple", "notices"}),
-            ("Dioxus notice config", ["about-dioxus.toml"], {"dioxus", "notices"}),
-            ("shared domain has UI reverse dependants", ["crates/domain/src/lib.rs"], {"rust_linux", "policy", "product_apple", "slint", "dioxus"}),
-            ("shared presentation has UI reverse dependants", ["crates/presentation/src/lib.rs"], {"rust_linux", "policy", "product_apple", "slint", "dioxus"}),
-            ("adapter changes build product", ["adapters/keychain-macos/src/lib.rs"], {"rust_linux", "rust_macos", "policy", "product_apple"}),
-            ("adapter manifest also checks notices", ["adapters/keychain-macos/Cargo.toml"], {"rust_linux", "rust_macos", "policy", "product_apple", "notices"}),
-            ("Apple Rust bridge checks both hosts", ["apple/rust-bridge/src/lib.rs"], {"rust_linux", "rust_macos", "policy", "product_apple"}),
+            (
+                "retired spike notice config fails closed",
+                ["about.toml"],
+                ALL,
+            ),
+            (
+                "shared domain enables product without diagnostic lanes",
+                ["crates/domain/src/lib.rs"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
+                "shared presentation enables product without diagnostic lanes",
+                ["crates/presentation/src/lib.rs"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
+                "adapter changes build product",
+                ["adapters/keychain-macos/src/lib.rs"],
+                {"rust_linux", "rust_macos", "policy", "product_apple"},
+            ),
+            (
+                "adapter manifest also checks notices",
+                ["adapters/keychain-macos/Cargo.toml"],
+                {"rust_linux", "rust_macos", "policy", "product_apple", "notices"},
+            ),
+            (
+                "Apple Rust bridge checks both hosts",
+                ["apple/rust-bridge/src/lib.rs"],
+                {"rust_linux", "rust_macos", "policy", "product_apple"},
+            ),
             ("macOS CLI checks both hosts", ["apps/cli-macos/src/main.rs"], {"rust_linux", "rust_macos", "policy"}),
-            ("Apple product UI host", ["apple/dioxus-ios/Info.plist"], {"product_apple", "dioxus"}),
-            ("ordinary non-macOS Apple path stays minimal", ["apple/ios/AppDelegate.swift"], {"product_apple"}),
+            (
+                "ordinary non-macOS Apple path stays minimal",
+                ["apple/ios/AppDelegate.swift"],
+                {"product_apple"},
+            ),
             (
                 "rename source and destination cannot hide a product path",
                 ["apple/macos/Removed.swift", "docs/Removed.md"],
@@ -111,9 +192,11 @@ class ChangeScopeTests(unittest.TestCase):
             ("scope tests stay in the control lane", ["scripts/test_ci_change_scope.py"], set()),
             ("performance reporter stays in its tested control lane", ["scripts/macos-performance-report.py"], set()),
             ("performance tests stay in the control lane", ["scripts/test_macos_performance_report.py"], set()),
-            ("M0 gate verifier stays in its self-tested control lane", ["scripts/verify-m0-gates.py"], set()),
-            ("evidence manifest stays in its self-tested control lane", ["scripts/write-evidence-manifest.py"], set()),
-            ("multiple paths union scopes", ["apps/blob-spike/src/main.rs", "apps/search-spike/src/main.rs"], {"rust_linux", "policy", "blob", "search"}),
+            (
+                "multiple product paths union scopes",
+                ["apple/licenses/rust-skia-notices.txt", "xtask/src/main.rs"],
+                {"rust_linux", "policy", "notices"},
+            ),
         )
         for label, paths, expected in cases:
             with self.subTest(label=label):
@@ -121,28 +204,40 @@ class ChangeScopeTests(unittest.TestCase):
                 actual = {name for name in NAMES if getattr(scope, name)}
                 self.assertEqual(actual, expected)
 
-    def test_full_mode_forces_every_scope(self) -> None:
-        scope = MODULE.classify(["docs/development.md"], full=True)
-        self.assertEqual({name for name in NAMES if getattr(scope, name)}, ALL)
-
-    def test_baseline_mode_adds_portable_rust_and_policy(self) -> None:
-        scope = MODULE.classify(["apple/licenses/rust-skia-notices.txt"], baseline=True)
-        actual = {name for name in NAMES if getattr(scope, name)}
-        self.assertEqual(actual, {"rust_linux", "policy", "notices"})
+    def test_cli_rejects_retired_modes(self) -> None:
+        for flag in ("--full", "--baseline"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), flag],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_cli_reads_stdin_and_emits_github_output_format(self) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT)],
-            input="apps/mime-spike/src/main.rs\n",
+            input="apple/rust-bridge/src/lib.rs\n",
             text=True,
             capture_output=True,
             check=True,
         )
         lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), len(NAMES))
-        self.assertEqual(dict(line.split("=", 1) for line in lines)["mime"], "true")
-        values = (line.split("=", 1)[1] for line in lines)
-        self.assertTrue(all(value in {"true", "false"} for value in values))
+        self.assertEqual(len(lines), len(ACTIVE_OUTPUTS))
+        self.assertEqual([line.split("=", 1)[0] for line in lines], list(ACTIVE_OUTPUTS))
+        values = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(
+            values,
+            {
+                "rust_linux": "true",
+                "rust_macos": "true",
+                "policy": "true",
+                "product_apple": "true",
+                "notices": "false",
+            },
+        )
+        self.assertTrue(all(value in {"true", "false"} for value in values.values()))
 
     def test_workflow_disables_rename_detection(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -156,22 +251,16 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", workflow)
         self.assertIn("github.event.pull_request.draft == false", workflow)
 
-    def test_workflow_keeps_deep_evidence_manual(self) -> None:
+    def test_workflow_is_product_only_pull_request_and_merge_queue_ci(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("\n  push:\n", workflow)
         self.assertNotIn("github.event_name == 'push'", workflow)
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("\n  pull_request:\n", workflow)
+        self.assertIn("\n  merge_group:\n", workflow)
         self.assertIn("\n    name: CI gate\n", workflow)
-        self.assertIn("\n    name: Manual evidence gate\n", workflow)
-        self.assertIn(
-            "github.event_name != 'workflow_dispatch'",
-            workflow,
-        )
-        self.assertEqual(
-            workflow.count("needs: [changes, manual_evidence_gate]"),
-            7,
-        )
-        self.assertNotIn("needs: [changes, ci_gate]", workflow)
+        for token in RETIRED_WORKFLOW_TOKENS:
+            with self.subTest(token=token):
+                self.assertNotIn(token, workflow)
 
     def test_workflow_disables_all_github_actions_caches(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -183,80 +272,11 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("cache-save-if:", workflow)
         self.assertNotIn("cache-on-failure:", workflow)
 
-    def test_evidence_artifacts_are_success_only_and_compressed(self) -> None:
+    def test_workflow_path_scopes_active_jobs(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        steps = re.findall(
-            r"(?ms)^      - name: (?P<name>[^\n]+)\n(?P<body>.*?)(?=^      - name:|\Z)",
-            workflow,
-        )
-        expected_pairs = (
-            (
-                "Bind OAuth feasibility evidence to the source commit",
-                "Upload OAuth feasibility evidence",
-                "${{ success() && github.event_name == 'workflow_dispatch' }}",
-            ),
-            (
-                "Bind Slint spike evidence to the source commit",
-                "Upload Slint spike screenshots and metrics",
-                "${{ success() }}",
-            ),
-            (
-                "Bind Dioxus spike evidence to the source commit",
-                "Upload Dioxus spike screenshots and metrics",
-                "${{ success() }}",
-            ),
-            (
-                "Bind SQLCipher feasibility evidence to the source commit",
-                "Upload SQLCipher feasibility evidence",
-                "${{ success() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}",
-            ),
-            (
-                "Bind encrypted search evidence to the source commit",
-                "Upload encrypted search evidence",
-                "${{ success() && hashFiles('apple/build/search-evidence/result.txt') != '' }}",
-            ),
-            (
-                "Bind MIME feasibility evidence to the source commit",
-                "Upload MIME feasibility evidence",
-                "${{ success() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}",
-            ),
-            (
-                "Bind MIME fuzz evidence to the source commit",
-                "Upload MIME parser fuzz evidence",
-                "${{ success() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}",
-            ),
-            (
-                "Bind blob feasibility evidence to the source commit",
-                "Upload blob feasibility evidence",
-                "${{ success() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}",
-            ),
-        )
-        artifact_indices = [
-            index
-            for index, (_, body) in enumerate(steps)
-            if "uses: actions/upload-artifact@" in body
-        ]
-
-        self.assertEqual(len(artifact_indices), len(expected_pairs))
-        for artifact_index, (bind_name, upload_name, condition) in zip(
-            artifact_indices, expected_pairs, strict=True
-        ):
-            with self.subTest(name=upload_name):
-                actual_upload_name, upload_body = steps[artifact_index]
-                actual_bind_name, bind_body = steps[artifact_index - 1]
-                self.assertEqual(actual_upload_name, upload_name)
-                self.assertEqual(actual_bind_name, bind_name)
-                self.assertIn(f"        if: {condition}\n", upload_body)
-                self.assertIn(f"        if: {condition}\n", bind_body)
-                self.assertIn("          compression-level: 9\n", upload_body)
-                self.assertIn("          retention-days: 90\n", upload_body)
-
-    def test_workflow_path_scopes_baseline_jobs(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        for output in ("rust_linux", "rust_macos", "policy"):
+        for output in ACTIVE_OUTPUTS:
             self.assertIn(f"      {output}: ${{{{ steps.scope.outputs.{output} }}}}", workflow)
             self.assertIn(f"if: ${{{{ needs.changes.outputs.{output} == 'true' }}}}", workflow)
-        self.assertIn("python3 scripts/ci-change-scope.py --baseline", workflow)
         self.assertNotIn("matrix:\n        os: [ubuntu-24.04, macos-15]", workflow)
 
     def test_workflow_keeps_dco_in_the_required_control_job(self) -> None:
@@ -265,35 +285,22 @@ class ChangeScopeTests(unittest.TestCase):
         changes_end = workflow.index("\n  apple_product:\n", changes_start)
         changes_job = workflow[changes_start:changes_end]
         self.assertIn("python3 scripts/check-dco.py", changes_job)
-        self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
-        self.assertIn("python3 scripts/write-evidence-manifest.py --self-test", changes_job)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_ci_change_scope.py", changes_job)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py", changes_job)
+        self.assertIn(
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py",
+            changes_job,
+        )
         self.assertNotIn("cargo run --locked --package xtask -- dco", workflow)
 
-    def test_optional_baselines_remain_visible_to_both_gates(self) -> None:
+    def test_optional_baselines_remain_visible_to_the_required_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         needs = "needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]"
-        self.assertEqual(workflow.count(needs), 2)
+        self.assertEqual(workflow.count(needs), 1)
         for result in ("RUST_LINUX_RESULT", "RUST_MACOS_RESULT", "POLICY_RESULT"):
-            self.assertEqual(workflow.count(f'case "${result}" in'), 2)
+            self.assertEqual(workflow.count(f'case "${result}" in'), 1)
 
-    def test_pull_request_product_lane_does_not_repeat_archives(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("name: Verify built Rust bridge symbols", workflow)
-        self.assertIn(
-            "apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
-            workflow,
-        )
-        for step in (
-            "Build unsigned iOS device debug application",
-            "Archive unsigned macOS debug application",
-            "Archive unsigned iOS debug application",
-            "Verify archived Rust bridge symbols",
-            "Verify OAuth PKCE and sandbox feasibility",
-        ):
-            marker = f"- name: {step}\n        if: github.event_name == 'workflow_dispatch'"
-            self.assertIn(marker, workflow)
-
-    def test_product_lane_runs_macos_tests_in_its_single_debug_build(self) -> None:
+    def test_product_lane_keeps_pr_macos_tests_ios_simulator_and_built_symbols(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("      - name: Test unsigned macOS debug application")
         end = workflow.index("      - name: Build unsigned iOS simulator debug application", start)
@@ -301,6 +308,23 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn(" xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac", macos_step)
         self.assertTrue(macos_step.rstrip().endswith("test"))
         self.assertNotIn("Build unsigned macOS debug application", workflow)
+        self.assertIn("name: Verify built Rust bridge symbols", workflow)
+        self.assertIn(
+            "apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
+            workflow,
+        )
+        self.assertIn(
+            "apple/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib",
+            workflow,
+        )
+        for retired_step in (
+            "Build unsigned iOS device debug application",
+            "Archive unsigned macOS debug application",
+            "Archive unsigned iOS debug application",
+            "Verify archived Rust bridge symbols",
+            "Verify OAuth PKCE and sandbox feasibility",
+        ):
+            self.assertNotIn(f"- name: {retired_step}", workflow)
 
 
 if __name__ == "__main__":

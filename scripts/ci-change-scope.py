@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Classify changed repository paths into conservative CI evidence scopes.
+"""Classify changed repository paths into conservative product CI scopes.
 
 Read newline-delimited paths from standard input, or pass paths as positional
 arguments.  The output uses the ``key=true`` format accepted by GitHub Actions
 when redirected to ``$GITHUB_OUTPUT``.  Any unrecognised path is intentionally
-treated as a full-evidence change.
+treated as a change that enables every active product scope.
 """
 
 from __future__ import annotations
@@ -21,33 +21,16 @@ class Scope:
     rust_macos: bool = False
     policy: bool = False
     product_apple: bool = False
-    slint: bool = False
-    dioxus: bool = False
-    sqlcipher: bool = False
-    search: bool = False
-    mime: bool = False
-    mime_fuzz: bool = False
-    blob: bool = False
     notices: bool = False
-    full_evidence: bool = False
 
     def enable(self, *names: str) -> None:
         for name in names:
             setattr(self, name, True)
 
 
-COMPONENT_PATHS = {
-    "apps/slint-spike/": ("slint",),
-    "apps/dioxus-spike/": ("dioxus",),
-    "apps/sqlcipher-spike/": ("sqlcipher",),
-    "apps/search-spike/": ("search",),
-    "apps/mime-spike/": ("mime",),
-    "apps/blob-spike/": ("blob",),
-}
-
-# These crates feed both current UI spikes.  They are production code, so they
-# also require the product build; the two reverse dependants are enumerated
-# instead of guessing from arbitrary Cargo metadata at CI runtime.
+# Shared domain crates feed the product surface, so they also require the
+# product Apple build rather than guessing reverse dependants from Cargo
+# metadata at CI runtime.
 SHARED_UI_CRATES = ("crates/domain/", "crates/application/", "crates/presentation/")
 APPLE_ADAPTERS = "adapters/"
 DOCS_ONLY_PREFIXES = ("docs/", ".github/")
@@ -58,8 +41,6 @@ CI_CONTROL_PATHS = {
     "scripts/test_check_dco.py",
     "scripts/test_ci_change_scope.py",
     "scripts/test_macos_performance_report.py",
-    "scripts/verify-m0-gates.py",
-    "scripts/write-evidence-manifest.py",
 }
 FULL_FANOUT_PATHS = {
     "Cargo.toml",
@@ -73,7 +54,7 @@ FULL_FANOUT_PREFIXES = (
 )
 
 
-def enable_full(scope: Scope) -> None:
+def enable_all(scope: Scope) -> None:
     scope.enable(*(field.name for field in fields(Scope)))
 
 
@@ -87,68 +68,38 @@ def normalise_path(path: str) -> str | None:
     return path or None
 
 
-def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False) -> Scope:
-    """Return the union of evidence scopes needed for *paths*.
+def classify(paths: Iterable[str]) -> Scope:
+    """Return the union of product CI scopes needed for *paths*.
 
     Empty input, malformed input, and unknown paths fail closed to every scope.
     """
     scope = Scope()
     seen = False
-    if full:
-        enable_full(scope)
-        return scope
 
     for raw_path in paths:
         seen = True
         path = normalise_path(raw_path)
         if path is None:
-            enable_full(scope)
+            enable_all(scope)
             continue
         if path in FULL_FANOUT_PATHS or path.startswith(FULL_FANOUT_PREFIXES):
-            enable_full(scope)
+            enable_all(scope)
             continue
         if path in CI_CONTROL_PATHS or path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
             continue
         if path.endswith("/Cargo.toml"):
             scope.enable("rust_linux", "policy", "notices")
-        component = next(
-            (names for prefix, names in COMPONENT_PATHS.items() if path.startswith(prefix)),
-            None,
-        )
-        if component is not None:
-            scope.enable("rust_linux", "policy", *component)
-            continue
-        if path.startswith("fuzz/") or path == "scripts/verify-mime-fuzz.sh":
-            scope.enable("rust_linux", "policy", "mime", "mime_fuzz")
-            continue
         if path.startswith("apple/licenses/"):
             scope.enable("notices")
             continue
         # Security-critical Apple packaging inputs can drift the fail-closed
         # policy checked by `cargo xtask verify`, so they also enable the
-        # portable Rust and policy lanes (not the broader evidence matrix).
-        # `apple/macos/**` hosts the product client XPC-wiring guards; the
-        # token broker, XcodeGen project, and entitlements are the other
-        # exact-scoped inputs. Component entitlements keep their component
-        # lanes additively rather than replacing them.
+        # portable Rust and policy lanes. `apple/macos/**` hosts the product
+        # client XPC-wiring guards; the token broker, XcodeGen project, and
+        # entitlements are the other exact-scoped inputs.
         is_component_entitlement = path.startswith("apple/") and path.endswith(
             ".entitlements"
         )
-        if path.startswith("apple/slint-"):
-            scope.enable("product_apple", "slint")
-            if is_component_entitlement:
-                scope.enable("rust_linux", "policy")
-            continue
-        if path.startswith("apple/dioxus-"):
-            scope.enable("product_apple", "dioxus")
-            if is_component_entitlement:
-                scope.enable("rust_linux", "policy")
-            continue
-        if path.startswith("apple/mime-") or path.startswith("apple/mime-common/"):
-            scope.enable("product_apple", "mime")
-            if is_component_entitlement:
-                scope.enable("rust_linux", "policy")
-            continue
         if (
             path.startswith("apple/macos-token-broker/")
             or path.startswith("apple/macos/")
@@ -158,7 +109,7 @@ def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False
             scope.enable("rust_linux", "policy", "product_apple")
             continue
         if path.startswith(SHARED_UI_CRATES):
-            scope.enable("rust_linux", "policy", "product_apple", "slint", "dioxus")
+            scope.enable("rust_linux", "policy", "product_apple")
             continue
         if path.startswith("crates/platform/") or path.startswith(APPLE_ADAPTERS):
             scope.enable("rust_linux", "rust_macos", "policy", "product_apple")
@@ -175,33 +126,13 @@ def classify(paths: Iterable[str], *, full: bool = False, baseline: bool = False
         if path.startswith("apple/"):
             scope.enable("product_apple")
             continue
-        if path == "about.toml":
-            scope.enable("slint", "notices")
-            continue
         if path == "about-bridge.toml":
             scope.enable("product_apple", "notices")
             continue
-        if path == "about-dioxus.toml":
-            scope.enable("dioxus", "notices")
-            continue
-        if path == "about-sqlcipher.toml":
-            scope.enable("sqlcipher", "notices")
-            continue
-        if path == "about-search.toml":
-            scope.enable("search", "notices")
-            continue
-        if path == "about-mime.toml":
-            scope.enable("mime", "notices")
-            continue
-        if path == "about-blob.toml":
-            scope.enable("blob", "notices")
-            continue
-        enable_full(scope)
+        enable_all(scope)
 
     if not seen:
-        enable_full(scope)
-    if baseline:
-        scope.enable("rust_linux", "policy")
+        enable_all(scope)
     return scope
 
 
@@ -210,25 +141,15 @@ def read_paths(arguments: list[str]) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Classify changed paths for fail-closed CI evidence.")
+    parser = argparse.ArgumentParser(description="Classify changed paths for fail-closed product CI.")
     parser.add_argument(
         "paths",
         nargs="*",
         metavar="PATH",
         help="Changed repository-relative paths; when omitted, read newline-delimited paths from standard input.",
     )
-    parser.add_argument(
-        "--full",
-        action="store_true",
-        help="Force every evidence scope (for main, merge groups, or manual runs).",
-    )
-    parser.add_argument(
-        "--baseline",
-        action="store_true",
-        help="Also require the portable Rust and policy baseline (for a selected manual suite).",
-    )
     arguments = parser.parse_args()
-    scope = classify(read_paths(arguments.paths), full=arguments.full, baseline=arguments.baseline)
+    scope = classify(read_paths(arguments.paths))
     for field in fields(Scope):
         print(f"{field.name}={'true' if getattr(scope, field.name) else 'false'}")
     return 0
