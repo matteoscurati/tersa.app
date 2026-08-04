@@ -18,6 +18,11 @@ struct RootView: View {
                     InboxView(
                         accountIdentifier: accountIdentifier,
                         freshness: viewModel.mailboxFreshness,
+                        isRefreshing: viewModel.isMailboxRefreshInProgress,
+                        reloadGeneration: viewModel.mailboxReloadGeneration,
+                        refreshNotice: viewModel.mailboxRefreshNotice,
+                        onRefresh: viewModel.refreshInbox,
+                        onReconnect: viewModel.reconnectInbox,
                         onDisconnect: viewModel.disconnect
                     )
                 } else {

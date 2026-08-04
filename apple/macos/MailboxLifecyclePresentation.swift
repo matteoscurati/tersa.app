@@ -137,3 +137,162 @@ enum MailboxFreshnessState: Equatable {
         date.formatted(date: .abbreviated, time: .shortened)
     }
 }
+
+/// Main-actor presentation fence for an Inbox-initiated refresh. It holds no
+/// credential, mailbox content, or network state; the connection coordinator
+/// owns those concerns. A successful terminal advances the local-read revision
+/// exactly once, while disconnect and stale callbacks are ignored.
+struct MailboxRefreshToken: Equatable {
+    fileprivate let generation: UInt64
+    fileprivate let accountIdentifier: Data
+}
+
+/// The Inbox-only result of a refresh attempt. It is deliberately separate
+/// from connection state: refreshing cached mail must not replace the Inbox
+/// with an OAuth or generic connection surface.
+enum MailboxRefreshNotice: Equatable {
+    case offline
+    case reconnectRequired
+    case unavailable
+
+    var message: String {
+        switch self {
+        case .offline:
+            return "Refresh could not reach Gmail. Showing cached mail."
+        case .reconnectRequired:
+            return "Reconnect is required before Tersa can refresh this inbox."
+        case .unavailable:
+            return "Refresh could not complete. Showing cached mail."
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .offline:
+            return "Inbox refresh is offline"
+        case .reconnectRequired:
+            return "Inbox reconnect is required"
+        case .unavailable:
+            return "Inbox refresh failed"
+        }
+    }
+
+    var requiresExplicitReconnect: Bool {
+        self == .reconnectRequired
+    }
+}
+
+/// Pure policy for the Inbox-only refresh origin. It prevents broker recovery
+/// outcomes from borrowing the ordinary connect ladder until the person taps
+/// the explicit Reconnect action.
+enum MailboxRefreshTerminal: Equatable {
+    case reconnect
+    case transport
+    case syncFailure
+    case unavailable
+}
+
+enum MailboxCredentialRecoveryOrigin: Equatable {
+    case ordinaryConnection
+    case automaticRefresh
+    case explicitReconnect
+}
+
+enum MailboxCredentialRecoveryEvent: Equatable {
+    case missingStoredCredential
+    case brokerReconnect
+    case brokerPermissionRequired
+    case syncReconnect
+    case syncPermissionRequired
+}
+
+enum MailboxCredentialRecoveryRoute: Equatable {
+    case authorizeFromConnectionLadder
+    case startExplicitReconnectLadder
+    case presentRefreshReconnect
+    case failConnectionPermission
+}
+
+enum MailboxRefreshTimeoutAction: Equatable {
+    case cancelOwnedBrokerClient
+    case finishAndFence(MailboxRefreshTerminal)
+}
+
+enum MailboxRefreshPolicy {
+    static func route(
+        origin: MailboxCredentialRecoveryOrigin,
+        event: MailboxCredentialRecoveryEvent
+    ) -> MailboxCredentialRecoveryRoute {
+        switch origin {
+        case .automaticRefresh:
+            return .presentRefreshReconnect
+        case .explicitReconnect:
+            return .startExplicitReconnectLadder
+        case .ordinaryConnection:
+            switch event {
+            case .brokerPermissionRequired:
+                return .failConnectionPermission
+            case .missingStoredCredential, .brokerReconnect, .syncReconnect, .syncPermissionRequired:
+                return .authorizeFromConnectionLadder
+            }
+        }
+    }
+
+    static let timeoutActions: [MailboxRefreshTimeoutAction] = [
+        .cancelOwnedBrokerClient,
+        .finishAndFence(.transport)
+    ]
+}
+
+enum MailboxRefreshPresentationPolicy {
+    static func notice(for terminal: MailboxRefreshTerminal) -> MailboxRefreshNotice {
+        switch terminal {
+        case .reconnect:
+            return .reconnectRequired
+        case .transport, .syncFailure:
+            return .offline
+        case .unavailable:
+            return .unavailable
+        }
+    }
+
+}
+
+struct MailboxRefreshPresentation {
+    private var generation: UInt64 = 0
+    private var active: MailboxRefreshToken?
+    private(set) var reloadGeneration: UInt64 = 0
+    private(set) var notice: MailboxRefreshNotice?
+
+    var isRefreshing: Bool { active != nil }
+    var activeToken: MailboxRefreshToken? { active }
+
+    mutating func begin(accountIdentifier: Data) -> MailboxRefreshToken? {
+        guard active == nil else { return nil }
+        notice = nil
+        generation &+= 1
+        let token = MailboxRefreshToken(
+            generation: generation,
+            accountIdentifier: accountIdentifier
+        )
+        active = token
+        return token
+    }
+
+    mutating func finish(_ token: MailboxRefreshToken, succeeded: Bool) -> Bool {
+        guard active == token else { return false }
+        active = nil
+        if succeeded {
+            reloadGeneration &+= 1
+        }
+        return true
+    }
+
+    mutating func present(_ notice: MailboxRefreshNotice) {
+        self.notice = notice
+    }
+
+    mutating func invalidate() {
+        active = nil
+    }
+}

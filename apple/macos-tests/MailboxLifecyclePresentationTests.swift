@@ -99,4 +99,123 @@ final class MailboxLifecyclePresentationTests: XCTestCase {
         XCTAssertTrue(fence.finish(retry, currentAccountIdentifier: primary))
         XCTAssertFalse(fence.finish(retry, currentAccountIdentifier: primary))
     }
+
+    func testRefreshAdmissionCoalescesUntilTheActiveRefreshFinishes() throws {
+        var presentation = MailboxRefreshPresentation()
+        let account = Data("primary-gmail".utf8)
+        let first = try XCTUnwrap(presentation.begin(accountIdentifier: account))
+
+        XCTAssertNil(presentation.begin(accountIdentifier: account))
+        XCTAssertTrue(presentation.isRefreshing)
+        XCTAssertTrue(presentation.finish(first, succeeded: false))
+        XCTAssertFalse(presentation.isRefreshing)
+        XCTAssertEqual(presentation.reloadGeneration, 0)
+    }
+
+    func testSuccessfulRefreshAdvancesReloadGenerationExactlyOnce() throws {
+        var presentation = MailboxRefreshPresentation()
+        let account = Data("primary-gmail".utf8)
+        let token = try XCTUnwrap(presentation.begin(accountIdentifier: account))
+
+        XCTAssertTrue(presentation.finish(token, succeeded: true))
+        XCTAssertEqual(presentation.reloadGeneration, 1)
+        XCTAssertFalse(presentation.finish(token, succeeded: true))
+        XCTAssertEqual(presentation.reloadGeneration, 1)
+    }
+
+    func testDisconnectInvalidationRejectsStaleRefreshCallback() throws {
+        var presentation = MailboxRefreshPresentation()
+        let account = Data("primary-gmail".utf8)
+        let token = try XCTUnwrap(presentation.begin(accountIdentifier: account))
+
+        presentation.invalidate()
+
+        XCTAssertFalse(presentation.finish(token, succeeded: true))
+        XCTAssertFalse(presentation.isRefreshing)
+        XCTAssertEqual(presentation.reloadGeneration, 0)
+    }
+
+    func testRefreshReconnectNoticeRequiresAnExplicitFollowUpAction() {
+        XCTAssertTrue(MailboxRefreshNotice.reconnectRequired.requiresExplicitReconnect)
+        XCTAssertFalse(MailboxRefreshNotice.offline.requiresExplicitReconnect)
+        XCTAssertFalse(MailboxRefreshNotice.unavailable.requiresExplicitReconnect)
+    }
+
+    func testAutomaticRefreshReconnectAndPermissionNeverAdmitOAuth() {
+        XCTAssertEqual(
+            MailboxRefreshPolicy.route(
+                origin: .automaticRefresh,
+                event: .brokerReconnect
+            ),
+            .presentRefreshReconnect
+        )
+        XCTAssertEqual(
+            MailboxRefreshPolicy.route(
+                origin: .automaticRefresh,
+                event: .brokerPermissionRequired
+            ),
+            .presentRefreshReconnect
+        )
+    }
+
+    func testOnlyOrdinaryOrExplicitConnectionRoutesCanAdmitOAuth() {
+        XCTAssertEqual(
+            MailboxRefreshPolicy.route(
+                origin: .ordinaryConnection,
+                event: .missingStoredCredential
+            ),
+            .authorizeFromConnectionLadder
+        )
+        XCTAssertEqual(
+            MailboxRefreshPolicy.route(
+                origin: .explicitReconnect,
+                event: .missingStoredCredential
+            ),
+            .startExplicitReconnectLadder
+        )
+    }
+
+    func testRefreshFailurePolicyKeepsTheInboxOnCachedOfflineOrUnavailableMail() {
+        XCTAssertEqual(MailboxRefreshPresentationPolicy.notice(for: .transport), .offline)
+        XCTAssertEqual(MailboxRefreshPresentationPolicy.notice(for: .syncFailure), .offline)
+        XCTAssertEqual(MailboxRefreshPresentationPolicy.notice(for: .unavailable), .unavailable)
+    }
+
+    func testRefreshTimeoutOrdersBrokerClientReleaseBeforeFinishAndFence() {
+        XCTAssertEqual(
+            MailboxRefreshPolicy.timeoutActions,
+            [.cancelOwnedBrokerClient, .finishAndFence(.transport)]
+        )
+        XCTAssertEqual(
+            MailboxRefreshPresentationPolicy.notice(for: .transport),
+            .offline
+        )
+    }
+
+    func testRefreshFailureNoticesDoNotAdvanceTheInboxReloadGeneration() throws {
+        let account = Data("primary-gmail".utf8)
+        for notice in [MailboxRefreshNotice.offline, .reconnectRequired, .unavailable] {
+            var presentation = MailboxRefreshPresentation()
+            let token = try XCTUnwrap(presentation.begin(accountIdentifier: account))
+
+            XCTAssertTrue(presentation.finish(token, succeeded: false))
+            presentation.present(notice)
+            XCTAssertFalse(presentation.isRefreshing)
+            XCTAssertEqual(presentation.reloadGeneration, 0)
+            XCTAssertEqual(presentation.notice, notice)
+        }
+    }
+
+    func testTimedOutRefreshFencesLateSuccessWithoutReloading() throws {
+        var presentation = MailboxRefreshPresentation()
+        let token = try XCTUnwrap(presentation.begin(accountIdentifier: Data("primary-gmail".utf8)))
+
+        XCTAssertTrue(presentation.finish(token, succeeded: false))
+        presentation.present(.offline)
+
+        XCTAssertFalse(presentation.finish(token, succeeded: true))
+        XCTAssertFalse(presentation.isRefreshing)
+        XCTAssertEqual(presentation.reloadGeneration, 0)
+        XCTAssertEqual(presentation.notice, .offline)
+    }
 }
