@@ -41,6 +41,8 @@ CI_CONTROL_PATHS = {
     "scripts/test_check_dco.py",
     "scripts/test_ci_change_scope.py",
     "scripts/test_macos_performance_report.py",
+    "scripts/verify-m0-gates.py",
+    "scripts/write-evidence-manifest.py",
 }
 FULL_FANOUT_PATHS = {
     "Cargo.toml",

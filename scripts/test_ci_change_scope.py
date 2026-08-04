@@ -202,6 +202,16 @@ class ChangeScopeTests(unittest.TestCase):
             ("performance reporter stays in its tested control lane", ["scripts/macos-performance-report.py"], set()),
             ("performance tests stay in the control lane", ["scripts/test_macos_performance_report.py"], set()),
             (
+                "transitional M0 gate helper stays in the control lane",
+                ["scripts/verify-m0-gates.py"],
+                set(),
+            ),
+            (
+                "transitional evidence-manifest helper stays in the control lane",
+                ["scripts/write-evidence-manifest.py"],
+                set(),
+            ),
+            (
                 "multiple product paths union scopes",
                 ["apple/licenses/rust-skia-notices.txt", "xtask/src/main.rs"],
                 {"rust_linux", "policy", "notices"},
@@ -302,6 +312,8 @@ class ChangeScopeTests(unittest.TestCase):
         )
         self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
         self.assertIn("python3 scripts/write-evidence-manifest.py --self-test", changes_job)
+        self.assertEqual(workflow.count("verify-m0-gates.py"), 1)
+        self.assertEqual(workflow.count("write-evidence-manifest.py"), 1)
         self.assertNotIn("cargo run --locked --package xtask -- dco", workflow)
 
     def test_development_doc_drops_retired_manual_ci_interface(self) -> None:
