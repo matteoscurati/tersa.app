@@ -13,6 +13,11 @@ import SwiftUI
 struct InboxView: View {
     let accountIdentifier: Data
     let freshness: MailboxFreshnessState
+    let isRefreshing: Bool
+    let reloadGeneration: UInt64
+    let refreshNotice: MailboxRefreshNotice?
+    let onRefresh: () -> Void
+    let onReconnect: () -> Void
     let onDisconnect: () -> Void
 
     @State private var worker = MailboxReadWorker()
@@ -27,6 +32,9 @@ struct InboxView: View {
                 if freshness.isVisible {
                     freshnessBanner
                 }
+                if let refreshNotice {
+                    refreshNoticeBanner(refreshNotice)
+                }
                 content
             }
                 .navigationTitle("Inbox")
@@ -40,6 +48,20 @@ struct InboxView: View {
                     SearchView(accountIdentifier: accountIdentifier)
                 }
                 .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button(action: onRefresh) {
+                            if isRefreshing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(isRefreshing)
+                        .accessibilityLabel("Refresh inbox")
+                        .accessibilityValue(isRefreshing ? "Refreshing" : "Ready")
+                        .accessibilityHint(isRefreshing ? "Inbox refresh is in progress." : "Refreshes mail using the connected account.")
+                    }
                     ToolbarItem(placement: .primaryAction) {
                         Button("Search", action: handleSearchTapped)
                             .accessibilityLabel("Search")
@@ -76,6 +98,9 @@ struct InboxView: View {
             ComposerView()
         }
         .onAppear(perform: loadInbox)
+        .onChange(of: reloadGeneration) { _, _ in
+            reloadInbox()
+        }
         .onChange(of: outcome) { _, newOutcome in
             announceOutcome(newOutcome)
         }
@@ -99,6 +124,28 @@ struct InboxView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(freshness.accessibilityLabel)
         .accessibilityValue(freshness.message())
+    }
+
+    private func refreshNoticeBanner(_ notice: MailboxRefreshNotice) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(notice.message)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            if notice.requiresExplicitReconnect {
+                Button("Reconnect", action: onReconnect)
+                    .accessibilityLabel("Reconnect account")
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(Color.orange.opacity(0.12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(notice.accessibilityLabel)
     }
 
     private var freshnessIcon: String {

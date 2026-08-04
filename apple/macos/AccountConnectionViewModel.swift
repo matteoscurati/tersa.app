@@ -23,6 +23,11 @@ final class AccountConnectionViewModel: ObservableObject {
     /// Aggregate freshness only; no mailbox content or provider identity is
     /// retained in the Swift presentation state.
     @Published private(set) var mailboxFreshness: MailboxFreshnessState = .unknown
+    /// Drives the Inbox refresh affordance without changing the connected
+    /// surface. A reload revision advances only after a committed sync.
+    @Published private(set) var isMailboxRefreshInProgress = false
+    @Published private(set) var mailboxReloadGeneration: UInt64 = 0
+    @Published private(set) var mailboxRefreshNotice: MailboxRefreshNotice?
     /// The M2 WARNING banner shown after a disconnect whose provider-side
     /// revoke could not be confirmed — the account may still be authorized at
     /// Google. Separate from the state machine AND from the plain-success
@@ -62,6 +67,7 @@ final class AccountConnectionViewModel: ObservableObject {
     /// terminal can never cancel a replacement client. MainActor-confined like
     /// every property on this class, so install/finish/cancel are race-free.
     private var activeTokenBrokerClient: TokenBrokerClient?
+    private var mailboxRefreshPresentation = MailboxRefreshPresentation()
 
     /// The M2 warning copy for a disconnect that returned
     /// `.succeededRevokeUnconfirmed`: fact → what we can't confirm → the
@@ -157,7 +163,11 @@ final class AccountConnectionViewModel: ObservableObject {
         case .connectAndSync:
             guard operationDeadline.timeOut(token, keepAlive: true) else { return }
             operationTimer = nil
-            state = .failed(.connectionTimedOut)
+            if isMailboxRefreshInProgress {
+                applyRefreshTimeout(token: token)
+            } else {
+                state = .failed(.connectionTimedOut)
+            }
         case .authorization:
             guard operationDeadline.timeOut(token, keepAlive: false) else { return }
             operationTimer = nil
@@ -223,6 +233,46 @@ final class AccountConnectionViewModel: ObservableObject {
         connect()
     }
 
+    /// Refreshes only the currently connected opaque account through the same
+    /// stored-credential broker ladder used by connect. This deliberately does
+    /// not bootstrap a profile or begin OAuth.
+    func refreshInbox() {
+        guard state == .connected,
+              let accountIdentifier = connectedAccountIdentifier,
+              !operationDeadline.hasActiveOperation,
+              let refreshToken = mailboxRefreshPresentation.begin(accountIdentifier: accountIdentifier)
+        else {
+            return
+        }
+        isMailboxRefreshInProgress = true
+        mailboxRefreshNotice = nil
+        let token = beginOperation(.connectAndSync, timeout: Self.connectAndSyncTimeout)
+        syncWithStoredCredential(
+            accountIdentifier: accountIdentifier,
+            token: token,
+            refreshToken: refreshToken
+        )
+    }
+
+    /// Begins the ordinary connection ladder only after the person explicitly
+    /// chooses Reconnect from the Inbox refresh notice.
+    func reconnectInbox() {
+        guard MailboxRefreshPolicy.route(
+            origin: .explicitReconnect,
+            event: .missingStoredCredential
+        ) == .startExplicitReconnectLadder else { return }
+        guard state == .connected,
+              let accountIdentifier = connectedAccountIdentifier,
+              let identifier = String(data: accountIdentifier, encoding: .utf8)
+        else {
+            return
+        }
+        mailboxRefreshNotice = nil
+        self.accountIdentifier = identifier
+        state = .notConnected
+        connect()
+    }
+
     /// Routes a failure's retry. A failed DISCONNECT must re-issue the
     /// disconnect — the Rust account slot stays fenced against sync and
     /// connect until a disconnect converges, so re-running the connect ladder
@@ -275,6 +325,9 @@ final class AccountConnectionViewModel: ObservableObject {
     /// leaving the outer intent and the recovery evidence in place so the
     /// retry path re-issues the disconnect.
     func disconnect() {
+        mailboxRefreshPresentation.invalidate()
+        isMailboxRefreshInProgress = false
+        mailboxRefreshNotice = nil
         (NSApp.delegate as? AppDelegate)?.tokenBrokerAuthorizationSession.cancel()
         cancelActiveTokenBrokerClient()
         guard let accountIdentifier = connectedAccountIdentifier, state != .disconnecting else {
@@ -552,24 +605,32 @@ final class AccountConnectionViewModel: ObservableObject {
     /// hands the SAME operation to the broker refresh ladder.
     private func syncWithStoredCredential(
         accountIdentifier: Data,
-        token: ConnectionOperationToken
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken? = nil
     ) {
         syncWorker.readBrokerSubject(accountIdentifier: accountIdentifier) { [weak self] result in
-            guard let self, self.operationDeadline.accepts(token) else {
+            guard let self, self.acceptsStoredCredentialSync(token, refreshToken: refreshToken) else {
                 return
             }
             switch result {
             case .absent:
-                _ = self.finishOperation(token)
-                self.authorizeAndConnect(accountIdentifier: accountIdentifier)
+                self.finishStoredCredentialAbsence(
+                    accountIdentifier: accountIdentifier,
+                    token: token,
+                    refreshToken: refreshToken
+                )
             case .failure:
-                _ = self.finishOperation(token)
-                self.state = .failed(.accountStateUnavailable)
+                self.finishStoredCredentialFailure(
+                    token: token,
+                    refreshToken: refreshToken,
+                    failure: .accountStateUnavailable
+                )
             case .found(let subject):
                 self.refreshStoredBrokerCredential(
                     subject: subject,
                     accountIdentifier: accountIdentifier,
-                    token: token
+                    token: token,
+                    refreshToken: refreshToken
                 )
             }
         }
@@ -585,13 +646,17 @@ final class AccountConnectionViewModel: ObservableObject {
     private func refreshStoredBrokerCredential(
         subject: String,
         accountIdentifier: Data,
-        token: ConnectionOperationToken
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken? = nil
     ) {
         guard let client = installTokenBrokerClient() else {
             // A broker client is already active: fail closed as busy rather
             // than racing a second refresh against the owned one.
-            _ = finishOperation(token)
-            state = .failed(.busyOrUnavailable)
+            finishStoredCredentialFailure(
+                token: token,
+                refreshToken: refreshToken,
+                failure: .busyOrUnavailable
+            )
             return
         }
         client.refreshAccessToken(accountSubject: subject) { [weak self] result in
@@ -609,7 +674,7 @@ final class AccountConnectionViewModel: ObservableObject {
                 guard self.finishTokenBrokerClient(client) else {
                     return
                 }
-                guard self.operationDeadline.accepts(token) else {
+                guard self.acceptsStoredCredentialSync(token, refreshToken: refreshToken) else {
                     return
                 }
                 switch result {
@@ -618,21 +683,25 @@ final class AccountConnectionViewModel: ObservableObject {
                     // identity; a mismatched subject must never feed another
                     // identity's access token into the sync.
                     guard refreshedToken.subject == subject else {
-                        _ = self.finishOperation(token)
-                        self.state = .failed(.unavailable)
+                        self.finishStoredCredentialFailure(
+                            token: token,
+                            refreshToken: refreshToken,
+                            failure: .unavailable
+                        )
                         return
                     }
                     self.syncWorker.beginBrokerSync(
                         accountIdentifier: accountIdentifier,
                         token: refreshedToken
                     ) { [weak self] status in
-                        guard let self, self.operationDeadline.accepts(token) else {
+                        guard let self, self.acceptsStoredCredentialSync(token, refreshToken: refreshToken) else {
                             return
                         }
                         self.finishStoredBrokerSync(
                             status: status,
                             accountIdentifier: accountIdentifier,
-                            token: token
+                            token: token,
+                            refreshToken: refreshToken
                         )
                     }
                 case .failure(let error):
@@ -643,24 +712,34 @@ final class AccountConnectionViewModel: ObservableObject {
                     switch recovery {
                     case .needsReconnect:
                         // The stored grant is gone or revoked: climb the ladder.
-                        _ = self.finishOperation(token)
-                        self.authorizeAndConnect(accountIdentifier: accountIdentifier)
+                        self.applyCredentialRecovery(
+                            event: .brokerReconnect,
+                            accountIdentifier: accountIdentifier,
+                            token: token,
+                            refreshToken: refreshToken
+                        )
                     case .permissionRequired:
-                        _ = self.finishOperation(token)
-                        self.state = .failed(.permissionRequired)
+                        self.applyCredentialRecovery(
+                            event: .brokerPermissionRequired,
+                            accountIdentifier: accountIdentifier,
+                            token: token,
+                            refreshToken: refreshToken
+                        )
                     case .transport:
                         // The refresh died in transit; land connected on the
                         // last-committed mailbox, offline — the stored-credential
                         // rung's SYNC_FAILED semantics.
-                        self.completeConnected(
+                        self.completeStoredCredentialSync(
                             accountIdentifier: accountIdentifier,
                             token: token,
-                            offline: true
+                            offline: true,
+                            refreshToken: refreshToken
                         )
                     default:
-                        _ = self.finishOperation(token)
-                        self.state = .failed(
-                            TokenBrokerStatusMapping.connectionFailure(for: recovery) ?? .unavailable
+                        self.finishStoredCredentialFailure(
+                            token: token,
+                            refreshToken: refreshToken,
+                            failure: TokenBrokerStatusMapping.connectionFailure(for: recovery) ?? .unavailable
                         )
                     }
                 }
@@ -675,35 +754,202 @@ final class AccountConnectionViewModel: ObservableObject {
     private func finishStoredBrokerSync(
         status: MailboxPollStatus,
         accountIdentifier: Data,
-        token: ConnectionOperationToken
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken? = nil
     ) {
         switch status {
         case .succeeded, .succeededRevokeUnconfirmed:
-            completeConnected(
+            completeStoredCredentialSync(
                 accountIdentifier: accountIdentifier,
                 token: token,
-                offline: false
+                offline: false,
+                refreshToken: refreshToken
             )
         case .syncFailed:
             // Offline case, as on the stored-credential rung: the gate did not
             // BLOCK, and the mailbox store only ever holds the last-COMMITTED
             // identity's data, so last-verified data may be shown.
-            completeConnected(
+            completeStoredCredentialSync(
                 accountIdentifier: accountIdentifier,
                 token: token,
-                offline: true
+                offline: true,
+                refreshToken: refreshToken
             )
-        case .needsReconnect, .permissionRequired:
-            _ = finishOperation(token)
-            authorizeAndConnect(accountIdentifier: accountIdentifier)
+        case .needsReconnect:
+            applyCredentialRecovery(
+                event: .syncReconnect,
+                accountIdentifier: accountIdentifier,
+                token: token,
+                refreshToken: refreshToken
+            )
+        case .permissionRequired:
+            applyCredentialRecovery(
+                event: .syncPermissionRequired,
+                accountIdentifier: accountIdentifier,
+                token: token,
+                refreshToken: refreshToken
+            )
         case .cancelled:
             // A disconnect dropped the in-flight sync; land neutral.
-            _ = finishOperation(token)
-            state = .notConnected
+            finishStoredCredentialCancellation(token: token, refreshToken: refreshToken)
         case .gateBlocked, .internalError, .unknownSession, .unrecognized,
              .running:
+            finishStoredCredentialFailure(
+                token: token,
+                refreshToken: refreshToken,
+                failure: Self.terminalFailure(status)
+            )
+        }
+    }
+
+    private func acceptsStoredCredentialSync(
+        _ token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken?
+    ) -> Bool {
+        guard operationDeadline.accepts(token) else { return false }
+        return refreshToken == nil || mailboxRefreshPresentation.isRefreshing
+    }
+
+    private func finishStoredCredentialAbsence(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken?
+    ) {
+        applyCredentialRecovery(
+            event: .missingStoredCredential,
+            accountIdentifier: accountIdentifier,
+            token: token,
+            refreshToken: refreshToken
+        )
+    }
+
+    private func finishStoredCredentialFailure(
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken?,
+        failure: ConnectionFailure
+    ) {
+        if let refreshToken {
+            finishRefresh(token: token, refreshToken: refreshToken, terminal: .unavailable)
+            return
+        }
+        _ = finishOperation(token)
+        state = .failed(failure)
+    }
+
+    private func finishStoredCredentialCancellation(
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken?
+    ) {
+        if let refreshToken {
+            finishRefresh(token: token, refreshToken: refreshToken, terminal: .unavailable)
+            return
+        }
+        _ = finishOperation(token)
+        state = .notConnected
+    }
+
+    /// Applies the one shared recovery policy for broker and sync terminals.
+    /// The automatic-refresh route has no OAuth-admitting branch.
+    private func applyCredentialRecovery(
+        event: MailboxCredentialRecoveryEvent,
+        accountIdentifier: Data,
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken?
+    ) {
+        let origin: MailboxCredentialRecoveryOrigin = refreshToken == nil
+            ? .ordinaryConnection
+            : .automaticRefresh
+        switch MailboxRefreshPolicy.route(origin: origin, event: event) {
+        case .authorizeFromConnectionLadder:
             _ = finishOperation(token)
-            state = .failed(Self.terminalFailure(status))
+            authorizeAndConnect(accountIdentifier: accountIdentifier)
+        case .presentRefreshReconnect:
+            guard let refreshToken else {
+                assertionFailure("Refresh reconnect route requires a refresh token")
+                return
+            }
+            finishRefresh(token: token, refreshToken: refreshToken, terminal: .reconnect)
+        case .failConnectionPermission:
+            _ = finishOperation(token)
+            state = .failed(.permissionRequired)
+        case .startExplicitReconnectLadder:
+            assertionFailure("Explicit reconnect route is entered only from the Inbox action")
+        }
+    }
+
+    /// Executes the policy's ordered timeout disposition. Releasing the owned
+    /// client precedes presentation finish/fencing, so a late cancellation
+    /// callback observes an empty slot and cannot touch a future refresh.
+    private func applyRefreshTimeout(token: ConnectionOperationToken) {
+        let refreshToken = mailboxRefreshPresentation.activeToken
+        for action in MailboxRefreshPolicy.timeoutActions {
+            switch action {
+            case .cancelOwnedBrokerClient:
+                cancelActiveTokenBrokerClient()
+            case .finishAndFence(let terminal):
+                guard let refreshToken else { continue }
+                finishRefresh(token: token, refreshToken: refreshToken, terminal: terminal)
+            }
+        }
+    }
+
+    /// Ends a refresh-only failure without changing the connected account or
+    /// cache. The operation generation is closed so a late non-cancellable
+    /// broker/sync callback cannot reload mail or begin OAuth.
+    private func finishRefresh(
+        token: ConnectionOperationToken,
+        refreshToken: MailboxRefreshToken,
+        terminal: MailboxRefreshTerminal
+    ) {
+        guard mailboxRefreshPresentation.finish(refreshToken, succeeded: false) else { return }
+        let notice = MailboxRefreshPresentationPolicy.notice(for: terminal)
+        mailboxRefreshPresentation.present(notice)
+        mailboxRefreshNotice = mailboxRefreshPresentation.notice
+        mailboxFreshness = offlineCachedFreshness
+        isMailboxRefreshInProgress = false
+        _ = finishOperation(token)
+        state = .connected
+    }
+
+    private func completeStoredCredentialSync(
+        accountIdentifier: Data,
+        token: ConnectionOperationToken,
+        offline: Bool,
+        refreshToken: MailboxRefreshToken?
+    ) {
+        syncWorker.readLifecycle(accountIdentifier: accountIdentifier) { [weak self] result in
+            guard let self, self.acceptsStoredCredentialSync(token, refreshToken: refreshToken) else {
+                return
+            }
+            if let refreshToken {
+                guard self.mailboxRefreshPresentation.finish(refreshToken, succeeded: !offline) else { return }
+                if offline {
+                    self.mailboxRefreshPresentation.present(
+                        MailboxRefreshPresentationPolicy.notice(for: .syncFailure)
+                    )
+                }
+                self.isMailboxRefreshInProgress = false
+                self.mailboxReloadGeneration = self.mailboxRefreshPresentation.reloadGeneration
+                self.mailboxRefreshNotice = self.mailboxRefreshPresentation.notice
+            }
+            let snapshot: MailboxLifecycleSnapshot? = switch result {
+            case .success(let snapshot): snapshot
+            case .failure: nil
+            }
+            self.mailboxFreshness = .afterSync(snapshot: snapshot, offline: offline)
+            self.disconnectNotice = nil
+            _ = self.finishOperation(token)
+            self.connectedAccountIdentifier = accountIdentifier
+            self.state = .connected
+        }
+    }
+
+    private var offlineCachedFreshness: MailboxFreshnessState {
+        switch mailboxFreshness {
+        case .fresh(let date), .offline(let date):
+            return .offline(lastSuccessfulSync: date)
+        case .unknown:
+            return .offline(lastSuccessfulSync: nil)
         }
     }
 
