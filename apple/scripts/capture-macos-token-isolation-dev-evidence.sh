@@ -32,7 +32,7 @@ BROKER_ENT="$SCRATCH/broker.embedded.entitlements.plist"
 TEAM_PROBE_SOURCE="$SCRATCH/tersa-team-probe.c"
 TEAM_PROBE="$SCRATCH/tersa-team-probe"
 PROFILE_PLIST="$SCRATCH/profile.plist"
-PROBE_ARG='--tersa-keychain-isolation-probe-v1'
+PROBE_ARG='--tersa-keychain-isolation-probe-v2'
 POSITIVE_CONTROL='not-confirmed'
 APP_PID=''
 PROBE_PID=''
@@ -140,6 +140,23 @@ APP_PROFILE=''
 BROKER_PROFILE=''
 APP_PROFILE_COUNT=0
 BROKER_PROFILE_COUNT=0
+
+# A profile authorizes a requested Keychain group when its keychain-access-groups
+# entitlement array holds the exact TEAMID.<group> entry or the TEAMID.* team
+# wildcard. A single wildcard profile may therefore legitimately authorize both
+# principals; the exactly-one-current-profile-per-principal count below keeps the
+# binding deterministic. Never prints the team ID, group, UUID, profile path, or
+# any entitlement value.
+kc_group_authorized() {
+  kga_xml="$1"; kga_group="$2"
+  if printf '%s' "$kga_xml" | grep -Fq "<string>$TEAM_ID.$kga_group</string>"; then
+    return 0
+  fi
+  if printf '%s' "$kga_xml" | grep -Fq "<string>$TEAM_ID.*</string>"; then
+    return 0
+  fi
+  return 1
+}
 for profile_dir in \
   "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
   "$HOME/Library/MobileDevice/Provisioning Profiles"; do
@@ -154,33 +171,30 @@ for profile_dir in \
       "$p_expiry" 2>/dev/null || continue
     p_appid="$(plutil -extract 'Entitlements.com\.apple\.application-identifier' raw "$PROFILE_PLIST" 2>/dev/null || true)"
     p_kc_xml="$(plutil -extract Entitlements.keychain-access-groups xml1 -o - "$PROFILE_PLIST" 2>/dev/null || true)"
-    p_ag_xml="$(plutil -extract 'Entitlements.com\.apple\.security\.application-groups' xml1 -o - "$PROFILE_PLIST" 2>/dev/null || true)"
     case "$p_appid" in
       "$TEAM_ID.*"|"$TEAM_ID.app.tersa.mac")
-        if printf '%s' "$p_kc_xml" | grep -Fq "<string>$TEAM_ID.app.tersa.shared</string>" \
-          && printf '%s' "$p_ag_xml" | grep -Fq "<string>$TEAM_ID.app.tersa.shared</string>"; then
+        # The app Keychain group is authorized by an exact TEAMID.app.tersa.shared
+        # entry or the TEAMID.* team wildcard. The macOS application group is
+        # verified on the final signed app entitlement below, not required to
+        # appear in this development profile.
+        if kc_group_authorized "$p_kc_xml" app.tersa.shared; then
           APP_PROFILE="$profile"; APP_PROFILE_COUNT=$((APP_PROFILE_COUNT + 1))
         fi ;;
     esac
     case "$p_appid" in
       "$TEAM_ID.*"|"$TEAM_ID.app.tersa.mac.token-broker")
-        # Item 1 gate: the dedicated token group must be EXPLICITLY authorized.
-        # A wildcard keychain group does not prove external registration, so a
-        # wildcard-only profile is intentionally not accepted here.
-        if printf '%s' "$p_kc_xml" | grep -Fq "<string>$TEAM_ID.app.tersa.token</string>"; then
+        if kc_group_authorized "$p_kc_xml" app.tersa.token; then
           BROKER_PROFILE="$profile"; BROKER_PROFILE_COUNT=$((BROKER_PROFILE_COUNT + 1))
         fi ;;
     esac
   done
 done
 [ "$APP_PROFILE_COUNT" -eq 1 ] \
-  || fail 'capture requires exactly one current Apple Development profile authorizing app.tersa.mac with the app.tersa.shared Keychain and application groups'
-[ "$BROKER_PROFILE_COUNT" -gt 0 ] \
-  || fail 'the dedicated token Keychain group (app.tersa.token) is not explicitly authorized by any current Apple Development profile; ADR-0024 Item 1 external registration is not complete - stopping before any live claim'
+  || fail 'capture requires exactly one current Apple Development profile authorizing app.tersa.mac and the app.tersa.shared Keychain group (exact entry or team wildcard)'
 [ "$BROKER_PROFILE_COUNT" -eq 1 ] \
-  || fail 'more than one current Apple Development profile explicitly authorizes the token group; resolve to exactly one before capture'
+  || fail 'capture requires exactly one current Apple Development profile authorizing the app.tersa.token Keychain group (exact entry or team wildcard); resolve to exactly one before capture'
 printf 'app_profile=present current Apple Development (identifier redacted)\n'
-printf 'broker_profile=present current Apple Development; dedicated token group explicitly authorized (identifier redacted)\n'
+printf 'broker_profile=present current Apple Development; token group authorized by exact entry or team wildcard (identifier redacted)\n'
 
 # --- Inside-out Apple Development signing ------------------------------------
 section 'Inside-out Apple Development signing'
@@ -327,11 +341,15 @@ assert_probe() {
   ap_lines="$(wc -l < "$PROBE_OUT_FILE" | tr -d ' ')"
   [ "$ap_lines" -eq 1 ] \
     || fail "the $ap_principal probe emitted $ap_lines line(s); expected exactly one evidence line"
-  ap_expected='{"schema_version":1,"principal":"'"$ap_principal"'","result":"missing-entitlement"}'
+  ap_expected='{"schema_version":2,"principal":"'"$ap_principal"'","result":"missing-entitlement"}'
   grep -Fxq "$ap_expected" "$PROBE_OUT_FILE" \
     || fail "the $ap_principal probe output is not the exact missing-entitlement evidence line"
+  # The exact missing-entitlement line is already enforced above, so any of the
+  # closed v2 non-pass labels here means the probe was not the expected refusal;
+  # fail closed. item-not-found is a read-only v1 outcome and cannot occur.
   case "$(cat "$PROBE_OUT_FILE")" in
-    *'"result":"item-not-found"'* | *'"result":"unexpected-status"'* | *'"result":"configuration-invalid"'*)
+    *'"result":"unexpectedly-authorized"'* | *'"result":"cleanup-failed"'* \
+      | *'"result":"unexpected-status"'* | *'"result":"configuration-invalid"'*)
       fail "the $ap_principal probe returned a non-pass result label" ;;
   esac
   printf 'isolation_probe[%s]=missing-entitlement (exit 0)\n' "$ap_principal"
@@ -391,7 +409,7 @@ printf 'positive_control=confirmed; broker exchange/refresh + Gmail sync/render 
 section 'Evidence record (redacted, commit-bound)'
 {
   printf 'tersa-macos-token-isolation-dev-evidence\n'
-  printf 'schema_version=1\n'
+  printf 'schema_version=2\n'
   printf 'source_commit=%s\n' "$COMMIT"
   printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'architecture=arm64-native\n'
@@ -399,7 +417,7 @@ section 'Evidence record (redacted, commit-bound)'
   printf 'signing_tier=Apple Development (identity, team, and profile redacted)\n'
   printf 'signing_order=broker XPC signed inside first, then containing app; deep strict verified\n'
   printf 'app_profile=present current Apple Development (identifier redacted)\n'
-  printf 'broker_profile=present current Apple Development; dedicated token group explicitly authorized (identifier redacted)\n'
+  printf 'broker_profile=present current Apple Development; token group authorized by exact entry or team wildcard (identifier redacted)\n'
   printf 'app_entitlements=exact five-key set; keychain group app.tersa.shared; App Group and network.server present\n'
   printf 'broker_entitlements=exact three-key set; keychain group app.tersa.token; no App Group; network.client only\n'
   printf 'hardened_runtime=present on both executables\n'

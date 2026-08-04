@@ -30,6 +30,7 @@ their signed access-group entitlements and describes an XPC service as a
 separately executable, sandboxed helper embedded in an app:
 
 - [Sharing access to Keychain items among a collection of apps](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)
+- [TN3125: Inside Code Signing: Provisioning Profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)
 - [TN3137: On Mac Keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
 - [Embedding a helper tool in a sandboxed app](https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app)
 
@@ -100,7 +101,9 @@ one executable both the new token group and the root/store group.
 
 Issue #51 remains open until all of the following are complete:
 
-1. Register the dedicated token Keychain group under the production Apple team.
+1. Ensure the production-team provisioning profile authorizes the exact token
+   Keychain group (`app.tersa.token`) by an exact `TEAMID.app.tersa.token`
+   entry or the `TEAMID.*` team wildcard.
 2. Add the embedded XPC service target and the closed IPC protocol; move token
    exchange, refresh, persistence, rotation, deletion, and revoke behind it.
 3. Remove token-group authority and direct refresh-token Keychain reachability
@@ -117,47 +120,81 @@ Issue #51 remains open until all of the following are complete:
    release signing posture.
 
 Items 2 through 4 are implemented in source and fail-closed in CI as of the
-point-4 cutover (see *Current packaging status*). The fixed-purpose,
-read-only negative probes required by Item 5 are now implemented in source
+point-4 cutover (see *Current packaging status*). The fixed-purpose
+negative-mutation canary required by Item 5 is now implemented in source
 as the shared `KeychainIsolationProbe`: one reviewed file compiled unchanged
 into both actual executables (`TersaMac` and `TersaMacTokenBroker`) and the
-`TersaMacTests` bundle, so a later signed run can execute the probe inside
+`TersaMacTests` bundle, so a later signed run can execute the canary inside
 the real processes. Exact XcodeGen source-path, source-surface, and
 capability guards in `cargo xtask architecture` hold that shape (see
-*Current packaging status*). The probes are fixed-purpose test entries that
-set `kSecUseDataProtectionKeychain` and expose no Keychain mutation or
+*Current packaging status*). The canary is a fixed-purpose negative-mutation
+test item: it opts into the Data Protection Keychain with device-only
+accessibility, carries only a non-secret one-byte zero value under a fixed
+public v2 service and a per-run UUID account, and exercises exactly one
+`SecItemAdd` (plus exactly one `SecItemDelete`, used only to clean up a
+canary whose add unexpectedly succeeded). It exposes no read, update, or
 generic-query capability.
 
-The probe is opt-in only and changes no production behavior unless the host
+The canary is opt-in only and changes no production behavior unless the host
 process is launched with the exact single argument
-`--tersa-keychain-isolation-probe-v1`. It then reads its own signed
+`--tersa-keychain-isolation-probe-v2`. It then reads its own signed
 `keychain-access-groups` entitlement, derives the one group the principal is
 forbidden from — the other principal's group, produced by keeping the team
 prefix and swapping the suffix between `.app.tersa.shared` and
-`.app.tersa.token` — and issues exactly one query-only `SecItemCopyMatching`
-against that group,
-requesting no item data and no attributes. Only `errSecMissingEntitlement`
-passes (exit `0`); `errSecItemNotFound`, a configuration-invalid entitlement
-(absent, malformed, zero/multiple, or wrong-suffix groups), and any
-unexpected status all exit nonzero.
+`.app.tersa.token` — and attempts exactly one `SecItemAdd` of the non-secret
+one-byte zero canary into that group, under a fixed public v2 service and a
+per-run UUID account, using the Data Protection Keychain with device-only
+accessibility. Only `errSecMissingEntitlement` passes (exit `0`).
+
+A mutation is required because an unauthorized `SecItemCopyMatching` returns
+`errSecItemNotFound`, whereas an unauthorized `SecItemAdd` returns
+`errSecMissingEntitlement`; the read-only design could never observe the
+missing-entitlement barrier and so could not prove the Item-5 status. If the
+add unexpectedly succeeds the barrier is broken: the canary performs exactly
+one immediate `SecItemDelete` for the exact canary and fails as
+`unexpectedly-authorized`; a cleanup failure fails as `cleanup-failed`; any
+other add status is `unexpected-status`; and an entitlement that does not
+resolve to exactly one valid group for the principal is
+`configuration-invalid`, with no mutation attempted. All non-pass outcomes
+exit nonzero.
 
 These deterministic unit, build, and unsigned-entrypoint checks do not prove
-signed runtime isolation. They prove only that the probe is fixed-purpose,
-read-only, and correctly shaped. An unsigned build has no signed entitlement
-context, and an ad-hoc build may embed an entitlement plist but is not Apple
-Development provisioned evidence for these team-scoped groups.
-Unsigned/ad-hoc outcomes are therefore non-authoritative and normally
+signed runtime isolation. They prove only that the canary is fixed-purpose,
+correctly shaped, and mutates only as intended. An unsigned build has no
+signed entitlement context, and an ad-hoc build may embed an entitlement
+plist but is not Apple Development provisioned evidence for these team-scoped
+groups. Unsigned/ad-hoc outcomes are therefore non-authoritative and normally
 configuration-invalid in the documented deterministic path, regardless of
 which status a scratch build happens to report; only the Apple Development
 signed Point-6 procedure can prove Item 5 runtime isolation. Item 5
 therefore remains unproved: normal token operations succeeding and both
-wrong-group probes receiving `errSecMissingEntitlement` must be run in an
-Apple Development signed build.
-Item 6 remains the Developer ID signed and notarized release-candidate tier,
-adding entitlement inspection and debugger/`task_for_pid` failure. Item 1
-remains external registration that this repository cannot produce or attest
+wrong-group canaries receiving `errSecMissingEntitlement` must be run in an
+Apple Development signed build. Item 6 remains the Developer ID signed and
+notarized release-candidate tier, adding entitlement inspection and
+debugger/`task_for_pid` failure. Item 1 requires that the production-team
+provisioning profile authorize the exact token group by an exact
+`TEAMID.app.tersa.token` entry or the `TEAMID.*` team wildcard — a profile
+check at capture time, not something this repository can produce or attest
 by inspection. Evidence must be redacted, commit-bound, and independently
 reviewed under the existing distribution protocol.
+
+Profile semantics, clarifying Item 1 rather than weakening it: a provisioning
+profile's `keychain-access-groups` entry `TEAMID.*` authorizes a concrete
+same-team access-group claim, while an exact `TEAMID.<group>` entry
+authorizes that one group. One current same-team profile may therefore
+authorize both principals through exact entries or the team wildcard, even as
+each principal's actual access is bounded by its exact signed
+`keychain-access-groups` entitlement — disjoint by construction. The harness
+does not require the `TeamIdentifierPrefix`-prefixed macOS application group
+to appear explicitly in the development profile; it verifies that group on
+the final signed app entitlement and gates the same-team, app-id, and
+current-profile posture. Because process authority is the exact signed
+entitlement, authorizing the token group through the profile rather than a
+separately registered standalone group is a registration clarification, not a
+weakening. See [TN3125: Inside Code Signing: Provisioning
+Profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)
+and [Sharing access to Keychain items among a collection of
+apps](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps).
 
 ## Consequences
 
@@ -262,15 +299,22 @@ and `TersaMacTests` from one explicit source path, and both executable
 targets set `ENABLE_HARDENED_RUNTIME = YES` and
 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO` with no conditional overrides, so a
 signed release applies only the committed entitlements. `cargo xtask
-architecture` guards that shape: the probe source inventory must be exactly
-the reviewed file; the code must contain exactly one `SecItemCopyMatching`
-and no `SecItemAdd`, `SecItemUpdate`, `SecItemDelete`, `kSecReturnData`, or
-`kSecReturnAttributes`; the query must bind `kSecAttrAccessGroup` to the
-derived forbidden group and set `kSecUseDataProtectionKeychain`; both
-executable settings blocks must keep the hardened-runtime and
+architecture` guards that shape: the canary source inventory must be exactly
+the reviewed file; the code must contain exactly one `SecItemAdd` and exactly
+one `SecItemDelete` (the fail-closed cleanup) and no other `SecItem`
+capability — no `SecItemCopyMatching`, `SecItemUpdate`, or read surface
+(`kSecReturnData` and `kSecReturnAttributes` are banned as the canary's
+evidence-redaction guard); the add and delete queries must bind
+`kSecAttrAccessGroup` to the derived forbidden group and set
+`kSecUseDataProtectionKeychain`; the v2 launch argument
+(`--tersa-keychain-isolation-probe-v2`), the fixed v2 canary service, the
+`schemaVersion` of `2`, the one-byte zero canary value (`Data([0])`), and the
+per-run `UUID().uuidString` account are pinned; the broken-barrier cleanup
+sequence and the zero-exit-only-for-`missingEntitlement` rule are pinned;
+both executable settings blocks must keep the hardened-runtime and
 base-entitlement-injection posture with no conditional override; and each
 executable's entry point must open with the exact, contiguous, unduplicated
-probe branch before any normal startup.
+canary branch before any normal startup.
 
 Point 6 adds the opt-in Apple Development evidence capture harness,
 `apple/scripts/capture-macos-token-isolation-dev-evidence.sh` — the Point-6
@@ -278,28 +322,29 @@ procedure referenced above. It builds tracked Release source from a `git
 archive` of `HEAD`, performs inside-out Apple Development signing of the
 embedded broker then the containing app, verifies the exact reviewed
 entitlement posture and disjoint Keychain groups, runs both fixed-purpose
-negative probes in the real signed processes, and drives the owner-led
+negative-mutation canaries in the real signed processes, and drives the owner-led
 positive control. It is opt-in, never runs in CI, and fails closed without
 recording a live claim on any unresolved precondition. Its existence is
 source only and pre-records no result; the operator runbook is
 `docs/m0/macos-token-isolation-dev-evidence.md`.
 
-What remains open is strictly the signed-runtime evidence: the
-dedicated token Keychain group is declared for the broker only and, unless
-externally completed, is not yet registered or provisioned under the
-production team — the repository cannot prove external registration;
-the opt-in Point-6 Apple Development harness exists in source, but
+What remains open is strictly the signed-runtime evidence: the production-team
+provisioning profile must authorize the exact token group (`app.tersa.token`)
+by an exact `TEAMID.app.tersa.token` entry or the `TEAMID.*` team wildcard —
+the repository can read the committed broker entitlement but cannot produce or
+attest the profile by inspection, and only its presence is checked at capture
+time; the opt-in Point-6 Apple Development harness exists in source, but
 development-signed runtime success and both wrong-group
-`errSecMissingEntitlement` fixed-purpose probes are not yet captured on a
-successful exact-commit run, nor independently reviewed; and the
-exact Developer ID signed and notarized release-candidate entitlement
-inspection, negative controls, and debugger/`task_for_pid` evidence are not
-yet produced. Builds remain unsigned unless an operator configures signing
-locally; the local unsigned Debug arm64 `TersaMac` build with the embedded
-broker succeeds, but an unsigned build proves no process-isolation property.
-This ADR still implements no signed runtime proof, notarization, or
-distribution evidence. Until the remaining required-evidence items land,
-final distribution remains blocked by issue #51.
+`errSecMissingEntitlement` fixed-purpose canaries are not yet captured on a
+successful exact-commit run, nor independently reviewed; and the exact
+Developer ID signed and notarized release-candidate entitlement inspection,
+negative controls, and debugger/`task_for_pid` evidence are not yet produced.
+Builds remain unsigned unless an operator configures signing locally; the
+local unsigned Debug arm64 `TersaMac` build with the embedded broker succeeds,
+but an unsigned build proves no process-isolation property. This ADR still
+implements no signed runtime proof, notarization, or distribution evidence.
+Until the remaining required-evidence items land, final distribution remains
+blocked by issue #51.
 
 ### Point-4 production cutover and legacy credential disposition
 

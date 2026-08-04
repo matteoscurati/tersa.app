@@ -4,13 +4,14 @@
 
 import XCTest
 
-/// Deterministic tests for the closed, read-only Keychain isolation probe.
+/// Deterministic tests for the closed, fixed-purpose Keychain isolation canary.
 ///
 /// These tests exercise only pure derivation, parsing, classification, query
 /// construction, and evidence mapping. They never call live `SecItem*` and never
 /// inspect the host process's real signing entitlements. Fixtures carry no
 /// credentials, tokens, or Keychain data; the team prefix is a synthetic
-/// placeholder that is never emitted by the probe.
+/// placeholder that is never emitted by the probe, and the canary account is a
+/// fixed fixture string rather than the runner's per-run UUID.
 final class KeychainIsolationProbeTests: XCTestCase {
 
     // A synthetic, non-real 10-character team prefix. The probe never prints it.
@@ -19,12 +20,16 @@ final class KeychainIsolationProbeTests: XCTestCase {
     private var mainGroup: String { "\(teamPrefix).app.tersa.shared" }
     private var tokenGroup: String { "\(teamPrefix).app.tersa.token" }
 
+    // A fixed, non-emitted account fixture standing in for the runner's per-run
+    // random UUID account.
+    private let account = "fixture-account"
+
     // MARK: Opt-in argument contract
 
     func testExactArgumentAccepted() {
         XCTAssertTrue(
             KeychainIsolationProbe.isProbeRequest(
-                ["/usr/bin/tersa", "--tersa-keychain-isolation-probe-v1"]
+                ["/usr/bin/tersa", "--tersa-keychain-isolation-probe-v2"]
             )
         )
     }
@@ -37,9 +42,11 @@ final class KeychainIsolationProbeTests: XCTestCase {
     }
 
     func testWrongArgumentRejected() {
+        // The stale v1 argument must be rejected so a stale harness cannot
+        // silently accept the changed v2 semantics.
         XCTAssertFalse(
             KeychainIsolationProbe.isProbeRequest(
-                ["/usr/bin/tersa", "--tersa-keychain-isolation-probe-v2"]
+                ["/usr/bin/tersa", "--tersa-keychain-isolation-probe-v1"]
             )
         )
         XCTAssertFalse(
@@ -60,7 +67,7 @@ final class KeychainIsolationProbeTests: XCTestCase {
             KeychainIsolationProbe.isProbeRequest(
                 [
                     "/usr/bin/tersa",
-                    "--tersa-keychain-isolation-probe-v1",
+                    "--tersa-keychain-isolation-probe-v2",
                     "extra",
                 ]
             )
@@ -69,8 +76,8 @@ final class KeychainIsolationProbeTests: XCTestCase {
             KeychainIsolationProbe.isProbeRequest(
                 [
                     "/usr/bin/tersa",
-                    "--tersa-keychain-isolation-probe-v1",
-                    "--tersa-keychain-isolation-probe-v1",
+                    "--tersa-keychain-isolation-probe-v2",
+                    "--tersa-keychain-isolation-probe-v2",
                 ]
             )
         )
@@ -225,11 +232,11 @@ final class KeychainIsolationProbeTests: XCTestCase {
         XCTAssertNil(KeychainIsolationProbe.parsedGroups(from: 42 as CFTypeRef))
     }
 
-    // MARK: Status classification and exit mapping
+    // MARK: Add status classification
 
     func testOnlyMissingEntitlementPasses() {
         XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: errSecMissingEntitlement),
+            KeychainIsolationProbe.classifyAdd(status: errSecMissingEntitlement),
             .missingEntitlement
         )
         XCTAssertEqual(
@@ -238,33 +245,31 @@ final class KeychainIsolationProbeTests: XCTestCase {
         )
     }
 
-    func testItemNotFoundFails() {
+    func testAddSuccessMeansBarrierBroken() {
+        // A successful add is the barrier-broken outcome that triggers cleanup;
+        // it is never a pass.
         XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: errSecItemNotFound),
-            .itemNotFound
+            KeychainIsolationProbe.classifyAdd(status: errSecSuccess),
+            .unexpectedlyAuthorized
         )
         XCTAssertNotEqual(
-            KeychainIsolationProbe.exitCode(for: .itemNotFound),
+            KeychainIsolationProbe.exitCode(for: .unexpectedlyAuthorized),
             0
         )
     }
 
-    func testArbitraryStatusFailsAsUnexpected() {
+    func testArbitraryAddStatusFailsAsUnexpected() {
         // Both negative and positive unknown statuses fail as unexpected.
         XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: -1),
+            KeychainIsolationProbe.classifyAdd(status: -1),
             .unexpectedStatus
         )
         XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: -25300),
-            .itemNotFound
-        )
-        XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: errSecParam),
+            KeychainIsolationProbe.classifyAdd(status: errSecParam),
             .unexpectedStatus
         )
         XCTAssertEqual(
-            KeychainIsolationProbe.classify(status: errSecAuthFailed),
+            KeychainIsolationProbe.classifyAdd(status: errSecAuthFailed),
             .unexpectedStatus
         )
         XCTAssertNotEqual(
@@ -273,21 +278,57 @@ final class KeychainIsolationProbeTests: XCTestCase {
         )
         XCTAssertNotEqual(
             KeychainIsolationProbe.exitCode(for: .unexpectedStatus),
-            KeychainIsolationProbe.exitCode(for: .itemNotFound)
+            KeychainIsolationProbe.exitCode(for: .unexpectedlyAuthorized)
+        )
+    }
+
+    // MARK: Cleanup classification after a broken barrier
+
+    func testCleanupSuccessOrNotFoundLeavesNoResidue() {
+        XCTAssertEqual(
+            KeychainIsolationProbe.cleanupOutcome(deleteStatus: errSecSuccess),
+            .unexpectedlyAuthorized
+        )
+        // Item-not-found means the canary was already gone: no residue, still a
+        // closed failure.
+        XCTAssertEqual(
+            KeychainIsolationProbe.cleanupOutcome(deleteStatus: errSecItemNotFound),
+            .unexpectedlyAuthorized
+        )
+    }
+
+    func testCleanupFailureFailsClosed() {
+        XCTAssertEqual(
+            KeychainIsolationProbe.cleanupOutcome(deleteStatus: errSecParam),
+            .cleanupFailed
+        )
+        XCTAssertEqual(
+            KeychainIsolationProbe.cleanupOutcome(deleteStatus: -1),
+            .cleanupFailed
+        )
+        XCTAssertNotEqual(
+            KeychainIsolationProbe.exitCode(for: .cleanupFailed),
+            0
+        )
+        XCTAssertNotEqual(
+            KeychainIsolationProbe.exitCode(for: .cleanupFailed),
+            KeychainIsolationProbe.exitCode(for: .unexpectedlyAuthorized)
         )
     }
 
     func testExitCodesAreStableAndDistinct() {
         XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .missingEntitlement), 0)
         XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .configurationInvalid), 2)
-        XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .itemNotFound), 3)
+        XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .unexpectedlyAuthorized), 3)
         XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .unexpectedStatus), 4)
+        XCTAssertEqual(KeychainIsolationProbe.exitCode(for: .cleanupFailed), 5)
         // The pass outcome is the unique zero code.
         let codes: [KeychainIsolationProbe.Outcome] = [
             .missingEntitlement,
-            .configurationInvalid,
-            .itemNotFound,
+            .unexpectedlyAuthorized,
+            .cleanupFailed,
             .unexpectedStatus,
+            .configurationInvalid,
         ]
         let unique = Set(codes.map { KeychainIsolationProbe.exitCode(for: $0) })
         XCTAssertEqual(unique.count, codes.count, "exit codes must be distinct")
@@ -295,35 +336,65 @@ final class KeychainIsolationProbeTests: XCTestCase {
 
     // MARK: Query construction
 
-    func testQueryContainsDataProtectionKeychainAndForbiddenGroup() {
-        let query = KeychainIsolationProbe.query(for: tokenGroup)
+    func testAddQueryContainsRequiredCanaryAttributes() {
+        let query = KeychainIsolationProbe.addQuery(for: tokenGroup, account: account)
         XCTAssertEqual(query[kSecClass] as? String, kSecClassGenericPassword as String)
+        XCTAssertEqual(query[kSecAttrService] as? String, KeychainIsolationProbe.service)
+        XCTAssertEqual(query[kSecAttrAccount] as? String, account)
         XCTAssertEqual(query[kSecAttrAccessGroup] as? String, tokenGroup)
         XCTAssertEqual(query[kSecUseDataProtectionKeychain] as? Bool, true)
-        XCTAssertEqual(query[kSecMatchLimit] as? String, kSecMatchLimitOne as String)
-        XCTAssertEqual(query[kSecAttrService] as? String, KeychainIsolationProbe.service)
-        XCTAssertEqual(query[kSecAttrAccount] as? String, KeychainIsolationProbe.account)
+        XCTAssertEqual(query[kSecValueData] as? Data, KeychainIsolationProbe.canaryValue)
+        XCTAssertEqual(
+            query[kSecAttrAccessible] as? String,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
+        )
     }
 
-    func testQueryRequestsNoDataOrAttributes() {
-        let query = KeychainIsolationProbe.query(for: tokenGroup)
-        // Read-only and disclosure-minimal: never ask for item data/attributes.
+    func testAddQueryRequestsNoReadOrReturnSurface() {
+        let query = KeychainIsolationProbe.addQuery(for: tokenGroup, account: account)
+        // The canary add never reads or returns data/attributes.
+        XCTAssertNil(query[kSecMatchLimit])
         XCTAssertNil(query[kSecReturnData])
         XCTAssertNil(query[kSecReturnAttributes])
         XCTAssertNil(query[kSecReturnPersistentRef])
         XCTAssertNil(query[kSecReturnRef])
     }
 
-    func testQueryForbiddenGroupIsExactlyDerivedValue() {
-        // Round-trip: derive the forbidden group, then confirm the query embeds
-        // that exact string and nothing else as the access group.
+    func testCanaryValueIsASingleFixedZeroByte() {
+        // Non-secret, one byte, zero value: no credential or user data.
+        XCTAssertEqual(KeychainIsolationProbe.canaryValue, Data([0]))
+        XCTAssertEqual(KeychainIsolationProbe.canaryValue.count, 1)
+    }
+
+    func testDeleteQueryIdentifiesTheExactCanaryWithoutValueData() {
+        let query = KeychainIsolationProbe.deleteQuery(for: tokenGroup, account: account)
+        XCTAssertEqual(query[kSecClass] as? String, kSecClassGenericPassword as String)
+        XCTAssertEqual(query[kSecAttrService] as? String, KeychainIsolationProbe.service)
+        XCTAssertEqual(query[kSecAttrAccount] as? String, account)
+        XCTAssertEqual(query[kSecAttrAccessGroup] as? String, tokenGroup)
+        XCTAssertEqual(query[kSecUseDataProtectionKeychain] as? Bool, true)
+        // Cleanup carries no value data and no read/return surface.
+        XCTAssertNil(query[kSecValueData])
+        XCTAssertNil(query[kSecAttrAccessible])
+        XCTAssertNil(query[kSecMatchLimit])
+        XCTAssertNil(query[kSecReturnData])
+        XCTAssertNil(query[kSecReturnAttributes])
+    }
+
+    func testQueriesBindTheDerivedForbiddenGroupAndAccount() {
+        // Round-trip: derive the forbidden group, then confirm both queries
+        // embed that exact string and the supplied account.
         let forbidden = KeychainIsolationProbe.resolve(
             groups: [mainGroup],
             principal: .mainApp
         )
         XCTAssertEqual(forbidden, tokenGroup)
-        let query = KeychainIsolationProbe.query(for: forbidden ?? "")
-        XCTAssertEqual(query[kSecAttrAccessGroup] as? String, tokenGroup)
+        let add = KeychainIsolationProbe.addQuery(for: forbidden ?? "", account: account)
+        let delete = KeychainIsolationProbe.deleteQuery(for: forbidden ?? "", account: account)
+        XCTAssertEqual(add[kSecAttrAccessGroup] as? String, tokenGroup)
+        XCTAssertEqual(delete[kSecAttrAccessGroup] as? String, tokenGroup)
+        XCTAssertEqual(add[kSecAttrAccount] as? String, account)
+        XCTAssertEqual(delete[kSecAttrAccount] as? String, account)
     }
 
     // MARK: Evidence labels and JSON shape
@@ -339,8 +410,12 @@ final class KeychainIsolationProbeTests: XCTestCase {
             "missing-entitlement"
         )
         XCTAssertEqual(
-            KeychainIsolationProbe.Outcome.itemNotFound.rawValue,
-            "item-not-found"
+            KeychainIsolationProbe.Outcome.unexpectedlyAuthorized.rawValue,
+            "unexpectedly-authorized"
+        )
+        XCTAssertEqual(
+            KeychainIsolationProbe.Outcome.cleanupFailed.rawValue,
+            "cleanup-failed"
         )
         XCTAssertEqual(
             KeychainIsolationProbe.Outcome.unexpectedStatus.rawValue,
@@ -350,7 +425,7 @@ final class KeychainIsolationProbeTests: XCTestCase {
             KeychainIsolationProbe.Outcome.configurationInvalid.rawValue,
             "configuration-invalid"
         )
-        XCTAssertEqual(KeychainIsolationProbe.schemaVersion, 1)
+        XCTAssertEqual(KeychainIsolationProbe.schemaVersion, 2)
     }
 
     func testEvidenceLineIsSingleLineCompactJSON() {
@@ -367,40 +442,73 @@ final class KeychainIsolationProbeTests: XCTestCase {
         else {
             return XCTFail("evidence line must be valid JSON: \(line)")
         }
-        XCTAssertEqual(object["schema_version"] as? Int, 1)
+        XCTAssertEqual(object["schema_version"] as? Int, 2)
         XCTAssertEqual(object["principal"] as? String, "main-app")
         XCTAssertEqual(object["result"] as? String, "missing-entitlement")
         XCTAssertNil(object["os_status"], "os_status must not appear on a known status")
     }
 
-    func testEvidenceLineIncludesOSStatusOnlyForUnexpectedStatus() {
-        // Known statuses never carry os_status.
-        XCTAssertFalse(
-            KeychainIsolationProbe.evidenceLine(
-                principal: .tokenBroker,
-                outcome: .itemNotFound
-            ).contains("os_status")
-        )
+    func testEvidenceLineIncludesOSStatusOnlyForUnexpectedAndCleanupFailed() {
+        // Known/closed statuses never carry os_status.
         XCTAssertFalse(
             KeychainIsolationProbe.evidenceLine(
                 principal: .tokenBroker,
                 outcome: .missingEntitlement
             ).contains("os_status")
         )
-        // An unexpected status carries the numeric OSStatus.
-        let line = KeychainIsolationProbe.evidenceLine(
+        XCTAssertFalse(
+            KeychainIsolationProbe.evidenceLine(
+                principal: .tokenBroker,
+                outcome: .unexpectedlyAuthorized
+            ).contains("os_status")
+        )
+        XCTAssertFalse(
+            KeychainIsolationProbe.evidenceLine(
+                principal: .tokenBroker,
+                outcome: .configurationInvalid
+            ).contains("os_status")
+        )
+        // An unexpected add status carries the numeric OSStatus.
+        let unexpected = KeychainIsolationProbe.evidenceLine(
             principal: .tokenBroker,
             outcome: .unexpectedStatus,
             osStatus: -50
         )
-        XCTAssertTrue(line.contains("\"os_status\":-50"))
-        guard let data = line.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return XCTFail("evidence line must be valid JSON: \(line)")
+        XCTAssertTrue(unexpected.contains("\"os_status\":-50"))
+        // A cleanup failure carries the redacted numeric delete status.
+        let cleanup = KeychainIsolationProbe.evidenceLine(
+            principal: .tokenBroker,
+            outcome: .cleanupFailed,
+            osStatus: -25300
+        )
+        XCTAssertTrue(cleanup.contains("\"os_status\":-25300"))
+        for line in [unexpected, cleanup] {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                return XCTFail("evidence line must be valid JSON: \(line)")
+            }
+            XCTAssertEqual(object["schema_version"] as? Int, 2)
         }
-        XCTAssertEqual(object["os_status"] as? Int, -50)
-        XCTAssertEqual(object["result"] as? String, "unexpected-status")
+        XCTAssertEqual(
+            (try? JSONSerialization.jsonObject(
+                with: unexpected.data(using: .utf8) ?? Data()
+            ) as? [String: Any])?["os_status"] as? Int,
+            -50
+        )
+        XCTAssertEqual(
+            (try? JSONSerialization.jsonObject(
+                with: cleanup.data(using: .utf8) ?? Data()
+            ) as? [String: Any])?["os_status"] as? Int,
+            -25300
+        )
+        // A cleanup-failed outcome must not carry os_status when none is given.
+        XCTAssertFalse(
+            KeychainIsolationProbe.evidenceLine(
+                principal: .tokenBroker,
+                outcome: .cleanupFailed
+            ).contains("os_status")
+        )
     }
 
     func testEvidenceLineNeverLeaksSecretMaterial() {
@@ -408,25 +516,23 @@ final class KeychainIsolationProbeTests: XCTestCase {
         // account, or arbitrary text — only the closed labels and schema.
         for outcome: KeychainIsolationProbe.Outcome in [
             .missingEntitlement,
-            .itemNotFound,
+            .unexpectedlyAuthorized,
+            .cleanupFailed,
             .unexpectedStatus,
             .configurationInvalid,
         ] {
             let line = KeychainIsolationProbe.evidenceLine(
                 principal: .mainApp,
                 outcome: outcome,
-                osStatus: outcome == .unexpectedStatus ? -7 : nil
+                osStatus: outcome == .unexpectedStatus || outcome == .cleanupFailed ? -7 : nil
             )
             XCTAssertFalse(line.contains(teamPrefix), "team prefix must not leak: \(line)")
-            XCTAssertFalse(line.contains("app.tersa"), "group must not leak: \(line)")
+            XCTAssertFalse(line.contains("app.tersa"), "group/service must not leak: \(line)")
             XCTAssertFalse(
                 line.contains(KeychainIsolationProbe.service),
                 "service must not leak: \(line)"
             )
-            XCTAssertFalse(
-                line.contains(KeychainIsolationProbe.account),
-                "account must not leak: \(line)"
-            )
+            XCTAssertFalse(line.contains(account), "account must not leak: \(line)")
             XCTAssertFalse(line.contains("error"), "no free-form error text: \(line)")
         }
     }

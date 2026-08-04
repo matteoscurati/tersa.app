@@ -5,29 +5,51 @@
 import Foundation
 import Security
 
-/// A fixed-purpose, read-only "wrong-Keychain-group" isolation probe.
+/// A fixed-purpose, negative-mutation "wrong-Keychain-group" isolation canary.
 ///
 /// This file compiles unchanged into three targets — TersaMac,
-/// TersaMacTokenBroker, and TersaMacTests — so Point 6 can run the probe inside
-/// the actual signed executables. When the host process is launched with
-/// exactly one argument (`--tersa-keychain-isolation-probe-v1`) it reads its own
-/// signed `keychain-access-groups` entitlement, derives the single Keychain
-/// access group the principal is *forbidden* from (the other principal's
-/// group), and issues exactly one query-only `SecItemCopyMatching` against that
-/// group. The only passing outcome is `errSecMissingEntitlement`: the kernel
-/// denied access to a group the process is not entitled to, which proves the
-/// main app and the token broker remain Keychain-isolated.
+/// TersaMacTokenBroker, and TersaMacTests — so Point 6 can run the canary inside
+/// the actual signed executables. When the host process is launched with exactly
+/// one argument (`--tersa-keychain-isolation-probe-v2`) it reads its own signed
+/// `keychain-access-groups` entitlement, derives the single Keychain access group
+/// the principal is *forbidden* from (the other principal's group), and attempts
+/// exactly one `SecItemAdd` of a non-secret, one-byte, zero-value
+/// generic-password canary into that group, using the Data Protection Keychain.
+/// The only passing outcome is `errSecMissingEntitlement`: the kernel refused to
+/// let the process create an item in a group it is not entitled to, which proves
+/// the main app and the token broker remain Keychain-isolated.
+///
+/// Why a mutation and not a read. Apple documents that adding an item to a group
+/// the app does not belong to returns `errSecMissingEntitlement`, but searching
+/// an unauthorized group with `SecItemCopyMatching` returns `errSecItemNotFound`.
+/// A read-only probe can therefore never observe the missing-entitlement barrier,
+/// so it cannot serve as isolation evidence. The canary instead mutates: only the
+/// add path distinguishes "denied for lack of entitlement" from "allowed". The v1
+/// read-only probe is superseded; the opt-in argument and evidence schema were
+/// bumped together so a stale v1 harness cannot silently accept the changed
+/// semantics.
 ///
 /// Hard guarantees, enforced by design:
-/// - No mutation. There is no `SecItemAdd`, `SecItemUpdate`, or
-///   `SecItemDelete` anywhere in this file, and the single query requests no
-///   item data and no attributes.
+/// - Exactly one mutation surface. There is exactly one `SecItemAdd` (the canary)
+///   and exactly one `SecItemDelete`, used only to clean up a canary whose add
+///   unexpectedly succeeded. There is no `SecItemCopyMatching`, `SecItemUpdate`,
+///   or any other `SecItem` capability, and the add passes `nil` so it returns no
+///   item data.
 /// - No caller-supplied input. The forbidden group is derived solely from the
 ///   process's own signed entitlement; a suffix is never accepted from a caller.
-/// - No entitlement weakening and no live evidence. The committed entitlements
-///   are untouched; nothing is written, and the JSON line leaks no entitlement
-///   value, group, team ID, service/account, Keychain data, token, or free-form
-///   error text.
+/// - No credential or user data. The canary carries a single fixed zero byte and
+///   a per-run random UUID account that is never emitted; service is a fixed v2
+///   public name. No token, refresh token, or user secret is touched.
+/// - Fail-closed cleanup. If the add succeeds the barrier is broken: the probe
+///   immediately attempts exactly one `SecItemDelete` for that exact canary
+///   (without value data) and emits a closed `unexpectedly-authorized` failure.
+///   If cleanup itself fails, the probe still fails closed as `cleanup-failed`
+///   carrying only the redacted numeric delete status; a non-secret one-byte
+///   residue may then remain in the forbidden group until it is removed.
+/// - No entitlement weakening and no live-evidence leak. The committed
+///   entitlements are untouched, and the JSON line leaks no entitlement value,
+///   group, team ID, service/account, Keychain data, token, or free-form error
+///   text.
 /// - No production behavior change without the exact opt-in argument.
 enum KeychainIsolationProbe {
 
@@ -35,11 +57,12 @@ enum KeychainIsolationProbe {
 
     /// The single accepted launch argument. Probe execution occurs only when
     /// `CommandLine.arguments` is exactly `[executablePath, argument]`.
-    static let argument = "--tersa-keychain-isolation-probe-v1"
+    static let argument = "--tersa-keychain-isolation-probe-v2"
 
-    /// Machine-readable evidence schema version. Bumped only if the JSON
-    /// surface changes.
-    static let schemaVersion = 1
+    /// Machine-readable evidence schema version. Bumped to 2 with the switch
+    /// from the read-only query (v1) to the negative-mutation canary, so a
+    /// stale v1 harness cannot silently accept the changed semantics.
+    static let schemaVersion = 2
 
     // MARK: Principals (closed)
 
@@ -73,28 +96,32 @@ enum KeychainIsolationProbe {
 
     /// The closed set of result labels emitted as the JSON `result` field.
     enum Outcome: String {
-        /// `errSecMissingEntitlement`: the process was correctly denied access
-        /// to the forbidden group. The only passing outcome.
+        /// `errSecMissingEntitlement`: the canary add was correctly refused for
+        /// the forbidden group. The only passing outcome.
         case missingEntitlement = "missing-entitlement"
-        /// `errSecItemNotFound`: the access-group gate did not deny the query,
-        /// so isolation could not be confirmed.
-        case itemNotFound = "item-not-found"
-        /// Any `OSStatus` other than the two known ones.
+        /// `errSecSuccess` on the add: the isolation barrier is broken. After
+        /// cleanup the probe fails with this closed label.
+        case unexpectedlyAuthorized = "unexpectedly-authorized"
+        /// The cleanup `SecItemDelete` after a broken barrier returned a status
+        /// other than success or item-not-found; a non-secret one-byte residue
+        /// may remain in the forbidden group until it is removed.
+        case cleanupFailed = "cleanup-failed"
+        /// Any add `OSStatus` other than missing-entitlement or success.
         case unexpectedStatus = "unexpected-status"
         /// The signed entitlement did not resolve to exactly one valid group
-        /// for this principal. No Keychain query is issued.
+        /// for this principal. No Keychain mutation is attempted.
         case configurationInvalid = "configuration-invalid"
     }
 
-    // MARK: Non-secret probe item identity
+    // MARK: Non-secret canary identity
 
-    /// Constant, non-secret service for the query. No item with this service is
-    /// ever created; it scopes a read against the forbidden group only. Unique
-    /// to this probe version.
-    static let service = "app.tersa.keychain-isolation-probe.v1"
+    /// Constant, non-secret service for the canary. Unique to this probe
+    /// version; it scopes the single canary item against the forbidden group.
+    static let service = "app.tersa.keychain-isolation-probe.v2"
 
-    /// Constant, non-secret account paired with `service`.
-    static let account = "tersa-keychain-isolation-probe.v1"
+    /// The fixed, non-secret canary value: a single zero byte. The canary never
+    /// carries a credential, token, or any user data.
+    static let canaryValue = Data([0])
 
     /// The `keychain-access-groups` entitlement key string for
     /// `SecTaskCopyValueForEntitlement`. The literal is the canonical,
@@ -164,21 +191,35 @@ extension KeychainIsolationProbe {
 
 extension KeychainIsolationProbe {
 
-    /// Builds the single fixed, query-only `SecItemCopyMatching` dictionary for
-    /// the derived forbidden group.
-    ///
-    /// The query requests no item data (`kSecReturnData` absent) and no
-    /// attributes (`kSecReturnAttributes` absent); it exists only to observe
-    /// whether the access-group gate denies the read. Pure — no Security
-    /// framework calls.
-    static func query(for forbiddenGroup: String) -> [CFString: Any] {
+    /// Builds the single fixed `SecItemAdd` dictionary for the canary in the
+    /// derived forbidden group. The canary value is the fixed one-byte
+    /// `canaryValue`; the account is the per-run random UUID supplied by the
+    /// runner (never a constant, never emitted). Accessibility is device-only,
+    /// matching the restrictive setting the Keychain adapters use. Pure — no
+    /// Security framework calls.
+    static func addQuery(for forbiddenGroup: String, account: String) -> [CFString: Any] {
         [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
             kSecAttrAccessGroup: forbiddenGroup as CFString,
             kSecUseDataProtectionKeychain: true,
-            kSecMatchLimit: kSecMatchLimitOne
+            kSecValueData: canaryValue,
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+    }
+
+    /// Builds the single fixed `SecItemDelete` dictionary used to clean up a
+    /// canary whose add unexpectedly succeeded. It carries no value data and
+    /// requests no return; it identifies the exact canary by class, service,
+    /// per-run account, and forbidden group. Pure — no Security framework calls.
+    static func deleteQuery(for forbiddenGroup: String, account: String) -> [CFString: Any] {
+        [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecAttrAccessGroup: forbiddenGroup as CFString,
+            kSecUseDataProtectionKeychain: true
         ]
     }
 }
@@ -187,13 +228,28 @@ extension KeychainIsolationProbe {
 
 extension KeychainIsolationProbe {
 
-    /// Classifies an `OSStatus` from the query. Only `errSecMissingEntitlement`
-    /// passes; `errSecItemNotFound` and every other status fail. Pure.
-    static func classify(status: OSStatus) -> Outcome {
+    /// Classifies the canary `SecItemAdd` status. `errSecMissingEntitlement` is
+    /// the only passing status; `errSecSuccess` means the isolation barrier is
+    /// broken and the probe must clean up the canary; every other status fails
+    /// closed as an unexpected status. Pure.
+    static func classifyAdd(status: OSStatus) -> Outcome {
         switch status {
         case errSecMissingEntitlement: return .missingEntitlement
-        case errSecItemNotFound: return .itemNotFound
+        case errSecSuccess: return .unexpectedlyAuthorized
         default: return .unexpectedStatus
+        }
+    }
+
+    /// Resolves the final outcome after the barrier was broken and the probe ran
+    /// its single cleanup `SecItemDelete`. `errSecSuccess` or `errSecItemNotFound`
+    /// mean the canary left no residue, so the outcome stays the closed
+    /// `unexpectedly-authorized` failure; any other delete status means cleanup
+    /// could not be confirmed and the probe fails closed as `cleanup-failed`.
+    /// Pure.
+    static func cleanupOutcome(deleteStatus: OSStatus) -> Outcome {
+        switch deleteStatus {
+        case errSecSuccess, errSecItemNotFound: return .unexpectedlyAuthorized
+        default: return .cleanupFailed
         }
     }
 
@@ -203,8 +259,9 @@ extension KeychainIsolationProbe {
         switch outcome {
         case .missingEntitlement: return 0
         case .configurationInvalid: return 2
-        case .itemNotFound: return 3
+        case .unexpectedlyAuthorized: return 3
         case .unexpectedStatus: return 4
+        case .cleanupFailed: return 5
         }
     }
 }
@@ -216,11 +273,11 @@ extension KeychainIsolationProbe {
     /// Emits the single compact, machine-readable JSON evidence line.
     ///
     /// Contains only the schema version, the stable principal label, and the
-    /// closed result label, plus — only for an unexpected status — the numeric
-    /// `OSStatus`. It never embeds entitlement values, groups, team IDs,
-    /// service/account, Keychain data, tokens, or free-form error text. The
-    /// emitted values are closed enums of `[a-z-]` and integers, so no JSON
-    /// escaping is required. Pure.
+    /// closed result label, plus — only for an unexpected status or a
+    /// cleanup-failed outcome — the redacted numeric `OSStatus`. It never embeds
+    /// entitlement values, groups, team IDs, service/account, Keychain data,
+    /// tokens, or free-form error text. The emitted values are closed enums of
+    /// `[a-z-]` and integers, so no JSON escaping is required. Pure.
     static func evidenceLine(
         principal: Principal,
         outcome: Outcome,
@@ -233,7 +290,8 @@ extension KeychainIsolationProbe {
             "\"principal\":\"" + principal.rawValue + "\"",
             "\"result\":\"" + outcome.rawValue + "\""
         ]
-        if outcome == .unexpectedStatus, let osStatus {
+        if let osStatus,
+           outcome == .unexpectedStatus || outcome == .cleanupFailed {
             pairs.append("\"os_status\":" + String(osStatus))
         }
         return "{" + pairs.joined(separator: ",") + "}"
@@ -244,12 +302,13 @@ extension KeychainIsolationProbe {
 
 extension KeychainIsolationProbe {
 
-    /// Runs the probe as `principal` and exits the process.
+    /// Runs the canary as `principal` and exits the process.
     ///
     /// Reads the current process's signed `keychain-access-groups` entitlement,
-    /// builds one query-only `SecItemCopyMatching` against the derived forbidden
-    /// group, emits exactly one JSON line on stdout, and exits with the
-    /// outcome's stable code. Never returns.
+    /// attempts exactly one `SecItemAdd` of a non-secret canary into the derived
+    /// forbidden group, cleans up only if the add unexpectedly succeeds, emits
+    /// exactly one JSON line on stdout, and exits with the outcome's stable code.
+    /// Never returns.
     static func runAsPrincipal(_ principal: Principal) -> Never {
         let value = copyKeychainAccessGroupsValue()
         let groups = parsedGroups(from: value)
@@ -258,10 +317,29 @@ extension KeychainIsolationProbe {
             emitAndExit(principal: principal, outcome: .configurationInvalid)
         }
 
-        let status = copyMatching(query: query(for: forbiddenGroup))
-        let outcome = classify(status: status)
-        let osStatus = outcome == .unexpectedStatus ? status : nil
-        emitAndExit(principal: principal, outcome: outcome, osStatus: osStatus)
+        let account = randomAccount()
+        let addStatus = addCanary(query: addQuery(for: forbiddenGroup, account: account))
+        switch classifyAdd(status: addStatus) {
+        case .missingEntitlement:
+            emitAndExit(principal: principal, outcome: .missingEntitlement)
+        case .unexpectedlyAuthorized:
+            // Barrier broken: clean up the exact canary, then fail closed.
+            let deleteStatus = deleteCanary(query: deleteQuery(for: forbiddenGroup, account: account))
+            let outcome = cleanupOutcome(deleteStatus: deleteStatus)
+            let osStatus = outcome == .cleanupFailed ? deleteStatus : nil
+            emitAndExit(principal: principal, outcome: outcome, osStatus: osStatus)
+        case .unexpectedStatus:
+            emitAndExit(principal: principal, outcome: .unexpectedStatus, osStatus: addStatus)
+        case .configurationInvalid, .cleanupFailed:
+            // classifyAdd never returns these; fail closed if it ever did.
+            emitAndExit(principal: principal, outcome: .unexpectedStatus, osStatus: addStatus)
+        }
+    }
+
+    /// A per-run random UUID account for the canary, so successive runs never
+    /// collide on a stale item or residue. Never emitted in evidence.
+    private static func randomAccount() -> String {
+        UUID().uuidString
     }
 
     /// Copies the current process's signed `keychain-access-groups` entitlement
@@ -277,12 +355,16 @@ extension KeychainIsolationProbe {
         )
     }
 
-    /// Issues the single query-only `SecItemCopyMatching` and returns its
-    /// status. The query requests no data and no attributes, so any returned
-    /// object is intentionally discarded.
-    private static func copyMatching(query: [CFString: Any]) -> OSStatus {
-        var result: CFTypeRef?
-        return SecItemCopyMatching(query as CFDictionary, &result)
+    /// Attempts the single canary `SecItemAdd`. The result pointer is `nil`, so
+    /// no item data is returned.
+    private static func addCanary(query: [CFString: Any]) -> OSStatus {
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    /// Attempts the single cleanup `SecItemDelete` for an exact canary whose add
+    /// unexpectedly succeeded.
+    private static func deleteCanary(query: [CFString: Any]) -> OSStatus {
+        SecItemDelete(query as CFDictionary)
     }
 
     /// Prints exactly one JSON line on stdout and exits with the outcome code.

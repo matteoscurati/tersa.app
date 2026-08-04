@@ -6811,11 +6811,11 @@ fn reviewed_token_broker_client_xpc_connection_is_pinned(document: &str, code: &
 }
 
 /// Fails closed unless the Keychain isolation probe is exactly one reviewed
-/// Swift source exercising only the reviewed, query-only Security framework
+/// Swift source exercising only the reviewed, fixed-purpose Security framework
 /// surface: one `SecTaskCreateFromSelf`, one `SecTaskCopyValueForEntitlement`,
-/// and one `SecItemCopyMatching` call, against a forbidden-group query that
-/// opts into the Data Protection Keychain. No mutation, no data return, and no
-/// other `SecItem` capability may appear in executable code.
+/// one `SecItemAdd`, and one `SecItemDelete`, driving a forbidden-group
+/// add/delete canary that opts into the Data Protection Keychain. No query, no
+/// update, and no other `SecItem` capability may appear in executable code.
 fn keychain_isolation_probe_source_surface_violations(
     sources: &[(PathBuf, String)],
 ) -> Vec<String> {
@@ -6823,15 +6823,16 @@ fn keychain_isolation_probe_source_surface_violations(
     // The probe compiles unchanged into the TersaMacTokenBroker target, so it
     // must honour the token-broker per-file capability policy. This is that
     // policy with the two capabilities the probe legitimately needs removed: the
-    // single `SecItemCopyMatching` query (audited by the SecItem guard below) and
-    // the `import Security` substrate. `kSecReturnData`/`kSecReturnAttributes`
-    // are retained as the probe's evidence-redaction guard. The probe may expose
-    // no `tersa_` C ABI at all, so the reviewed prefix is `None`.
-    const PROBE_FORBIDDEN_IDENTIFIERS: [&str; 14] = [
+    // fixed-purpose `SecItemAdd`/`SecItemDelete` add/delete canary pair (audited
+    // by the SecItem guard below) and the `import Security` substrate. The canary
+    // only mutates, so the query and update surfaces — `SecItemCopyMatching` and
+    // `SecItemUpdate` — stay banned. `kSecReturnData`/`kSecReturnAttributes` are
+    // retained as the probe's evidence-redaction guard. The probe may expose no
+    // `tersa_` C ABI at all, so the reviewed prefix is `None`.
+    const PROBE_FORBIDDEN_IDENTIFIERS: [&str; 13] = [
         "processIdentifier",
-        "SecItemAdd",
+        "SecItemCopyMatching",
         "SecItemUpdate",
-        "SecItemDelete",
         "URLSession",
         "URLRequest",
         "_silgen_name",
@@ -6885,7 +6886,7 @@ fn keychain_isolation_probe_source_surface_violations(
         &code, PROBE_PATH,
     ));
     violations.extend(keychain_isolation_probe_required_surface_violations(
-        &code, PROBE_PATH,
+        document, &code, PROBE_PATH,
     ));
     let canonical = rust_token_canonical(&code);
     if !canonical.contains("kSecAttrAccessGroup:forbiddenGroup") {
@@ -6902,10 +6903,11 @@ fn keychain_isolation_probe_source_surface_violations(
 }
 
 fn keychain_isolation_probe_secitem_violations(code: &str, probe_path: &str) -> Vec<String> {
-    // Reject every SecItem-prefixed identifier except the single query
-    // SecItemCopyMatching. The byte before a genuine identifier start cannot be
-    // an identifier character, so an embedded substring like `mySecItem` is
-    // never mistaken for a probe surface.
+    // Reject every SecItem-prefixed identifier except the fixed-purpose
+    // add/delete canary pair SecItemAdd and SecItemDelete. The byte before a
+    // genuine identifier start cannot be an identifier character, so an embedded
+    // substring like `mySecItem` is never mistaken for a probe surface.
+    const ALLOWED_SECITEM: [&str; 2] = ["SecItemAdd", "SecItemDelete"];
     let mut stray_secitem = BTreeSet::new();
     for (match_index, _) in code.match_indices("SecItem") {
         let before = code[..match_index].bytes().next_back();
@@ -6921,35 +6923,71 @@ fn keychain_isolation_probe_secitem_violations(code: &str, probe_path: &str) -> 
             }
         }
         let identifier = &code[match_index..end];
-        if identifier != "SecItemCopyMatching" {
+        if !ALLOWED_SECITEM.contains(&identifier) {
             stray_secitem.insert(identifier.to_owned());
         }
     }
     let mut violations = Vec::new();
     for identifier in stray_secitem {
         violations.push(format!(
-            "Keychain isolation probe `{probe_path}` must not exercise SecItem capability `{identifier}`; only SecItemCopyMatching is allowed"
+            "Keychain isolation probe `{probe_path}` must not exercise SecItem capability `{identifier}`; only SecItemAdd and SecItemDelete are allowed"
         ));
     }
     violations
 }
 
+/// Pushes a focused violation unless the canonicalized probe source keeps the
+/// `case .unexpectedlyAuthorized` branch's exact immediate cleanup sequence:
+/// delete the exact canary, resolve the cleanup outcome, derive the redacted
+/// `osStatus` only for a `.cleanupFailed` outcome, then emit and exit — in that
+/// order, before the `.unexpectedStatus` case. Checking one contiguous canonical
+/// substring means reordering, dropping, or rewriting any single statement
+/// fails closed.
+fn keychain_isolation_probe_cleanup_sequence_violation(
+    canonical: &str,
+    probe_path: &str,
+) -> Vec<String> {
+    // `concat!` joins the canonicalized (whitespace-free) statements with no
+    // separator, pinning the branch's exact immediate cleanup sequence.
+    const IMMEDIATE_CLEANUP_SEQUENCE: &str = concat!(
+        "letdeleteStatus=deleteCanary(query:deleteQuery(for:forbiddenGroup,account:account))",
+        "letoutcome=cleanupOutcome(deleteStatus:deleteStatus)",
+        "letosStatus=outcome==.cleanupFailed?deleteStatus:nil",
+        "emitAndExit(principal:principal,outcome:outcome,osStatus:osStatus)",
+    );
+    if canonical.contains(IMMEDIATE_CLEANUP_SEQUENCE) {
+        Vec::new()
+    } else {
+        vec![format!(
+            "Keychain isolation probe `{probe_path}` must keep the case \
+             .unexpectedlyAuthorized immediate cleanup sequence"
+        )]
+    }
+}
+
 fn keychain_isolation_probe_required_surface_violations(
+    document: &str,
     code: &str,
     probe_path: &str,
 ) -> Vec<String> {
-    const REQUIRED_CALLS: [&str; 3] = [
+    const REQUIRED_CALLS: [&str; 5] = [
         "SecTaskCreateFromSelf",
         "SecTaskCopyValueForEntitlement",
-        "SecItemCopyMatching",
+        "SecItemAdd",
+        "SecItemDelete",
+        "UUID",
     ];
-    const REQUIRED_QUERY_KEYS: [&str; 6] = [
-        "kSecClassGenericPassword",
-        "kSecAttrService",
-        "kSecAttrAccount",
-        "kSecAttrAccessGroup",
-        "kSecUseDataProtectionKeychain",
-        "kSecMatchLimitOne",
+    // The add and delete canaries each build one forbidden-group dictionary, so
+    // the shared query keys appear exactly twice (once per query) while the
+    // add-only value and accessibility keys appear exactly once.
+    const EXPECTED_QUERY_KEY_COUNTS: [(&str, usize); 7] = [
+        ("kSecClassGenericPassword", 2),
+        ("kSecAttrService", 2),
+        ("kSecAttrAccount", 2),
+        ("kSecAttrAccessGroup", 2),
+        ("kSecUseDataProtectionKeychain", 2),
+        ("kSecValueData", 1),
+        ("kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly", 1),
     ];
     let mut violations = Vec::new();
     for call in REQUIRED_CALLS {
@@ -6959,12 +6997,70 @@ fn keychain_isolation_probe_required_surface_violations(
             ));
         }
     }
-    for key in REQUIRED_QUERY_KEYS {
-        if identifier_occurrence_count(code, key) != 1 {
+    for (key, expected) in EXPECTED_QUERY_KEY_COUNTS {
+        if identifier_occurrence_count(code, key) != expected {
             violations.push(format!(
-                "Keychain isolation probe `{probe_path}` must contain exactly one executable `{key}` occurrence"
+                "Keychain isolation probe `{probe_path}` must contain exactly {expected} executable `{key}` occurrence(s)"
             ));
         }
+    }
+    let canonical = rust_token_canonical(code);
+    // The v2 argument and service are pinned by their string literals, which
+    // stripping removes, so they are anchored against the raw source.
+    let raw_canonical = rust_token_canonical(document);
+    if !raw_canonical.contains("\"--tersa-keychain-isolation-probe-v2\"") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must pin the v2 launch argument"
+        ));
+    }
+    if !raw_canonical.contains("\"app.tersa.keychain-isolation-probe.v2\"") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must pin the v2 canary service"
+        ));
+    }
+    if !canonical.contains("schemaVersion=2") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must bind schemaVersion to 2"
+        ));
+    }
+    if !canonical.contains("Data([0])") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must carry the one-byte zero canary value"
+        ));
+    }
+    if !canonical.contains("UUID().uuidString") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must derive the canary account from UUID().uuidString"
+        ));
+    }
+    if !canonical.contains("addCanary(query:addQuery(for:forbiddenGroup,account:account))") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must add the canary via addCanary(addQuery(for:forbiddenGroup,account:account))"
+        ));
+    }
+    if !canonical.contains("deleteCanary(query:deleteQuery(for:forbiddenGroup,account:account))") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must clean up via deleteCanary(deleteQuery(for:forbiddenGroup,account:account))"
+        ));
+    }
+    if !canonical.contains("classifyAdd") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must classify the add status via classifyAdd"
+        ));
+    }
+    if !canonical.contains("cleanupOutcome") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must resolve cleanup via cleanupOutcome"
+        ));
+    }
+    violations.extend(keychain_isolation_probe_cleanup_sequence_violation(
+        &canonical, probe_path,
+    ));
+    // A zero exit code is correct only for the missing-entitlement refusal.
+    if !canonical.contains("missingEntitlement:return0") {
+        violations.push(format!(
+            "Keychain isolation probe `{probe_path}` must exit zero only for the missing-entitlement outcome"
+        ));
     }
     violations
 }
@@ -7091,11 +7187,14 @@ fn macos_token_isolation_dev_evidence_script_violations(document: &str) -> Vec<S
 /// Records the macOS token isolation dev-evidence capture-flow anchor
 /// violations. The anchors appear in committed byte order; the signing-order
 /// invariants (broker signed inside first, strict-verified, then the
-/// containing app signed and deep-strict verified), the probe result
-/// contract (exit 0, exactly one output line, the exact missing-entitlement
-/// JSON, and the item-not-found/unexpected-status/configuration-invalid
-/// rejections), and the commit-bound evidence record written only after the
-/// operator's confirmation are all expressed as positional predecessors.
+/// containing app signed and deep-strict verified), the fixed-purpose
+/// add/delete-canary probe result contract (exit 0, exactly one output line,
+/// the exact `schema_version` 2 missing-entitlement JSON, and the
+/// unexpectedly-authorized/cleanup-failed/unexpected-status/configuration-invalid
+/// rejections), the ordered broker Keychain group profile authorization by
+/// exact entry or team wildcard, and the commit-bound evidence record written
+/// only after the operator's confirmation are all expressed as positional
+/// predecessors.
 fn collect_macos_token_isolation_capture_order_violations(
     document: &str,
     confine: &str,
@@ -7121,8 +7220,8 @@ fn collect_macos_token_isolation_capture_order_violations(
             "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
         ),
         (
-            "explicit token group profile authorization",
-            "grep -Fq \"<string>$TEAM_ID.app.tersa.token</string>\"",
+            "broker Keychain group profile authorization (exact entry or team wildcard)",
+            "kc_group_authorized \"$p_kc_xml\" app.tersa.token",
         ),
         (
             "broker codesign before the containing app",
@@ -7144,9 +7243,13 @@ fn collect_macos_token_isolation_capture_order_violations(
         ("exactly one probe output line", "[ \"$ap_lines\" -eq 1 ]"),
         (
             "exact missing-entitlement evidence line",
-            "'{\"schema_version\":1,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
+            "'{\"schema_version\":2,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
         ),
-        ("reject item-not-found", "'\"result\":\"item-not-found\"'"),
+        (
+            "reject unexpectedly-authorized",
+            "'\"result\":\"unexpectedly-authorized\"'",
+        ),
+        ("reject cleanup-failed", "'\"result\":\"cleanup-failed\"'"),
         (
             "reject unexpected-status",
             "'\"result\":\"unexpected-status\"'",
@@ -7195,8 +7298,11 @@ fn collect_macos_token_isolation_capture_order_violations(
 /// Records the macOS token isolation dev-evidence singular anchor violations:
 /// anchors that are top-of-script definitions or evidence-record invariants
 /// rather than capture-flow steps, but are still part of the reviewed contract:
-/// the exact opt-in probe argument, the gitignored commit-bound record path,
-/// and the development-only non-distribution claim recorded inside it.
+/// the exact fixed-purpose v2 opt-in probe argument, the keychain-access-groups
+/// authorization helper's exact team-group and team-wildcard forms, the
+/// gitignored commit-bound record path, the `schema_version` 2 stamp written
+/// into the evidence record, and the development-only non-distribution claim
+/// recorded inside it.
 fn collect_macos_token_isolation_singular_anchor_violations(
     document: &str,
     confine: &str,
@@ -7205,7 +7311,15 @@ fn collect_macos_token_isolation_singular_anchor_violations(
     const SINGULAR: &[(&str, &str)] = &[
         (
             "exact opt-in probe argument",
-            "PROBE_ARG='--tersa-keychain-isolation-probe-v1'",
+            "PROBE_ARG='--tersa-keychain-isolation-probe-v2'",
+        ),
+        (
+            "profile helper exact team-group authorization",
+            "\"<string>$TEAM_ID.$kga_group</string>\"",
+        ),
+        (
+            "profile helper team-wildcard authorization",
+            "\"<string>$TEAM_ID.*</string>\"",
         ),
         (
             "gitignored commit-bound evidence record directory",
@@ -7214,6 +7328,10 @@ fn collect_macos_token_isolation_singular_anchor_violations(
         (
             "gitignored commit-bound evidence record file",
             "token-isolation-evidence.txt",
+        ),
+        (
+            "evidence record schema_version 2 stamp",
+            "printf 'schema_version=2\\n'",
         ),
         (
             "development-only non-distribution claim",
@@ -18342,11 +18460,14 @@ mod keychain_isolation_probe_tests {
 
     #[test]
     fn probe_rejects_each_forbidden_capability_as_executable_code() {
+        // SecItemAdd and SecItemDelete are the probe's permitted add/delete
+        // canary pair, so the remaining forbidden executable capabilities are
+        // the query surface (SecItemCopyMatching, SecItemUpdate) and the
+        // return-data redaction guard. Each row injects one as executable code.
         let reviewed = reviewed_document();
         for forbidden in [
-            "SecItemAdd",
+            "SecItemCopyMatching",
             "SecItemUpdate",
-            "SecItemDelete",
             "kSecReturnData",
             "kSecReturnAttributes",
         ] {
@@ -18421,28 +18542,59 @@ mod keychain_isolation_probe_tests {
         for call in [
             "SecTaskCreateFromSelf",
             "SecTaskCopyValueForEntitlement",
-            "SecItemCopyMatching",
+            "SecItemAdd",
+            "SecItemDelete",
+            "UUID",
         ] {
-            let mutated = base.replace(call, "RemovedCall");
-            assert_ne!(mutated, base, "removing {call} must alter fixture");
-            expect(&surface_doc(&mutated), call);
+            // Removal drops the single executable call to zero.
+            let removed = base.replace(call, "RemovedCall");
+            assert_ne!(removed, base, "removing {call} must alter fixture");
+            expect(&surface_doc(&removed), call);
+
+            // A second executable call raises the count to two.
+            let duplicated = base.replacen(
+                "import Foundation",
+                &format!("let _ = {call}()\nimport Foundation"),
+                1,
+            );
+            assert_ne!(duplicated, base, "duplicating {call} must alter fixture");
+            expect(&surface_doc(&duplicated), call);
         }
     }
 
     #[test]
-    fn probe_requires_each_query_key_exactly_once() {
+    fn probe_pins_each_query_key_to_its_expected_count() {
         let base = reviewed_code();
-        for key in [
-            "kSecClassGenericPassword",
-            "kSecAttrService",
-            "kSecAttrAccount",
-            "kSecAttrAccessGroup",
-            "kSecUseDataProtectionKeychain",
-            "kSecMatchLimitOne",
+        // The shared query keys appear once per canary (add + delete), so exactly
+        // twice; the add-only value and accessibility keys appear exactly once.
+        for (key, expected) in [
+            ("kSecClassGenericPassword", 2),
+            ("kSecAttrService", 2),
+            ("kSecAttrAccount", 2),
+            ("kSecAttrAccessGroup", 2),
+            ("kSecUseDataProtectionKeychain", 2),
+            ("kSecValueData", 1),
+            ("kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly", 1),
         ] {
-            let mutated = base.replace(key, &format!("Wrong{key}"));
-            assert_ne!(mutated, base, "renaming {key} must alter fixture");
-            expect(&surface_doc(&mutated), key);
+            // Renaming every occurrence drops the count to zero.
+            let renamed = base.replace(key, &format!("Wrong{key}"));
+            assert_ne!(
+                renamed, base,
+                "renaming {key} (expected {expected}) must alter fixture"
+            );
+            expect(&surface_doc(&renamed), key);
+
+            // One extra executable occurrence pushes the count past `expected`.
+            let extra = base.replacen(
+                "import Foundation",
+                &format!("let _ = {key}\nimport Foundation"),
+                1,
+            );
+            assert_ne!(
+                extra, base,
+                "adding {key} (expected {expected}) must alter fixture"
+            );
+            expect(&surface_doc(&extra), key);
         }
     }
 
@@ -18507,6 +18659,136 @@ mod keychain_isolation_probe_tests {
             "executable dlopen mutation must alter fixture"
         );
         expect(&surface_doc(&mutated), "dlopen");
+    }
+
+    #[test]
+    fn probe_pins_each_v2_required_surface_anchor() {
+        // The v2 required-surface guard fails closed unless every canonical
+        // anchor survives intact. Each row independently mutates one anchor in
+        // the real reviewed fixture and asserts the focused violation. The
+        // string-literal anchors (arg, service) are pinned against the raw
+        // source; the executable anchors are pinned against the stripped code.
+        // Source mutations only — no Security API is ever called.
+        //
+        // The `UUID().uuidString` row is distinct from the call-count test: it
+        // keeps the single `UUID()` call but drops the `.uuidString` surface, so
+        // only the required-surface guard fires.
+        let reviewed = reviewed_document();
+        // `classifyAdd` and `cleanupOutcome` occur more than once, so each is
+        // removed wholesale; every other needle is unique in the fixture.
+        let anchors: [(&str, &str, &str); 10] = [
+            (
+                "\"--tersa-keychain-isolation-probe-v2\"",
+                "\"--tersa-keychain-isolation-probe-v9\"",
+                "launch argument",
+            ),
+            (
+                "\"app.tersa.keychain-isolation-probe.v2\"",
+                "\"app.tersa.keychain-isolation-probe.v9\"",
+                "canary service",
+            ),
+            (
+                "schemaVersion = 2",
+                "schemaVersion = 9",
+                "bind schemaVersion",
+            ),
+            ("Data([0])", "Data([9])", "zero canary value"),
+            (
+                "UUID().uuidString",
+                "UUID().uuidBytes",
+                "derive the canary account",
+            ),
+            (
+                "addCanary(query: addQuery(for: forbiddenGroup, account: account))",
+                "addCanary(addQuery(for: forbiddenGroup, account: account))",
+                "add the canary via",
+            ),
+            (
+                "deleteCanary(query: deleteQuery(for: forbiddenGroup, account: account))",
+                "deleteCanary(deleteQuery(for: forbiddenGroup, account: account))",
+                "clean up via",
+            ),
+            ("classifyAdd", "classifyRemoved", "classify the add status"),
+            ("cleanupOutcome", "cleanupRemoved", "resolve cleanup via"),
+            (
+                "case .missingEntitlement: return 0",
+                "case .missingEntitlement: return 7",
+                "exit zero only",
+            ),
+        ];
+        for (needle, replacement, fragment) in anchors {
+            let mutated = reviewed.replace(needle, replacement);
+            assert_ne!(
+                mutated, reviewed,
+                "mutating `{needle}` must alter the reviewed fixture"
+            );
+            expect(&surface_doc(&mutated), fragment);
+        }
+    }
+
+    #[test]
+    fn probe_pins_the_unexpectedly_authorized_immediate_cleanup_sequence() {
+        // The `case .unexpectedlyAuthorized` branch must keep one contiguous
+        // immediate cleanup sequence: delete the exact canary, resolve the
+        // cleanup outcome, derive the redacted `osStatus` only for a cleanup
+        // failure, then emit and exit — in that exact order, before the
+        // `.unexpectedStatus` case. Each row mutates the real reviewed fixture
+        // once and asserts the focused sequence violation; other violations may
+        // coexist. Source mutations only; no Security API is ever called.
+        let reviewed = reviewed_document();
+        // The branch's four statements are indented twelve spaces; centralizing
+        // the indent keeps the line needles byte-exact and auditable.
+        let indent = "            ";
+        let delete_line = format!(
+            "{indent}let deleteStatus = deleteCanary(query: deleteQuery(for: forbiddenGroup, account: account))\n"
+        );
+        let outcome_line =
+            format!("{indent}let outcome = cleanupOutcome(deleteStatus: deleteStatus)\n");
+        let osstatus_line =
+            format!("{indent}let osStatus = outcome == .cleanupFailed ? deleteStatus : nil\n");
+        let emit_line = format!(
+            "{indent}emitAndExit(principal: principal, outcome: outcome, osStatus: osStatus)\n"
+        );
+        let delete_call = "deleteCanary(query: deleteQuery(for: forbiddenGroup, account: account))";
+        let mutations: [(&str, String); 6] = [
+            ("remove the cleanup delete", reviewed.replace(&delete_line, "")),
+            (
+                "reorder the delete after cleanupOutcome",
+                reviewed.replace(
+                    &format!("{delete_line}{outcome_line}"),
+                    &format!("{outcome_line}{delete_line}"),
+                ),
+            ),
+            (
+                "bind the delete query to callerGroup",
+                reviewed.replace(
+                    delete_call,
+                    "deleteCanary(query: deleteQuery(for: callerGroup, account: account))",
+                ),
+            ),
+            (
+                "bind the delete query to anotherAccount",
+                reviewed.replace(
+                    delete_call,
+                    "deleteCanary(query: deleteQuery(for: forbiddenGroup, account: anotherAccount))",
+                ),
+            ),
+            ("remove cleanupOutcome", reviewed.replace(&outcome_line, "")),
+            (
+                "move emitAndExit before cleanupOutcome",
+                reviewed.replace(
+                    &format!("{outcome_line}{osstatus_line}{emit_line}"),
+                    &format!("{emit_line}{outcome_line}{osstatus_line}"),
+                ),
+            ),
+        ];
+        for (description, mutated) in mutations {
+            assert_ne!(
+                mutated, reviewed,
+                "mutation `{description}` must alter the reviewed fixture"
+            );
+            expect(&surface_doc(&mutated), "immediate cleanup sequence");
+        }
     }
 }
 
@@ -18764,100 +19046,117 @@ mod macos_token_isolation_dev_evidence_script_tests {
         );
     }
 
+    // Each (label, exact anchor) pair mirrors the helper's contract. Removing
+    // any one anchor must surface a violation naming that anchor's label, so
+    // a removed step cannot pass silently.
+    const MATERIAL_ANCHORS: &[(&str, &str)] = &[
+        (
+            "clean worktree precondition",
+            "git status --porcelain --untracked-files=all",
+        ),
+        ("exact commit binding", "COMMIT=\"$(git rev-parse HEAD)\""),
+        (
+            "git archive of the bound commit",
+            "git archive --format=tar --output=\"$SCRATCH/source.tar\" \"$COMMIT\"",
+        ),
+        ("unsigned build gate", "CODE_SIGNING_ALLOWED=NO"),
+        (
+            "shared group build setting",
+            "TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\"",
+        ),
+        (
+            "token group build setting",
+            "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
+        ),
+        (
+            "broker Keychain group profile authorization (exact entry or team wildcard)",
+            "kc_group_authorized \"$p_kc_xml\" app.tersa.token",
+        ),
+        (
+            "broker codesign before the containing app",
+            "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_BROKER_ENT\"",
+        ),
+        (
+            "broker strict verification",
+            "codesign --verify --strict \"$BROKER_XPC\"",
+        ),
+        (
+            "containing app codesign after the broker",
+            "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_APP_ENT\"",
+        ),
+        (
+            "app deep strict verification after the broker verify",
+            "codesign --verify --deep --strict \"$APP\"",
+        ),
+        ("probe exit equals zero", "[ \"$ap_exit\" = 0 ]"),
+        ("exactly one probe output line", "[ \"$ap_lines\" -eq 1 ]"),
+        (
+            "exact missing-entitlement evidence line",
+            "'{\"schema_version\":2,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
+        ),
+        (
+            "reject unexpectedly-authorized",
+            "'\"result\":\"unexpectedly-authorized\"'",
+        ),
+        ("reject cleanup-failed", "'\"result\":\"cleanup-failed\"'"),
+        (
+            "reject unexpected-status",
+            "'\"result\":\"unexpected-status\"'",
+        ),
+        (
+            "reject configuration-invalid",
+            "'\"result\":\"configuration-invalid\"'",
+        ),
+        (
+            "broker isolation probe invocation",
+            "assert_probe \"$BROKER_BIN\" 'token-broker'",
+        ),
+        (
+            "app isolation probe invocation",
+            "assert_probe \"$APP_BIN\" 'main-app'",
+        ),
+        (
+            "owner confirmation equals the bound commit",
+            "[ \"$confirmation\" = \"$COMMIT\" ]",
+        ),
+        (
+            "evidence record written only after confirmation",
+            ">\"$RECORD\"",
+        ),
+        (
+            "exact opt-in probe argument",
+            "PROBE_ARG='--tersa-keychain-isolation-probe-v2'",
+        ),
+        (
+            "profile helper exact team-group authorization",
+            "\"<string>$TEAM_ID.$kga_group</string>\"",
+        ),
+        (
+            "profile helper team-wildcard authorization",
+            "\"<string>$TEAM_ID.*</string>\"",
+        ),
+        (
+            "gitignored commit-bound evidence record directory",
+            "apple/build/dev-evidence",
+        ),
+        (
+            "gitignored commit-bound evidence record file",
+            "token-isolation-evidence.txt",
+        ),
+        (
+            "evidence record schema_version 2 stamp",
+            "printf 'schema_version=2\\n'",
+        ),
+        (
+            "development-only non-distribution claim",
+            "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
+        ),
+    ];
+
     #[test]
     fn removing_each_material_anchor_fails_closed() {
         let reviewed = reviewed_document();
-        // Each (label, exact anchor) pair mirrors the helper's contract. Removing
-        // any one anchor must surface a violation naming that anchor's label, so
-        // a removed step cannot pass silently.
-        let anchors: &[(&str, &str)] = &[
-            (
-                "clean worktree precondition",
-                "git status --porcelain --untracked-files=all",
-            ),
-            ("exact commit binding", "COMMIT=\"$(git rev-parse HEAD)\""),
-            (
-                "git archive of the bound commit",
-                "git archive --format=tar --output=\"$SCRATCH/source.tar\" \"$COMMIT\"",
-            ),
-            ("unsigned build gate", "CODE_SIGNING_ALLOWED=NO"),
-            (
-                "shared group build setting",
-                "TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\"",
-            ),
-            (
-                "token group build setting",
-                "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
-            ),
-            (
-                "explicit token group profile authorization",
-                "grep -Fq \"<string>$TEAM_ID.app.tersa.token</string>\"",
-            ),
-            (
-                "broker codesign before the containing app",
-                "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_BROKER_ENT\"",
-            ),
-            (
-                "broker strict verification",
-                "codesign --verify --strict \"$BROKER_XPC\"",
-            ),
-            (
-                "containing app codesign after the broker",
-                "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_APP_ENT\"",
-            ),
-            (
-                "app deep strict verification after the broker verify",
-                "codesign --verify --deep --strict \"$APP\"",
-            ),
-            ("probe exit equals zero", "[ \"$ap_exit\" = 0 ]"),
-            ("exactly one probe output line", "[ \"$ap_lines\" -eq 1 ]"),
-            (
-                "exact missing-entitlement evidence line",
-                "'{\"schema_version\":1,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
-            ),
-            ("reject item-not-found", "'\"result\":\"item-not-found\"'"),
-            (
-                "reject unexpected-status",
-                "'\"result\":\"unexpected-status\"'",
-            ),
-            (
-                "reject configuration-invalid",
-                "'\"result\":\"configuration-invalid\"'",
-            ),
-            (
-                "broker isolation probe invocation",
-                "assert_probe \"$BROKER_BIN\" 'token-broker'",
-            ),
-            (
-                "app isolation probe invocation",
-                "assert_probe \"$APP_BIN\" 'main-app'",
-            ),
-            (
-                "owner confirmation equals the bound commit",
-                "[ \"$confirmation\" = \"$COMMIT\" ]",
-            ),
-            (
-                "evidence record written only after confirmation",
-                ">\"$RECORD\"",
-            ),
-            (
-                "exact opt-in probe argument",
-                "PROBE_ARG='--tersa-keychain-isolation-probe-v1'",
-            ),
-            (
-                "gitignored commit-bound evidence record directory",
-                "apple/build/dev-evidence",
-            ),
-            (
-                "gitignored commit-bound evidence record file",
-                "token-isolation-evidence.txt",
-            ),
-            (
-                "development-only non-distribution claim",
-                "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
-            ),
-        ];
-        for (label, anchor) in anchors {
+        for (label, anchor) in MATERIAL_ANCHORS {
             let mutated = reviewed.replacen(anchor, "", 1);
             assert_ne!(
                 mutated, reviewed,

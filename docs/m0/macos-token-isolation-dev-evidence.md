@@ -6,9 +6,9 @@ This runbook documents the opt-in, operator-run Apple Development evidence
 capture harness for ADR-0024 *Required implementation and evidence* Item 5. On
 an exact Apple Development signed build the harness proves that normal broker
 token operations succeed (the owner-driven positive control) and that both
-fixed-purpose negative probes receive `errSecMissingEntitlement`: the broker
-probing the installation root/store group and the main app probing the token
-group.
+fixed-purpose negative-mutation canaries receive `errSecMissingEntitlement`:
+the broker's canary against the installation root/store group and the main
+app's canary against the token group.
 
 This is **development evidence only**. It is not Developer ID signing,
 notarization, distribution, or closure of ADR-0024 Item 6. It is opt-in, never
@@ -22,11 +22,14 @@ against that capture. Until then, ADR-0024 Item 5 development-signed isolation
 evidence remains open. The harness is source only: its existence in the
 repository does not pre-record a result.
 
-The dedicated token Keychain group (`app.tersa.token`) and an explicitly
-authorizing Apple Development profile are external runtime preconditions that
-the harness gates on (ADR-0024 Item 1). That external registration is separate
-from source inspection and cannot be produced or attested by reading the
-repository; only its presence is checked at capture time.
+The harness gates on the production-team provisioning profile authorizing the
+dedicated token Keychain group (`app.tersa.token`) — by an exact
+`TEAMID.app.tersa.token` entry or the `TEAMID.*` team wildcard (ADR-0024
+Item 1). That profile is an Apple-Development runtime precondition whose
+presence is checked at capture time; it cannot be produced or attested by
+reading the repository. The exact signed process entitlement — not the
+profile's broad authorization — still limits actual access: both principals'
+signed `keychain-access-groups` remain exact and disjoint.
 
 ## Prerequisites
 
@@ -36,8 +39,8 @@ repository; only its presence is checked at capture time.
 | 2 | A clean worktree, commit-bound capture | `git status --porcelain --untracked-files=all` is empty; the build is a `git archive` of `HEAD` |
 | 3 | Exactly one valid Apple Development identity | `security find-identity` selects exactly one `Apple Development` hash; the identity, team, and profile are never printed |
 | 4 | An effective Apple Team Identifier under that identity | resolved by a throwaway signed team probe and matched to `^[A-Z0-9]{10}$` |
-| 5 | Exactly one current Apple Development profile authorizing `app.tersa.mac` with the `app.tersa.shared` Keychain and application groups | provisioned-profile scan; a wildcard-only profile is not accepted |
-| 6 | Exactly one current Apple Development profile **explicitly** authorizing the dedicated token group `app.tersa.token` | the Item 1 gate; a wildcard keychain group does not satisfy it and is rejected |
+| 5 | Exactly one current Apple Development profile authorizing `app.tersa.mac` and the `app.tersa.shared` Keychain group | provisioned-profile scan; the group is authorized by an exact `TEAMID.app.tersa.shared` entry or the `TEAMID.*` team wildcard. The TeamIdentifierPrefix-prefixed macOS application group is not required to appear in the development profile; the harness verifies it on the final signed app entitlement |
+| 6 | Exactly one current Apple Development profile authorizing the dedicated token group `app.tersa.token` | the Item 1 gate; the group is authorized by an exact `TEAMID.app.tersa.token` entry or the `TEAMID.*` team wildcard. One same-team profile may authorize both principals; the exactly-one-current-profile-per-principal count keeps the binding deterministic |
 
 Any unmet prerequisite aborts before a build, before any signing, and before
 any live claim.
@@ -63,28 +66,44 @@ credential, token, account identifier, or mail datum is written by the harness.
 
 The harness launches each real signed executable directly (not a subshell),
 bounded to 40 s, with the single opt-in argument
-`--tersa-keychain-isolation-probe-v1`. The probe derives the one group its
-principal is forbidden from — the other principal's group, by keeping the team
-prefix and swapping the suffix between `.app.tersa.shared` and `.app.tersa.token`
-— and issues exactly one query-only `SecItemCopyMatching` against that group,
-requesting no item data and no attributes.
+`--tersa-keychain-isolation-probe-v2`. The canary reads its own signed
+`keychain-access-groups` entitlement, derives the one group its principal is
+forbidden from — the other principal's group, by keeping the team prefix and
+swapping the suffix between `.app.tersa.shared` and `.app.tersa.token` — and
+attempts exactly one `SecItemAdd` of a non-secret one-byte zero-value canary
+into that group. The canary uses the Data Protection Keychain with
+device-only accessibility, a fixed public v2 service, and a per-run UUID
+account that is never emitted.
 
-Both probes must pass, each with all four conditions:
+Only `errSecMissingEntitlement` passes: the kernel refused to let the process
+create an item in a group it is not entitled to. If the add unexpectedly
+succeeds the barrier is broken, so the canary immediately performs exactly one
+`SecItemDelete` for that exact canary (no value data) and fails closed as
+`unexpectedly-authorized`; a cleanup failure is `cleanup-failed` (a non-secret
+one-byte residue may remain until removed). Any other add status is
+`unexpected-status`, and an entitlement that does not resolve to exactly one
+valid group for the principal is `configuration-invalid` (no mutation is
+attempted). `errSecItemNotFound` cannot occur: it is a read-only outcome and
+the canary never reads.
 
-1. The probe exits `0`.
+Both canaries must pass, each with all four conditions:
+
+1. The canary exits `0`.
 2. It emits exactly one line on stdout.
 3. That line is exactly (substituting the principal):
-   `{"schema_version":1,"principal":"token-broker","result":"missing-entitlement"}`
+   `{"schema_version":2,"principal":"token-broker","result":"missing-entitlement"}`
    for the broker, and
-   `{"schema_version":1,"principal":"main-app","result":"missing-entitlement"}`
+   `{"schema_version":2,"principal":"main-app","result":"missing-entitlement"}`
    for the main app.
 4. The result is not one of the non-pass labels
-   (`item-not-found`, `unexpected-status`, `configuration-invalid`).
+   (`unexpectedly-authorized`, `cleanup-failed`, `unexpected-status`,
+   `configuration-invalid`).
 
-The broker probe proves the broker cannot reach the installation root/store
-group; the main-app probe proves the main app cannot reach the token group. A
-probe that times out, exits nonzero, emits the wrong number of lines, emits
-different content, or returns any non-pass label fails the capture.
+The broker canary proves the broker cannot create an item in the installation
+root/store group; the main-app canary proves the main app cannot create an item
+in the token group. A canary that times out, exits nonzero, emits the wrong
+number of lines, emits different content, or returns any non-pass label fails
+the capture.
 
 ## Positive control
 
@@ -140,9 +159,9 @@ commit-typed confirmation, so a run that stops at a precondition, a probe, a
 signature/entitlement check, or an unconfirmed positive control proves nothing
 about signed runtime isolation. The most common failure sources are a dirty
 worktree, more or fewer than one Apple Development identity, a missing or
-ambiguous provisioning profile, the token group not explicitly authorized
-(ADR-0024 Item 1), a probe returning a non-pass status or timing out, or a
-positive control not confirmed.
+ambiguous provisioning profile, the token group not authorized by an exact
+entry or the team wildcard (ADR-0024 Item 1), a canary returning a non-pass
+status or timing out, or a positive control not confirmed.
 
 ## Privacy constraints
 
