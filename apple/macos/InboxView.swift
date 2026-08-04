@@ -6,11 +6,18 @@ import SwiftUI
 
 /// Live inbox over the 2b read C ABI. The store is empty until Step 3 sync,
 /// so a real read currently returns zero rows and renders the empty state;
-/// the list and thread navigation render once data exists. The toolbar opens
-/// the submit-only search screen and the read-only composer entry, and holds
-/// the confirmation-gated disconnect control.
+/// the list and thread navigation render once data exists. The visible inbox
+/// action row opens the submit-only search screen and the read-only composer
+/// entry, and holds the confirmation-gated disconnect control.
 @MainActor
 struct InboxView: View {
+    private enum PresentedSheet: String, Identifiable {
+        case search
+        case composer
+
+        var id: String { rawValue }
+    }
+
     let accountIdentifier: Data
     let freshness: MailboxFreshnessState
     let isRefreshing: Bool
@@ -22,13 +29,14 @@ struct InboxView: View {
 
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
-    @State private var showingSearch = false
-    @State private var showingComposer = false
+    @State private var presentedSheet: PresentedSheet?
     @State private var showingDisconnectConfirmation = false
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                inboxActionBar
+                Divider()
                 if freshness.isVisible {
                     freshnessBanner
                 }
@@ -39,49 +47,7 @@ struct InboxView: View {
             }
                 .navigationTitle("Inbox")
                 .navigationDestination(for: String.self) { threadId in
-                    ThreadView(
-                        accountIdentifier: accountIdentifier,
-                        threadIdentifier: Data(threadId.utf8)
-                    )
-                }
-                .navigationDestination(isPresented: $showingSearch) {
-                    SearchView(accountIdentifier: accountIdentifier)
-                }
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button(action: onRefresh) {
-                            if isRefreshing {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Label("Refresh", systemImage: "arrow.clockwise")
-                            }
-                        }
-                        .disabled(isRefreshing)
-                        .accessibilityLabel("Refresh inbox")
-                        .accessibilityValue(isRefreshing ? "Refreshing" : "Ready")
-                        .accessibilityHint(isRefreshing ? "Inbox refresh is in progress." : "Refreshes mail using the connected account.")
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button("Search", action: handleSearchTapped)
-                            .accessibilityLabel("Search")
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button("New Message", action: handleComposeTapped)
-                            .keyboardShortcut("n", modifiers: .command)
-                            .accessibilityLabel("New message")
-                    }
-                    // A rare, destructive account action belongs off the
-                    // primary row: an overflow menu, one step from the
-                    // high-frequency controls, behind its confirmation.
-                    ToolbarItem(placement: .automatic) {
-                        Menu {
-                            Button("Disconnect Account…", action: handleDisconnectTapped)
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                        }
-                        .accessibilityLabel("Account actions")
-                    }
+                    threadDestination(for: threadId)
                 }
         }
         .confirmationDialog(
@@ -94,8 +60,22 @@ struct InboxView: View {
         } message: {
             Text("Tersa will stop having access to your Google Account, and mail stored on this Mac will be deleted. Your mail in Gmail is not affected.")
         }
-        .sheet(isPresented: $showingComposer) {
-            ComposerView()
+        .sheet(item: $presentedSheet) { sheet in
+            switch sheet {
+            case .search:
+                NavigationStack {
+                    SearchView(
+                        accountIdentifier: accountIdentifier,
+                        onClose: { presentedSheet = nil }
+                    )
+                        .navigationDestination(for: String.self) { threadId in
+                            threadDestination(for: threadId)
+                        }
+                }
+                .frame(minWidth: 480, minHeight: 360)
+            case .composer:
+                ComposerView()
+            }
         }
         .onAppear(perform: loadInbox)
         .onChange(of: reloadGeneration) { _, _ in
@@ -104,6 +84,64 @@ struct InboxView: View {
         .onChange(of: outcome) { _, newOutcome in
             announceOutcome(newOutcome)
         }
+    }
+
+    /// A content-level action row stays visible when `InboxView` is hosted by
+    /// AppKit's `NSHostingController`, where scene-owned SwiftUI toolbars are
+    /// not materialized. These are the primary inbox controls, not a duplicate
+    /// fallback toolbar.
+    private var inboxActionBar: some View {
+        HStack(spacing: 10) {
+            Button(action: onRefresh) {
+                Label {
+                    Text("Refresh")
+                } icon: {
+                    if isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .frame(width: 16, height: 16)
+                    }
+                }
+            }
+            .disabled(isRefreshing)
+            .accessibilityLabel("Refresh inbox")
+            .accessibilityValue(isRefreshing ? "Refreshing" : "Ready")
+            .accessibilityHint(
+                isRefreshing
+                    ? "Inbox refresh is in progress."
+                    : "Refreshes mail using the connected account."
+            )
+
+            Button(action: handleSearchTapped) {
+                Image(systemName: "magnifyingglass")
+            }
+            .accessibilityLabel("Search")
+            .help("Search")
+
+            Button(action: handleComposeTapped) {
+                Image(systemName: "square.and.pencil")
+            }
+            .accessibilityLabel("New message")
+            .help("New message")
+
+            Spacer(minLength: 8)
+
+            // Keep the rare destructive account action away from the primary
+            // controls, one step behind an overflow menu and its confirmation.
+            Menu {
+                Button("Disconnect Account…", action: handleDisconnectTapped)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .accessibilityLabel("Account actions")
+            .help("Account actions")
+        }
+        .buttonStyle(.bordered)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 
     private var freshnessBanner: some View {
@@ -233,15 +271,27 @@ struct InboxView: View {
     }
 
     private func handleSearchTapped() {
-        showingSearch = true
+        presentedSheet = .search
     }
 
     private func handleDisconnectTapped() {
-        showingDisconnectConfirmation = true
+        // Let NSMenu finish dismissing before presenting the confirmation;
+        // presenting synchronously from its action can be swallowed on macOS.
+        Task { @MainActor in
+            await Task.yield()
+            showingDisconnectConfirmation = true
+        }
     }
 
     private func handleComposeTapped() {
-        showingComposer = true
+        presentedSheet = .composer
+    }
+
+    private func threadDestination(for threadId: String) -> some View {
+        ThreadView(
+            accountIdentifier: accountIdentifier,
+            threadIdentifier: Data(threadId.utf8)
+        )
     }
 
     private func announceOutcome(_ newOutcome: MailboxReadOutcome?) {

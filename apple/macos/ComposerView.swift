@@ -4,7 +4,7 @@
 
 import SwiftUI
 
-/// Composer entry presented as a sheet from the inbox toolbar. Phase 1 has no
+/// Composer entry presented as a sheet from the inbox action row. Phase 1 has no
 /// send symbol, no network, and no write surface, so the sheet offers fields
 /// and an honest notice instead of any send control. All text is in-memory
 /// view state and is discarded when the sheet is dismissed.
