@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
@@ -181,6 +182,74 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("Swatinem/rust-cache@", workflow)
         self.assertNotIn("cache-save-if:", workflow)
         self.assertNotIn("cache-on-failure:", workflow)
+
+    def test_evidence_artifacts_are_success_only_and_compressed(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        steps = re.findall(
+            r"(?ms)^      - name: (?P<name>[^\n]+)\n(?P<body>.*?)(?=^      - name:|\Z)",
+            workflow,
+        )
+        expected_pairs = (
+            (
+                "Bind OAuth feasibility evidence to the source commit",
+                "Upload OAuth feasibility evidence",
+                "${{ success() && github.event_name == 'workflow_dispatch' }}",
+            ),
+            (
+                "Bind Slint spike evidence to the source commit",
+                "Upload Slint spike screenshots and metrics",
+                "${{ success() }}",
+            ),
+            (
+                "Bind Dioxus spike evidence to the source commit",
+                "Upload Dioxus spike screenshots and metrics",
+                "${{ success() }}",
+            ),
+            (
+                "Bind SQLCipher feasibility evidence to the source commit",
+                "Upload SQLCipher feasibility evidence",
+                "${{ success() && hashFiles('apple/build/sqlcipher-evidence/result.txt') != '' }}",
+            ),
+            (
+                "Bind encrypted search evidence to the source commit",
+                "Upload encrypted search evidence",
+                "${{ success() && hashFiles('apple/build/search-evidence/result.txt') != '' }}",
+            ),
+            (
+                "Bind MIME feasibility evidence to the source commit",
+                "Upload MIME feasibility evidence",
+                "${{ success() && hashFiles('apple/build/mime-evidence/result.txt') != '' }}",
+            ),
+            (
+                "Bind MIME fuzz evidence to the source commit",
+                "Upload MIME parser fuzz evidence",
+                "${{ success() && hashFiles('fuzz/target/mime-fuzz-evidence/result.txt') != '' }}",
+            ),
+            (
+                "Bind blob feasibility evidence to the source commit",
+                "Upload blob feasibility evidence",
+                "${{ success() && hashFiles('apple/build/blob-evidence/result.txt') != '' }}",
+            ),
+        )
+        artifact_indices = [
+            index
+            for index, (_, body) in enumerate(steps)
+            if "uses: actions/upload-artifact@" in body
+        ]
+
+        self.assertEqual(len(artifact_indices), len(expected_pairs))
+        for artifact_index, (bind_name, upload_name, condition) in zip(
+            artifact_indices, expected_pairs, strict=True
+        ):
+            with self.subTest(name=upload_name):
+                actual_upload_name, upload_body = steps[artifact_index]
+                actual_bind_name, bind_body = steps[artifact_index - 1]
+                self.assertEqual(actual_upload_name, upload_name)
+                self.assertEqual(actual_bind_name, bind_name)
+                self.assertIn(f"        if: {condition}\n", upload_body)
+                self.assertIn(f"        if: {condition}\n", bind_body)
+                self.assertIn("          compression-level: 9\n", upload_body)
+                self.assertIn("          retention-days: 90\n", upload_body)
 
     def test_workflow_path_scopes_baseline_jobs(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
