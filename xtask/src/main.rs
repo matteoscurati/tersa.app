@@ -7301,8 +7301,9 @@ fn collect_macos_token_isolation_capture_order_violations(
 /// the exact fixed-purpose v2 opt-in probe argument, the keychain-access-groups
 /// authorization helper's exact team-group and team-wildcard forms, the
 /// gitignored commit-bound record path, the `schema_version` 2 stamp written
-/// into the evidence record, and the development-only non-distribution claim
-/// recorded inside it.
+/// into the evidence record, the development-only non-distribution claim
+/// recorded inside it, the `ent_has` literal-key dot escaping, and the literal
+/// (unescaped) forbidden debug/injection call-site keys.
 fn collect_macos_token_isolation_singular_anchor_violations(
     document: &str,
     confine: &str,
@@ -7336,6 +7337,18 @@ fn collect_macos_token_isolation_singular_anchor_violations(
         (
             "development-only non-distribution claim",
             "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
+        ),
+        (
+            "internal literal-key dot escaping",
+            "  eh_key=\"$(printf '%s' \"$1\" | sed 's/\\./\\\\./g')\"",
+        ),
+        (
+            "literal forbidden allow-dyld call-site key",
+            "'com.apple.security.cs.allow-dyld-environment-variables'",
+        ),
+        (
+            "literal forbidden disable-library-validation call-site key",
+            "'com.apple.security.cs.disable-library-validation'",
         ),
     ];
     for (label, anchor) in SINGULAR {
@@ -19151,6 +19164,18 @@ mod macos_token_isolation_dev_evidence_script_tests {
             "development-only non-distribution claim",
             "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
         ),
+        (
+            "internal literal-key dot escaping",
+            "  eh_key=\"$(printf '%s' \"$1\" | sed 's/\\./\\\\./g')\"",
+        ),
+        (
+            "literal forbidden allow-dyld call-site key",
+            "'com.apple.security.cs.allow-dyld-environment-variables'",
+        ),
+        (
+            "literal forbidden disable-library-validation call-site key",
+            "'com.apple.security.cs.disable-library-validation'",
+        ),
     ];
 
     #[test]
@@ -19258,6 +19283,45 @@ mod macos_token_isolation_dev_evidence_script_tests {
         expect(
             &macos_token_isolation_dev_evidence_script_violations(&mutated),
             "probe exit equals zero",
+        );
+    }
+
+    #[test]
+    fn removing_internal_dot_escaping_fails_closed() {
+        let reviewed = reviewed_document();
+        // Revert `ent_has` to pass the raw key straight to plutil, so dotted
+        // keys are read as nested paths again (the original false negative).
+        let escaped = "  eh_key=\"$(printf '%s' \"$1\" | sed 's/\\./\\\\./g')\"\n  plutil -extract \"$eh_key\" raw \"$2\" >/dev/null 2>&1";
+        let unescaped = "  plutil -extract \"$1\" raw \"$2\" >/dev/null 2>&1";
+        let mutated = reviewed.replacen(escaped, unescaped, 1);
+        assert_ne!(
+            mutated, reviewed,
+            "removing the internal dot escaping must alter the script"
+        );
+        expect(
+            &macos_token_isolation_dev_evidence_script_violations(&mutated),
+            "internal literal-key dot escaping",
+        );
+    }
+
+    #[test]
+    fn pre_escaping_a_forbidden_call_site_key_again_fails_closed() {
+        let reviewed = reviewed_document();
+        // Re-introduce caller-side dot escaping on a forbidden call-site key:
+        // `ent_has` would then double-escape it and silently allow the
+        // entitlement, so the literal unescaped anchor must disappear.
+        let mutated = reviewed.replacen(
+            "'com.apple.security.cs.allow-dyld-environment-variables'",
+            "'com\\.apple\\.security\\.cs\\.allow-dyld-environment-variables'",
+            1,
+        );
+        assert_ne!(
+            mutated, reviewed,
+            "re-escaping a forbidden call-site key must alter the script"
+        );
+        expect(
+            &macos_token_isolation_dev_evidence_script_violations(&mutated),
+            "literal forbidden allow-dyld call-site key",
         );
     }
 }

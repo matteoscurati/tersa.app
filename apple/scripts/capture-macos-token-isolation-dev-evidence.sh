@@ -246,7 +246,15 @@ plutil -lint "$BROKER_ENT" >/dev/null
 plutil -lint "$APP_ENT" >/dev/null
 
 ent_value() { plutil -extract "$1" raw "$2" 2>/dev/null || true; }
-ent_has() { plutil -extract "$1" raw "$2" >/dev/null 2>&1; }
+# `ent_has` takes a literal plist key (dots included) and escapes every dot for
+# the plutil key path, so a reviewed key such as com.apple.security.app-sandbox
+# is matched as one top-level key instead of a nested com.apple.security path.
+# It never prints the key, value, or plist path. Callers pass literal keys only;
+# array-index reads (e.g. keychain-access-groups.0) stay with `ent_value`.
+ent_has() {
+  eh_key="$(printf '%s' "$1" | sed 's/\./\\./g')"
+  plutil -extract "$eh_key" raw "$2" >/dev/null 2>&1
+}
 
 # Broker: exactly the three reviewed keys; token group only; no App Group or
 # network.server.
@@ -285,9 +293,9 @@ printf 'app_entitlements=exact five-key set; shared group; App Group and network
 # Forbidden debug/injection exceptions must be absent on both executables.
 for plist in "$APP_ENT" "$BROKER_ENT"; do
   for forbidden in 'get-task-allow' \
-    'com\.apple\.security\.cs\.debugger' \
-    'com\.apple\.security\.cs\.disable-library-validation' \
-    'com\.apple\.security\.cs\.allow-dyld-environment-variables'; do
+    'com.apple.security.cs.debugger' \
+    'com.apple.security.cs.disable-library-validation' \
+    'com.apple.security.cs.allow-dyld-environment-variables'; do
     if ent_has "$forbidden" "$plist"; then
       fail 'a forbidden debug/injection entitlement is present on a signed executable'
     fi
