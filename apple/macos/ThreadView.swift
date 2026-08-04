@@ -4,24 +4,47 @@
 
 import SwiftUI
 
-/// One thread over the 2b read C ABI, opened from the inbox list. Exercised
-/// only once the store holds data; the loading, empty, and failure states
-/// mirror the inbox.
+/// One thread over the 2b read C ABI, opened from the inbox or search results.
+/// Exercised only once the store holds data; the loading, empty, and failure
+/// states mirror the inbox.
 @MainActor
 struct ThreadView: View {
     let accountIdentifier: Data
     let threadIdentifier: Data
 
+    @Environment(\.dismiss) private var dismiss
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
 
     var body: some View {
-        content
+        VStack(spacing: 0) {
+            threadHeader
+            Divider()
+            content
+        }
             .navigationTitle("Thread")
             .onAppear(perform: loadThread)
             .onChange(of: outcome) { _, newOutcome in
                 announceOutcome(newOutcome)
             }
+    }
+
+    private var threadHeader: some View {
+        HStack {
+            Button(action: dismiss.callAsFunction) {
+                Label("Back", systemImage: "chevron.left")
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .accessibilityLabel("Back")
+            Spacer()
+        }
+        .overlay {
+            Text("Thread")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 
     @ViewBuilder

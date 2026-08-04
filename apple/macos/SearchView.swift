@@ -16,16 +16,21 @@ struct SearchView: View {
     private static let maximumQueryByteCount = 256
 
     let accountIdentifier: Data
+    let onClose: () -> Void
 
     @State private var worker = MailboxReadWorker()
     @State private var outcome: MailboxReadOutcome?
     @State private var queryText = ""
-    @State private var submittedQuery = ""
     @State private var searching = false
     @State private var validationMessage: String?
+    @State private var didHandleInitialAppearance = false
+    @FocusState private var searchFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
+            searchHeader
+            Divider()
+            searchField
             if let validationMessage {
                 validationBanner(validationMessage)
             }
@@ -33,10 +38,6 @@ struct SearchView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Search")
-        .searchable(text: $queryText, prompt: "Search sender or subject")
-        .onSubmit(of: .search) {
-            handleSearchSubmit()
-        }
         .onChange(of: outcome) { _, newOutcome in
             announceSearchOutcome(newOutcome)
         }
@@ -46,6 +47,39 @@ struct SearchView: View {
         .onChange(of: validationMessage) { _, newMessage in
             announceValidationMessage(newMessage)
         }
+        .onChange(of: queryText) { _, _ in
+            validationMessage = nil
+        }
+        .onAppear(perform: handleSearchAppear)
+    }
+
+    private var searchHeader: some View {
+        HStack {
+            Text("Search")
+                .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+            Spacer()
+            Button("Close", action: onClose)
+            .keyboardShortcut(.cancelAction)
+            .accessibilityLabel("Close search")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            TextField("Search sender or subject", text: $queryText)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(handleSearchSubmit)
+                .accessibilityLabel("Search sender or subject")
+                .accessibilityAddTraits(.isSearchField)
+                .focused($searchFieldFocused)
+            Button("Search", action: handleSearchSubmit)
+                .disabled(searching)
+                .accessibilityLabel("Search mailbox")
+        }
+        .padding(16)
     }
 
     @ViewBuilder
@@ -131,9 +165,9 @@ struct SearchView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Try again", action: handleSearchReloadTapped)
+            Button("Search current text", action: handleSearchSubmit)
                 .keyboardShortcut(.defaultAction)
-                .accessibilityLabel("Try again")
+                .accessibilityLabel("Search current text")
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -154,9 +188,9 @@ struct SearchView: View {
         .accessibilityLabel(message)
     }
 
-    /// Validates the field, then enqueues one bounded search. An empty field
-    /// does nothing; an over-limit or control-character field sets an inline
-    /// message and never reaches the ABI.
+    /// Validates the field, then enqueues one bounded search. Empty, over-limit,
+    /// or control-character input clears stale results, sets an inline message,
+    /// and never reaches the ABI.
     private func handleSearchSubmit() {
         // Serialize submits: the worker serves one request at a time, so a
         // resubmit while a search is in flight is ignored to avoid displaying an
@@ -165,8 +199,10 @@ struct SearchView: View {
             return
         }
         validationMessage = nil
+        outcome = nil
         let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            validationMessage = "Enter a sender or subject to search."
             return
         }
         guard trimmed.utf8.count <= Self.maximumQueryByteCount else {
@@ -177,15 +213,7 @@ struct SearchView: View {
             validationMessage = "Search text cannot contain control characters."
             return
         }
-        submittedQuery = trimmed
         runSearch(trimmed)
-    }
-
-    private func handleSearchReloadTapped() {
-        // Restore the field to the query being retried so its completed result
-        // is not dropped by the field-match guard below.
-        queryText = submittedQuery
-        runSearch(submittedQuery)
     }
 
     private func runSearch(_ query: String) {
@@ -209,6 +237,15 @@ struct SearchView: View {
             return
         }
         AccessibilityNotification.Announcement("Searching").post()
+    }
+
+    private func handleSearchAppear() {
+        guard !didHandleInitialAppearance else {
+            return
+        }
+        didHandleInitialAppearance = true
+        searchFieldFocused = true
+        AccessibilityNotification.Announcement("Search opened").post()
     }
 
     private func announceSearchOutcome(_ newOutcome: MailboxReadOutcome?) {
