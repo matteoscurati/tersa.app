@@ -83,6 +83,7 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     "evidence_suite",
     "Manual evidence gate",
     "gh workflow run CI",
+    "Apple evidence job",
 )
 
 
@@ -277,6 +278,15 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("\n  pull_request:\n", workflow)
         self.assertIn("\n  merge_group:\n", workflow)
         self.assertIn("\n    name: CI gate\n", workflow)
+        merge_group_start = workflow.index("            merge_group)\n")
+        merge_group_end = workflow.index("            pull_request)\n", merge_group_start)
+        merge_group_branch = workflow[merge_group_start:merge_group_end]
+        self.assertIn(
+            'python3 scripts/ci-change-scope.py >> "$GITHUB_OUTPUT"',
+            merge_group_branch,
+        )
+        self.assertNotIn("git diff", merge_group_branch)
+        self.assertNotIn("|", merge_group_branch)
         for token in RETIRED_WORKFLOW_TOKENS:
             with self.subTest(token=token):
                 self.assertNotIn(token, workflow)

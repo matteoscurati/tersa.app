@@ -251,11 +251,11 @@ cargo run --locked --release --package tersa-search-spike \
   --target aarch64-apple-darwin -- --profile manual
 ```
 
-The CI profile uses 10,000 synthetic messages and at least 128 MiB of normalized
-text. The optional manual host profile uses 100,000 messages and at least 2 GiB
-of normalized text; it can consume substantial time and disk. Every host result
-is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only that the
-locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
+The default host profile uses 10,000 synthetic messages and at least 128 MiB of
+normalized text. The optional manual host profile uses 100,000 messages and at
+least 2 GiB of normalized text; it can consume substantial time and disk. Every
+host result is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only
+that the locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
 production performance. Only the physical-device M0 run can close the iPhone
 gate.
 
@@ -431,8 +431,9 @@ python3 apple/scripts/verify-dioxus-runtime.py
 The Dioxus verifier pins the exact 0.7.9 graph, rejects Manganis and devtools,
 allows only the required `tokio_runtime` feature, and checks the private
 WebSocket's loopback bind and mutual-key invariants in the resolved source. The
-shared macOS notice gate regenerates the Apple-target notices, while the
-separate Apple evidence job checks live listeners with `lsof`. Notice
+shared macOS notice gate regenerates the Apple-target notices. The live-listener
+check with `lsof` is local-only through
+`sh apple/scripts/capture-dioxus-evidence.sh`; no CI job performs it. Notice
 comparison stays on macOS because
 `cargo-about` 0.9.1 is not byte-stable for Apple target selection across host
 operating systems. This is diagnostic evidence, not a product backend or App
