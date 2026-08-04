@@ -154,6 +154,54 @@ The loopback peer check is not browser authentication. Any local process can
 connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
 against redirect injection and intercepted authorization codes.
 
+## macOS Keychain isolation probe
+
+ADR 0024 isolates refresh-token Keychain authority in the separately signed
+`TersaMacTokenBroker` XPC service. Its Item 5 negative controls need a
+fixed-purpose, read-only probe compiled into the real executables. That probe
+(`KeychainIsolationProbe`) is an internal, version-pinned diagnostic, not a
+public interface: it runs only when a host process is launched with the exact
+single argument `--tersa-keychain-isolation-probe-v1`, then reads its own
+signed `keychain-access-groups` entitlement, derives the other principal's
+Keychain group, and issues one query-only `SecItemCopyMatching` against it. It
+mutates nothing and returns no item data. See
+[ADR 0024](architecture/adr-0024-macos-token-process-isolation.md) for the full
+contract; this section covers only the safe deterministic checks.
+
+These checks prove the probe is fixed-purpose, read-only, and correctly shaped.
+They do not prove signed runtime isolation. The xtask architecture gate holds
+the probe source inventory, capability, query, entry-point, and
+signing-settings guards:
+
+```sh
+cargo xtask architecture
+```
+
+Generate the Xcode project and run the `TersaMacTests` bundle unsigned. The
+probe's pure derivation, entitlement parsing, query construction, status
+classification, and evidence mapping are unit-tested there without invoking
+live `SecItem*` or any real signing entitlement:
+
+```sh
+sh apple/scripts/generate-project.sh
+xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
+  -configuration Debug -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO test
+```
+
+Unsigned and ad-hoc output is not isolation evidence. An unsigned build has
+no signed entitlement context, and an ad-hoc build may embed an entitlement
+plist but is not Apple Development provisioned evidence for these team-scoped
+groups. Unsigned/ad-hoc outcomes are therefore non-authoritative and
+normally configuration-invalid in the documented deterministic path,
+regardless of which status a scratch build happens to report; only the Apple
+Development signed Point-6 procedure can prove Item 5 runtime isolation.
+Never weaken, broaden, or ad-hoc-substitute the committed entitlements to
+make a local run appear to pass. The signed-runtime procedure — normal token operations plus both
+wrong-group probes in an Apple Development build, then the Developer ID signed
+and notarized release candidate — is a separate evidence step tracked by
+ADR 0024 Items 5 and 6.
+
 ## SQLCipher feasibility
 
 The M0 encrypted-storage diagnostic is isolated from the shared application

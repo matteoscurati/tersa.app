@@ -28,6 +28,9 @@ targets:
     platform: macOS
     sources:
       - path: macos
+      # Shared read-only Keychain isolation probe compiled into the main app,
+      # the token broker, and the test bundle from one explicit source path.
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
       - path: licenses/THIRD_PARTY_NOTICES-bridge-macos.txt
         buildPhase: resources
     info:
@@ -55,6 +58,11 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         CODE_SIGN_ENTITLEMENTS: macos/TersaMac.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: macos/TersaMac-Bridging-Header.h
+        # Signed-release integrity for the Keychain isolation probe path: harden
+        # the runtime and forbid Xcode from injecting default base entitlements
+        # so only the committed entitlements apply. No debug exceptions.
+        ENABLE_HARDENED_RUNTIME: "YES"
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: "NO"
         # Cargo and rustup read their compiler sysroot outside SRCROOT. Keep
         # this exception scoped to the target that invokes the locked script.
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
@@ -72,6 +80,9 @@ targets:
     platform: macOS
     sources:
       - path: macos-token-broker
+      # Shared read-only Keychain isolation probe (same source as the main app
+      # and the test bundle); opt-in launch argument only, no listener change.
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
     info:
       path: macos-token-broker/Info.plist
       properties:
@@ -94,6 +105,11 @@ targets:
         CODE_SIGN_ENTITLEMENTS: macos-token-broker/TersaMacTokenBroker.entitlements
         SKIP_INSTALL: "YES"
         SWIFT_OBJC_BRIDGING_HEADER: macos-token-broker/TersaMacTokenBroker-Bridging-Header.h
+        # Signed-release integrity for the Keychain isolation probe path: harden
+        # the runtime and forbid Xcode from injecting default base entitlements
+        # so only the committed entitlements apply. No debug exceptions.
+        ENABLE_HARDENED_RUNTIME: "YES"
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: "NO"
         TERSA_MACOS_TOKEN_GROUP: "$(TeamIdentifierPrefix)app.tersa.token"
         # Cargo and rustup read their compiler sysroot outside SRCROOT. Keep
         # this exception scoped to the target that invokes the locked script.
@@ -109,6 +125,10 @@ targets:
     platform: macOS
     sources:
       - path: macos-tests
+      # Shared read-only Keychain isolation probe source compiled directly into
+      # the test bundle so pure derivation/query/status logic is unit-tested
+      # without invoking live SecItem or real signing entitlements.
+      - path: keychain-isolation-probe/KeychainIsolationProbe.swift
       # Compile the coordinator and broker client mapping directly so
       # deterministic tests do not invoke the app target's AppKit/FFI bootstrap
       # or live OAuth/Keychain/network surfaces.
