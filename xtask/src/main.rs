@@ -7302,8 +7302,11 @@ fn collect_macos_token_isolation_capture_order_violations(
 /// authorization helper's exact team-group and team-wildcard forms, the
 /// gitignored commit-bound record path, the `schema_version` 2 stamp written
 /// into the evidence record, the development-only non-distribution claim
-/// recorded inside it, the `ent_has` literal-key dot escaping, and the literal
-/// (unescaped) forbidden debug/injection call-site keys.
+/// recorded inside it, the `ent_has` literal-key dot escaping, the literal
+/// (unescaped) forbidden debug/injection call-site keys, the normalized
+/// scratch-parent derivation, its empty-parent fail-closed guard, and the
+/// single-separator mktemp template (so a TMPDIR trailing slash cannot
+/// reintroduce the `LaunchServices`/`pgrep` exact-path mismatch).
 fn collect_macos_token_isolation_singular_anchor_violations(
     document: &str,
     confine: &str,
@@ -7349,6 +7352,18 @@ fn collect_macos_token_isolation_singular_anchor_violations(
         (
             "literal forbidden disable-library-validation call-site key",
             "'com.apple.security.cs.disable-library-validation'",
+        ),
+        (
+            "normalized scratch parent",
+            "SCRATCH_PARENT=\"${TMPDIR:-/tmp}\"",
+        ),
+        (
+            "empty scratch parent fail-closed",
+            "[ -n \"$SCRATCH_PARENT\" ]",
+        ),
+        (
+            "single-separator scratch mktemp template",
+            "mktemp -d \"$SCRATCH_PARENT/tersa-token-isolation-evidence.XXXXXX\"",
         ),
     ];
     for (label, anchor) in SINGULAR {
@@ -19176,6 +19191,18 @@ mod macos_token_isolation_dev_evidence_script_tests {
             "literal forbidden disable-library-validation call-site key",
             "'com.apple.security.cs.disable-library-validation'",
         ),
+        (
+            "normalized scratch parent",
+            "SCRATCH_PARENT=\"${TMPDIR:-/tmp}\"",
+        ),
+        (
+            "empty scratch parent fail-closed",
+            "[ -n \"$SCRATCH_PARENT\" ]",
+        ),
+        (
+            "single-separator scratch mktemp template",
+            "mktemp -d \"$SCRATCH_PARENT/tersa-token-isolation-evidence.XXXXXX\"",
+        ),
     ];
 
     #[test]
@@ -19192,6 +19219,30 @@ mod macos_token_isolation_dev_evidence_script_tests {
                 label,
             );
         }
+    }
+
+    #[test]
+    fn restoring_the_double_slash_prone_mktemp_join_fails_closed() {
+        let reviewed = reviewed_document();
+        // Revert the single-separator mktemp template to the pre-fix direct join
+        // `${TMPDIR:-/tmp}/...`, bypassing the normalized `$SCRATCH_PARENT`. A
+        // trailing-slash TMPDIR would again yield a `...//tersa-...` path that
+        // `LaunchServices` canonicalizes away from the script's
+        // `pgrep -f "$APP_BIN"` match, so the single-separator template anchor
+        // must vanish and the guard must fail closed on that production label.
+        let normalized =
+            "SCRATCH=\"$(mktemp -d \"$SCRATCH_PARENT/tersa-token-isolation-evidence.XXXXXX\")\"";
+        let double_slash =
+            "SCRATCH=\"$(mktemp -d \"${TMPDIR:-/tmp}/tersa-token-isolation-evidence.XXXXXX\")\"";
+        let mutated = reviewed.replacen(normalized, double_slash, 1);
+        assert_ne!(
+            mutated, reviewed,
+            "restoring the double-slash-prone mktemp join must alter the script"
+        );
+        expect(
+            &macos_token_isolation_dev_evidence_script_violations(&mutated),
+            "single-separator scratch mktemp template",
+        );
     }
 
     #[test]

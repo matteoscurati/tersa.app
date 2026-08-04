@@ -17,10 +17,26 @@
 
 set -eu
 
+section() { printf '\n== %s ==\n' "$1"; }
+fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="$ROOT/apple/build/dev-evidence"
 RECORD="$BUILD_DIR/token-isolation-evidence.txt"
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-token-isolation-evidence.XXXXXX")"
+# Normalize the scratch parent before mktemp. A TMPDIR ending in `/` would
+# otherwise join to `.../T//tersa-token-isolation-evidence...`: mktemp takes the
+# double-slash path, but LaunchServices canonicalizes the launched executable
+# command line (collapsing the `//`), so the script's exact `pgrep -f "$APP_BIN"`
+# could not match the running app. Stripping every trailing slash and adding
+# exactly one separator makes the script and LaunchServices resolve the same
+# path. The normalized parent is never printed (redaction).
+SCRATCH_PARENT="${TMPDIR:-/tmp}"
+while [ "$SCRATCH_PARENT" != "${SCRATCH_PARENT%/}" ]; do
+  SCRATCH_PARENT="${SCRATCH_PARENT%/}"
+done
+[ -n "$SCRATCH_PARENT" ] \
+  || fail 'the scratch parent resolved empty; refusing to capture without a normalized TMPDIR'
+SCRATCH="$(mktemp -d "$SCRATCH_PARENT/tersa-token-isolation-evidence.XXXXXX")"
 DERIVED="$SCRATCH/DerivedData"
 SOURCE="$SCRATCH/source"
 APP="$DERIVED/Build/Products/Release/Tersa.app"
@@ -58,9 +74,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
-
-section() { printf '\n== %s ==\n' "$1"; }
-fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 cd "$ROOT"
 
