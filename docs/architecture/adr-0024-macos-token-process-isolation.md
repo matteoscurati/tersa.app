@@ -272,12 +272,26 @@ base-entitlement-injection posture with no conditional override; and each
 executable's entry point must open with the exact, contiguous, unduplicated
 probe branch before any normal startup.
 
+Point 6 adds the opt-in Apple Development evidence capture harness,
+`apple/scripts/capture-macos-token-isolation-dev-evidence.sh` — the Point-6
+procedure referenced above. It builds tracked Release source from a `git
+archive` of `HEAD`, performs inside-out Apple Development signing of the
+embedded broker then the containing app, verifies the exact reviewed
+entitlement posture and disjoint Keychain groups, runs both fixed-purpose
+negative probes in the real signed processes, and drives the owner-led
+positive control. It is opt-in, never runs in CI, and fails closed without
+recording a live claim on any unresolved precondition. Its existence is
+source only and pre-records no result; the operator runbook is
+`docs/m0/macos-token-isolation-dev-evidence.md`.
+
 What remains open is strictly the signed-runtime evidence: the
 dedicated token Keychain group is declared for the broker only and, unless
 externally completed, is not yet registered or provisioned under the
 production team — the repository cannot prove external registration;
+the opt-in Point-6 Apple Development harness exists in source, but
 development-signed runtime success and both wrong-group
-`errSecMissingEntitlement` fixed-purpose probes are not yet run; and the
+`errSecMissingEntitlement` fixed-purpose probes are not yet captured on a
+successful exact-commit run, nor independently reviewed; and the
 exact Developer ID signed and notarized release-candidate entitlement
 inspection, negative controls, and debugger/`task_for_pid` evidence are not
 yet produced. Builds remain unsigned unless an operator configures signing

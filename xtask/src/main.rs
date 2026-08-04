@@ -687,6 +687,19 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &development,
         &evidence,
     ));
+    let token_isolation_evidence_script =
+        fs::read_to_string("apple/scripts/capture-macos-token-isolation-dev-evidence.sh")?;
+    violations.extend(macos_token_isolation_dev_evidence_script_violations(
+        &token_isolation_evidence_script,
+    ));
+    // The development-only evidence script is opt-in and must never run in CI;
+    // any reference from the workflow is a contract violation.
+    if ci.contains("capture-macos-token-isolation-dev-evidence.sh") {
+        violations.push(
+            "the development-only macOS token isolation evidence script must not be referenced from `.github/workflows/ci.yml`"
+                .to_owned(),
+        );
+    }
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
     violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
     Ok(())
@@ -7048,6 +7061,172 @@ fn keychain_isolation_probe_entrypoint_inventory_violations(
         )),
     }
     violations
+}
+
+/// Returns the byte position of the single occurrence of `needle` in
+/// `haystack`, or `None` when the anchor is absent or appears more than once.
+/// A repeated anchor is a singularity failure: a contract that requires exactly
+/// one occurrence cannot be satisfied by a duplicated step.
+fn single_occurrence_position(haystack: &str, needle: &str) -> Option<usize> {
+    let mut positions = haystack.match_indices(needle);
+    let first = positions.next()?.0;
+    (positions.next().is_none()).then_some(first)
+}
+
+/// Fails closed unless the Apple-Development-signed macOS token/root Keychain
+/// isolation development-evidence capture script
+/// (`apple/scripts/capture-macos-token-isolation-dev-evidence.sh`, ADR-0024
+/// Item 5) preserves its reviewed in-order contract. Every anchor must occur
+/// exactly once and at a strictly increasing byte position relative to its
+/// predecessor, so a removed, duplicated, or reordered step fails closed. The
+/// order mirrors the committed script, so the real script is the contract.
+fn macos_token_isolation_dev_evidence_script_violations(document: &str) -> Vec<String> {
+    const CONFINE: &str = "macOS token isolation dev-evidence script";
+    let mut violations = Vec::new();
+    collect_macos_token_isolation_capture_order_violations(document, CONFINE, &mut violations);
+    collect_macos_token_isolation_singular_anchor_violations(document, CONFINE, &mut violations);
+    violations
+}
+
+/// Records the macOS token isolation dev-evidence capture-flow anchor
+/// violations. The anchors appear in committed byte order; the signing-order
+/// invariants (broker signed inside first, strict-verified, then the
+/// containing app signed and deep-strict verified), the probe result
+/// contract (exit 0, exactly one output line, the exact missing-entitlement
+/// JSON, and the item-not-found/unexpected-status/configuration-invalid
+/// rejections), and the commit-bound evidence record written only after the
+/// operator's confirmation are all expressed as positional predecessors.
+fn collect_macos_token_isolation_capture_order_violations(
+    document: &str,
+    confine: &str,
+    violations: &mut Vec<String>,
+) {
+    const IN_ORDER: &[(&str, &str)] = &[
+        (
+            "clean worktree precondition",
+            "git status --porcelain --untracked-files=all",
+        ),
+        ("exact commit binding", "COMMIT=\"$(git rev-parse HEAD)\""),
+        (
+            "git archive of the bound commit",
+            "git archive --format=tar --output=\"$SCRATCH/source.tar\" \"$COMMIT\"",
+        ),
+        ("unsigned build gate", "CODE_SIGNING_ALLOWED=NO"),
+        (
+            "shared group build setting",
+            "TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\"",
+        ),
+        (
+            "token group build setting",
+            "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
+        ),
+        (
+            "explicit token group profile authorization",
+            "grep -Fq \"<string>$TEAM_ID.app.tersa.token</string>\"",
+        ),
+        (
+            "broker codesign before the containing app",
+            "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_BROKER_ENT\"",
+        ),
+        (
+            "broker strict verification",
+            "codesign --verify --strict \"$BROKER_XPC\"",
+        ),
+        (
+            "containing app codesign after the broker",
+            "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_APP_ENT\"",
+        ),
+        (
+            "app deep strict verification after the broker verify",
+            "codesign --verify --deep --strict \"$APP\"",
+        ),
+        ("probe exit equals zero", "[ \"$ap_exit\" = 0 ]"),
+        ("exactly one probe output line", "[ \"$ap_lines\" -eq 1 ]"),
+        (
+            "exact missing-entitlement evidence line",
+            "'{\"schema_version\":1,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
+        ),
+        ("reject item-not-found", "'\"result\":\"item-not-found\"'"),
+        (
+            "reject unexpected-status",
+            "'\"result\":\"unexpected-status\"'",
+        ),
+        (
+            "reject configuration-invalid",
+            "'\"result\":\"configuration-invalid\"'",
+        ),
+        (
+            "broker isolation probe invocation",
+            "assert_probe \"$BROKER_BIN\" 'token-broker'",
+        ),
+        (
+            "app isolation probe invocation",
+            "assert_probe \"$APP_BIN\" 'main-app'",
+        ),
+        (
+            "owner confirmation equals the bound commit",
+            "[ \"$confirmation\" = \"$COMMIT\" ]",
+        ),
+        (
+            "evidence record written only after confirmation",
+            ">\"$RECORD\"",
+        ),
+    ];
+    let mut previous: Option<(&str, usize)> = None;
+    for (label, anchor) in IN_ORDER {
+        match single_occurrence_position(document, anchor) {
+            None => violations.push(format!(
+                "{confine}: the `{label}` anchor must appear exactly once"
+            )),
+            Some(position) => {
+                if let Some((prev_label, prev_position)) = previous
+                    && position <= prev_position
+                {
+                    violations.push(format!(
+                        "{confine}: the `{label}` anchor must follow the `{prev_label}` anchor in capture order"
+                    ));
+                }
+                previous = Some((label, position));
+            }
+        }
+    }
+}
+
+/// Records the macOS token isolation dev-evidence singular anchor violations:
+/// anchors that are top-of-script definitions or evidence-record invariants
+/// rather than capture-flow steps, but are still part of the reviewed contract:
+/// the exact opt-in probe argument, the gitignored commit-bound record path,
+/// and the development-only non-distribution claim recorded inside it.
+fn collect_macos_token_isolation_singular_anchor_violations(
+    document: &str,
+    confine: &str,
+    violations: &mut Vec<String>,
+) {
+    const SINGULAR: &[(&str, &str)] = &[
+        (
+            "exact opt-in probe argument",
+            "PROBE_ARG='--tersa-keychain-isolation-probe-v1'",
+        ),
+        (
+            "gitignored commit-bound evidence record directory",
+            "apple/build/dev-evidence",
+        ),
+        (
+            "gitignored commit-bound evidence record file",
+            "token-isolation-evidence.txt",
+        ),
+        (
+            "development-only non-distribution claim",
+            "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
+        ),
+    ];
+    for (label, anchor) in SINGULAR {
+        if single_occurrence_position(document, anchor).is_none() {
+            violations.push(format!(
+                "{confine}: the `{label}` anchor must appear exactly once"
+            ));
+        }
+    }
 }
 
 fn token_broker_source_surface_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
@@ -18556,6 +18735,230 @@ mod keychain_isolation_probe_entrypoint_confinement_tests {
         assert!(
             violations.is_empty(),
             "comment/string decoys must stay inert: {violations:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod macos_token_isolation_dev_evidence_script_tests {
+    use super::macos_token_isolation_dev_evidence_script_violations;
+
+    fn reviewed_document() -> String {
+        include_str!("../../apple/scripts/capture-macos-token-isolation-dev-evidence.sh").to_owned()
+    }
+
+    fn expect(violations: &[String], fragment: &str) {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fragment)),
+            "expected a violation containing `{fragment}`, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_script_preserves_the_contract() {
+        assert!(
+            macos_token_isolation_dev_evidence_script_violations(&reviewed_document()).is_empty(),
+            "the reviewed dev-evidence script must have zero violations"
+        );
+    }
+
+    #[test]
+    fn removing_each_material_anchor_fails_closed() {
+        let reviewed = reviewed_document();
+        // Each (label, exact anchor) pair mirrors the helper's contract. Removing
+        // any one anchor must surface a violation naming that anchor's label, so
+        // a removed step cannot pass silently.
+        let anchors: &[(&str, &str)] = &[
+            (
+                "clean worktree precondition",
+                "git status --porcelain --untracked-files=all",
+            ),
+            ("exact commit binding", "COMMIT=\"$(git rev-parse HEAD)\""),
+            (
+                "git archive of the bound commit",
+                "git archive --format=tar --output=\"$SCRATCH/source.tar\" \"$COMMIT\"",
+            ),
+            ("unsigned build gate", "CODE_SIGNING_ALLOWED=NO"),
+            (
+                "shared group build setting",
+                "TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\"",
+            ),
+            (
+                "token group build setting",
+                "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
+            ),
+            (
+                "explicit token group profile authorization",
+                "grep -Fq \"<string>$TEAM_ID.app.tersa.token</string>\"",
+            ),
+            (
+                "broker codesign before the containing app",
+                "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_BROKER_ENT\"",
+            ),
+            (
+                "broker strict verification",
+                "codesign --verify --strict \"$BROKER_XPC\"",
+            ),
+            (
+                "containing app codesign after the broker",
+                "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_APP_ENT\"",
+            ),
+            (
+                "app deep strict verification after the broker verify",
+                "codesign --verify --deep --strict \"$APP\"",
+            ),
+            ("probe exit equals zero", "[ \"$ap_exit\" = 0 ]"),
+            ("exactly one probe output line", "[ \"$ap_lines\" -eq 1 ]"),
+            (
+                "exact missing-entitlement evidence line",
+                "'{\"schema_version\":1,\"principal\":\"'\"$ap_principal\"'\",\"result\":\"missing-entitlement\"}'",
+            ),
+            ("reject item-not-found", "'\"result\":\"item-not-found\"'"),
+            (
+                "reject unexpected-status",
+                "'\"result\":\"unexpected-status\"'",
+            ),
+            (
+                "reject configuration-invalid",
+                "'\"result\":\"configuration-invalid\"'",
+            ),
+            (
+                "broker isolation probe invocation",
+                "assert_probe \"$BROKER_BIN\" 'token-broker'",
+            ),
+            (
+                "app isolation probe invocation",
+                "assert_probe \"$APP_BIN\" 'main-app'",
+            ),
+            (
+                "owner confirmation equals the bound commit",
+                "[ \"$confirmation\" = \"$COMMIT\" ]",
+            ),
+            (
+                "evidence record written only after confirmation",
+                ">\"$RECORD\"",
+            ),
+            (
+                "exact opt-in probe argument",
+                "PROBE_ARG='--tersa-keychain-isolation-probe-v1'",
+            ),
+            (
+                "gitignored commit-bound evidence record directory",
+                "apple/build/dev-evidence",
+            ),
+            (
+                "gitignored commit-bound evidence record file",
+                "token-isolation-evidence.txt",
+            ),
+            (
+                "development-only non-distribution claim",
+                "NOT Developer ID, notarization, distribution, or ADR-0024 Item 6 closure",
+            ),
+        ];
+        for (label, anchor) in anchors {
+            let mutated = reviewed.replacen(anchor, "", 1);
+            assert_ne!(
+                mutated, reviewed,
+                "removing the `{label}` anchor must alter the script"
+            );
+            expect(
+                &macos_token_isolation_dev_evidence_script_violations(&mutated),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn swapping_the_signing_order_fails_closed() {
+        let reviewed = reviewed_document();
+        // Place the containing-app codesign before the broker codesign: the
+        // inside-out signing order is now reversed, so capture order is violated.
+        // A placeholder performs a true two-way swap (naive chained replaces
+        // cancel themselves out).
+        let broker = "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_BROKER_ENT\"";
+        let app = "codesign -s \"$IDENTITY_HASH\" --entitlements \"$RESOLVED_APP_ENT\"";
+        let placeholder = "\x00SIGN_SWAP_PLACEHOLDER\x00";
+        let mutated = reviewed
+            .replacen(broker, placeholder, 1)
+            .replacen(app, broker, 1)
+            .replacen(placeholder, app, 1);
+        assert_ne!(
+            mutated, reviewed,
+            "signing-order swap must alter the script"
+        );
+        let violations = macos_token_isolation_dev_evidence_script_violations(&mutated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("capture order")),
+            "reversed signing order must surface a capture-order violation: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn moving_the_evidence_record_before_confirmation_fails_closed() {
+        let reviewed = reviewed_document();
+        // Swap the confirmation guard and the record write so the record is
+        // emitted before the operator confirms the bounded outcome.
+        let confirmation = "[ \"$confirmation\" = \"$COMMIT\" ]";
+        let record = ">\"$RECORD\"";
+        let placeholder = "\x00RECORD_SWAP_PLACEHOLDER\x00";
+        let mutated = reviewed
+            .replacen(confirmation, placeholder, 1)
+            .replacen(record, confirmation, 1)
+            .replacen(placeholder, record, 1);
+        assert_ne!(
+            mutated, reviewed,
+            "record/confirmation swap must alter the script"
+        );
+        let violations = macos_token_isolation_dev_evidence_script_violations(&mutated);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("capture order")),
+            "a record written before confirmation must surface a capture-order violation: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_probe_invocation_fails_closed() {
+        let reviewed = reviewed_document();
+        // A second broker probe invocation breaks the exactly-once contract.
+        let mutated = reviewed.replacen(
+            "assert_probe \"$BROKER_BIN\" 'token-broker'",
+            "assert_probe \"$BROKER_BIN\" 'token-broker'\nassert_probe \"$BROKER_BIN\" 'token-broker'",
+            1,
+        );
+        assert_ne!(
+            mutated, reviewed,
+            "duplicate probe mutation must alter the script"
+        );
+        expect(
+            &macos_token_isolation_dev_evidence_script_violations(&mutated),
+            "broker isolation probe invocation",
+        );
+    }
+
+    #[test]
+    fn inert_shell_comments_do_not_satisfy_a_removed_executable_anchor() {
+        let reviewed = reviewed_document();
+        // Remove the executable exit-zero guard and leave only an inert note
+        // whose text does not reproduce the exact anchor bytes. The contract
+        // requires the executable statement, not a comment that mentions it.
+        let mutated = reviewed.replacen(
+            "[ \"$ap_exit\" = 0 ]",
+            "# the probe exit-zero guard was removed (inert note)",
+            1,
+        );
+        assert_ne!(
+            mutated, reviewed,
+            "removing the exit-zero anchor must alter the script"
+        );
+        expect(
+            &macos_token_isolation_dev_evidence_script_violations(&mutated),
+            "probe exit equals zero",
         );
     }
 }
