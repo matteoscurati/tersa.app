@@ -85,6 +85,42 @@ final class MailboxLifecyclePresentationTests: XCTestCase {
         XCTAssertEqual(MailboxLifecycleReadResult.failure.launchProjection, .unavailable)
     }
 
+    func testLaunchProjectionReopensOnlyVerifiedCachedMailbox() {
+        XCTAssertEqual(
+            MailboxLifecycleReadResult.success(
+                MailboxLifecycleSnapshot(disconnectRecovery: nil, lastSuccessfulSync: date)
+            ).launchProjection,
+            .cachedMailbox(lastSuccessfulSync: date)
+        )
+        XCTAssertEqual(
+            MailboxLifecycleReadResult.success(
+                MailboxLifecycleSnapshot(disconnectRecovery: nil, lastSuccessfulSync: nil)
+            ).launchProjection,
+            .noCachedMailbox
+        )
+    }
+
+    func testLaunchProjectionGivesRecoveryPrecedenceOverCachedTimestamp() {
+        XCTAssertEqual(
+            MailboxLifecycleReadResult.success(
+                MailboxLifecycleSnapshot(
+                    disconnectRecovery: .incompleteTeardown,
+                    lastSuccessfulSync: date
+                )
+            ).launchProjection,
+            .recovery(.disconnectIncomplete)
+        )
+        XCTAssertEqual(
+            MailboxLifecycleReadResult.success(
+                MailboxLifecycleSnapshot(
+                    disconnectRecovery: .revokeUnconfirmed,
+                    lastSuccessfulSync: date
+                )
+            ).launchProjection,
+            .recovery(.revokeUnconfirmed)
+        )
+    }
+
     func testLaunchRestoreFenceRejectsUserIntentAndAccountChanges() {
         var fence = MailboxLifecycleRestoreFence()
         let primary = Data("primary-gmail".utf8)

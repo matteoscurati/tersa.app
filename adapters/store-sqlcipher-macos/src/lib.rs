@@ -97,7 +97,7 @@ mod macos {
         account: AccountId,
         connection: Mutex<Connection>,
         #[cfg(test)]
-        fail_next_mutation: Mutex<bool>,
+        fail_next_mutation: Mutex<Option<usize>>,
     }
 
     impl fmt::Debug for SqlCipherMailboxStore {
@@ -448,14 +448,21 @@ mod macos {
                 account,
                 connection: Mutex::new(connection),
                 #[cfg(test)]
-                fail_next_mutation: Mutex::new(false),
+                fail_next_mutation: Mutex::new(None),
             })
         }
 
         #[cfg(test)]
         fn fail_next_mutation(&self) {
             if let Ok(mut failpoint) = self.fail_next_mutation.lock() {
-                *failpoint = true;
+                *failpoint = Some(1);
+            }
+        }
+
+        #[cfg(test)]
+        fn fail_mutation_at(&self, checkpoint: usize) {
+            if let Ok(mut failpoint) = self.fail_next_mutation.lock() {
+                *failpoint = Some(checkpoint);
             }
         }
 
@@ -465,7 +472,15 @@ mod macos {
                 .fail_next_mutation
                 .lock()
                 .map_err(|_poison| MailboxStoreError::Storage)?;
-            Ok(std::mem::take(&mut *failpoint))
+            let Some(checkpoint) = *failpoint else {
+                return Ok(false);
+            };
+            if checkpoint == 1 {
+                *failpoint = None;
+                return Ok(true);
+            }
+            *failpoint = Some(checkpoint - 1);
+            Ok(false)
         }
 
         fn checked_account(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
@@ -719,6 +734,20 @@ mod macos {
                 if clear_mailbox {
                     transaction
                         .execute("DELETE FROM messages", [])
+                        .map_err(store_error)?;
+                    #[cfg(test)]
+                    if self.take_failpoint()? {
+                        return Err(MailboxStoreError::Storage);
+                    }
+                    // Mailbox freshness belongs to the recorded identity. A
+                    // replacement identity must not inherit prior mail's
+                    // successful-sync timestamp, and this update commits with
+                    // the mailbox clear and identity record below.
+                    transaction
+                        .execute(
+                            "UPDATE account_lifecycle SET last_successful_sync_unix_millis = NULL WHERE singleton = 1",
+                            [],
+                        )
                         .map_err(store_error)?;
                     #[cfg(test)]
                     if self.take_failpoint()? {
@@ -4885,6 +4914,7 @@ mod macos {
                 &first,
             ))
             .unwrap();
+            run(store.record_successful_sync(&account(), 1_000)).unwrap();
             // A different account connects: clear the cached mailbox and record the
             // new hash in one transaction, compare-and-set against the prior identity.
             let second = IdentityHash::from_bytes([2; 32]);
@@ -4905,6 +4935,21 @@ mod macos {
                 run(store.load_identity(&account())).unwrap(),
                 Some(second.clone())
             );
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                None
+            );
+            // The new identity can record freshness only after its own later
+            // successful sync.
+            run(store.record_successful_sync(&account(), 2_000)).unwrap();
+            assert_eq!(
+                run(store.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(2_000)
+            );
             drop(store);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert!(
@@ -4915,6 +4960,12 @@ mod macos {
             assert_eq!(
                 run(reopened.load_identity(&account())).unwrap(),
                 Some(second)
+            );
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(2_000)
             );
         }
 
@@ -4937,26 +4988,37 @@ mod macos {
                 &recorded,
             ))
             .unwrap();
-            store.fail_next_mutation();
             let replacement = IdentityHash::from_bytes([2; 32]);
-            assert_eq!(
-                run(store.reconcile_identity(
-                    &account(),
-                    &replacement,
-                    IdentityReconcile::ClearMailboxAndRecord,
-                    Some(&recorded),
-                )),
-                Err(MailboxStoreError::Storage)
-            );
-            // Neither the mailbox clear nor the hash record took effect.
-            assert_eq!(
-                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
-                vec![seeded.clone()]
-            );
-            assert_eq!(
-                run(store.load_identity(&account())).unwrap(),
-                Some(recorded.clone())
-            );
+            run(store.record_successful_sync(&account(), 1_000)).unwrap();
+            // The clear path has three transaction checkpoints: after mailbox
+            // deletion, lifecycle freshness clear, and identity record. Each
+            // failure must restore all three old-state components together.
+            for checkpoint in 1..=3 {
+                store.fail_mutation_at(checkpoint);
+                assert_eq!(
+                    run(store.reconcile_identity(
+                        &account(),
+                        &replacement,
+                        IdentityReconcile::ClearMailboxAndRecord,
+                        Some(&recorded),
+                    )),
+                    Err(MailboxStoreError::Storage)
+                );
+                assert_eq!(
+                    run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                    vec![seeded.clone()]
+                );
+                assert_eq!(
+                    run(store.load_identity(&account())).unwrap(),
+                    Some(recorded.clone())
+                );
+                assert_eq!(
+                    run(store.lifecycle_metadata(&account()))
+                        .unwrap()
+                        .last_successful_sync_unix_millis(),
+                    Some(1_000)
+                );
+            }
             drop(store);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert_eq!(
@@ -4966,6 +5028,12 @@ mod macos {
             assert_eq!(
                 run(reopened.load_identity(&account())).unwrap(),
                 Some(recorded)
+            );
+            assert_eq!(
+                run(reopened.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                Some(1_000)
             );
         }
 

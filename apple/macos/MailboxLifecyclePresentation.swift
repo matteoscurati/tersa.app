@@ -34,7 +34,15 @@ enum MailboxLifecycleReadResult {
     var launchProjection: MailboxLifecycleLaunchProjection {
         switch self {
         case .success(let snapshot):
-            return .recovery(snapshot.recoveryPresentation)
+            switch snapshot.recoveryPresentation {
+            case .disconnectIncomplete, .revokeUnconfirmed:
+                return .recovery(snapshot.recoveryPresentation)
+            case .none:
+                guard let lastSuccessfulSync = snapshot.lastSuccessfulSync else {
+                    return .noCachedMailbox
+                }
+                return .cachedMailbox(lastSuccessfulSync: lastSuccessfulSync)
+            }
         case .failure:
             return .unavailable
         }
@@ -43,6 +51,8 @@ enum MailboxLifecycleReadResult {
 
 enum MailboxLifecycleLaunchProjection: Equatable {
     case recovery(MailboxLifecycleRecoveryPresentation)
+    case cachedMailbox(lastSuccessfulSync: Date)
+    case noCachedMailbox
     case unavailable
 }
 

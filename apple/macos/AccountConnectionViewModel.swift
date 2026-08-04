@@ -1314,6 +1314,18 @@ final class AccountConnectionViewModel: ObservableObject {
                 case .none:
                     break
                 }
+            case .cachedMailbox(let lastSuccessfulSync):
+                // This is a content-free local projection only. It reopens
+                // the verified committed cache offline and never starts the
+                // token broker, mailbox synchronization, bootstrap, or OAuth
+                // at launch.
+                self.connectedAccountIdentifier = accountIdentifier
+                self.mailboxFreshness = .offline(lastSuccessfulSync: lastSuccessfulSync)
+                self.state = .connected
+            case .noCachedMailbox:
+                // A remembered alias alone is not evidence of committed mail.
+                // Keep the launch surface neutral until explicit user intent.
+                break
             }
         }
     }
