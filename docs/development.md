@@ -66,11 +66,15 @@ queue runs retain the conservative fast gate. Diagnostic Slint, Dioxus,
 SQLCipher, search, MIME, fuzz, blob, and OAuth evidence runs only through an
 explicit `workflow_dispatch` selection. Use `all` at release or at an
 architecture evidence checkpoint, and select one suite while investigating a
-specific diagnostic. These artifacts remain bound to the selected immutable
-commit and retain the existing 90-day protocol lifetime. GitHub Actions cache
-restore and save are disabled for every job and event, including manual evidence
-runs. Every run therefore starts without a repository cache and cannot recreate
-the deleted cache inventory. Manual runs publish
+specific diagnostic. Successful manual evidence remains bound to the selected
+immutable commit and retains the unchanged 90-day protocol lifetime at maximum
+artifact compression. Evidence bind and upload steps are not scheduled after an
+earlier failure or after run cancellation has already begun. If cancellation
+occurs after an upload has started, GitHub Actions does not retroactively delete
+that artifact. GitHub Actions cache restore and save are disabled for every job
+and event, including manual evidence runs. Every run therefore starts without a
+repository cache and cannot recreate the deleted cache inventory. Manual runs
+publish
 `Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
 evidence selection cannot substitute for the real pull-request scope or DCO
 check.
