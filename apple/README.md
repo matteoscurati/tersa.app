@@ -12,24 +12,21 @@ entitlement, signing, package, OAuth, network, or real-account fixture. All
 iPhone and iPad product work remains deferred to Phase 2; the existing mobile
 targets below remain feasibility diagnostics only.
 
-The additive `TersaMimeMac` and `TersaMimeIOS` schemes compile a separate native
-Swift WKWebView policy around the portable `tersa-mime-spike`. The macOS host
-probe uses a nonpersistent data store, disabled content JavaScript, block-all
-network rules, navigation denial, an App Sandbox with a network client but no
-server entitlement, and a separate in-app transport-control canary run. The iOS schemes
-provide locked compile evidence only; neither target is the production message
-viewer.
+Historical note: the M0 MIME Apple diagnostic schemes and portable MIME spike
+were removed by ADR-0025 housekeeping (PR4). No Apple MIME diagnostic target,
+WKWebView hostile-content probe, or MIME renderer remains in this tree.
+Hostile-content handling remains a product requirement; see the historical
+[MIME feasibility record](../docs/m0/mime-html-feasibility.md).
 
 Generate the project and use the reproducible build commands in
 [Development](../docs/development.md#apple-bootstrap).
 
-`rust-bridge` and the MIME diagnostic are part of the root Cargo workspace, so
-the standard formatting, lint, test, documentation, dependency, and advisory
-checks cover them. The bridge depends inward on `tersa-application`,
-`tersa-presentation`, and, on macOS only, `tersa-keychain-macos` for the
-one-shot product bootstrap command. It receives no key, database path, store,
-profile, or reusable storage capability, preserving the rule that shared core
-layers never depend on Apple frameworks.
+`rust-bridge` is part of the root Cargo workspace, so the standard formatting,
+lint, test, documentation, dependency, and advisory checks cover it. The bridge
+depends inward on `tersa-application`, `tersa-presentation`, and, on macOS only,
+`tersa-keychain-macos` for the one-shot product bootstrap command. It receives
+no key, database path, store, profile, or reusable storage capability,
+preserving the rule that shared core layers never depend on Apple frameworks.
 
 The base targets also contain the M0 OAuth Authorization Code + PKCE adapter.
 Rust owns S256 material, state, expiry, callback validation, and the macOS

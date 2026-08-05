@@ -16,7 +16,7 @@ production-security claim.
 | Gmail messages, headers, addresses, labels, drafts, and local intent | Authenticated transport; encrypted local persistence; account isolation; bounded retention |
 | Root and derived encryption keys | CSPRNG generation; device-only Data Protection Keychain storage; domain-separated derivation; no export or diagnostics |
 | SQLCipher databases, WAL/journals, blobs, thumbnails, and search indexes | Application encryption at rest; controlled temporary storage; integrity checks; crypto-erasure |
-| MIME, HTML, inline resources, and attachments | Bounded parsing; typed sanitized output; deny-by-default rendering; no automatic remote fetch |
+| MIME, HTML, inline resources, and attachments | Required future product controls: bounded parsing; typed sanitized output; deny-by-default rendering; no automatic remote fetch. No active MIME renderer or parser is present in the product graph |
 | Exports, clipboard data, and notifications | Explicit user declassification; minimum disclosure; no claim of encryption after export |
 | Logs, crash reports, and CI evidence | Aggregate and redacted; no content, queries, secrets, paths, or stable user identifiers |
 | Release artifacts and dependency graph | Reproducible inputs where practical; signed distribution; notarization; SBOM and advisory review |
@@ -36,8 +36,9 @@ production-security claim.
    `MailboxReader`; UI, future CLI mutations, and future MCP access must go
    through authorized application use cases rather than widening direct store
    authority.
-5. MIME parsers, WebKit, attachment decoders, exports, logs, and diagnostic
-   evidence cross from hostile or sensitive data into narrower representations.
+5. Planned MIME parsers, render surfaces, attachment decoders, exports, logs,
+   and diagnostic evidence cross from hostile or sensitive data into narrower
+   representations. No active MIME parser or render surface is present yet.
 
 ## Attacker capabilities
 
@@ -59,7 +60,7 @@ passcode, Google credentials, signing identity, or an authorized local process.
 |---|---|---|
 | OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, system authentication session on iOS, refresh token in device-only Keychain | Real Google exchange, Keychain persistence, revocation, and physical-device flow remain open |
 | Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, macOS Data Protection Keychain root key with device-only accessibility, fixed App Group profile layout, locked product bootstrap, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; signed cross-target Keychain interoperability remains PR 33b evidence after the deterministic PR 33a.5 source slice, while pathname SQLite and mutable final names retain the documented same-user race residuals |
-| Malicious MIME/HTML and tracking pixels | Size/depth/part limits, attachment exclusion, typed `SafeHtml`, nonpersistent WKWebView, JavaScript/network/navigation denial, remote images blocked | Parser/WebKit zero-days and physical-device containment remain open |
+| Malicious MIME/HTML and tracking pixels | Required future product controls: size/depth/part limits, attachment exclusion, typed sanitized output, deny-by-default render surface with JavaScript/network/navigation denial, remote images blocked. Historical M0 host diagnostic retired in PR4; no active renderer claims | Parser/WebKit zero-days, production implementation, and physical-device containment remain open |
 | Malicious attachment or decompression bomb | On-demand fetch, byte/ratio/time/memory limits, no macro execution, sandboxed short-lived worker when needed | Complex production parsers and sandbox evidence are not implemented |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, stable RFC Message-ID, server reconciliation after ambiguous timeout | Production sync/outbox is not implemented |
 | Cross-account or cross-surface access | `(account_id, gmail_id)` identity, per-account storage/key namespace, application authorization boundary, future single-writer host on macOS | Production repositories and IPC authorization remain open |

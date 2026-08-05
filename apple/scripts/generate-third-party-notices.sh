@@ -4,7 +4,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Generates or verifies complete target-specific license inventories for the
-# Apple product and retained MIME diagnostic applications.
+# active Apple product applications.
 set -eu
 
 mode=${1:---check}
@@ -12,7 +12,6 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 apple_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
 workspace_dir=$(CDPATH='' cd -- "${apple_dir}/.." && pwd)
 bridge_config="${workspace_dir}/about-bridge.toml"
-mime_config="${workspace_dir}/about-mime.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
 
@@ -71,20 +70,9 @@ generate_notice THIRD_PARTY_NOTICES-bridge-ios.txt \
   apple/rust-bridge/Cargo.toml - "$bridge_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
-generate_notice THIRD_PARTY_NOTICES-mime-macos.txt "macOS arm64 MIME diagnostic" \
-  apps/mime-spike/Cargo.toml - "$mime_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-mime-ios.txt "iOS arm64 MIME diagnostic targets" \
-  apps/mime-spike/Cargo.toml - "$mime_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
-
 if [ "$mode" = "--check" ]; then
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-macos.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-ios.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-ios.txt"
 fi

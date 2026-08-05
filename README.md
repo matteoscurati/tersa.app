@@ -6,10 +6,10 @@ The project is currently in early product development on the macOS-first path.
 It is not yet usable as a complete email client and has no published application
 builds.
 
-The repository contains the shared Rust core, Apple bridge and product surfaces,
-and the retained MIME feasibility diagnostic. The M0 Slint/Dioxus UI diagnostics
-and the M0 SQLCipher, search/Tantivy, and blob diagnostics are retired; their
-ADR history and detailed studies remain as historical records.
+The repository contains the shared Rust core, Apple bridge, and product
+surfaces. The M0 Slint/Dioxus UI diagnostics, the M0 SQLCipher, search/Tantivy,
+and blob diagnostics, and the M0 MIME/hostile-HTML and fuzz diagnostics are
+retired; their ADR history and detailed studies remain as historical records.
 
 ## Product boundaries
 
