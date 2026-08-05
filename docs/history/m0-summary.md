@@ -74,8 +74,10 @@ Native SwiftUI was selected and a product vertical slice exists
 ([ADR 0020](../architecture/adr-0020-macos-production-ui-toolkit.md),
 [ADR 0021](../architecture/adr-0021-macos-ui-vertical-slice.md)). Retained
 development-signed evidence snapshots did not close release or accessibility
-gates. Use the active quality and release protocols above for current
-acceptance work.
+gates. Active non-gate development capture for accessibility and App Sandbox
+lives in
+[macOS UI development evidence](../quality/macos-ui-dev-evidence.md). Use the
+active quality and release protocols above for current acceptance work.
 
 ## Retirement
 

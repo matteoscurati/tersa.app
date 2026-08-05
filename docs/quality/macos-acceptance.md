@@ -48,6 +48,12 @@ versions, and aggregate measurements. A failed redaction scan, an unredacted
 artifact, a mutable or commit-mismatched locator, an expired review, incomplete
 metadata, or self-review fails closed.
 
+Development-signed iteration evidence for accessibility and App Sandbox denial
+is recorded separately in
+[macOS UI development evidence](macos-ui-dev-evidence.md). That record is
+explicitly non-gate and never substitutes for the Developer ID requirements
+below.
+
 ## macOS UI acceptance
 
 Use the release-equivalent Developer ID candidate on an Apple Silicon Mac.

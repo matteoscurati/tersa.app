@@ -710,10 +710,12 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     let project_generation_wrapper = fs::read_to_string("apple/scripts/generate-project.sh")?;
     let ci = fs::read_to_string(".github/workflows/ci.yml")?;
     let development = fs::read_to_string("docs/development.md")?;
+    let ui_evidence = fs::read_to_string("apple/scripts/capture-macos-ui-dev-evidence.sh")?;
     violations.extend(project_generation_surface_violations(
         &project_generation_wrapper,
         &ci,
         &development,
+        &ui_evidence,
     ));
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
     violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
@@ -5266,6 +5268,7 @@ fn project_generation_surface_violations(
     wrapper: &str,
     ci: &str,
     development: &str,
+    ui_evidence: &str,
 ) -> Vec<String> {
     let mut violations = Vec::new();
     if wrapper != project_generation_wrapper() {
@@ -5277,6 +5280,11 @@ fn project_generation_surface_violations(
     for (path, document, minimum_wrapper_calls) in [
         (".github/workflows/ci.yml", ci, 1),
         ("docs/development.md", development, 1),
+        (
+            "apple/scripts/capture-macos-ui-dev-evidence.sh",
+            ui_evidence,
+            1,
+        ),
     ] {
         if contains_xcodegen_generation_invocation(document) {
             violations.push(format!(
@@ -5293,6 +5301,39 @@ fn project_generation_surface_violations(
             ));
         }
     }
+// The UI development evidence capture signs the embedded token broker
+    // inside-out: the nested XPC is signed with its dedicated broker
+    // entitlements and strictly verified before the outer application is
+    // signed with the outer entitlement set. Pin the exact reviewed commands
+    // and their relative order so that fix cannot silently regress. Text
+    // anchors pin the reviewed commands only; they do not by themselves prove
+    // signing semantics.
+    let xpc_sign_command =
+        "codesign -s \"$IDENTITY_HASH\" --entitlements \"$BROKER_RESOLVED_ENTITLEMENTS\"";
+    let xpc_verify_command = "codesign --verify --deep --strict \"$XPC\"";
+    let app_sign_command = concat!(
+        "--entitlements \"$RESOLVED_ENTITLEMENTS\" \\\n",
+        "  --force --options runtime --timestamp=none \"$APP\"",
+    );
+    for command in [xpc_sign_command, xpc_verify_command, app_sign_command] {
+        if ui_evidence.matches(command).count() != 1 {
+            violations.push(format!(
+                "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly the reviewed nested-signing command `{command}`"
+            ));
+        }
+    }
+    if let (Some(xpc_sign_at), Some(xpc_verify_at), Some(app_sign_at)) = (
+        ui_evidence.find(xpc_sign_command),
+        ui_evidence.find(xpc_verify_command),
+        ui_evidence.find(app_sign_command),
+    ) && !(xpc_sign_at < xpc_verify_at && xpc_verify_at < app_sign_at)
+    {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must sign and strictly verify the embedded XPC before signing the outer application"
+                .to_owned(),
+        );
+    }
+    violations.extend(macos_ui_token_group_evidence_violations(ui_evidence));
     violations
 }
 
@@ -5616,6 +5657,252 @@ fn shell_variable_reference(token: &str) -> Option<&str> {
 
 fn shell_command_string_flag(token: &str) -> bool {
     token.starts_with('-') && !token.starts_with("--") && token[1..].chars().any(|flag| flag == 'c')
+}
+
+fn macos_ui_token_group_evidence_violations(ui_evidence: &str) -> Vec<String> {
+    const XPC_INVENTORY_OUTPUT: &str =
+        "embedded_xpc=exactly TersaMacTokenBroker.xpc at the reviewed location\\n";
+
+    let commands = shell_executable_logical_commands(ui_evidence);
+    let mut violations = macos_ui_token_group_command_pin_violations(&commands);
+    let reviewed_compiled_check = reviewed_compiled_token_group_check();
+
+    let reviewed_setup = reviewed_token_group_setup();
+    let setup_commands = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            command
+                .iter()
+                .map(String::as_str)
+                .eq(reviewed_setup)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let token_group_setup_at = (setup_commands.len() == 1).then(|| setup_commands[0]);
+    if token_group_setup_at.is_none() {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one executable reviewed token-group xcodebuild setup command"
+                .to_owned(),
+        );
+    }
+    let reviewed_build = reviewed_token_group_build();
+    let xcodebuild_commands = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            command
+                .iter()
+                .map(String::as_str)
+                .eq(reviewed_build)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let xcodebuild_at = (xcodebuild_commands.len() == 1).then(|| xcodebuild_commands[0]);
+    if xcodebuild_at.is_none() {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must execute exactly one reviewed xcodebuild build command with propagated arguments"
+                .to_owned(),
+        );
+    }
+    let xpc_inventory_at = commands.iter().position(|command| {
+        shell_command_name(command.first().map(String::as_str).unwrap_or_default()) == "printf"
+            && command.iter().any(|token| token == XPC_INVENTORY_OUTPUT)
+    });
+    let compiled_check_at = commands.iter().position(|command| {
+        command
+            .iter()
+            .map(String::as_str)
+            .eq(reviewed_compiled_check)
+    });
+    let first_codesign_after_build_at = xcodebuild_at.and_then(|build| {
+        commands
+            .iter()
+            .enumerate()
+            .skip(build + 1)
+            .find_map(|(index, command)| {
+                (shell_command_name(command.first().map(String::as_str).unwrap_or_default())
+                    == "codesign")
+                    .then_some(index)
+            })
+    });
+    if !matches!(
+        (
+            token_group_setup_at,
+            xcodebuild_at,
+            xpc_inventory_at,
+            compiled_check_at,
+            first_codesign_after_build_at,
+        ),
+        (Some(setup), Some(build), Some(inventory), Some(check), Some(codesign))
+            if setup < build && build < inventory && inventory < check && check < codesign
+    ) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must set the token group before xcodebuild, inventory the XPC, check the compiled broker, then sign"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn reviewed_compiled_token_group_check() -> [&'static str; 8] {
+    [
+        "LC_ALL=C",
+        "grep",
+        "-aFq",
+        "$TEAM_ID.app.tersa.token",
+        "$XPC/Contents/MacOS/TersaMacTokenBroker",
+        "||",
+        "fail",
+        "the Rust token broker did not compile the team-prefixed token group",
+    ]
+}
+
+fn reviewed_token_group_setup() -> [&'static str; 6] {
+    [
+        "set",
+        "--",
+        "$@",
+        "CODE_SIGNING_ALLOWED=NO",
+        "TERSA_MACOS_APP_GROUP=$TEAM_ID.app.tersa.shared",
+        "TERSA_MACOS_TOKEN_GROUP=$TEAM_ID.app.tersa.token",
+    ]
+}
+
+fn reviewed_token_group_build() -> [&'static str; 4] {
+    ["xcodebuild", "$@", "build", ">/dev/null"]
+}
+
+fn macos_ui_token_group_command_pin_violations(commands: &[Vec<String>]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let token_group_assignments = commands
+        .iter()
+        .flat_map(|command| command.iter())
+        .filter(|token| token.starts_with("TERSA_MACOS_TOKEN_GROUP="))
+        .collect::<Vec<_>>();
+    if token_group_assignments.as_slice() != ["TERSA_MACOS_TOKEN_GROUP=$TEAM_ID.app.tersa.token"] {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one executable team-prefixed token-group Xcode build override"
+                .to_owned(),
+        );
+    }
+    let reviewed_check = reviewed_compiled_token_group_check();
+    let compiled_checks = commands
+        .iter()
+        .filter(|command| {
+            command.iter().any(|token| {
+                token == "$XPC/Contents/MacOS/TersaMacTokenBroker" || token == reviewed_check[7]
+            })
+        })
+        .collect::<Vec<_>>();
+    if compiled_checks.len() != 1
+        || compiled_checks[0]
+            .iter()
+            .map(String::as_str)
+            .ne(reviewed_check)
+    {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one executable reviewed compiled token-broker token-group check"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn shell_executable_logical_commands(document: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut logical_line = String::new();
+    let mut heredoc_terminators = Vec::new();
+    for physical_line in document.lines() {
+        if let Some(terminator) = heredoc_terminators.first() {
+            if physical_line == terminator {
+                heredoc_terminators.remove(0);
+            }
+            continue;
+        }
+        logical_line.push_str(physical_line);
+        if physical_line.ends_with('\\') {
+            logical_line.pop();
+            continue;
+        }
+        let tokens = shell_tokens(&logical_line);
+        heredoc_terminators.extend(shell_heredoc_terminators(&logical_line));
+        if !tokens.is_empty() {
+            commands.push(tokens);
+        }
+        logical_line.clear();
+    }
+    if !logical_line.is_empty() {
+        let tokens = shell_tokens(&logical_line);
+        if !tokens.is_empty() {
+            commands.push(tokens);
+        }
+    }
+    commands
+}
+
+fn shell_heredoc_terminators(line: &str) -> Vec<String> {
+    let mut terminators = Vec::new();
+    let mut quote = None;
+    let mut at_word_boundary = true;
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else if character == '\\' && delimiter == '"' {
+                characters.next();
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => {
+                quote = Some(character);
+                at_word_boundary = false;
+            }
+            '\\' => {
+                characters.next();
+                at_word_boundary = false;
+            }
+            '#' if at_word_boundary => break,
+            '#' => at_word_boundary = false,
+            character if character.is_whitespace() => at_word_boundary = true,
+            ';' | '|' | '&' => at_word_boundary = true,
+            '<' if characters.peek() == Some(&'<') => {
+                characters.next();
+                if characters.peek() == Some(&'-') {
+                    characters.next();
+                }
+                while characters
+                    .peek()
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    characters.next();
+                }
+                let Some(first) = characters.next() else {
+                    break;
+                };
+                let delimiter: String = match first {
+                    quote @ ('\'' | '"') => characters
+                        .by_ref()
+                        .take_while(|character| *character != quote)
+                        .collect(),
+                    first => std::iter::once(first)
+                        .chain(characters.by_ref().take_while(|character| {
+                            !character.is_whitespace()
+                                && !matches!(*character, ';' | '|' | '&' | '<' | '>')
+                        }))
+                        .collect(),
+                };
+                if !delimiter.is_empty() {
+                    terminators.push(delimiter);
+                }
+                at_word_boundary = false;
+            }
+            _ => at_word_boundary = false,
+        }
+    }
+    terminators
 }
 
 fn shell_command_name(token: &str) -> &str {
@@ -14786,16 +15073,270 @@ targets:
         );
     }
 
+    fn macos_ui_evidence_signing_fixture() -> &'static str {
+        concat!(
+            "sh apple/scripts/generate-project.sh\n",
+            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
+            "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
+            "xcodebuild \"$@\" build >/dev/null\n",
+            "printf 'embedded_xpc=exactly TersaMacTokenBroker.xpc at the reviewed location\\n'\n",
+            "LC_ALL=C grep -aFq \"$TEAM_ID.app.tersa.token\" \"$XPC/Contents/MacOS/TersaMacTokenBroker\" \\\n",
+            "  || fail 'the Rust token broker did not compile the team-prefixed token group'\n",
+            "codesign -s \"$IDENTITY_HASH\" ",
+            "--entitlements \"$BROKER_RESOLVED_ENTITLEMENTS\" \\\n",
+            "  --force --options runtime --timestamp=none \"$XPC\" >/dev/null 2>&1\n",
+            "codesign --verify --deep --strict \"$XPC\" >/dev/null 2>&1\n",
+            "codesign -s \"$IDENTITY_HASH\" ",
+            "--entitlements \"$RESOLVED_ENTITLEMENTS\" \\\n",
+            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1\n",
+        )
+    }
+
+    #[test]
+    fn macos_ui_evidence_must_sign_the_nested_xpc_inside_out() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        assert!(
+            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer)
+                .is_empty()
+        );
+
+        assert!(
+            project_generation_surface_violations(&wrapper, &ci, consumer, consumer)
+                .iter()
+                .any(|violation| violation.contains("reviewed nested-signing command"))
+        );
+
+        let wrong_entitlements = ui_consumer.replace(
+            "--entitlements \"$BROKER_RESOLVED_ENTITLEMENTS\"",
+            "--entitlements \"$RESOLVED_ENTITLEMENTS\"",
+        );
+        assert!(
+            project_generation_surface_violations(
+                &wrapper,
+                &ci,
+                consumer,
+                &wrong_entitlements,
+            )
+            .iter()
+            .any(|violation| violation.contains("reviewed nested-signing command"))
+        );
+
+        let reordered = concat!(
+            "sh apple/scripts/generate-project.sh\n",
+            "codesign -s \"$IDENTITY_HASH\" ",
+            "--entitlements \"$RESOLVED_ENTITLEMENTS\" \\\n",
+            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1\n",
+            "codesign -s \"$IDENTITY_HASH\" ",
+            "--entitlements \"$BROKER_RESOLVED_ENTITLEMENTS\" \\\n",
+            "  --force --options runtime --timestamp=none \"$XPC\" >/dev/null 2>&1\n",
+            "codesign --verify --deep --strict \"$XPC\" >/dev/null 2>&1\n",
+        );
+        assert!(
+            project_generation_surface_violations(&wrapper, &ci, consumer, reordered)
+                .iter()
+                .any(|violation| violation.contains("before signing the outer application"))
+        );
+
+        let duplicate_xpc_sign = concat!(
+            "codesign -s \"$IDENTITY_HASH\" ",
+            "--entitlements \"$BROKER_RESOLVED_ENTITLEMENTS\" \\\n",
+            "  --force --options runtime --timestamp=none \"$XPC\" >/dev/null 2>&1\n",
+        );
+        let duplicated = format!("{ui_consumer}{duplicate_xpc_sign}");
+        assert!(
+            project_generation_surface_violations(&wrapper, &ci, consumer, &duplicated)
+                .iter()
+                .any(|violation| {
+                    violation.contains("must contain exactly the reviewed nested-signing command")
+                })
+        );
+
+        for (label, mutation) in [
+            (
+                "missing token-group override",
+                ui_consumer.replace(
+                    "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
+                    "",
+                ),
+            ),
+            (
+                "unprefixed token-group override",
+                ui_consumer.replace(
+                    "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
+                    "TERSA_MACOS_TOKEN_GROUP=\"app.tersa.token\"",
+                ),
+            ),
+            (
+                "wrong token-group override",
+                ui_consumer.replace(
+                    "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"",
+                    "TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.shared\"",
+                ),
+            ),
+            (
+                "missing compiled token-group check",
+                ui_consumer.replace(
+                    "LC_ALL=C grep -aFq \"$TEAM_ID.app.tersa.token\" \"$XPC/Contents/MacOS/TersaMacTokenBroker\" \\\n  || fail 'the Rust token broker did not compile the team-prefixed token group'\n",
+                    "",
+                ),
+            ),
+        ] {
+            assert!(
+                project_generation_surface_violations(&wrapper, &ci, consumer, &mutation)
+                    .iter()
+                    .any(|violation| {
+                        violation.contains("executable team-prefixed token-group Xcode build override")
+                            || violation.contains("executable reviewed compiled token-broker token-group check")
+                    }),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_ui_evidence_token_group_command_guards_fail_closed() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        let reviewed_setup = concat!(
+            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
+            "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
+        );
+        let reviewed_compiled_check = concat!(
+            "LC_ALL=C grep -aFq \"$TEAM_ID.app.tersa.token\" \"$XPC/Contents/MacOS/TersaMacTokenBroker\" \\\n",
+            "  || fail 'the Rust token broker did not compile the team-prefixed token group'\n",
+        );
+        let setup_after_build = ui_consumer.replace(reviewed_setup, "").replace(
+            "xcodebuild \"$@\" build >/dev/null\n",
+            &format!("xcodebuild \"$@\" build >/dev/null\n{reviewed_setup}"),
+        );
+        let compiled_check_after_codesign = ui_consumer.replace(reviewed_compiled_check, "");
+        let compiled_check_after_codesign =
+            format!("{compiled_check_after_codesign}{reviewed_compiled_check}");
+        let duplicate_wrong_assignment =
+            format!("{ui_consumer}TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.shared\"\n");
+        let setup_without_propagated_arguments = ui_consumer.replace(
+            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO ",
+            "set -- CODE_SIGNING_ALLOWED=NO ",
+        );
+        let build_without_propagated_arguments = ui_consumer.replace(
+            "xcodebuild \"$@\" build >/dev/null",
+            "xcodebuild build >/dev/null",
+        );
+        let inert_heredoc = ui_consumer
+            .replace(reviewed_setup, "")
+            .replace(reviewed_compiled_check, "");
+        let inert_heredoc = format!(
+            "{inert_heredoc}cat <<'INERT_TOKEN_GROUP_GUARD'\n{reviewed_setup}{reviewed_compiled_check}INERT_TOKEN_GROUP_GUARD\n"
+        );
+        for (label, mutation) in [
+            (
+                "duplicate wrong token-group assignment",
+                duplicate_wrong_assignment,
+            ),
+            ("token-group setup after xcodebuild", setup_after_build),
+            (
+                "token-group setup without propagated arguments",
+                setup_without_propagated_arguments,
+            ),
+            (
+                "xcodebuild without propagated arguments",
+                build_without_propagated_arguments,
+            ),
+            (
+                "compiled token-group check after codesign",
+                compiled_check_after_codesign,
+            ),
+            ("inert heredoc token-group anchors", inert_heredoc),
+        ] {
+            assert!(
+                project_generation_surface_violations(&wrapper, &ci, consumer, &mutation)
+                    .iter()
+                    .any(|violation| {
+                        violation.contains("token group before xcodebuild")
+                            || violation.contains("reviewed token-group xcodebuild setup command")
+                            || violation.contains(
+                                "reviewed xcodebuild build command with propagated arguments",
+                            )
+                            || violation.contains(
+                                "executable team-prefixed token-group Xcode build override",
+                            )
+                            || violation.contains(
+                                "executable reviewed compiled token-broker token-group check",
+                            )
+                    }),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_ui_evidence_heredoc_setup_anchors_are_inert() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        let reviewed_setup = concat!(
+            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
+            "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
+        );
+        let marker_hash = ui_consumer.replace(
+            reviewed_setup,
+            &format!(": marker#text <<'INERT_MARKER_HASH'\n{reviewed_setup}INERT_MARKER_HASH\n"),
+        );
+        let escaped_space = ui_consumer.replace(
+            reviewed_setup,
+            &format!(
+                ": marker\\ #text <<'INERT_ESCAPED_SPACE'\n{reviewed_setup}INERT_ESCAPED_SPACE\n"
+            ),
+        );
+        let escaped_newline = ui_consumer.replace(
+            reviewed_setup,
+            &format!(
+                ": marker\\\n#text <<'INERT_ESCAPED_NEWLINE'\n{reviewed_setup}INERT_ESCAPED_NEWLINE\n"
+            ),
+        );
+        let second_heredoc = ui_consumer.replace(
+            reviewed_setup,
+            &format!(
+                ": <<'INERT_FIRST' <<'INERT_SECOND'\nharmless first heredoc body\nINERT_FIRST\n{reviewed_setup}INERT_SECOND\n"
+            ),
+        );
+        for (label, mutation) in [
+            ("marker-hash", marker_hash),
+            ("escaped-space", escaped_space),
+            ("escaped-newline", escaped_newline),
+            ("second heredoc", second_heredoc),
+        ] {
+            assert!(
+                project_generation_surface_violations(&wrapper, &ci, consumer, &mutation)
+                    .iter()
+                    .any(|violation| {
+                        violation.contains("reviewed token-group xcodebuild setup command")
+                    }),
+                "{label} inert heredoc setup must fail closed"
+            );
+        }
+    }
+
     #[test]
     fn project_generation_must_use_the_exact_no_env_wrapper() {
         let wrapper = project_generation_wrapper();
         let ci = "sh apple/scripts/generate-project.sh\n";
         let consumer = "sh apple/scripts/generate-project.sh\n";
-        assert!(project_generation_surface_violations(&wrapper, ci, consumer).is_empty());
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        assert!(project_generation_surface_violations(&wrapper, ci, consumer, ui_consumer).is_empty());
 
         let missing_no_env = wrapper.replace(" --no-env", "");
         assert!(
-            project_generation_surface_violations(&missing_no_env, ci, consumer)
+            project_generation_surface_violations(&missing_no_env, ci, consumer, ui_consumer)
                 .iter()
                 .any(|violation| violation.contains("exact reviewed --no-env wrapper"))
         );
@@ -14804,13 +15345,13 @@ targets:
             " generate --spec apple/project.yml --project apple\n"
         );
         assert!(
-            project_generation_surface_violations(&wrapper, &(ci.to_owned() + direct), consumer)
+            project_generation_surface_violations(&wrapper, &(ci.to_owned() + direct), consumer, ui_consumer)
                 .iter()
                 .any(|violation| violation.contains("must not bypass"))
         );
         let root_form = "xcodegen --spec apple/project.yml --project apple\n";
         assert!(
-            project_generation_surface_violations(&wrapper, &format!("{ci}{root_form}"), consumer)
+            project_generation_surface_violations(&wrapper, &format!("{ci}{root_form}"), consumer, ui_consumer)
                 .iter()
                 .any(|violation| violation.contains("must not bypass"))
         );

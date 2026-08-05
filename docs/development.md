@@ -31,6 +31,18 @@ release acceptance are defined by the
 [macOS acceptance protocol](quality/macos-acceptance.md) and the
 [macOS performance harness](quality/macos-performance.md).
 
+Development-signed (non-gate) accessibility and App Sandbox capture for the
+macOS UI vertical slice follows
+[macOS UI development evidence](quality/macos-ui-dev-evidence.md):
+
+```sh
+sh apple/scripts/capture-macos-ui-dev-evidence.sh
+```
+
+That runner requires a clean worktree, exactly one Apple Development identity,
+and a matching Mac Development profile. It cannot satisfy
+`P1-MACOS-001`/`002`/`003`.
+
 ### CI execution modes
 
 Open implementation pull requests as drafts. Draft creation and synchronization
