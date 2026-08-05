@@ -55,16 +55,17 @@ account-connection UI states over the existing credentialless bootstrap C
 ABI and the existing OAuth session state shapes only, and visualizes the
 sync-flow states of the bounded sync and cache ADR without executing a real
 sync. Step 2 must not invoke the existing macOS OAuth C ABI symbols
-`tersa_oauth_macos_begin`, `tersa_oauth_macos_poll`, `tersa_oauth_cancel`,
-or `tersa_oauth_macos_entitlement_probe`: begin stands up a live loopback
-listener and authorization request, poll and cancel drive that
-callback-transport session, and the entitlement probe performs a
-loopback network check. Step 2 may only render the connection state
-shapes those operations would drive; their invocation is deferred to
-Step 3, and the authorization-code-to-token exchange itself remains
-unimplemented until Step 3. Step 3 lights up OAuth and Gmail behind the
-existing ports without changing the Step 2 bridge read surface; that
-invariance is the test of a correct cut.
+`tersa_oauth_macos_begin`, `tersa_oauth_macos_poll`, or `tersa_oauth_cancel`:
+begin stands up a live loopback listener and authorization request, and poll
+and cancel drive that callback-transport session. The dedicated
+`tersa_oauth_macos_entitlement_probe` export that Step 2 also excluded was
+later retired with the obsolete combined OAuth verifier; it is no longer part
+of the bridge surface. Step 2 may only render the connection state shapes
+those operations would drive; their invocation is deferred to Step 3, and the
+authorization-code-to-token exchange itself remains unimplemented until
+Step 3. Step 3 lights up OAuth and Gmail behind the existing ports without
+changing the Step 2 bridge read surface; that invariance is the test of a
+correct cut.
 
 Because Step 2 runs no sync, the production cache is empty, so empty-state
 UX is a first-class deliverable. No production demo-data or
@@ -154,8 +155,9 @@ send and outbox are MVP-completion work.
 Each Swift pull request carries a per-screen accessibility acceptance
 checklist per ADR-0020: native `NSAccessibility` roles, names, values,
 states, logical order, and actions, with VoiceOver-only and
-Full-Keyboard-Access-only core flows. This is the bar by reference to
-`P1-MACOS-001`; it is not restated here.
+Full-Keyboard-Access-only core flows. This is the bar by reference to the
+[macOS acceptance protocol](../quality/macos-acceptance.md); it is not
+restated here.
 
 The reviewed entitlement allowlist stays closed; Step 2 needs no new
 entitlement. Any future entitlement enters only through a reviewed change
@@ -164,19 +166,18 @@ plus the acceptance-protocol denial tests.
 ### Dev-signed evidence
 
 PR 2f captures development-signed accessibility and sandbox evidence for
-iteration only. Such evidence can never count toward `P1-MACOS-001`,
-`P1-MACOS-002`, or `P1-MACOS-003`, which remain Developer-ID and
+iteration only. Such evidence can never count toward macOS UI acceptance,
+release acceptance, or the Phase 1 aggregate, which remain Developer-ID and
 notarization only.
 
 ## Non-claims
 
-This ADR passes, reopens, closes, downgrades, or edits no gate;
-`gate-register.json` is unchanged, `ui_baseline_approved` stays false, and
-`M1-UI-001` stays blocked.
+This ADR passes, reopens, closes, downgrades, or edits no acceptance claim;
+the mobile-inclusive production UI baseline stays unapproved, and M1 stays
+blocked.
 
 This ADR implies development or ad-hoc signing only; it and its Step 2
-artifacts record no `P1-MACOS-001`, `P1-MACOS-002`, or `P1-MACOS-003`
-evidence.
+artifacts record no distribution-signed macOS acceptance evidence.
 
 This ADR pre-approves no entitlement beyond the plan to keep the existing
 reviewed set closed, and it adds no mailbox mutation, OAuth, token,

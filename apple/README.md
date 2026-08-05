@@ -13,10 +13,10 @@ iPhone and iPad product work remains deferred to Phase 2; the existing mobile
 targets below remain feasibility diagnostics only.
 
 Historical note: the M0 MIME Apple diagnostic schemes and portable MIME spike
-were removed by ADR-0025 housekeeping (PR4). No Apple MIME diagnostic target,
+were removed by ADR-0025 housekeeping. No Apple MIME diagnostic target,
 WKWebView hostile-content probe, or MIME renderer remains in this tree.
-Hostile-content handling remains a product requirement; see the historical
-[MIME feasibility record](../docs/m0/mime-html-feasibility.md).
+Hostile-content handling remains a product security requirement; see the
+[M0 historical summary](../docs/history/m0-summary.md).
 
 Generate the project and use the reproducible build commands in
 [Development](../docs/development.md#apple-bootstrap).
@@ -28,14 +28,20 @@ depends inward on `tersa-application`, `tersa-presentation`, and, on macOS only,
 no key, database path, store, profile, or reusable storage capability,
 preserving the rule that shared core layers never depend on Apple frameworks.
 
-The base targets also contain the M0 OAuth Authorization Code + PKCE adapter.
-Rust owns S256 material, state, expiry, callback validation, and the macOS
+The base targets also contain the OAuth Authorization Code + PKCE adapter. Rust
+owns S256 material, state, expiry, callback validation, and the macOS
 literal-loopback listener. macOS opens the system browser only after the
 listener is bound; iOS uses an ephemeral `ASWebAuthenticationSession` with an
-exact build-injected callback scheme. Neither path starts automatically. This
+exact build-injected callback scheme. The `legacy-oauth` bridge feature remains
+required for the active iOS path and still exports the legacy macOS begin/poll
+surface for source completeness; the product macOS archive rejects that legacy
+surface through its closed contract. Neither path starts automatically. This
 slice does not exchange codes, store tokens, call Gmail, or claim a real Google
-authorization. Run the deterministic fake-callback and signed sandbox probe as
-documented in [Development](../docs/development.md#oauth-pkce-feasibility).
+authorization. Product OAuth and token authority follow
+[ADR 0023](../docs/architecture/adr-0023-step3-oauth-and-bounded-sync.md) and
+[ADR 0024](../docs/architecture/adr-0024-macos-token-process-isolation.md). See
+[Development](../docs/development.md#oauth-pkce) for local configuration
+boundaries.
 
 The Apple targets narrowly disable Xcode user-script sandboxing only for their
 Cargo build phases because Cargo and rustup read the compiler sysroot outside

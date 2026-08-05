@@ -557,30 +557,15 @@ fn apple_bridge_package_violations(package: &Package, canonical_library: &str) -
         violations
             .push("tersa-apple-bridge must not expose a Cargo custom-build target".to_owned());
     }
-    let canonical_example = Path::new(canonical_library)
-        .parent()
-        .and_then(Path::parent)
-        .map(|package_root| package_root.join("examples/oauth_entitlement_probe.rs"))
-        .and_then(|path| path.to_str().map(str::to_owned));
     let has_exact_library = package.targets.iter().any(|target| {
         target.name == "tersa_apple_bridge"
             && target.src_path.as_str() == canonical_library
             && target.kind == [TargetKind::RLib, TargetKind::StaticLib]
             && target.crate_types == [CrateType::RLib, CrateType::StaticLib]
     });
-    let has_exact_example = canonical_example
-        .as_deref()
-        .is_some_and(|canonical_example| {
-            package.targets.iter().any(|target| {
-                target.name == "oauth_entitlement_probe"
-                    && target.src_path.as_str() == canonical_example
-                    && target.kind == [TargetKind::Example]
-                    && target.crate_types == [CrateType::Bin]
-            })
-        });
-    if package.targets.len() != 2 || !has_exact_library || !has_exact_example {
+    if package.targets.len() != 1 || !has_exact_library {
         violations.push(
-            "tersa-apple-bridge must expose only the reviewed rlib/staticlib and oauth_entitlement_probe example targets from their canonical sources"
+            "tersa-apple-bridge must expose only the reviewed rlib/staticlib library target from its canonical source"
                 .to_owned(),
         );
     }
@@ -1334,7 +1319,6 @@ fn bridge_package_source_surface_violations(
         violations.push("the Apple bridge must not track a conventional build.rs".to_owned());
     }
     let reviewed_rust_sources = BTreeSet::from([
-        PathBuf::from("apple/rust-bridge/examples/oauth_entitlement_probe.rs"),
         PathBuf::from("apple/rust-bridge/src/lib.rs"),
         PathBuf::from("apple/rust-bridge/src/mailbox.rs"),
         PathBuf::from("apple/rust-bridge/src/oauth.rs"),
@@ -1348,7 +1332,7 @@ fn bridge_package_source_surface_violations(
         .collect::<BTreeSet<_>>();
     if tracked_rust_sources != reviewed_rust_sources {
         violations.push(
-            "the Apple bridge tracked Rust source inventory must match the reviewed library, mailbox read module, OAuth module, and entitlement probe"
+            "the Apple bridge tracked Rust source inventory must match the reviewed library, mailbox read module, and OAuth module"
                 .to_owned(),
         );
     }
@@ -1379,7 +1363,8 @@ fn bridge_package_source_surface_violations(
 }
 
 /// The exact count message for the Apple bridge's reviewed C ABI symbol set.
-const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str = "the Apple bridge production exported C ABI set must match the eleven reviewed symbols, including the unexposed entitlement probe";
+const APPLE_BRIDGE_C_ABI_COUNT_MESSAGE: &str =
+    "the Apple bridge production exported C ABI set must match the ten reviewed symbols";
 /// The exact count message for the mailbox-sync FFI's reviewed C ABI symbol
 /// set. It pins THIS crate's own seven declared `#[no_mangle]` exports — the
 /// ADR-0024 broker-fed entry points plus the shared lifecycle-query and poll;
@@ -1934,10 +1919,6 @@ fn expected_apple_c_abi_exports() -> BTreeMap<&'static str, &'static str> {
         (
             "tersa_oauth_macos_begin",
             "pubunsafeextern\"C\"fntersa_oauth_macos_begin(client_id:*constu8,client_id_len:usize,output_session_id:*mutu64,output_url:*mutu8,output_url_capacity:usize,output_url_len:*mutusize,)->i32",
-        ),
-        (
-            "tersa_oauth_macos_entitlement_probe",
-            "pubextern\"C\"fntersa_oauth_macos_entitlement_probe()->i32",
         ),
         (
             "tersa_oauth_macos_poll",
@@ -10777,8 +10758,6 @@ pub unsafe extern "C" fn tersa_oauth_macos_begin(
 ) -> i32 {}
 #[unsafe(no_mangle)]
 pub extern "C" fn tersa_oauth_macos_poll(session_id: u64) -> i32 {}
-#[unsafe(no_mangle)]
-pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
 "#;
         (lib, mailbox, oauth)
     }
@@ -10833,19 +10812,19 @@ pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {}
             );
         }
 
-        let twelfth_symbol = reviewed_apple_bridge_documents(
+        let eleventh_symbol = reviewed_apple_bridge_documents(
             format!(
                 "{lib}\n#[unsafe(no_mangle)] pub extern \"C\" fn unexpected_export() -> i32 {{}}"
             ),
             mailbox.to_owned(),
             oauth.to_owned(),
         );
-        let violations = bridge_export_violations(&twelfth_symbol);
+        let violations = bridge_export_violations(&eleventh_symbol);
         assert!(
             violations
                 .iter()
-                .any(|violation| violation.contains("eleven reviewed symbols")),
-            "a twelfth symbol must trip the reviewed-count message: {violations:?}"
+                .any(|violation| violation.contains("ten reviewed symbols")),
+            "an eleventh symbol must trip the reviewed-count message: {violations:?}"
         );
 
         let comment_mask_bypass = reviewed_apple_bridge_documents(
@@ -11406,7 +11385,7 @@ const NOTE: &str = "#[cfg_attr(unix, unsafe(no_mangle))]";
     struct BridgeSourceGraphFixture {
         manifest_path: PathBuf,
         lib_path: PathBuf,
-        example_path: PathBuf,
+        oauth_path: PathBuf,
         inventory: BTreeSet<PathBuf>,
         clean: Vec<(PathBuf, String)>,
     }
@@ -11416,7 +11395,6 @@ const NOTE: &str = "#[cfg_attr(unix, unsafe(no_mangle))]";
         let lib_path = PathBuf::from("apple/rust-bridge/src/lib.rs");
         let mailbox_path = PathBuf::from("apple/rust-bridge/src/mailbox.rs");
         let oauth_path = PathBuf::from("apple/rust-bridge/src/oauth.rs");
-        let example_path = PathBuf::from("apple/rust-bridge/examples/oauth_entitlement_probe.rs");
         let inventory =
             BTreeSet::from([lib_path.clone(), mailbox_path.clone(), oauth_path.clone()]);
         let inert_source = r##"
@@ -11437,21 +11415,20 @@ mod tests {
             (lib_path.clone(), inert_source.to_owned()),
             (mailbox_path.clone(), String::new()),
             (oauth_path.clone(), String::new()),
-            (example_path.clone(), String::new()),
         ];
         BridgeSourceGraphFixture {
             manifest_path,
             lib_path,
-            example_path,
+            oauth_path,
             inventory,
             clean,
         }
     }
 
     #[test]
-    fn bridge_source_graph_accepts_the_reviewed_surface_and_rejects_example_injection() {
+    fn bridge_source_graph_accepts_the_reviewed_surface_and_rejects_source_injection() {
         let BridgeSourceGraphFixture {
-            example_path,
+            oauth_path,
             inventory,
             clean,
             ..
@@ -11466,8 +11443,8 @@ mod tests {
             let mut documents = clean.clone();
             documents
                 .iter_mut()
-                .find(|(path, _document)| path == &example_path)
-                .expect("example fixture must exist")
+                .find(|(path, _document)| path == &oauth_path)
+                .expect("oauth fixture must exist")
                 .1 = injected.to_owned();
             assert!(
                 !bridge_package_source_surface_violations(&documents, &inventory).is_empty(),

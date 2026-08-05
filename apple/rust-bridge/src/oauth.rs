@@ -1107,37 +1107,6 @@ mod macos {
         MacSessionEntry { status, cancel }
     }
 
-    pub(super) fn entitlement_probe() -> i32 {
-        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
-            return STATUS_INTERNAL;
-        };
-        if listener.set_nonblocking(true).is_err() {
-            return STATUS_INTERNAL;
-        }
-        let Ok(address) = listener.local_addr() else {
-            return STATUS_INTERNAL;
-        };
-        let connected = TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let accepted = loop {
-            match listener.accept() {
-                Ok(connection) => break Some(connection),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break None;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break None,
-            }
-        };
-        if accepted.is_some() && connected {
-            STATUS_SUCCEEDED
-        } else {
-            STATUS_INTERNAL
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         #![expect(
@@ -1451,7 +1420,7 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-use macos::{MacSessionEntry, begin as begin_macos, entitlement_probe, spawn as spawn_macos};
+use macos::{MacSessionEntry, begin as begin_macos, spawn as spawn_macos};
 
 #[cfg(target_os = "macos")]
 static MACOS_SESSIONS: OnceLock<Mutex<BTreeMap<u64, MacSessionEntry>>> = OnceLock::new();
@@ -1542,17 +1511,6 @@ pub extern "C" fn tersa_oauth_macos_poll(session_id: u64) -> i32 {
         sessions.remove(&session_id);
     }
     status
-}
-
-/// Probes sandboxed loopback server and outbound client capabilities.
-#[cfg(target_os = "macos")]
-#[expect(
-    unsafe_code,
-    reason = "a stable unmangled symbol is required by the C-compatible Apple bridge"
-)]
-#[unsafe(no_mangle)]
-pub extern "C" fn tersa_oauth_macos_entitlement_probe() -> i32 {
-    entitlement_probe()
 }
 
 #[cfg(test)]

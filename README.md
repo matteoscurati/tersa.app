@@ -7,9 +7,9 @@ It is not yet usable as a complete email client and has no published application
 builds.
 
 The repository contains the shared Rust core, Apple bridge, and product
-surfaces. The M0 Slint/Dioxus UI diagnostics, the M0 SQLCipher, search/Tantivy,
-and blob diagnostics, and the M0 MIME/hostile-HTML and fuzz diagnostics are
-retired; their ADR history and detailed studies remain as historical records.
+surfaces. The M0 diagnostic program is retired; a short
+[historical summary](docs/history/m0-summary.md) and preserved ADRs record what
+it learned.
 
 ## Product boundaries
 
@@ -24,13 +24,14 @@ retired; their ADR history and detailed studies remain as historical records.
 
 See the [roadmap](docs/roadmap.md) for the milestone sequence and MVP
 exclusions. The accepted
-[product constraints](docs/architecture/adr-0006-product-constraints.md) and the
-still-tracked [M0 gate register](docs/m0/gate-register.json) define historical
-and remaining evidence requirements. See the
-[threat model](docs/security/threat-model.md) and
+[product constraints](docs/architecture/adr-0006-product-constraints.md) remain
+in force. See the [threat model](docs/security/threat-model.md) and
 [security data flow](docs/security/data-flow.md) for the current security
 boundaries. Physical-device and signed-distribution closure follows the
-[M0 physical-device and distribution protocol](docs/m0/physical-device-and-distribution-protocol.md).
+[Apple physical-device and distribution protocol](docs/release/apple-distribution.md).
+macOS UI and release acceptance are defined by the
+[macOS acceptance protocol](docs/quality/macos-acceptance.md) and the
+[macOS performance harness](docs/quality/macos-performance.md).
 
 ## Development
 

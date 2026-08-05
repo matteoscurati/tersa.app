@@ -1,12 +1,17 @@
-# M0 physical-device and distribution protocol
+# Apple physical-device and distribution protocol
 
 ## Purpose and non-claim
 
 This protocol defines the evidence required to close physical-device and
-signed-distribution gates. It records no execution, device result, signature,
-notarization, TestFlight installation, or App Review result in this PR. Host,
+signed-distribution acceptance. It records no execution, device result,
+signature, notarization, TestFlight installation, or App Review result. Host,
 simulator, unsigned archive, and source-inspection results cannot substitute
 for the procedures below.
+
+Related active protocols:
+
+- [macOS acceptance protocol](../quality/macos-acceptance.md)
+- [macOS performance harness](../quality/macos-performance.md)
 
 ## Candidate and device matrix
 
@@ -21,7 +26,8 @@ SHA-256. Device identifiers are recorded only as non-unique classes.
 | Mac | Apple Silicon Mac with 8 GiB RAM | Keyboard-only operation, VoiceOver, window lifecycle, lock/unlock, memory, performance, energy, Developer ID distribution |
 
 At least two qualifying people participate: an implementer or evidence producer
-and an independent reviewer. A person cannot fill both roles for the same gate.
+and an independent reviewer. A person cannot fill both roles for the same
+acceptance claim.
 
 ## Test procedures
 
@@ -39,7 +45,7 @@ and an independent reviewer. A person cannot fill both roles for the same gate.
    shortcuts. The final text and cursor position must match the scripted
    synthetic fixture.
 
-A gate fails on an unreachable core action, missing or misleading accessible
+Acceptance fails on an unreachable core action, missing or misleading accessible
 state, focus loss, destructive text corruption, or a crash. A source-generated
 semantic tree without physical assistive-technology execution is diagnostic
 evidence only.
@@ -62,7 +68,7 @@ evidence only.
 
 Measure a release-equivalent signed build after one warm-up run and at least
 five recorded runs per device class. Report median and p95 without device
-identifiers or content. The M0 targets are:
+identifiers or content. The product thresholds are:
 
 | Metric | iPhone/iPad threshold | Mac threshold |
 |---|---:|---:|
@@ -74,8 +80,8 @@ identifiers or content. The M0 targets are:
 
 Record Energy Log or equivalent aggregate results for a fixed 30-minute
 foreground script and an idle interval. No periodic iOS background execution is
-assumed or claimed. A threshold miss is a failed gate or an accepted ADR with a
-new budget; it is never silently relabelled as diagnostic success.
+assumed or claimed. A threshold miss is a failed acceptance claim or an accepted
+ADR with a new budget; it is never silently relabelled as diagnostic success.
 
 ## Signed distribution procedures
 
@@ -103,22 +109,22 @@ spctl --assess --type execute --verbose=4 Tersa.app
 
 The evidence manifest records the application artifact SHA-256 without
 publishing certificate material, local paths, team identifiers, or notarization
-credentials. An App Review smoke result remains a separate gate from
-notarization.
+credentials. An App Review smoke result remains a separate claim from
+notarization. macOS UI and release acceptance details are in the
+[macOS acceptance protocol](../quality/macos-acceptance.md).
 
 ## Evidence, redaction, and attestation
 
-At every evidence tier, `evidence.commit` and `evidence.artifact` are a
-presence-bound pair: both are `null`, or both are present. A non-null commit is
-an exact lowercase 40-character Git SHA. Any non-null artifact is validated as
-an immutable commit-bound manifest, including its digest, redaction flag,
-generation timestamp, and retention semantics. Evidence at the exact
-`simulator` tier must include that commit-bound artifact, even for a diagnostic
-gate. The existing `device-unsigned` diagnostics are explicitly
-allowed to retain null commit and artifact fields; they do not claim a device
-pass or substitute for signed physical-device evidence.
+At every evidence tier, commit and artifact are a presence-bound pair: both are
+absent, or both are present. A present commit is an exact lowercase 40-character
+Git SHA. Any present artifact is validated as an immutable commit-bound
+manifest, including its digest, redaction flag, generation timestamp, and
+retention semantics. Simulator-tier evidence must include that commit-bound
+artifact even when it is only diagnostic. Device-unsigned diagnostics may retain
+null commit and artifact fields; they do not claim a device pass or substitute
+for signed physical-device evidence.
 
-Each passed physical-device or signed-distribution gate requires:
+Each passed physical-device or signed-distribution claim requires:
 
 - an exact commit SHA and an immutable artifact locator bound to that same SHA;
 - a SHA-256 for a redacted evidence manifest;
@@ -129,35 +135,34 @@ Each passed physical-device or signed-distribution gate requires:
 - a different named reviewer, compared case-insensitively, with one or more
   reviewed competence identifiers: `apple-platform`, `accessibility`,
   `security`, or `release-engineering`;
-- the canonical explicit independent-review attestation required by the gate
-  schema;
+- an explicit independent-review attestation;
 - timezone-qualified review and expiry timestamps.
 
 Repository evidence uses
-`repository://evidence/<exact-evidence.commit>/<path>`. GitHub Actions evidence
-uses `github-actions://runs/<run>/artifacts/<id>/manifest.json#evidence-commit=<exact-evidence.commit>`.
+`repository://evidence/<exact-commit>/<path>`. GitHub Actions evidence uses
+`github-actions://runs/<run>/artifacts/<id>/manifest.json#evidence-commit=<exact-commit>`.
 The repository path is relative to the commit-specific evidence namespace and
 must not contain empty, current-directory, or parent-directory segments.
 The uploaded `manifest.json` records the exact `GITHUB_SHA`, generation and
 retention timestamps, and the relative path, size, and SHA-256 of every evidence
-file. The gate record contains the manifest SHA-256 and matching timestamps. The
-validator compares the locator SHA with `evidence.commit`, bounds retention to
-90 days, and requires review expiry no later than artifact expiry; it does not
-rely on a mutable run name, branch, or artifact label. The independent reviewer
-verifies the downloaded manifest and its file hashes before attesting.
+file. The acceptance record contains the manifest SHA-256 and matching
+timestamps. Reviewers compare the locator SHA with the claimed commit, bound
+retention to 90 days, and require review expiry no later than artifact expiry;
+they do not rely on a mutable run name, branch, or artifact label. The
+independent reviewer verifies the downloaded manifest and its file hashes before
+attesting.
 
 Whenever complete review metadata and an artifact coexist at any tier, the
 review timestamp must be on or after manifest generation. For GitHub Actions
 artifacts, review expiry must also be no later than the artifact retention
 timestamp. Signed-tier and passed physical/distribution claims additionally
-require the named independent reviewer and canonical attestation described
-above.
+require the named independent reviewer and attestation described above.
 
 GitHub Actions evidence is retained for 90 days, while the manifest uses an
-89-day safety margin. A gate backed by that form must be reviewed and expire no
-later than the recorded retention timestamp; repository evidence is
-preferred when the review period needs to outlive artifact retention. The gate
-validator rejects missing fields, unknown gate IDs, tier downgrades, unresolved
-dependencies, self-review, expired review, abbreviated commit identifiers,
-mutable or mismatched locators, unredacted artifacts, insufficient evidence
-tiers, and any UI or M1 pass while no production UI baseline is approved.
+89-day safety margin. A claim backed by that form must be reviewed and expire no
+later than the recorded retention timestamp; repository evidence is preferred
+when the review period needs to outlive artifact retention. Missing fields, tier
+downgrades, unresolved prerequisites, self-review, expired review, abbreviated
+commit identifiers, mutable or mismatched locators, unredacted artifacts, or
+insufficient evidence tiers fail closed. No UI or M1 pass is valid while no
+production UI baseline is approved.
