@@ -12,7 +12,7 @@ Every host result is labeled `NOT A DEVICE-GATE RESULT`.
 ## Portable boundary
 
 `tersa-mime-spike` exclusively owns exact-pinned `mail-parser` 0.11.5 and
-`ammonia` 4.1.3. It has no workspace dependencies and performs no network I/O.
+`ammonia` 4.1.4. It has no workspace dependencies and performs no network I/O.
 Before parser invocation it rejects an encoded message larger than 512 KiB.
 The deterministic traversal then limits:
 

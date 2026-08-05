@@ -273,7 +273,7 @@ def table_statuses(path: Path, errors: list[str]) -> dict[str, str]:
 
 
 def validate_xtask_isolation(errors: list[str]) -> None:
-    """Ensure retired Slint/Dioxus diagnostic isolation hooks stay removed."""
+    """Ensure retired diagnostic isolation hooks and packages stay removed."""
     try:
         source = XTASK_SOURCE.read_text(encoding="utf-8")
     except OSError as exc:
@@ -287,6 +287,22 @@ def validate_xtask_isolation(errors: list[str]) -> None:
         "is_dioxus_runtime_dependency",
         "tersa-slint-spike",
         "tersa-dioxus-spike",
+        # Retired storage/search/blob diagnostic isolation (PR3). Marker set
+        # covers removed xtask constructs and package names only. This scan
+        # reads xtask source exclusively, so durable deny.toml bans for
+        # tantivy/chacha20poly1305 are not treated as live isolation hooks.
+        "check_search_dependency",
+        "check_search_dependency_graph",
+        "check_blob_dependency",
+        "check_blob_dependency_graph",
+        "blob_dependency_graph_violations",
+        "blob_manifest_dependency_violations",
+        "BLOB_DIAGNOSTIC_OWNERS",
+        "tersa-sqlcipher-spike",
+        "tersa-search-spike",
+        "tersa-blob-spike",
+        "tantivy",
+        "chacha20poly1305",
     ):
         if marker in source:
             error(

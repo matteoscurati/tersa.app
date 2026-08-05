@@ -6,12 +6,19 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Crash-safe chunked-AEAD blob feasibility
 
+> **Historical record only (PR3).** The M0 blob diagnostic executable,
+> `apple/scripts/verify-blob-feasibility.sh`, diagnostic about config,
+> ChaCha20-Poly1305 workspace pin, and `THIRD_PARTY_NOTICES-blob-*` outputs were
+> removed by ADR-0025 housekeeping (PR3). Commands and package names below are
+> non-executable historical text pending PR5 consolidation. This document does
+> not claim a production blob implementation.
+
 ## Decision status
 
-This M0 slice validates a bounded candidate encrypted-blob format and a
-deterministic process-crash publication protocol using synthetic data. It is a
+This M0 slice validated a bounded candidate encrypted-blob format and a
+deterministic process-crash publication protocol using synthetic data. It was a
 portable diagnostic in `apps/blob-spike`, not a production storage component.
-Every successful host run prints exactly:
+Every successful historical host run printed exactly:
 
 ```text
 Blob AEAD M0 feasibility PASS
@@ -67,9 +74,11 @@ accounts. The crash child receives only its bounded private protocol over
 standard input and moves the received key buffers into the diagnostic's
 zeroizing key owner. No derivation or production key hierarchy is implied.
 
-## Reproduction
+## Historical reproduction (non-executable)
 
-On macOS with the pinned Rust toolchain and Apple targets installed:
+The following commands are retained only as historical record. The package,
+verifier, diagnostic about config, and notice outputs no longer exist in the
+tree after PR3; do not run them.
 
 ```sh
 cargo test --locked --package tersa-blob-spike
@@ -80,12 +89,11 @@ IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
   --package tersa-blob-spike --target aarch64-apple-ios-sim
 ```
 
-The shared macOS notice gate regenerates all target-specific notices. Blob
-feasibility evidence is local-only through
-`sh apple/scripts/verify-blob-feasibility.sh`. That script builds and runs the
-macOS arm64 process-crash protocol and accepts only its exact aggregate
-result. It is not merge-blocking CI and does not upload or retain CI artifacts.
-iOS device and simulator targets remain compile evidence only.
+Historically, blob feasibility evidence was local-only through
+`sh apple/scripts/verify-blob-feasibility.sh`. That script built and ran the
+macOS arm64 process-crash protocol and accepted only its exact aggregate
+result. It was not merge-blocking CI and did not upload or retain CI artifacts.
+iOS device and simulator targets were compile evidence only.
 
 ## Non-claims and remaining gates
 
