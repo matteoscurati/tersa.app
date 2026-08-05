@@ -58,8 +58,11 @@ parity and prevents a UI-dependent or M1 pass while
 
 M1 remains blocked until a production UI baseline has passed. `cargo xtask
 verify` deliberately remains Rust-only because changing its Rust crate is out
-of scope for this decision. CI's policy job runs the Python gate validator;
-contributors must run it explicitly before `cargo xtask verify`.
+of scope for this decision. The lightweight change-scope job runs only
+`python3 scripts/verify-m0-gates.py --self-test`; full register validation is
+contributor-run and local until the gate register is removed in PR5. The policy
+job does not run the gate validator. Contributors must run the full validator
+explicitly before `cargo xtask verify`.
 
 Diagnostic-only UI isolation is enforced by `xtask` dependency-boundary checks:
 Slint and Dioxus may occur only in their respective spike packages, not in the

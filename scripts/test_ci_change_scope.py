@@ -84,6 +84,11 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     "Manual evidence gate",
     "gh workflow run CI",
     "Apple evidence job",
+    # Temporary unautomated fuzz policy gap pending PR4 removal.
+    "checked through its own locked verifier and deny policy",
+    # Combined OAuth verifier is obsolete after ADR-0024; do not recommend it.
+    "After creating the unsigned base archives, run:",
+    "```sh\nsh apple/scripts/verify-oauth-feasibility.sh\n```",
 )
 # Present-tense operational claims only. Past-tense historical run locators
 # (for example owner-attested dates) stay allowed in the M0 study records.
@@ -112,6 +117,25 @@ RETIRED_M0_OPERATIONAL_CLAIMS = (
     "It builds the macOS, iOS device, and iOS simulator targets",
     "CI uses a public non-functional client identifier",
     "The CI host profile",
+    # Fuzz verifier does not automate license/source/advisory policy.
+    "validates the independent fuzz lock against its isolated license, source, and advisory policy",
+    # Combined OAuth verifier is stale after the ADR-0024 token-broker cutover.
+    "deterministic fake callbacks through\n`sh apple/scripts/verify-oauth-feasibility.sh`",
+    # Notice CI compares committed apple/licenses sources, not Xcode packages.
+    "compares them byte-for-byte with the resources packaged by Xcode",
+)
+# Architecture docs that still carry operational CI/local evidence claims.
+ARCHITECTURE_REGRESSION_DOCS = (
+    ROOT / "docs" / "architecture" / "adr-0005-dioxus-diagnostic-runtime.md",
+    ROOT / "docs" / "architecture" / "adr-0006-product-constraints.md",
+    ROOT / "docs" / "architecture" / "adr-0010-dioxus-sandboxed-navigation-classification.md",
+    ROOT / "docs" / "architecture" / "dependency-rules.md",
+)
+RETIRED_ARCHITECTURE_OPERATIONAL_CLAIMS = (
+    "CI verifies every Apple target's resolved feature set",
+    "while Apple CI\ncross-builds the same locked graphs",
+    "so CI can retain evidence",
+    "CI's policy job runs the Python gate validator",
 )
 
 
@@ -364,6 +388,13 @@ class ChangeScopeTests(unittest.TestCase):
         for path in M0_FEASIBILITY_DOCS:
             text = path.read_text(encoding="utf-8")
             for claim in RETIRED_M0_OPERATIONAL_CLAIMS:
+                with self.subTest(path=path.name, claim=claim):
+                    self.assertNotIn(claim, text)
+
+    def test_architecture_docs_drop_retired_operational_ci_claims(self) -> None:
+        for path in ARCHITECTURE_REGRESSION_DOCS:
+            text = path.read_text(encoding="utf-8")
+            for claim in RETIRED_ARCHITECTURE_OPERATIONAL_CLAIMS:
                 with self.subTest(path=path.name, claim=claim):
                     self.assertNotIn(claim, text)
 

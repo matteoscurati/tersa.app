@@ -45,8 +45,10 @@ exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
 `memmap2`, `tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
 `mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
 `tersa-mime-spike`. The portable MIME and blob M0 spikes are exceptions to the
-Apple target gate: Linux CI exercises their deterministic tests, while Apple CI
-cross-builds the same locked graphs. `chacha20poly1305` 0.10.1 is pinned exactly
+Apple target gate: Linux CI exercises their deterministic tests, while the
+documented local Apple-target commands cross-build the same locked graphs.
+Product Apple CI does not cover those spike cross-builds.
+`chacha20poly1305` 0.10.1 is pinned exactly
 and exclusive to `tersa-blob-spike`; `hmac` 0.12.1 is pinned exactly and may be
 reached by `tersa-blob-spike`, `tersa-keychain-macos` through HKDF, and the
 macOS-only CLI through its Keychain composition chain. New workspace crates

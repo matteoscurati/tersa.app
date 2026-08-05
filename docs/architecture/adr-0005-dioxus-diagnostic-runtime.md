@@ -50,12 +50,15 @@ synthetic UI state. Its evidence-only mode injects synthetic URLs to exercise
 the locally patched deny boundary described in ADR-0007. This is not sufficient
 for untrusted production email content.
 
-CI verifies every Apple target's resolved feature set, the absence of Manganis
-and Dioxus devtools, the exact loopback bind expression, independent CSPRNG
-creation and constant-time validation of the 256-byte mutual WebSocket keys,
-the source navigation policy, target-specific notices, packaged resources,
-linked WebKit frameworks, repeated live loopback-only listener snapshots,
-lifecycle markers, screenshots, and stable OCR text.
+Local `python3 apple/scripts/verify-dioxus-runtime.py` and
+`sh apple/scripts/capture-dioxus-evidence.sh` cover every Apple target's
+resolved feature set, the absence of Manganis and Dioxus devtools, the exact
+loopback bind expression, independent CSPRNG creation and constant-time
+validation of the 256-byte mutual WebSocket keys, the source navigation policy,
+packaged resources, linked WebKit frameworks, repeated live loopback-only
+listener snapshots, lifecycle markers, screenshots, and stable OCR text. Those
+checks are local-only and are not merge-blocking CI. CI still runs only the
+target-specific notice regeneration and comparison for this path.
 
 Wry also adds 13 informational or unsoundness advisories through its non-Apple
 lockfile graph. `cargo audit` cannot evaluate target reachability, so CI uses

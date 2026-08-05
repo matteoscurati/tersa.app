@@ -117,24 +117,24 @@ xcodebuild ... \
   TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.ci
 ```
 
-After creating the unsigned base archives, run:
+The combined local verifier `sh apple/scripts/verify-oauth-feasibility.sh` is
+obsolete after the ADR-0024 token-broker cutover: it still expects
+`TersaOAuthClientID` and `_tersa_oauth_macos_begin` in TersaMac plus retired
+archive inputs that product CI no longer produces. Do not use it as a current
+local route; PR5 will remove it. Its historical scope covered archived symbols
+and injected Info.plist values, ad-hoc signing of a macOS archive copy with the
+exact five-key production entitlement shape for static signing evidence, and a
+separately signed runnable loopback probe limited to App Sandbox plus network
+client and server entitlements: an ad-hoc identity cannot authorize the
+production team-bound Keychain access group, so that probe proved only the
+OAuth sandbox networking subset. Signed same-team Keychain interoperability
+remains a later distribution gate. Neither current product CI nor local
+verification covers that obsolete combined macOS OAuth surface.
 
-```sh
-sh apple/scripts/verify-oauth-feasibility.sh
-```
-
-The verifier checks archived symbols and injected Info.plist values, ad-hoc
-signs a copy of the macOS archive with the exact five-key production
-entitlement shape, and captures that static signing evidence. It separately
-signs the runnable loopback probe with only App Sandbox plus network client and
-server entitlements: an ad-hoc identity cannot authorize the production
-team-bound Keychain access group. The runnable probe therefore proves only the
-OAuth sandbox networking subset; signed same-team Keychain interoperability is
-a later distribution gate. Rust tests exercise the deterministic callback,
-negative state machine, bounded HTTP parser, static responses,
-speculative-connection recovery, absolute read deadline, and one-shot valid
-callback. No evidence file contains state, verifier, authorization code, token,
-or authorization URL.
+Rust tests exercise the deterministic callback, negative state machine, bounded
+HTTP parser, static responses, speculative-connection recovery, absolute read
+deadline, and one-shot valid callback. No evidence file contains state,
+verifier, authorization code, token, or authorization URL.
 
 The loopback peer check is not browser authentication. Any local process can
 connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
@@ -402,8 +402,10 @@ ignored with all local Apple build products.
 
 The Rust bridge, both UI spikes, and the MIME diagnostic are root workspace
 members and are therefore covered by `cargo xtask verify` and the repository
-supply-chain checks. The standalone fuzz project is deliberately excluded and
-checked through its own locked verifier and deny policy. Only the Apple
+supply-chain checks. The standalone fuzz project is deliberately excluded.
+Local `sh scripts/verify-mime-fuzz.sh` covers only the finite fuzz path; its
+license, source, and advisory policies are not automated after diagnostic CI
+retirement and remain unchecked pending PR4 removal. Only the Apple
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`
