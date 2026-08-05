@@ -176,6 +176,31 @@ RETIRED_ARCHITECTURE_OPERATIONAL_CLAIMS = (
 )
 
 
+def _macos_quality_cargo_inventory(job_text: str) -> list[str]:
+    """Ordered inventory of executable-looking cargo lines in a job body.
+
+    Non-comment lines containing the token ``cargo `` are collected. Only two
+    prefixes before that token are normalized: empty (block-scalar shell) and
+    exact ``run: `` (single-line YAML ``run`` scalar). Any other prefix keeps
+    the full stripped line so exact equality against the pinned sequence fails
+    rather than silently dropping execution modifiers.
+    """
+    inventory: list[str] = []
+    for raw_line in job_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        cargo_at = stripped.find("cargo ")
+        if cargo_at < 0:
+            continue
+        prefix = stripped[:cargo_at]
+        if prefix == "" or prefix == "run: ":
+            inventory.append(stripped[cargo_at:])
+        else:
+            inventory.append(stripped)
+    return inventory
+
+
 class ChangeScopeTests(unittest.TestCase):
     def test_active_scope_contract(self) -> None:
         self.assertEqual(NAMES, ACTIVE_OUTPUTS)
@@ -996,14 +1021,12 @@ class ChangeScopeTests(unittest.TestCase):
 
         jobs = dict(self._workflow_job_blocks(workflow))
         job = jobs["macos_quality"]
-        # Exact executable Cargo lines (trimmed content starting with `cargo `).
-        # Equality catches appended, removed, reordered, or replaced flags; the
-        # conditional notices path contributes the leading `cargo fetch --locked`.
-        workflow_cargo_lines = [
-            line.strip()
-            for line in job.splitlines()
-            if line.strip().startswith("cargo ")
-        ]
+        # Exact executable Cargo inventory: bare block-scalar lines and single-line
+        # `run: cargo ...` scalars only. Equality catches appended, removed,
+        # reordered, or replaced flags; undeclared single-line `run: cargo`,
+        # env/command-prefixed cargo, and extra invocations fail rather than
+        # normalize away. Notices path contributes leading `cargo fetch --locked`.
+        workflow_cargo_lines = _macos_quality_cargo_inventory(job)
         self.assertEqual(
             workflow_cargo_lines,
             ["cargo fetch --locked", *pinned_commands],
@@ -1026,6 +1049,34 @@ class ChangeScopeTests(unittest.TestCase):
         # Developer-facing command remains implemented in xtask.
         self.assertIn('Some("ci-macos")', xtask)
         self.assertIn("fn ci_macos()", xtask)
+
+    def test_macos_quality_cargo_inventory_prefix_rules(self) -> None:
+        """Bare and run: normalize; any other prefix stays full-line."""
+        sample = "\n".join(
+            (
+                "              cargo fetch --locked",
+                "        run: cargo clippy --locked --workspace",
+                "        FOO=1 cargo build --release",
+                "        env cargo test",
+                "        command: cargo doc",
+                "        sh -c 'cargo check'",
+                "        # cargo ignored as comment",
+                "        tool: cargo-about@0.9.1",
+                "        run: env cargo build",
+            )
+        )
+        self.assertEqual(
+            _macos_quality_cargo_inventory(sample),
+            [
+                "cargo fetch --locked",
+                "cargo clippy --locked --workspace",
+                "FOO=1 cargo build --release",
+                "env cargo test",
+                "command: cargo doc",
+                "sh -c 'cargo check'",
+                "run: env cargo build",
+            ],
+        )
 
     def test_workflow_forbids_cache_artifact_and_manual_triggers(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
