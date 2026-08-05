@@ -17,6 +17,48 @@ unmaintained = "all"
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+# Permanent retirement boundary: the removed M0 Slint/Dioxus diagnostic UI
+# runtimes and their webview/windowing stack must not re-enter the workspace
+# graph. Explicit crate names only (cargo-deny has no package globs).
+deny = [
+    # Slint runtime and published family crates from the retired lock graph.
+    { crate = "slint" },
+    { crate = "slint-build" },
+    { crate = "slint-macros" },
+    { crate = "i-slint-backend-linuxkms" },
+    { crate = "i-slint-backend-selector" },
+    { crate = "i-slint-backend-winit" },
+    { crate = "i-slint-common" },
+    { crate = "i-slint-compiler" },
+    { crate = "i-slint-core" },
+    { crate = "i-slint-core-macros" },
+    { crate = "i-slint-renderer-skia" },
+    { crate = "i-slint-renderer-software" },
+    # Dioxus core/runtime family packages from the retired diagnostic path.
+    { crate = "dioxus" },
+    { crate = "dioxus-asset-resolver" },
+    { crate = "dioxus-cli-config" },
+    { crate = "dioxus-config-macros" },
+    { crate = "dioxus-core" },
+    { crate = "dioxus-core-macro" },
+    { crate = "dioxus-core-types" },
+    { crate = "dioxus-desktop" },
+    { crate = "dioxus-document" },
+    { crate = "dioxus-history" },
+    { crate = "dioxus-hooks" },
+    { crate = "dioxus-html" },
+    { crate = "dioxus-html-internal-macro" },
+    { crate = "dioxus-interpreter-js" },
+    { crate = "dioxus-rsx" },
+    { crate = "dioxus-signals" },
+    { crate = "dioxus-stores" },
+    { crate = "dioxus-stores-macro" },
+    # Webview/windowing and asset runtime used by the retired Dioxus path.
+    { crate = "manganis" },
+    { crate = "tao" },
+    { crate = "tao-macros" },
+    { crate = "wry" },
+]
 
 [licenses]
 version = 2

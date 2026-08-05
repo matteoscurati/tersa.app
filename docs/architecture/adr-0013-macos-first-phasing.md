@@ -68,8 +68,10 @@ The revised execution order is:
 
 1. Select and validate the production macOS UI toolkit via a separately
    reviewed ADR (reserved ADR-0020). This amendment approves no toolkit;
-   ADR-0006 A9 ("Neither Slint nor Dioxus is production-approved") still
-   stands.
+   the durable ADR-0006 A9 UI boundary still stands. That constraint was
+   historically stated as neither Slint nor Dioxus being production-approved;
+   see the historical note under A9 in
+   [ADR-0006](adr-0006-product-constraints.md).
 2. Implement the macOS UI vertical-slice source (item 9 above, roadmap
    item 8) against the existing Rust core, under ad-hoc/development
    signing, producing accessibility and App Sandbox development evidence

@@ -301,7 +301,7 @@ class ChangeScopeTests(unittest.TestCase):
                 ALL,
             ),
             (
-                "retired rust-skia notice path fails closed",
+                "retired rust-skia notice stays isolated to the notices lane",
                 ["apple/licenses/rust-skia-notices.txt"],
                 {"notices"},
             ),
