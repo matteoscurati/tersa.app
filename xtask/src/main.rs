@@ -9508,20 +9508,12 @@ fn check_sqlcipher_dependency(
     dependency: &cargo_metadata::Dependency,
     violations: &mut Vec<String>,
 ) {
-    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
-
     let target = dependency.target.as_ref().map(ToString::to_string);
-    let expected_target = if package_name == "tersa-store-sqlcipher-macos" {
-        MACOS_STORE_TARGET
-    } else {
-        APPLE_TARGET
-    };
     violations.extend(sqlcipher_manifest_dependency_violations(
         package_name,
         dependency.name.as_str(),
         &dependency.req.to_string(),
         target.as_deref(),
-        expected_target,
         dependency.uses_default_features,
         &dependency.features,
     ));
@@ -9532,7 +9524,6 @@ fn sqlcipher_manifest_dependency_violations(
     dependency_name: &str,
     requirement: &str,
     target: Option<&str>,
-    apple_target: &str,
     uses_default_features: bool,
     features: &[String],
 ) -> Vec<String> {
@@ -9552,9 +9543,9 @@ fn sqlcipher_manifest_dependency_violations(
             "{package_name} -> {dependency_name} (SQLCipher is exclusive to approved Apple SQLCipher owners)"
         ));
     }
-    if target != Some(apple_target) {
+    if target != Some(MACOS_STORE_TARGET) {
         violations.push(format!(
-            "{package_name} -> {dependency_name} must use target `{apple_target}`"
+            "{package_name} -> {dependency_name} must use target `{MACOS_STORE_TARGET}`"
         ));
     }
     if dependency_name == "rusqlite" {
@@ -17133,8 +17124,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 "tersa-application",
                 "rusqlite",
                 "=0.39.0",
-                Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
-                r#"cfg(any(target_os = "macos", target_os = "ios"))"#,
+                Some(r#"cfg(target_os = "macos")"#),
                 false,
                 &["bundled-sqlcipher".to_owned()],
             ),
@@ -17153,7 +17143,6 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                     "rusqlite",
                     "=0.39.0",
                     Some(r#"cfg(target_os = "macos")"#),
-                    r#"cfg(target_os = "macos")"#,
                     false,
                     &["bundled-sqlcipher".to_owned()],
                 ),
@@ -17165,6 +17154,36 @@ final class BrokerSyncSecrets: @unchecked Sendable {
     }
 
     #[test]
+    fn composition_owners_must_use_macos_only_sqlcipher_target() {
+        // Active composition owners never declare rusqlite directly (closed
+        // direct-dependency policy forbids that edge elsewhere). If a direct
+        // declaration did appear, the manifest gate must require macOS-only —
+        // never the retired spike-era iOS-inclusive Apple cfg.
+        assert_eq!(
+            sqlcipher_manifest_dependency_violations(
+                "tersa-oauth-sync-macos",
+                "rusqlite",
+                "=0.39.0",
+                Some(r#"cfg(any(target_os = "macos", target_os = "ios"))"#),
+                false,
+                &["bundled-sqlcipher".to_owned()],
+            ),
+            vec!["tersa-oauth-sync-macos -> rusqlite must use target `cfg(target_os = \"macos\")`"]
+        );
+        assert!(
+            sqlcipher_manifest_dependency_violations(
+                "tersa-oauth-sync-macos",
+                "rusqlite",
+                "=0.39.0",
+                Some(r#"cfg(target_os = "macos")"#),
+                false,
+                &["bundled-sqlcipher".to_owned()],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn enforces_exact_rusqlite_version_and_features() {
         assert!(
             sqlcipher_manifest_dependency_violations(
@@ -17172,7 +17191,6 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 "rusqlite",
                 "=0.39.0",
                 Some(r#"cfg(target_os = "macos")"#),
-                r#"cfg(target_os = "macos")"#,
                 false,
                 &["bundled-sqlcipher".to_owned()],
             )
@@ -17184,7 +17202,6 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 "rusqlite",
                 "^0.39",
                 Some(r#"cfg(target_os = "macos")"#),
-                r#"cfg(target_os = "macos")"#,
                 true,
                 &["bundled-sqlcipher".to_owned(), "load_extension".to_owned()],
             ),
