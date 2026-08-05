@@ -1158,9 +1158,30 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async { Ok(None) })
+        }
     }
 
     impl MailboxStore for FakeStore {
+        fn mark_message_read<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn mark_thread_read<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _thread_id: &'a ThreadId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async { Ok(()) })
+        }
         fn upsert_envelopes<'a>(
             &'a self,
             _account: &'a AccountId,

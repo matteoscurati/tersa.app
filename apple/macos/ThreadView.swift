@@ -85,8 +85,9 @@ struct ThreadView: View {
 
     private func threadList(_ rows: [MessageRow]) -> some View {
         List(rows) { row in
-            MailboxMessageRowView(row: row)
+            ThreadMessageDetailView(row: row)
         }
+        .listStyle(.plain)
         .accessibilityLabel("Thread")
         .accessibilityValue(String(rows.count) + (rows.count == 1 ? " message" : " messages"))
     }
@@ -134,5 +135,52 @@ struct ThreadView: View {
             return
         }
         AccessibilityNotification.Announcement(newOutcome.announcement).post()
+    }
+}
+
+/// Expanded message card: sender, subject, date, and offline body/preview text.
+@MainActor
+private struct ThreadMessageDetailView: View {
+    let row: MessageRow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                if row.unread {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
+                }
+                Text(row.from)
+                    .font(.headline)
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                Text(row.receivedDate, format: .dateTime.month(.abbreviated).day().hour().minute())
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(row.subject)
+                .font(.title3)
+                .fontWeight(.semibold)
+            Divider()
+            Text(row.displayBody.isEmpty ? "No message body is available offline." : row.displayBody)
+                .font(.body)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .foregroundStyle(row.displayBody.isEmpty ? .secondary : .primary)
+        }
+        .padding(.vertical, 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        let unreadText = row.unread ? "Unread, " : ""
+        let dateText = row.receivedDate.formatted(
+            .dateTime.month(.abbreviated).day().hour().minute()
+        )
+        let body = row.displayBody.isEmpty ? "No message body is available offline" : row.displayBody
+        return unreadText + row.from + ", " + row.subject + ", " + dateText + ", " + body
     }
 }

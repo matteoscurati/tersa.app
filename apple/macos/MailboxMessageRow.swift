@@ -27,6 +27,12 @@ struct MailboxMessageRowView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if !row.preview.isEmpty {
+                    Text(row.preview)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
             Spacer()
             Text(row.receivedDate, format: .dateTime.month(.abbreviated).day().hour().minute())
@@ -43,6 +49,7 @@ struct MailboxMessageRowView: View {
         let dateText = row.receivedDate.formatted(
             .dateTime.month(.abbreviated).day().hour().minute()
         )
-        return unreadText + row.from + ", " + row.subject + ", " + dateText
+        let previewText = row.preview.isEmpty ? "" : ", " + row.preview
+        return unreadText + row.from + ", " + row.subject + previewText + ", " + dateText
     }
 }

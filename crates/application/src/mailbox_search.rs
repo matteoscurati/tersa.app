@@ -208,7 +208,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
-    use tersa_domain::mailbox::{HeaderText, MessageId, ThreadId, UnixTimestampMillis};
+    use tersa_domain::mailbox::{HeaderText, Message, MessageId, ThreadId, UnixTimestampMillis};
 
     use super::*;
 
@@ -256,6 +256,14 @@ mod tests {
             _limit: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 

@@ -270,12 +270,13 @@ pub trait RemoteMailbox: Send + Sync {
     ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>>;
 }
 
-/// Reads envelope rows, but no complete message bodies, from a local store.
+/// Reads envelope rows and optional cached complete messages from a local store.
 ///
-/// An envelope includes its existing body-derived preview field. This port
-/// deliberately excludes complete cached message bodies and every mutation;
-/// narrower output adapters must project away preview when their contract
-/// requires metadata only.
+/// An envelope includes its existing body-derived preview field. Complete
+/// cached bodies are available only through [`MailboxReader::get_message`] when
+/// the store holds them; narrower output adapters may project away preview and
+/// bodies when their contract requires metadata only. This port still excludes
+/// every mutation.
 pub trait MailboxReader: Send + Sync {
     /// Lists envelopes in a deterministic total order: received time descending,
     /// then message identifier ascending, limited by the local result limit.
@@ -303,6 +304,21 @@ pub trait MailboxReader: Send + Sync {
         thread_id: &'a ThreadId,
         limit: StoreLimit,
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>>;
+    /// Returns one complete cached message when a body is present for `message_id`.
+    ///
+    /// Returns `Ok(None)` when the message is absent **or** only an envelope row
+    /// exists without a cached body. Callers that need metadata for body-less
+    /// rows must use the envelope listing methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
+    fn get_message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>>;
 }
 
 impl<T: MailboxReader + ?Sized> MailboxReader for &T {
@@ -321,6 +337,13 @@ impl<T: MailboxReader + ?Sized> MailboxReader for &T {
     ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
         (**self).thread_envelopes(account, thread_id, limit)
     }
+    fn get_message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+        (**self).get_message(account, message_id)
+    }
 }
 
 /// Persists mailbox data in a local store.
@@ -331,6 +354,35 @@ impl<T: MailboxReader + ?Sized> MailboxReader for &T {
 /// cancellation and atomicity behavior. Reusable cross-crate test support is
 /// deferred.
 pub trait MailboxStore: MailboxReader {
+    /// Marks one message as locally read without touching remote labels.
+    ///
+    /// The product holds only `gmail.readonly`, so server-side UNREAD removal is
+    /// out of scope. Local read is sticky under later envelope reconciliation:
+    /// a subsequent remote UNREAD snapshot must not re-open a message the user
+    /// already opened. Absent messages are a successful no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized or the
+    /// store cannot be written.
+    fn mark_message_read<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
+    /// Marks every message in one thread as locally read.
+    ///
+    /// Same local-only and sticky rules as [`Self::mark_message_read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized or the
+    /// store cannot be written.
+    fn mark_thread_read<'a>(
+        &'a self,
+        account: &'a AccountId,
+        thread_id: &'a ThreadId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>>;
     /// Inserts or replaces mailbox envelopes for an account.
     ///
     /// Unlike [`Self::reconcile_recent_envelopes`], this write is **not** identity-
@@ -395,6 +447,20 @@ pub trait MailboxStore: MailboxReader {
 }
 
 impl<T: MailboxStore + ?Sized> MailboxStore for &T {
+    fn mark_message_read<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).mark_message_read(account, message_id)
+    }
+    fn mark_thread_read<'a>(
+        &'a self,
+        account: &'a AccountId,
+        thread_id: &'a ThreadId,
+    ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+        (**self).mark_thread_read(account, thread_id)
+    }
     fn upsert_envelopes<'a>(
         &'a self,
         account: &'a AccountId,
@@ -628,6 +694,22 @@ mod tests {
         messages: Mutex<HashMap<(AccountId, MessageId), Message>>,
     }
     impl MailboxStore for FakeStore {
+        fn mark_message_read<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            mark_fake_read(self, account, Some(message_id), None);
+            Box::pin(ready(Ok(())))
+        }
+        fn mark_thread_read<'a>(
+            &'a self,
+            account: &'a AccountId,
+            thread_id: &'a ThreadId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            mark_fake_read(self, account, None, Some(thread_id));
+            Box::pin(ready(Ok(())))
+        }
         fn upsert_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -636,13 +718,35 @@ mod tests {
             let mut map = self.envelopes.lock().unwrap();
             let stored = map.entry(account.clone()).or_default();
             for value in values {
+                // Sticky local read: once unread is false, a later remote UNREAD
+                // snapshot does not reopen the message.
+                let next = if let Some(existing) = stored
+                    .iter()
+                    .find(|existing| existing.message_id() == value.message_id())
+                {
+                    if !existing.is_unread() && value.is_unread() {
+                        MessageEnvelope::new(
+                            value.message_id().clone(),
+                            value.thread_id().clone(),
+                            value.from().clone(),
+                            value.subject().clone(),
+                            value.preview().clone(),
+                            value.received_at(),
+                            false,
+                        )
+                    } else {
+                        value.clone()
+                    }
+                } else {
+                    value.clone()
+                };
                 if let Some(position) = stored
                     .iter()
-                    .position(|existing| existing.message_id() == value.message_id())
+                    .position(|existing| existing.message_id() == next.message_id())
                 {
-                    stored[position] = value.clone();
+                    stored[position] = next;
                 } else {
-                    stored.push(value.clone());
+                    stored.push(next);
                 }
             }
             Box::pin(ready(Ok(())))
@@ -748,6 +852,53 @@ mod tests {
                 .cloned())))
         }
     }
+    fn mark_fake_read(
+        store: &FakeStore,
+        account: &AccountId,
+        message_id: Option<&MessageId>,
+        thread_id: Option<&ThreadId>,
+    ) {
+        let mut map = store.envelopes.lock().unwrap();
+        let Some(values) = map.get_mut(account) else {
+            return;
+        };
+        for value in values.iter_mut() {
+            let matches_message = message_id.is_none_or(|id| value.message_id() == id);
+            let matches_thread = thread_id.is_none_or(|id| value.thread_id() == id);
+            if matches_message && matches_thread && value.is_unread() {
+                *value = MessageEnvelope::new(
+                    value.message_id().clone(),
+                    value.thread_id().clone(),
+                    value.from().clone(),
+                    value.subject().clone(),
+                    value.preview().clone(),
+                    value.received_at(),
+                    false,
+                );
+            }
+        }
+        let mut messages = store.messages.lock().unwrap();
+        for ((stored_account, stored_id), message) in messages.iter_mut() {
+            if stored_account != account {
+                continue;
+            }
+            let matches_message = message_id.is_none_or(|id| stored_id == id);
+            let matches_thread = thread_id.is_none_or(|id| message.envelope().thread_id() == id);
+            if matches_message && matches_thread && message.envelope().is_unread() {
+                let envelope = MessageEnvelope::new(
+                    message.envelope().message_id().clone(),
+                    message.envelope().thread_id().clone(),
+                    message.envelope().from().clone(),
+                    message.envelope().subject().clone(),
+                    message.envelope().preview().clone(),
+                    message.envelope().received_at(),
+                    false,
+                );
+                *message = Message::new(envelope, message.content().clone());
+            }
+        }
+    }
+
     impl MailboxReader for FakeStore {
         fn list_envelopes<'a>(
             &'a self,
@@ -793,6 +944,18 @@ mod tests {
             });
             values.truncate(usize::from(limit.get()));
             Box::pin(ready(Ok(values)))
+        }
+        fn get_message<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(ready(Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .get(&(account.clone(), message_id.clone()))
+                .cloned())))
         }
     }
 

@@ -31,7 +31,8 @@ impl std::error::Error for MailboxViewModelError {}
 /// Holds one owned mailbox row with the stable metadata field parity.
 ///
 /// Values are projected verbatim: no date formatting and no output escaping,
-/// which remain the output adapter's responsibility.
+/// which remain the output adapter's responsibility. `body_text` is optional
+/// display text derived from a cached complete message when available.
 #[derive(Clone, Eq, PartialEq)]
 pub struct MessageRowViewModel {
     /// The opaque message identifier.
@@ -42,6 +43,10 @@ pub struct MessageRowViewModel {
     pub from: String,
     /// The subject header text.
     pub subject: String,
+    /// The provider preview/snippet text.
+    pub preview: String,
+    /// Optional plain-text body for display when a cached complete message is present.
+    pub body_text: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub received_at_millis: i64,
     /// Whether the message is unread.
@@ -49,7 +54,7 @@ pub struct MessageRowViewModel {
 }
 
 impl MessageRowViewModel {
-    /// Projects one metadata message into an owned view row.
+    /// Projects one metadata message into an owned view row without a body.
     #[must_use]
     pub fn from_message(message: &MailboxMetadataMessage) -> Self {
         Self {
@@ -57,9 +62,27 @@ impl MessageRowViewModel {
             thread_id: message.thread_id().as_str().to_owned(),
             from: message.from().as_str().to_owned(),
             subject: message.subject().as_str().to_owned(),
+            preview: message.preview().as_str().to_owned(),
+            body_text: None,
             received_at_millis: message.received_at().as_millis(),
             unread: message.is_unread(),
         }
+    }
+
+    /// Projects one metadata message and attaches display text from a cached body.
+    #[must_use]
+    pub fn from_message_with_body(
+        message: &MailboxMetadataMessage,
+        body_bytes: Option<&[u8]>,
+    ) -> Self {
+        let mut row = Self::from_message(message);
+        if let Some(bytes) = body_bytes {
+            let text = display_text_from_rfc5322(bytes);
+            if !text.is_empty() {
+                row.body_text = Some(text);
+            }
+        }
+        row
     }
 }
 
@@ -71,10 +94,60 @@ impl fmt::Debug for MessageRowViewModel {
             .field("thread_id", &"[REDACTED]")
             .field("from", &"[REDACTED]")
             .field("subject", &"[REDACTED]")
+            .field("preview", &"[REDACTED]")
+            .field("body_text", &self.body_text.as_ref().map(|_| "[REDACTED]"))
             .field("received_at_millis", &self.received_at_millis)
             .field("unread", &self.unread)
             .finish()
     }
+}
+
+/// Maximum characters of body text exposed to the UI from a cached raw message.
+const MAX_DISPLAY_BODY_CHARS: usize = 32_768;
+
+/// Derives bounded plain-text display content from a cached RFC 5322 message.
+///
+/// This is a conservative, fail-closed extraction for offline reading: it strips
+/// headers, prefers a `text/plain` part when multipart is obvious, undoes soft
+/// quoted-printable breaks, and never attempts HTML sanitization or remote
+/// resource loading. Incomplete MIME stays truncated/plain rather than rendered.
+#[must_use]
+pub fn display_text_from_rfc5322(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let body = strip_rfc5322_headers(text.as_ref());
+    let body = prefer_text_plain_part(body);
+    let body = decode_quoted_printable_soft(body);
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed.chars().take(MAX_DISPLAY_BODY_CHARS).collect()
+}
+
+fn strip_rfc5322_headers(message: &str) -> &str {
+    if let Some(index) = message.find("\r\n\r\n") {
+        return &message[index + 4..];
+    }
+    if let Some(index) = message.find("\n\n") {
+        return &message[index + 2..];
+    }
+    message
+}
+
+fn prefer_text_plain_part(body: &str) -> &str {
+    let lowered = body.to_ascii_lowercase();
+    // Prefer the first text/plain body region after its part headers when present
+    // (multipart outer headers may already have been stripped).
+    if let Some(plain_at) = lowered.find("content-type: text/plain") {
+        let after = &body[plain_at..];
+        return strip_rfc5322_headers(after);
+    }
+    body
+}
+
+fn decode_quoted_printable_soft(body: &str) -> String {
+    body.replace("=\r\n", "").replace("=\n", "")
 }
 
 /// Holds an owned inbox listing ready for a platform presentation adapter.
@@ -173,6 +246,25 @@ impl ThreadViewModel {
             limit: document.limit().get(),
             rows: rows_from_document(document),
         })
+    }
+
+    /// Builds a thread view model from already-projected rows.
+    ///
+    /// Used by the trusted composition after attaching cached body display text
+    /// and applying local mark-as-read.
+    #[must_use]
+    pub fn from_rows(
+        account_id: String,
+        thread_id: String,
+        limit: u16,
+        rows: Vec<MessageRowViewModel>,
+    ) -> Self {
+        Self {
+            account_id,
+            thread_id,
+            limit,
+            rows,
+        }
     }
 
     /// Returns the opaque account identifier.
@@ -311,7 +403,7 @@ mod tests {
     use tersa_application::mailbox_metadata::{inbox_metadata, thread_metadata};
     use tersa_application::mailbox_search::{MailboxSearchQuery, search_metadata};
     use tersa_domain::mailbox::{
-        AccountId, HeaderText, MessageEnvelope, MessageId, UnixTimestampMillis,
+        AccountId, HeaderText, Message, MessageEnvelope, MessageId, UnixTimestampMillis,
     };
 
     use super::*;
@@ -339,6 +431,14 @@ mod tests {
             let result = Ok(self.envelopes.clone());
             Box::pin(async move { result })
         }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
+        }
     }
 
     fn account() -> AccountId {
@@ -363,6 +463,32 @@ mod tests {
             UnixTimestampMillis::new(timestamp).unwrap(),
             true,
         )
+    }
+
+    #[test]
+    fn display_text_strips_headers_and_prefers_plain_part() {
+        let raw = b"From: a@b\r\nSubject: s\r\n\r\nHello body\r\n";
+        assert_eq!(display_text_from_rfc5322(raw), "Hello body");
+
+        let multipart = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<html>x</html>\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n--b--\r\n";
+        assert_eq!(display_text_from_rfc5322(multipart), "Plain body\n--b--");
+    }
+
+    #[test]
+    fn row_projection_carries_preview_and_optional_body() {
+        let document = inbox_document(vec![envelope("m1", 1)]);
+        let message = &document.messages()[0];
+        let row = MessageRowViewModel::from_message(message);
+        assert_eq!(row.preview, "preview-m1");
+        assert!(row.body_text.is_none());
+
+        let with_body = MessageRowViewModel::from_message_with_body(
+            message,
+            Some(b"From: x\r\n\r\nCached body"),
+        );
+        assert_eq!(with_body.body_text.as_deref(), Some("Cached body"));
     }
 
     fn run<T>(future: impl Future<Output = T>) -> T {
