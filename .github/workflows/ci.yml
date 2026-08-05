@@ -454,6 +454,15 @@ jobs:
           trap 'flush_logs || true; trap - EXIT; exit 130' INT
           trap 'flush_logs || true; trap - EXIT; exit 143' TERM
 
+          # Fail closed if this job was selected but neither lane is exactly
+          # true. An empty/false/unexpected selector must never report notices
+          # success after launching no child.
+          if [ "$RUN_RUST" != "true" ] && [ "$RUN_NOTICES" != "true" ]; then
+            echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true (RUN_RUST=${RUN_RUST:-}; RUN_NOTICES=${RUN_NOTICES:-}); refusing no-op success." >&2
+            trap - EXIT INT TERM
+            exit 1
+          fi
+
           rust_pid=""
           notices_pid=""
           rust_status=0
@@ -514,19 +523,27 @@ jobs:
           fi
 
           # Success path: no full-log upload; disarm traps, summarize lanes, and
-          # emit one final ok summary per test phase (non-fatal if format changes).
+          # emit phase-aggregate Cargo evidence (non-fatal if format changes).
           trap - EXIT INT TERM
           if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then
             echo "macOS quality: Rust suite and third-party notices succeeded."
           elif [ "$RUN_RUST" = "true" ]; then
             echo "macOS quality: Rust suite succeeded."
-          else
+          elif [ "$RUN_NOTICES" = "true" ]; then
             echo "macOS quality: third-party notices succeeded."
+          else
+            # Unreachable when early selector validation holds; keep fail-closed.
+            echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true; refusing no-op success." >&2
+            exit 1
           fi
           if [ "$RUN_RUST" = "true" ]; then
             # Phase windows use the existing suite markers so normal tests and
-            # doc-tests cannot hide each other. Empty/missing/format-change
-            # results print an explicit unavailable line and never fail success.
+            # doc-tests cannot hide each other. Aggregate every crate's
+            # `test result: ok.` summary inside the window (count + sum of
+            # passed/failed) instead of keeping only the final line. Empty,
+            # missing, or unparseable phases print an explicit unavailable line
+            # and never fail success. Awk is macOS/BSD/POSIX-compatible (no
+            # GNU three-argument match).
             tests_summary=""
             doctests_summary=""
             if [ -f "$rust_log" ]; then
@@ -534,16 +551,50 @@ jobs:
                 awk '
                   $0 == "Running tests check..." { in_phase=1; next }
                   $0 == "Running documentation tests check..." { in_phase=0 }
-                  in_phase && index($0, "test result: ok.") { last=$0 }
-                  END { if (last != "") print last }
+                  in_phase && index($0, "test result: ok.") {
+                    line_passed = ""
+                    line_failed = ""
+                    for (i = 2; i <= NF; i++) {
+                      if ($i ~ /^passed/) line_passed = $(i-1)
+                      if ($i ~ /^failed/) line_failed = $(i-1)
+                    }
+                    if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+                      unparseable = 1
+                      next
+                    }
+                    summaries++
+                    passed += line_passed + 0
+                    failed += line_failed + 0
+                  }
+                  END {
+                    if (!unparseable && summaries > 0)
+                      print "summaries=" summaries " passed=" passed " failed=" failed
+                  }
                 ' "$rust_log"
               )" || true
               doctests_summary="$(
                 awk '
                   $0 == "Running documentation tests check..." { in_phase=1; next }
                   $0 == "Running documentation check..." { in_phase=0 }
-                  in_phase && index($0, "test result: ok.") { last=$0 }
-                  END { if (last != "") print last }
+                  in_phase && index($0, "test result: ok.") {
+                    line_passed = ""
+                    line_failed = ""
+                    for (i = 2; i <= NF; i++) {
+                      if ($i ~ /^passed/) line_passed = $(i-1)
+                      if ($i ~ /^failed/) line_failed = $(i-1)
+                    }
+                    if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+                      unparseable = 1
+                      next
+                    }
+                    summaries++
+                    passed += line_passed + 0
+                    failed += line_failed + 0
+                  }
+                  END {
+                    if (!unparseable && summaries > 0)
+                      print "summaries=" summaries " passed=" passed " failed=" failed
+                  }
                 ' "$rust_log"
               )" || true
             fi

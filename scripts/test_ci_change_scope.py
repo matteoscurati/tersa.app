@@ -211,32 +211,102 @@ def _macos_quality_cargo_inventory(job_text: str) -> list[str]:
     return inventory
 
 
+def _macos_quality_non_comment_lines_ending_backslash(job_text: str) -> list[str]:
+    """Physical non-comment lines that end with a shell continuation backslash."""
+    offenders: list[str] = []
+    for raw_line in job_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            offenders.append(raw_line)
+    return offenders
+
+
+def _named_step_env_entries(job_text: str, step_name: str) -> dict[str, str]:
+    """Exact env key/value map for a named job step (no YAML dependency).
+
+    Parses only the ``env:`` block of the step whose ``- name:`` matches
+    *step_name*. Sibling keys at the step indent (for example ``run:``) end the
+    map. Any added, removed, or changed key is visible to exact equality.
+    """
+    header = f"      - name: {step_name}"
+    lines = job_text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line == header:
+            start = index + 1
+            break
+    if start is None:
+        raise AssertionError(f"step not found: {step_name}")
+
+    entries: dict[str, str] = {}
+    in_env = False
+    for line in lines[start:]:
+        # Next step at the same indent ends this step.
+        if line.startswith("      - name: "):
+            break
+        if line == "        env:":
+            in_env = True
+            continue
+        if not in_env:
+            # Allow other step keys before env; once env ends we stop below.
+            continue
+        if line.startswith("          ") and not line.startswith("           "):
+            body = line[10:]
+            key, sep, value = body.partition(": ")
+            if not sep or not key:
+                raise AssertionError(f"unparseable env entry in {step_name}: {line!r}")
+            entries[key] = value
+            continue
+        if line.startswith("        ") and not line.startswith("         "):
+            # Sibling step key (run, if, with, ...): end of env map.
+            break
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        raise AssertionError(f"unexpected env block line in {step_name}: {line!r}")
+    return entries
+
+
+# POSIX/BSD-compatible Cargo phase aggregation (mirrors workflow awk field parse).
+_CARGO_PHASE_AGGREGATE_AWK = r"""
+in_phase && index($0, "test result: ok.") {
+  line_passed = ""
+  line_failed = ""
+  for (i = 2; i <= NF; i++) {
+    if ($i ~ /^passed/) line_passed = $(i-1)
+    if ($i ~ /^failed/) line_failed = $(i-1)
+  }
+  if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+    unparseable = 1
+    next
+  }
+  summaries++
+  passed += line_passed + 0
+  failed += line_failed + 0
+}
+END {
+  if (!unparseable && summaries > 0)
+    print "summaries=" summaries " passed=" passed " failed=" failed
+}
+"""
+
+
 class ChangeScopeTests(unittest.TestCase):
-    def test_active_scope_contract(self) -> None:
-        self.assertEqual(NAMES, ACTIVE_OUTPUTS)
-        for retired in RETIRED_SCOPE_NAMES:
-            self.assertNotIn(retired, NAMES)
+    def _assert_rust_macos_implies_rust_linux(
+        self, enabled: set[str], *, label: str
+    ) -> None:
+        """Load-bearing invariant: any macOS Rust selection also selects Linux."""
+        if "rust_macos" in enabled:
+            self.assertIn(
+                "rust_linux",
+                enabled,
+                f"{label}: rust_macos without rust_linux is forbidden",
+            )
 
-    def test_retired_ui_helpers_are_not_control_paths(self) -> None:
-        for retired in (
-            "scripts/write-evidence-manifest.py",
-            "apple/scripts/prepare-verified-skia.sh",
-            "apple/scripts/verify-rust-skia-notices.py",
-            "apple/scripts/verify-dioxus-runtime.py",
-            "apple/scripts/build-slint-executable.sh",
-            "apple/scripts/build-dioxus-executable.sh",
-            "apple/scripts/capture-slint-evidence.sh",
-            "apple/scripts/capture-dioxus-evidence.sh",
-            "apple/scripts/capture-dioxus-device-evidence.sh",
-            "apple/scripts/verify-sqlcipher-feasibility.sh",
-            "apple/scripts/verify-search-feasibility.sh",
-            "apple/scripts/verify-blob-feasibility.sh",
-        ):
-            with self.subTest(path=retired):
-                self.assertNotIn(retired, MODULE.CI_CONTROL_PATHS)
-
-    def test_path_table(self) -> None:
-        cases = (
+    def _path_table_cases(self) -> tuple[tuple[str, list[str], set[str]], ...]:
+        """Table-driven classifier cases shared by equality and invariant checks."""
+        return (
             ("empty input fails closed", [], ALL),
             ("unknown path fails closed", ["new-area/input.txt"], ALL),
             ("ambiguous path fails closed", ["../Cargo.toml"], ALL),
@@ -499,11 +569,107 @@ class ChangeScopeTests(unittest.TestCase):
                 ALL,
             ),
         )
-        for label, paths, expected in cases:
+
+    def test_active_scope_contract(self) -> None:
+        self.assertEqual(NAMES, ACTIVE_OUTPUTS)
+        for retired in RETIRED_SCOPE_NAMES:
+            self.assertNotIn(retired, NAMES)
+        # Active output matrix always lists both host lanes; macOS cannot exist alone.
+        self.assertIn("rust_linux", ACTIVE_OUTPUTS)
+        self.assertIn("rust_macos", ACTIVE_OUTPUTS)
+        self.assertLess(
+            ACTIVE_OUTPUTS.index("rust_linux"),
+            ACTIVE_OUTPUTS.index("rust_macos"),
+        )
+
+    def test_retired_ui_helpers_are_not_control_paths(self) -> None:
+        for retired in (
+            "scripts/write-evidence-manifest.py",
+            "apple/scripts/prepare-verified-skia.sh",
+            "apple/scripts/verify-rust-skia-notices.py",
+            "apple/scripts/verify-dioxus-runtime.py",
+            "apple/scripts/build-slint-executable.sh",
+            "apple/scripts/build-dioxus-executable.sh",
+            "apple/scripts/capture-slint-evidence.sh",
+            "apple/scripts/capture-dioxus-device-evidence.sh",
+            "apple/scripts/capture-dioxus-evidence.sh",
+            "apple/scripts/verify-sqlcipher-feasibility.sh",
+            "apple/scripts/verify-search-feasibility.sh",
+            "apple/scripts/verify-blob-feasibility.sh",
+        ):
+            with self.subTest(path=retired):
+                self.assertNotIn(retired, MODULE.CI_CONTROL_PATHS)
+
+    def test_path_table(self) -> None:
+        for label, paths, expected in self._path_table_cases():
             with self.subTest(label=label):
                 scope = MODULE.classify(paths)
                 actual = {name for name in NAMES if getattr(scope, name)}
                 self.assertEqual(actual, expected)
+                # Expected rows and live classify results both encode the host
+                # invariant so a future macOS-only rule cannot be blessed by
+                # merely adding a table row.
+                self._assert_rust_macos_implies_rust_linux(expected, label=f"{label} expected")
+                self._assert_rust_macos_implies_rust_linux(actual, label=f"{label} actual")
+
+    def test_rust_macos_implies_rust_linux_over_all_classifier_surfaces(self) -> None:
+        """Property: every result enabling rust_macos also enables rust_linux.
+
+        Covers the full path table, executable control-path matrix, and CLI
+        emission so a macOS-only classifier change fails without relying on a
+        single blessed equality row.
+        """
+        for label, paths, expected in self._path_table_cases():
+            with self.subTest(surface="path_table", label=label):
+                self._assert_rust_macos_implies_rust_linux(expected, label=label)
+                actual = {
+                    name
+                    for name in NAMES
+                    if getattr(MODULE.classify(paths), name)
+                }
+                self._assert_rust_macos_implies_rust_linux(actual, label=label)
+
+        control_paths = sorted(MODULE.CI_CONTROL_PATHS) + [
+            ".github/workflows/ci.yml",
+            ".github/workflows/any-workflow.yml",
+            "xtask/src/main.rs",
+            "xtask/Cargo.toml",
+        ]
+        for path in control_paths:
+            with self.subTest(surface="control_path", path=path):
+                actual = {
+                    name
+                    for name in NAMES
+                    if getattr(MODULE.classify([path]), name)
+                }
+                self._assert_rust_macos_implies_rust_linux(actual, label=path)
+
+        # Active output name set and full-fanout set also obey the invariant.
+        self._assert_rust_macos_implies_rust_linux(set(ACTIVE_OUTPUTS), label="ACTIVE_OUTPUTS")
+        self._assert_rust_macos_implies_rust_linux(ALL, label="ALL")
+        # Classifier enable sites that list rust_macos must list rust_linux.
+        classifier = SCRIPT.read_text(encoding="utf-8")
+        for match in re.finditer(
+            r'scope\.enable\(([^)]*)\)',
+            classifier,
+        ):
+            args = match.group(1)
+            if "rust_macos" in args:
+                with self.subTest(surface="enable_site", args=args):
+                    self.assertIn("rust_linux", args)
+        # CLI GitHub-output emission for a rust_macos path also enables rust_linux.
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input="apple/rust-bridge/src/lib.rs\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        enabled = {name for name, value in values.items() if value == "true"}
+        self._assert_rust_macos_implies_rust_linux(enabled, label="cli_github_output")
+        self.assertEqual(values.get("rust_macos"), "true")
+        self.assertEqual(values.get("rust_linux"), "true")
 
     def test_cli_rejects_retired_modes(self) -> None:
         for flag in ("--full", "--baseline"):
@@ -951,18 +1117,31 @@ class ChangeScopeTests(unittest.TestCase):
         )
         self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
         self.assertIn('exit "$notices_status"', job)
-        # Traps arm before launch; notices starts before sequential Rust suite;
-        # both children background; unconditional waits/reaps; Rust-first status.
+        # Traps arm before launch; selector validation before children; notices
+        # starts before sequential Rust suite; both children background;
+        # unconditional waits/reaps; Rust-first status.
         trap_exit = job.index(
             """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT"""
         )
-        notices_bg = job.index(') >"$notices_log" 2>&1 &')
-        notices_pid = job.index("notices_pid=$!")
-        rust_seq = job.index('echo "Running Clippy check..."')
-        rust_bg = job.index(') >"$rust_log" 2>&1 &')
-        rust_pid = job.index("rust_pid=$!")
-        wait_rust = job.index('wait "$rust_pid" || rust_status=$?')
-        wait_notices = job.index('wait "$notices_pid" || notices_status=$?')
+        selector_gate = job.index(
+            'if [ "$RUN_RUST" != "true" ] && [ "$RUN_NOTICES" != "true" ]; then',
+            trap_exit,
+        )
+        selector_diag = job.index(
+            "neither RUN_RUST nor RUN_NOTICES is exactly true",
+            selector_gate,
+        )
+        selector_clear = job.index("trap - EXIT INT TERM", selector_diag)
+        selector_exit = job.index("exit 1", selector_clear)
+        notices_bg = job.index(') >"$notices_log" 2>&1 &', selector_exit)
+        notices_pid = job.index("notices_pid=$!", notices_bg)
+        rust_seq = job.index('echo "Running Clippy check..."', notices_pid)
+        rust_bg = job.index(') >"$rust_log" 2>&1 &', rust_seq)
+        rust_pid = job.index("rust_pid=$!", rust_bg)
+        wait_rust = job.index('wait "$rust_pid" || rust_status=$?', rust_pid)
+        wait_notices = job.index(
+            'wait "$notices_pid" || notices_status=$?', wait_rust
+        )
         # Failure path: dump both available full logs once before trap cleanup.
         failure_gate = job.index(
             'if [ "$rust_status" -ne 0 ] || [ "$notices_status" -ne 0 ]; then',
@@ -974,7 +1153,7 @@ class ChangeScopeTests(unittest.TestCase):
         exit_rust = job.index('exit "$rust_status"', fail_rust)
         exit_notices = job.index('exit "$notices_status"', exit_rust)
         # Success path: disarm traps without full dump; concise selected-lane
-        # summary plus one final ok summary per test phase (not full logs).
+        # summary plus phase-aggregate Cargo evidence (not full logs).
         trap_clear_ok = job.index("trap - EXIT INT TERM", exit_notices)
         summary_both = job.index(
             'echo "macOS quality: Rust suite and third-party notices succeeded."',
@@ -984,26 +1163,49 @@ class ChangeScopeTests(unittest.TestCase):
             'echo "macOS quality: Rust suite succeeded."',
             summary_both,
         )
-        summary_notices = job.index(
-            'echo "macOS quality: third-party notices succeeded."',
+        summary_notices_gate = job.index(
+            'elif [ "$RUN_NOTICES" = "true" ]; then',
             summary_rust,
         )
-        # Phase-specific extracts: normal tests then doc-tests, each with a
-        # non-fatal fallback. Must not scrape the whole log and tail only the
-        # final crates (which often hide the normal test phase).
+        summary_notices = job.index(
+            'echo "macOS quality: third-party notices succeeded."',
+            summary_notices_gate,
+        )
+        summary_noop_else = job.index(
+            "neither RUN_RUST nor RUN_NOTICES is exactly true; refusing no-op success.",
+            summary_notices,
+        )
+        summary_noop_exit = job.index("exit 1", summary_noop_else)
+        # Phase-specific aggregates: normal tests then doc-tests. Count every
+        # `test result: ok.` summary and sum passed/failed fields inside each
+        # marker window. Reject last-line-only scrape of the final crate.
         tests_phase_start = job.index(
             '$0 == "Running tests check..." { in_phase=1; next }',
-            summary_notices,
+            summary_noop_exit,
         )
         tests_phase_end = job.index(
             '$0 == "Running documentation tests check..." { in_phase=0 }',
             tests_phase_start,
         )
-        tests_ok_match = job.index(
-            'in_phase && index($0, "test result: ok.") { last=$0 }',
+        tests_aggregate = job.index(
+            'in_phase && index($0, "test result: ok.") {',
             tests_phase_end,
         )
-        tests_extract_nonfatal = job.index(')" || true', tests_ok_match)
+        tests_field_parse = job.index(
+            'if ($i ~ /^passed/) line_passed = $(i-1)',
+            tests_aggregate,
+        )
+        tests_failed_parse = job.index(
+            'if ($i ~ /^failed/) line_failed = $(i-1)',
+            tests_field_parse,
+        )
+        tests_unparseable = job.index("unparseable = 1", tests_failed_parse)
+        tests_summaries_inc = job.index("summaries++", tests_unparseable)
+        tests_print = job.index(
+            'print "summaries=" summaries " passed=" passed " failed=" failed',
+            tests_summaries_inc,
+        )
+        tests_extract_nonfatal = job.index(')" || true', tests_print)
         doctests_phase_start = job.index(
             '$0 == "Running documentation tests check..." { in_phase=1; next }',
             tests_extract_nonfatal,
@@ -1012,11 +1214,25 @@ class ChangeScopeTests(unittest.TestCase):
             '$0 == "Running documentation check..." { in_phase=0 }',
             doctests_phase_start,
         )
-        doctests_ok_match = job.index(
-            'in_phase && index($0, "test result: ok.") { last=$0 }',
+        doctests_aggregate = job.index(
+            'in_phase && index($0, "test result: ok.") {',
             doctests_phase_end,
         )
-        doctests_extract_nonfatal = job.index(')" || true', doctests_ok_match)
+        doctests_field_parse = job.index(
+            'if ($i ~ /^passed/) line_passed = $(i-1)',
+            doctests_aggregate,
+        )
+        doctests_failed_parse = job.index(
+            'if ($i ~ /^failed/) line_failed = $(i-1)',
+            doctests_field_parse,
+        )
+        doctests_unparseable = job.index("unparseable = 1", doctests_failed_parse)
+        doctests_summaries_inc = job.index("summaries++", doctests_unparseable)
+        doctests_print = job.index(
+            'print "summaries=" summaries " passed=" passed " failed=" failed',
+            doctests_summaries_inc,
+        )
+        doctests_extract_nonfatal = job.index(')" || true', doctests_print)
         tests_echo = job.index(
             'echo "Cargo tests: $tests_summary"',
             doctests_extract_nonfatal,
@@ -1033,12 +1249,20 @@ class ChangeScopeTests(unittest.TestCase):
             'echo "Cargo doc-tests: summary unavailable (log format changed)."',
             doctests_echo,
         )
-        # Reject the old whole-log tail approach that hid normal-test evidence.
+        # Reject last-line-only and whole-log tail approaches that hide crates.
+        self.assertNotIn("last=$0", job)
+        self.assertNotIn("{ last=$0 }", job)
         self.assertNotIn("tail -n 4", job)
         self.assertNotIn("cargo_ok_lines", job)
         self.assertNotIn('grep -F \'test result: ok.\' "$rust_log"', job)
         self.assertNotIn('printf \'%s\\n\' "$cargo_ok_lines"', job)
-        self.assertLess(trap_exit, notices_bg)
+        # No GNU awk three-argument match in phase aggregation.
+        self.assertNotIn("match($0,", job)
+        self.assertLess(trap_exit, selector_gate)
+        self.assertLess(selector_gate, selector_diag)
+        self.assertLess(selector_diag, selector_clear)
+        self.assertLess(selector_clear, selector_exit)
+        self.assertLess(selector_exit, notices_bg)
         self.assertLess(notices_bg, notices_pid)
         self.assertLess(notices_pid, rust_seq)
         self.assertLess(rust_seq, rust_bg)
@@ -1054,15 +1278,28 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(exit_notices, trap_clear_ok)
         self.assertLess(trap_clear_ok, summary_both)
         self.assertLess(summary_both, summary_rust)
-        self.assertLess(summary_rust, summary_notices)
-        self.assertLess(summary_notices, tests_phase_start)
+        self.assertLess(summary_rust, summary_notices_gate)
+        self.assertLess(summary_notices_gate, summary_notices)
+        self.assertLess(summary_notices, summary_noop_else)
+        self.assertLess(summary_noop_else, summary_noop_exit)
+        self.assertLess(summary_noop_exit, tests_phase_start)
         self.assertLess(tests_phase_start, tests_phase_end)
-        self.assertLess(tests_phase_end, tests_ok_match)
-        self.assertLess(tests_ok_match, tests_extract_nonfatal)
+        self.assertLess(tests_phase_end, tests_aggregate)
+        self.assertLess(tests_aggregate, tests_field_parse)
+        self.assertLess(tests_field_parse, tests_failed_parse)
+        self.assertLess(tests_failed_parse, tests_unparseable)
+        self.assertLess(tests_unparseable, tests_summaries_inc)
+        self.assertLess(tests_summaries_inc, tests_print)
+        self.assertLess(tests_print, tests_extract_nonfatal)
         self.assertLess(tests_extract_nonfatal, doctests_phase_start)
         self.assertLess(doctests_phase_start, doctests_phase_end)
-        self.assertLess(doctests_phase_end, doctests_ok_match)
-        self.assertLess(doctests_ok_match, doctests_extract_nonfatal)
+        self.assertLess(doctests_phase_end, doctests_aggregate)
+        self.assertLess(doctests_aggregate, doctests_field_parse)
+        self.assertLess(doctests_field_parse, doctests_failed_parse)
+        self.assertLess(doctests_failed_parse, doctests_unparseable)
+        self.assertLess(doctests_unparseable, doctests_summaries_inc)
+        self.assertLess(doctests_summaries_inc, doctests_print)
+        self.assertLess(doctests_print, doctests_extract_nonfatal)
         self.assertLess(doctests_extract_nonfatal, tests_echo)
         self.assertLess(tests_echo, tests_fallback)
         self.assertLess(tests_fallback, doctests_echo)
@@ -1075,12 +1312,25 @@ class ChangeScopeTests(unittest.TestCase):
         # Success path must not cat the full buffered logs.
         self.assertNotIn('cat "$rust_log"', job[trap_clear_ok:])
         self.assertNotIn('cat "$notices_log"', job[trap_clear_ok:])
-        # Unavailable fallbacks must not fail a successful job.
+        # Unavailable fallbacks stay non-fatal; the only success-path exit 1 is
+        # the explicit no-op selector fail-closed else (early gate is pre-launch).
         success_path = job[trap_clear_ok:]
-        self.assertNotIn("exit 1", success_path)
+        self.assertEqual(success_path.count("exit 1"), 1)
+        self.assertIn(
+            "neither RUN_RUST nor RUN_NOTICES is exactly true; refusing no-op success.",
+            success_path,
+        )
         self.assertEqual(success_path.count("|| true"), 2)
-        self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
-        self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
+        # Exact step env pin: only RUN_RUST and RUN_NOTICES with expected values.
+        self.assertEqual(
+            _named_step_env_entries(job, "Run macOS quality checks"),
+            {
+                "RUN_RUST": "${{ needs.changes.outputs.rust_macos }}",
+                "RUN_NOTICES": "${{ needs.changes.outputs.notices }}",
+            },
+        )
+        # No shell continuation lines anywhere in the executable job body.
+        self.assertEqual(_macos_quality_non_comment_lines_ending_backslash(job), [])
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
         self.assertIn("tool: cargo-about@0.9.1", job)
         self.assertIn("cargo fetch --locked", job)
@@ -1228,6 +1478,233 @@ class ChangeScopeTests(unittest.TestCase):
             _macos_quality_cargo_inventory("        tool: cargo-about@0.9.1\n"),
             [],
         )
+
+    def test_macos_quality_forbids_shell_continuation_and_pins_step_env(self) -> None:
+        """Adjacent-line and step-env bypasses fail closed without YAML deps."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+
+        # Current job body must need no continuation lines.
+        self.assertEqual(_macos_quality_non_comment_lines_ending_backslash(job), [])
+        # Regression: `true || \` before a pinned cargo line is detected.
+        bypass = job.replace(
+            "              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+            "              true || \\\n"
+            "              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+        )
+        offenders = _macos_quality_non_comment_lines_ending_backslash(bypass)
+        self.assertTrue(any(line.rstrip().endswith("\\") for line in offenders))
+        # Comment-only trailing backslash is ignored.
+        self.assertEqual(
+            _macos_quality_non_comment_lines_ending_backslash(
+                "          # intentional comment \\\n              cargo test --locked\n"
+            ),
+            [],
+        )
+
+        expected_env = {
+            "RUN_RUST": "${{ needs.changes.outputs.rust_macos }}",
+            "RUN_NOTICES": "${{ needs.changes.outputs.notices }}",
+        }
+        self.assertEqual(
+            _named_step_env_entries(job, "Run macOS quality checks"),
+            expected_env,
+        )
+        # Added step env key (for example RUSTFLAGS override) must not match pin.
+        with_extra = job.replace(
+            "          RUN_NOTICES: ${{ needs.changes.outputs.notices }}\n",
+            "          RUN_NOTICES: ${{ needs.changes.outputs.notices }}\n"
+            "          RUSTFLAGS: ''\n",
+        )
+        self.assertNotEqual(
+            _named_step_env_entries(with_extra, "Run macOS quality checks"),
+            expected_env,
+        )
+        self.assertIn(
+            "RUSTFLAGS",
+            _named_step_env_entries(with_extra, "Run macOS quality checks"),
+        )
+        # Removed or changed values also fail exact equality.
+        missing = job.replace(
+            "          RUN_NOTICES: ${{ needs.changes.outputs.notices }}\n",
+            "",
+        )
+        self.assertNotEqual(
+            _named_step_env_entries(missing, "Run macOS quality checks"),
+            expected_env,
+        )
+        changed = job.replace(
+            "          RUN_RUST: ${{ needs.changes.outputs.rust_macos }}\n",
+            "          RUN_RUST: 'true'\n",
+        )
+        self.assertNotEqual(
+            _named_step_env_entries(changed, "Run macOS quality checks"),
+            expected_env,
+        )
+        # Existing cargo inventory + folded/tab/quoted regressions remain active.
+        self.assertEqual(
+            _macos_quality_cargo_inventory(job),
+            [
+                "cargo fetch --locked",
+                "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+                "cargo test --locked --workspace --all-targets --all-features",
+                "cargo test --locked --workspace --doc --all-features",
+                "cargo doc --locked --workspace --no-deps --all-features",
+            ],
+        )
+
+    def test_macos_quality_selector_fail_closed_without_selected_lanes(self) -> None:
+        """Job must not claim notices success when neither selector is true."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        # Early validation before children launch.
+        early = job.index(
+            'if [ "$RUN_RUST" != "true" ] && [ "$RUN_NOTICES" != "true" ]; then'
+        )
+        early_exit = job.index("exit 1", early)
+        notices_launch = job.index('if [ "$RUN_NOTICES" = "true" ]; then', early_exit)
+        rust_launch = job.index('if [ "$RUN_RUST" = "true" ]; then', notices_launch)
+        self.assertLess(early, early_exit)
+        self.assertLess(early_exit, notices_launch)
+        self.assertLess(notices_launch, rust_launch)
+        # Final summary is trifurcated; bare else no longer claims notices success.
+        self.assertIn('elif [ "$RUN_NOTICES" = "true" ]; then', job)
+        # Notices-only success string only appears under the notices elif arm.
+        notices_success = 'echo "macOS quality: third-party notices succeeded."'
+        self.assertEqual(job.count(notices_success), 1)
+        notices_elif = job.index('elif [ "$RUN_NOTICES" = "true" ]; then')
+        self.assertLess(notices_elif, job.index(notices_success, notices_elif))
+        # Valid mode gates remain exact-true checks.
+        self.assertIn('if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then', job)
+        self.assertIn('elif [ "$RUN_RUST" = "true" ]; then', job)
+        self.assertIn('if [ "$RUN_RUST" = "true" ]; then', job)
+        self.assertIn('if [ "$RUN_NOTICES" = "true" ]; then', job)
+
+    def test_cargo_phase_aggregation_sums_all_crate_summaries(self) -> None:
+        """Aggregate awk counts every ok summary; last-line-only is insufficient."""
+        # Multi-crate normal-test window: last crate alone would report only 1
+        # passed, while the real suite passed 6 across three summaries.
+        tests_log = "\n".join(
+            (
+                "Running tests check...",
+                "running 3 tests",
+                "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+                "running 2 tests",
+                "test result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+                "running 1 test",
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+                "Running documentation tests check...",
+                "test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+                "",
+            )
+        )
+        # Doc-test window includes compile-fail crates after an empty xtask line.
+        doctests_log = "\n".join(
+            (
+                "Running documentation tests check...",
+                "running 0 tests",
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+                "running 2 tests",
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+                "Running documentation check...",
+                "test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+                "",
+            )
+        )
+        empty_log = "Running tests check...\nRunning documentation tests check...\n"
+        unparseable_log = "\n".join(
+            (
+                "Running tests check...",
+                "test result: ok. not-a-number passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+                "Running documentation tests check...",
+                "",
+            )
+        )
+
+        def run_phase_awk(script_prefix: str, log_text: str) -> str:
+            program = script_prefix + _CARGO_PHASE_AGGREGATE_AWK
+            result = subprocess.run(
+                ["awk", program],
+                input=log_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"awk failed: {result.stderr!r}",
+            )
+            return result.stdout
+
+        tests_prefix = (
+            '$0 == "Running tests check..." { in_phase=1; next }\n'
+            '$0 == "Running documentation tests check..." { in_phase=0 }\n'
+        )
+        doctests_prefix = (
+            '$0 == "Running documentation tests check..." { in_phase=1; next }\n'
+            '$0 == "Running documentation check..." { in_phase=0 }\n'
+        )
+        self.assertEqual(
+            run_phase_awk(tests_prefix, tests_log),
+            "summaries=3 passed=6 failed=1\n",
+        )
+        self.assertEqual(
+            run_phase_awk(doctests_prefix, doctests_log),
+            "summaries=2 passed=2 failed=0\n",
+        )
+        # Windows isolate phases: doc-test totals must not leak into tests.
+        self.assertEqual(
+            run_phase_awk(tests_prefix, doctests_log),
+            "",
+        )
+        # Empty / unparseable phases emit nothing (workflow prints unavailable).
+        self.assertEqual(run_phase_awk(tests_prefix, empty_log), "")
+        self.assertEqual(run_phase_awk(tests_prefix, unparseable_log), "")
+        # Last-line-only logic would wrongly report only the final crate.
+        last_only = subprocess.run(
+            [
+                "awk",
+                (
+                    '$0 == "Running tests check..." { in_phase=1; next }\n'
+                    '$0 == "Running documentation tests check..." { in_phase=0 }\n'
+                    'in_phase && index($0, "test result: ok.") { last=$0 }\n'
+                    'END { if (last != "") print last }\n'
+                ),
+            ],
+            input=tests_log,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        self.assertIn("1 passed", last_only)
+        self.assertNotIn("summaries=3", last_only)
+        # Workflow embeds the same aggregation field-parse contract twice.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        self.assertEqual(job.count("summaries++"), 2)
+        self.assertEqual(job.count('if ($i ~ /^passed/) line_passed = $(i-1)'), 2)
+        self.assertEqual(job.count('if ($i ~ /^failed/) line_failed = $(i-1)'), 2)
+        self.assertEqual(
+            job.count(
+                'print "summaries=" summaries " passed=" passed " failed=" failed'
+            ),
+            2,
+        )
+        self.assertEqual(
+            job.count('echo "Cargo tests: summary unavailable (log format changed)."'),
+            1,
+        )
+        self.assertEqual(
+            job.count(
+                'echo "Cargo doc-tests: summary unavailable (log format changed)."'
+            ),
+            1,
+        )
+        self.assertNotIn("last=$0", job)
 
     def test_ci_macos_consolidation_doc_records_measured_exact_head_sample(self) -> None:
         """Budget is measured; stale unmeasured claims must not return."""
