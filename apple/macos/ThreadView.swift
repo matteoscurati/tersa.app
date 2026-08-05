@@ -363,12 +363,16 @@ private struct SandboxedMailHTMLView: NSViewRepresentable {
             {
                 var result = html
                 result.insert(
-                    contentsOf: "<head>\(headInjection)</head>",
+                    contentsOf: "<head>" + headInjection + "</head>",
                     at: htmlClose.upperBound
                 )
                 return result
             }
-            return "<!DOCTYPE html><html><head>\(headInjection)</head><body>\(html)</body></html>"
+            return "<!DOCTYPE html><html><head>"
+                + headInjection
+                + "</head><body>"
+                + html
+                + "</body></html>"
         }
 
         func webView(
