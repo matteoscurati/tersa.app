@@ -168,7 +168,8 @@ plus the acceptance-protocol denial tests.
 PR 2f captures development-signed accessibility and sandbox evidence for
 iteration only. Such evidence can never count toward macOS UI acceptance,
 release acceptance, or the Phase 1 aggregate, which remain Developer-ID and
-notarization only.
+notarization only. The active capture procedure and status live in
+[macOS UI development evidence](../quality/macos-ui-dev-evidence.md).
 
 ## Non-claims
 

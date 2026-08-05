@@ -17,6 +17,9 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tersa-ui-evidence.XXXXXX")"
 SOURCE="$SCRATCH/source"
 RESOLVED_ENTITLEMENTS="$SCRATCH/resolved.entitlements.plist"
 EMBEDDED_ENTITLEMENTS="$SCRATCH/embedded.entitlements.plist"
+XPC="$APP/Contents/XPCServices/TersaMacTokenBroker.xpc"
+BROKER_RESOLVED_ENTITLEMENTS="$SCRATCH/resolved-broker.entitlements.plist"
+XPC_EMBEDDED_ENTITLEMENTS="$SCRATCH/xpc-embedded.entitlements.plist"
 TEAM_PROBE_SOURCE="$SCRATCH/tersa-team-probe.c"
 TEAM_PROBE="$SCRATCH/tersa-team-probe"
 SANDBOX_CANARY_APP="$SCRATCH/Tersa Sandbox Canary.app"
@@ -97,12 +100,43 @@ else
     TERSA_OAUTH_REDIRECT_SCHEME="${TERSA_OAUTH_REDIRECT_SCHEME:-app.tersa.oauth.development-evidence}"
 fi
 set -- "$@" CODE_SIGNING_ALLOWED=NO \
-  TERSA_MACOS_APP_GROUP="$TEAM_ID.app.tersa.shared"
+  TERSA_MACOS_APP_GROUP="$TEAM_ID.app.tersa.shared" \
+  TERSA_MACOS_TOKEN_GROUP="$TEAM_ID.app.tersa.token"
 xcodebuild "$@" build >/dev/null
 printf 'unsigned_build=ok\n'
 LC_ALL=C grep -aFq "$TEAM_ID.app.tersa.shared" "$APP/Contents/MacOS/Tersa" \
   || fail 'the Rust binary did not compile the team-prefixed App Group'
 printf 'compiled_application_group=matches signing team (identifier redacted)\n'
+
+section 'Nested XPC bundle inventory'
+# The reviewed embedding location must contain exactly the token broker XPC and
+# nothing else: a missing XPC leaves the deep verification defect in place,
+# while an additional unreviewed .xpc bundle would be signed sight unseen.
+[ -d "$APP/Contents/XPCServices" ] \
+  || fail 'nested signing: the reviewed Contents/XPCServices embedding location is missing'
+[ -d "$XPC" ] \
+  || fail 'nested signing: the expected embedded TersaMacTokenBroker.xpc is missing'
+XPC_COUNT=0
+for candidate in "$APP/Contents/XPCServices"/*.xpc; do
+  [ -d "$candidate" ] || continue
+  XPC_COUNT=$((XPC_COUNT + 1))
+  [ "$candidate" = "$XPC" ] \
+    || fail 'nested signing: an unreviewed additional .xpc bundle is embedded in the application'
+done
+[ "$XPC_COUNT" -eq 1 ] \
+  || fail 'nested signing: the application must embed exactly the reviewed TersaMacTokenBroker.xpc'
+XPC_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$XPC/Contents/Info.plist" 2>/dev/null)" \
+  || fail 'nested signing: the embedded XPC bundle identifier is unavailable'
+[ "$XPC_BUNDLE_ID" = 'app.tersa.mac.token-broker' ] \
+  || fail 'nested signing: the embedded XPC bundle identifier differs from the reviewed token broker'
+APP_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist" 2>/dev/null)" \
+  || fail 'the application bundle identifier is unavailable'
+[ "$APP_BUNDLE_ID" = 'app.tersa.mac' ] \
+  || fail 'the application bundle identifier differs from the reviewed identifier'
+printf 'embedded_xpc=exactly TersaMacTokenBroker.xpc at the reviewed location\n'
+LC_ALL=C grep -aFq "$TEAM_ID.app.tersa.token" "$XPC/Contents/MacOS/TersaMacTokenBroker" \
+  || fail 'the Rust token broker did not compile the team-prefixed token group'
+printf 'compiled_token_group=matches signing team (identifier redacted)\n'
 
 PROFILE_MATCH=''
 PROFILE_COUNT=0
@@ -117,10 +151,7 @@ for profile_dir in \
     profile_app_id="$(plutil -extract 'Entitlements.com\.apple\.application-identifier' raw "$SCRATCH/profile.plist" 2>/dev/null || true)"
     profile_expiry="$(plutil -extract ExpirationDate raw "$SCRATCH/profile.plist" 2>/dev/null || true)"
     [ "$profile_team" = "$TEAM_ID" ] || continue
-    case "$profile_app_id" in
-      "$TEAM_ID.*"|"$TEAM_ID.app.tersa.mac") ;;
-      *) continue ;;
-    esac
+    [ "$profile_app_id" = "$TEAM_ID.*" ] || continue
     python3 -c 'from datetime import datetime, timezone; import sys; assert datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")) > datetime.now(timezone.utc)' \
       "$profile_expiry" 2>/dev/null || continue
     PROFILE_MATCH="$profile"
@@ -129,16 +160,106 @@ for profile_dir in \
 done
 [ "$PROFILE_COUNT" -eq 1 ] \
   || fail 'capture requires exactly one current matching Mac Development profile'
+
+# The same development profile is embedded in the nested token broker, so it
+# must be the team wildcard that covers both bundle identifiers and the
+# dedicated token Keychain group. This validation only narrows the reviewed
+# match above; it never broadens it.
+security cms -D -i "$PROFILE_MATCH" >"$SCRATCH/profile.plist" 2>/dev/null \
+  || fail 'the selected provisioning profile could not be decoded'
+PROFILE_APPLICATION_ID="$(plutil -extract 'Entitlements.com\.apple\.application-identifier' raw "$SCRATCH/profile.plist" 2>/dev/null)" \
+  || fail 'the selected provisioning profile has no application identifier'
+[ "$PROFILE_APPLICATION_ID" = "$TEAM_ID.*" ] \
+  || fail 'nested signing: the profile application identifier is not the team wildcard covering both bundle identifiers'
+PROFILE_KEYCHAIN_WILDCARD=''
+profile_group_index=0
+while profile_group="$(plutil -extract "Entitlements.keychain-access-groups.$profile_group_index" raw "$SCRATCH/profile.plist" 2>/dev/null)"; do
+  if [ "$profile_group" = "$TEAM_ID.*" ]; then
+    PROFILE_KEYCHAIN_WILDCARD=present
+  fi
+  profile_group_index=$((profile_group_index + 1))
+done
+[ -n "$PROFILE_KEYCHAIN_WILDCARD" ] \
+  || fail 'nested signing: the profile Keychain groups lack the team wildcard covering the dedicated token group'
+
 cp "$PROFILE_MATCH" "$APP/Contents/embedded.provisionprofile"
 chmod 600 "$APP/Contents/embedded.provisionprofile"
+cp "$PROFILE_MATCH" "$XPC/Contents/embedded.provisionprofile"
+chmod 600 "$XPC/Contents/embedded.provisionprofile"
 
 sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
   "$SOURCE/apple/macos/TersaMac.entitlements" >"$RESOLVED_ENTITLEMENTS"
 plutil -lint "$RESOLVED_ENTITLEMENTS" >/dev/null
+# The broker keeps its dedicated three-key entitlement set resolved from the
+# committed file into scratch; the outer five-key set is never reused on it.
+sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
+  "$SOURCE/apple/macos-token-broker/TersaMacTokenBroker.entitlements" \
+  >"$BROKER_RESOLVED_ENTITLEMENTS"
+plutil -lint "$BROKER_RESOLVED_ENTITLEMENTS" >/dev/null
+UNRESOLVED_TEAM_PLACEHOLDER="\${TeamIdentifierPrefix}"
+if LC_ALL=C grep -qF "$UNRESOLVED_TEAM_PLACEHOLDER" "$BROKER_RESOLVED_ENTITLEMENTS"; then
+  fail 'nested signing: the resolved token-broker entitlements still contain the team placeholder'
+fi
+
+# Sign inside-out: the nested XPC first with its own entitlements, verified
+# strictly, then the outer app, verified deep and strict across the whole tree.
+codesign -s "$IDENTITY_HASH" --entitlements "$BROKER_RESOLVED_ENTITLEMENTS" \
+  --force --options runtime --timestamp=none "$XPC" >/dev/null 2>&1 \
+  || fail 'nested signing: the embedded XPC could not be Apple Development signed'
+codesign --verify --deep --strict "$XPC" >/dev/null 2>&1 \
+  || fail 'nested signing: strict code-signature verification failed for the embedded XPC'
+
+XPC_SIGNATURE="$(codesign -dv --verbose=4 "$XPC" 2>&1)" \
+  || fail 'nested signing: XPC code-signature inspection failed'
+printf '%s\n' "$XPC_SIGNATURE" | grep -q '^Authority=Apple Development:' \
+  || fail 'nested signing: the embedded XPC is not signed by Apple Development'
+printf '%s\n' "$XPC_SIGNATURE" | grep -q "^TeamIdentifier=$TEAM_ID$" \
+  || fail 'nested signing: the embedded XPC signature has the wrong team identifier'
+printf '%s\n' "$XPC_SIGNATURE" | grep -qE '^CodeDirectory .*flags=.*runtime' \
+  || fail 'nested signing: the embedded XPC is missing Hardened Runtime'
+
+codesign -d --entitlements :- --xml "$XPC" >"$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null \
+  || fail 'nested signing: the embedded XPC entitlements could not be read'
+plutil -lint "$XPC_EMBEDDED_ENTITLEMENTS" >/dev/null
+XPC_ENTITLEMENTS_OUT="$(plutil -p "$XPC_EMBEDDED_ENTITLEMENTS")" \
+  || fail 'nested signing: the embedded XPC entitlements could not be rendered'
+XPC_TOP_LEVEL_KEYS="$(printf '%s\n' "$XPC_ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>' || true)"
+[ "$XPC_TOP_LEVEL_KEYS" -eq 3 ] \
+  || fail 'nested signing: the embedded XPC entitlement count differs from the reviewed three-key set'
+[ "$(plutil -extract 'com\.apple\.security\.app-sandbox' raw "$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null)" = 'true' ] \
+  || fail 'nested signing: the embedded XPC app-sandbox entitlement is not boolean true'
+[ "$(plutil -extract 'com\.apple\.security\.network\.client' raw "$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null)" = 'true' ] \
+  || fail 'nested signing: the embedded XPC network.client entitlement is not boolean true'
+printf '%s\n' "$XPC_ENTITLEMENTS_OUT" \
+  | grep -qE '^  "keychain-access-groups" => \[$' \
+  || fail 'nested signing: the embedded XPC Keychain groups entitlement is not an array'
+XPC_KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null)" \
+  || fail 'nested signing: the embedded XPC Keychain group is unavailable'
+[ "$XPC_KEYCHAIN_GROUP" = "$TEAM_ID.app.tersa.token" ] \
+  || fail 'nested signing: the embedded XPC Keychain group is not the dedicated team-prefixed app.tersa.token'
+if plutil -extract keychain-access-groups.1 raw "$XPC_EMBEDDED_ENTITLEMENTS" >/dev/null 2>&1; then
+  fail 'nested signing: the embedded XPC declares more than its single dedicated Keychain group'
+fi
+for forbidden in \
+  'com.apple.security.application-groups' 'com.apple.security.network.server' \
+  'com.apple.security.get-task-allow' 'com.apple.security.cs.debugger' \
+  'com.apple.security.cs.disable-library-validation' \
+  'com.apple.security.cs.allow-dyld-environment-variables'; do
+  if printf '%s\n' "$XPC_ENTITLEMENTS_OUT" | grep -qF "\"$forbidden\""; then
+    fail "nested signing: the embedded XPC declares forbidden capability: $forbidden"
+  fi
+done
+printf 'xpc_signature=valid Apple Development (authority and team redacted)\n'
+printf 'xpc_hardened_runtime=present\n'
+printf 'xpc_embedded_profile=same current Mac Development profile (identifier redacted)\n'
+printf 'xpc_entitlements=exact reviewed three-key set\n'
+printf 'xpc_keychain_group=[TEAM_REDACTED].app.tersa.token\n'
+
 codesign -s "$IDENTITY_HASH" --entitlements "$RESOLVED_ENTITLEMENTS" \
-  --force --options runtime --timestamp=none "$APP" >/dev/null 2>&1
+  --force --options runtime --timestamp=none "$APP" >/dev/null 2>&1 \
+  || fail 'outer signing: the application could not be Apple Development signed'
 codesign --verify --deep --strict "$APP" >/dev/null 2>&1 \
-  || fail 'strict code-signature verification failed'
+  || fail 'outer signing: strict code-signature verification failed for the whole application'
 
 SIGNATURE="$(codesign -dv --verbose=4 "$APP" 2>&1)" \
   || fail 'code-signature inspection failed'
@@ -152,10 +273,12 @@ printf 'signature=valid Apple Development (authority and team redacted)\n'
 printf 'hardened_runtime=present\n'
 printf 'embedded_profile=present current Mac Development (identifier redacted)\n'
 
-codesign -d --entitlements :- --xml "$APP" >"$EMBEDDED_ENTITLEMENTS" 2>/dev/null
+codesign -d --entitlements :- --xml "$APP" >"$EMBEDDED_ENTITLEMENTS" 2>/dev/null \
+  || fail 'the application entitlements could not be read'
 plutil -lint "$EMBEDDED_ENTITLEMENTS" >/dev/null
-ENTITLEMENTS_OUT="$(plutil -p "$EMBEDDED_ENTITLEMENTS")"
-TOP_LEVEL_KEYS="$(printf '%s\n' "$ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>')"
+ENTITLEMENTS_OUT="$(plutil -p "$EMBEDDED_ENTITLEMENTS")" \
+  || fail 'the application entitlements could not be rendered'
+TOP_LEVEL_KEYS="$(printf '%s\n' "$ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>' || true)"
 [ "$TOP_LEVEL_KEYS" -eq 5 ] \
   || fail 'the embedded entitlement count differs from the reviewed five-key set'
 for key in \
@@ -165,8 +288,10 @@ for key in \
   printf '%s\n' "$ENTITLEMENTS_OUT" | grep -qE "^  \"$key\" =>" \
     || fail "reviewed entitlement missing: $key"
 done
-APP_GROUP="$(plutil -extract 'com\.apple\.security\.application-groups.0' raw "$EMBEDDED_ENTITLEMENTS")"
-KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$EMBEDDED_ENTITLEMENTS")"
+APP_GROUP="$(plutil -extract 'com\.apple\.security\.application-groups.0' raw "$EMBEDDED_ENTITLEMENTS")" \
+  || fail 'the embedded application group is unavailable'
+KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$EMBEDDED_ENTITLEMENTS")" \
+  || fail 'the embedded Keychain group is unavailable'
 [ "$APP_GROUP" = "$TEAM_ID.app.tersa.shared" ] \
   || fail 'the embedded application group is not team-prefixed app.tersa.shared'
 [ "$KEYCHAIN_GROUP" = "$TEAM_ID.app.tersa.shared" ] \
