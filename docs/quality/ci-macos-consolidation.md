@@ -13,9 +13,9 @@ parallel Apple macOS test / iOS simulator build) removes measured cold-start
 and serial overhead without dropping checks. The acceptance budgets below were
 met by one exact-head full-fanout sample (see
 [Exact-head sample (measured)](#exact-head-sample-measured)). That sample is
-not a long-run statistical guarantee: aggregate macOS headroom was only three
-seconds under the 220-second budget. Re-measure with the procedure below after
-material workflow or runner changes.
+not a long-run statistical guarantee: aggregate macOS headroom was eight
+seconds under the 220-second budget, and runner variance can still breach it.
+Re-measure with the procedure below after material workflow or runner changes.
 
 ## Baseline (pre-consolidation)
 
@@ -39,23 +39,29 @@ Representative full-fanout pull request **#106**, GitHub Actions run
 ## Exact-head sample (measured)
 
 One passing exact-head full-fanout sample from GitHub Actions run
-**30997714456** at head
-`9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69` (all six visible jobs green):
+**31001855133** at head
+`a0c8a91f7f3606ef4139bd84005e3f8894694e98` (all six visible jobs green):
 
 | Metric | Value |
 | --- | --- |
-| Head commit | `9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69` |
-| Wall-clock | 132 seconds |
+| Head commit | `a0c8a91f7f3606ef4139bd84005e3f8894694e98` |
+| Wall-clock | 127 seconds |
 | `Apple product` job duration | 101 seconds |
-| `macOS quality` job duration | 116 seconds |
-| Aggregate macOS job seconds | 217 |
+| `macOS quality` job duration | 111 seconds |
+| Aggregate macOS job seconds | 212 |
 | Concurrent macOS jobs | exactly 2 |
 | Visible jobs | exactly 6 (all green) |
-| Aggregate macOS headroom vs 220 s | 3 seconds |
+| Aggregate macOS headroom vs 220 s | 8 seconds |
 
-This is a single sample, not a multi-run distribution. The three-second
-aggregate headroom means small runner or suite regressions can breach the
-budget; re-run the measurement procedure after material changes.
+The sample head is the exact commit whose tree contains the shipped executable
+workflow bytes measured by that run. The later commit that records this sample
+changes only this quality document and the static documentation-contract
+assertions that pin it; it does not change workflow bytes, job topology,
+commands, or macOS workload. No future commit hash is claimed here.
+
+This is a single sample, not a multi-run distribution. The eight-second
+aggregate headroom means runner variance or small suite regressions can still
+breach the budget; re-run the measurement procedure after material changes.
 
 ## Coverage matrix and ownership
 

@@ -1711,18 +1711,28 @@ class ChangeScopeTests(unittest.TestCase):
         doc = (ROOT / "docs" / "quality" / "ci-macos-consolidation.md").read_text(
             encoding="utf-8"
         )
-        # Exact-head sample evidence from Actions run 30997714456.
-        self.assertIn("30997714456", doc)
-        self.assertIn("9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69", doc)
-        self.assertIn("132 seconds", doc)
+        # Exact-head sample evidence from Actions run 31001855133.
+        self.assertIn("31001855133", doc)
+        self.assertIn("a0c8a91f7f3606ef4139bd84005e3f8894694e98", doc)
+        self.assertIn("127 seconds", doc)
         self.assertIn("101 seconds", doc)
-        self.assertIn("116 seconds", doc)
-        self.assertIn("217", doc)
+        self.assertIn("111 seconds", doc)
+        self.assertIn("212", doc)
         self.assertIn("exactly 2", doc)
         self.assertIn("exactly 6", doc)
-        self.assertIn("3 seconds", doc)
+        self.assertIn("8 seconds", doc)
         self.assertIn("Exact-head sample (measured)", doc)
         self.assertIn("Exact-head measurement procedure", doc)
+        # Superseded normative sample (run 30997714456) must not remain.
+        for superseded in (
+            "30997714456",
+            "9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69",
+            "132 seconds",
+            "116 seconds",
+            "3 seconds",
+        ):
+            with self.subTest(superseded=superseded):
+                self.assertNotIn(superseded, doc)
         # Stale "unmeasured" budget claims must not return.
         for stale in (
             "does **not** claim that the\nacceptance budget has been measured",
