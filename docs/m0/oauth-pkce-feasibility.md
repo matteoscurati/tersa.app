@@ -27,11 +27,14 @@ requires.
 
 ## Evidence boundary
 
-CI uses a public non-functional client identifier, a public test callback
-scheme, and deterministic fake callbacks. It builds the macOS, iOS device, and
-iOS simulator targets, verifies exported bridge symbols and Info.plist values,
-and executes an ad-hoc-signed macOS sandbox probe that needs both inbound and
-outbound loopback networking.
+Current product CI covers the unsigned macOS test, iOS simulator build, and
+bridge-symbol verification. The combined local verifier
+`sh apple/scripts/verify-oauth-feasibility.sh` is stale since the ADR-0024
+token-broker cutover: it still expects `TersaOAuthClientID` and
+`_tersa_oauth_macos_begin` in TersaMac, and archive inputs that product CI no
+longer produces. Do not use it as a current evidence route. Some of its iOS
+assertions may still describe valid product facts, but the combined verifier is
+obsolete as a whole; PR5 will delete it.
 
 On 2026-08-01, Step 3f exercised a Release/arm64 build signed with an Apple
 Development identity and the full committed production entitlements. The

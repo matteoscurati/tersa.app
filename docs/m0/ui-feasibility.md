@@ -54,17 +54,21 @@ Both URLs use the prefix
 
 Target-specific third-party notices are generated from the locked diagnostic
 runtime graph with `cargo-about` 0.9.1. CI regenerates them offline and compares
-them byte-for-byte with the resources packaged by Xcode.
+them byte-for-byte with the committed sources under `apple/licenses`.
 
-CI treats screenshots as evidence only when Vision OCR finds the product marker
-and visible diagnostic rows. The exact 10,000-row label is also required in each
-packaged binary and in the unobstructed macOS screenshot. This split keeps iOS
-evidence valid when a first-boot system card covers the app header without
-weakening the packaged row-budget assertion. Missing or blank evidence fails
-the job and artifact upload.
+Local screenshot and simulator launch evidence is captured with
+`sh apple/scripts/capture-slint-evidence.sh`. That local-only path compares
+packaged Xcode notice resources and treats screenshots as evidence only when
+Vision OCR finds the product marker and visible diagnostic rows. The exact
+10,000-row label is also required in each packaged binary and in the
+unobstructed macOS screenshot. This split keeps iOS evidence valid when a
+first-boot system card covers the app header without weakening the packaged
+row-budget assertion. Missing or blank evidence fails the local capture. It is
+not merge-blocking CI and does not upload artifacts.
 
 The local CoreSimulator runtime could not be exercised because the installed
-framework is 1051.54 while Xcode 26.6 requires 1051.55. CI owns the simulator
-runtime evidence. Launch metrics in the CI artifact measure time until the
-process or simulator launch command is observed; they are diagnostics, not
-time-to-interactive performance claims.
+framework is 1051.54 while Xcode 26.6 requires 1051.55. When the runtime is
+available, the same local capture script owns simulator runtime evidence.
+Launch metrics from that capture measure time until the process or simulator
+launch command is observed; they are diagnostics, not time-to-interactive
+performance claims.

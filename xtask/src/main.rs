@@ -5252,7 +5252,7 @@ fn project_generation_surface_violations(
         );
     }
     for (path, document, minimum_wrapper_calls) in [
-        (".github/workflows/ci.yml", ci, 3),
+        (".github/workflows/ci.yml", ci, 1),
         ("docs/development.md", development, 1),
         (
             "apple/scripts/capture-dioxus-device-evidence.sh",
@@ -15121,15 +15121,13 @@ targets:
     #[test]
     fn project_generation_must_use_the_exact_no_env_wrapper() {
         let wrapper = project_generation_wrapper();
-        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let ci = "sh apple/scripts/generate-project.sh\n";
         let consumer = "sh apple/scripts/generate-project.sh\n";
-        assert!(
-            project_generation_surface_violations(&wrapper, &ci, consumer, consumer).is_empty()
-        );
+        assert!(project_generation_surface_violations(&wrapper, ci, consumer, consumer).is_empty());
 
         let missing_no_env = wrapper.replace(" --no-env", "");
         assert!(
-            project_generation_surface_violations(&missing_no_env, &ci, consumer, consumer)
+            project_generation_surface_violations(&missing_no_env, ci, consumer, consumer)
                 .iter()
                 .any(|violation| violation.contains("exact reviewed --no-env wrapper"))
         );
@@ -15138,15 +15136,20 @@ targets:
             " generate --spec apple/project.yml --project apple\n"
         );
         assert!(
-            project_generation_surface_violations(&wrapper, &(ci + direct), consumer, consumer,)
-                .iter()
-                .any(|violation| violation.contains("must not bypass"))
+            project_generation_surface_violations(
+                &wrapper,
+                &(ci.to_owned() + direct),
+                consumer,
+                consumer,
+            )
+            .iter()
+            .any(|violation| violation.contains("must not bypass"))
         );
         let root_form = "xcodegen --spec apple/project.yml --project apple\n";
         assert!(
             project_generation_surface_violations(
                 &wrapper,
-                &format!("{consumer}{consumer}{consumer}{root_form}"),
+                &format!("{ci}{root_form}"),
                 consumer,
                 consumer,
             )

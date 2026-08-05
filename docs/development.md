@@ -21,23 +21,28 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
-Run the M0 product-gate validator separately before that Rust-only command:
+The xtask architecture check is the enforcement point for direct and transitive
+diagnostic-only Slint and Dioxus dependency isolation on every supported Apple
+target; `cargo deny` alone cannot establish that runtime boundary.
+
+While the frozen M0 gate register remains tracked, keep the product-gate
+validator and its self-test available:
 
 ```sh
 python3 scripts/verify-m0-gates.py
 python3 scripts/verify-m0-gates.py --self-test
 ```
 
-CI runs the validator in its policy job. It remains separate from
-`cargo xtask verify` because the register is a documentation-policy artifact.
-The xtask architecture check is the enforcement point for direct and transitive
-diagnostic-only Slint and Dioxus dependency isolation on every supported Apple
-target; `cargo deny` alone cannot establish that runtime boundary.
-
-The validator self-test is mandatory in CI. Adding a gate, changing a minimum
-evidence tier, or changing the attestation schema requires a matching validator
-update and independent exact-head review; editing the JSON alone fails closed.
-For physical-device or signed-distribution evidence, follow the
+CI runs `python3 scripts/verify-m0-gates.py --self-test` in the lightweight
+change-scope job. That mode performs full register validation plus negative
+mutation self-tests; the policy job does not own it. Contributors should run
+the same `--self-test` command locally before `cargo xtask verify`. The
+validator is not an active product lane; it stays only while the register is
+still in tree and retires with that register in the documentation PR. Adding a
+gate, changing a minimum evidence tier, or changing the attestation schema
+still requires a matching validator update and independent exact-head review;
+editing the JSON alone fails closed. For physical-device or signed-distribution
+evidence, follow the
 [physical-device and distribution protocol](m0/physical-device-and-distribution-protocol.md),
 including its commit-bound locator and review-retention rules.
 
@@ -45,39 +50,35 @@ including its commit-bound locator and review-retention rules.
 
 Open implementation pull requests as drafts. Draft creation and synchronization
 schedule no CI runners; changing the pull request to ready-for-review triggers
-the required path-scoped lane. Subsequent ready pull-request commits supersede
-an older in-progress run through the per-PR concurrency group. Every ready pull
-request runs only the lightweight classifier, its deterministic control-script
-tests, DCO validation, and the final gate. Documentation, workflow, and exact
-self-tested CI-control changes stop there, so their required run normally
+the required path-scoped product CI. Subsequent ready pull-request commits
+supersede an older in-progress run through the per-PR concurrency group. Every
+ready pull request runs the lightweight classifier job (deterministic
+control-script tests, retained-helper self-tests, DCO validation, and change
+scope), then only the path-scoped active lanes that apply, and finally the
+required `CI gate`. Documentation, workflow, and exact self-tested CI-control
+changes stop at the classifier and gate, so their required run normally
 finishes in seconds.
+
+The five path-scoped active lanes are:
+
+- Rust (Linux)
+- Rust (macOS)
+- Policy and supply chain
+- Apple product
+- Third-party notices
 
 Portable Rust or xtask changes add Linux Rust verification and supply-chain
 policy. macOS Rust verification is reserved for platform, adapter, Apple bridge,
-and macOS CLI paths. Apple product paths add the real macOS and iOS-simulator
-build; that build also covers the Rust linked into the application. Root
-manifests, shared build inputs, and unknown paths still fail closed to the full
-baseline. The Apple PR gate builds macOS and the iOS simulator once. Device
-builds, archives, and OAuth feasibility capture belong to explicit evidence
-runs, not the required PR path.
+and macOS CLI paths. Apple product paths add the real macOS test and
+iOS-simulator build; that build also covers the Rust linked into the
+application. Root manifests, shared build inputs, and unknown paths still fail
+closed to the full active baseline.
 
-Merging does not repeat the already-required checks on a `main` push. Merge
-queue runs retain the conservative fast gate. Diagnostic Slint, Dioxus,
-SQLCipher, search, MIME, fuzz, blob, and OAuth evidence runs only through an
-explicit `workflow_dispatch` selection. Use `all` at release or at an
-architecture evidence checkpoint, and select one suite while investigating a
-specific diagnostic. Successful manual evidence remains bound to the selected
-immutable commit and retains the unchanged 90-day protocol lifetime at maximum
-artifact compression. Evidence bind and upload steps are not scheduled after an
-earlier failure or after run cancellation has already begun. If cancellation
-occurs after an upload has started, GitHub Actions does not retroactively delete
-that artifact. GitHub Actions cache restore and save are disabled for every job
-and event, including manual evidence runs. Every run therefore starts without a
-repository cache and cannot recreate the deleted cache inventory. Manual runs
-publish
-`Manual evidence gate`, never the branch-protected `CI gate`, so a narrow
-evidence selection cannot substitute for the real pull-request scope or DCO
-check.
+Merge-group runs fan out conservatively across every active product lane for the
+combined state. There is no `main` push workflow and no manual evidence-suite
+dispatch path. GitHub Actions cache restore and save are disabled for every job
+and event, so each run starts without a repository cache. CI uploads no
+diagnostic artifacts.
 
 The repository is public and uses only standard GitHub-hosted runners, so runner
 execution has no billable minute charge. The policy above still minimizes queue
@@ -86,27 +87,11 @@ time, redundant macOS capacity, and artifact growth.
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
 build paths fan out conservatively, while documentation, workflow, and exact
 self-tested control paths avoid build jobs. xtask-only changes run the portable
-Linux and policy baseline but avoid Apple evidence. The classifier and its own
-tests are an exact control-path allowlist exercised inside the scope job; every
-other unknown `scripts/` path still fans out. Its table-driven tests must change
-with every new scope rule. A single suite can be reproduced without running
-unrelated evidence:
-
-```sh
-gh workflow run CI --ref <commit-or-branch> -f evidence_suite=dioxus
-```
-
-Run the full retained evidence set for a release candidate with:
-
-```sh
-gh workflow run CI --ref <immutable-commit> -f evidence_suite=all
-```
-
-The supported suite names are `all`, `product`, `slint`, `dioxus`, `sqlcipher`,
-`search`, `mime`, `mime-fuzz`, `blob`, and `notices`. A dedicated macOS lane owns
-the single target-specific notice regeneration whenever the selected scope
-requires it; diagnostic jobs still compare the committed notice resources in
-their packaged products.
+Linux and policy baseline but avoid Apple product work. The classifier and its
+own tests are an exact control-path allowlist exercised inside the scope job;
+every other unknown `scripts/` path still fans out. Its table-driven tests must
+change with every new scope rule. A dedicated macOS lane owns the single
+target-specific notice regeneration whenever the selected scope requires it.
 
 ## Dependency changes
 
@@ -135,24 +120,24 @@ xcodebuild ... \
   TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.ci
 ```
 
-After creating the unsigned base archives, run:
+The combined local verifier `sh apple/scripts/verify-oauth-feasibility.sh` is
+obsolete after the ADR-0024 token-broker cutover: it still expects
+`TersaOAuthClientID` and `_tersa_oauth_macos_begin` in TersaMac plus retired
+archive inputs that product CI no longer produces. Do not use it as a current
+local route; PR5 will remove it. Its historical scope covered archived symbols
+and injected Info.plist values, ad-hoc signing of a macOS archive copy with the
+exact five-key production entitlement shape for static signing evidence, and a
+separately signed runnable loopback probe limited to App Sandbox plus network
+client and server entitlements: an ad-hoc identity cannot authorize the
+production team-bound Keychain access group, so that probe proved only the
+OAuth sandbox networking subset. Signed same-team Keychain interoperability
+remains a later distribution gate. Neither current product CI nor local
+verification covers that obsolete combined macOS OAuth surface.
 
-```sh
-sh apple/scripts/verify-oauth-feasibility.sh
-```
-
-The verifier checks archived symbols and injected Info.plist values, ad-hoc
-signs a copy of the macOS archive with the exact five-key production
-entitlement shape, and captures that static signing evidence. It separately
-signs the runnable loopback probe with only App Sandbox plus network client and
-server entitlements: an ad-hoc identity cannot authorize the production
-team-bound Keychain access group. The runnable probe therefore proves only the
-OAuth sandbox networking subset; signed same-team Keychain interoperability is
-a later distribution gate. Rust tests exercise the deterministic callback,
-negative state machine, bounded HTTP parser, static responses,
-speculative-connection recovery, absolute read deadline, and one-shot valid
-callback. No evidence file contains state, verifier, authorization code, token,
-or authorization URL.
+Rust tests exercise the deterministic callback, negative state machine, bounded
+HTTP parser, static responses, speculative-connection recovery, absolute read
+deadline, and one-shot valid callback. No evidence file contains state,
+verifier, authorization code, token, or authorization URL.
 
 The loopback peer check is not browser authentication. Any local process can
 connect to a loopback port; unpredictable OAuth state and PKCE are the defenses
@@ -269,11 +254,11 @@ cargo run --locked --release --package tersa-search-spike \
   --target aarch64-apple-darwin -- --profile manual
 ```
 
-The CI profile uses 10,000 synthetic messages and at least 128 MiB of normalized
-text. The optional manual host profile uses 100,000 messages and at least 2 GiB
-of normalized text; it can consume substantial time and disk. Every host result
-is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only that the
-locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
+The default host profile uses 10,000 synthetic messages and at least 128 MiB of
+normalized text. The optional manual host profile uses 100,000 messages and at
+least 2 GiB of normalized text; it can consume substantial time and disk. Every
+host result is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only
+that the locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
 production performance. Only the physical-device M0 run can close the iPhone
 gate.
 
@@ -306,6 +291,8 @@ rustup toolchain install nightly-2026-07-14 --profile minimal \
   --component clippy --component rust-src --component rustfmt
 cargo install cargo-fuzz --version 0.13.2 --locked
 sh scripts/verify-mime-fuzz.sh
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 cargo deny --locked --manifest-path fuzz/Cargo.toml \
   --config fuzz/deny.toml check
 cargo audit --file fuzz/Cargo.lock --deny warnings
@@ -420,8 +407,12 @@ ignored with all local Apple build products.
 
 The Rust bridge, both UI spikes, and the MIME diagnostic are root workspace
 members and are therefore covered by `cargo xtask verify` and the repository
-supply-chain checks. The standalone fuzz project is deliberately excluded and
-checked through its own locked verifier and deny policy. Only the Apple
+supply-chain checks. The standalone fuzz project is deliberately excluded.
+Local `sh scripts/verify-mime-fuzz.sh` covers only the finite fuzz path; its
+formatting, Clippy/lint, license, source, and advisory policies are not
+automated after diagnostic CI retirement and remain unchecked pending PR4
+removal. Root workspace policy still rejects fuzz dependencies entering the
+workspace graph. Only the Apple
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`
@@ -449,8 +440,9 @@ python3 apple/scripts/verify-dioxus-runtime.py
 The Dioxus verifier pins the exact 0.7.9 graph, rejects Manganis and devtools,
 allows only the required `tokio_runtime` feature, and checks the private
 WebSocket's loopback bind and mutual-key invariants in the resolved source. The
-shared macOS notice gate regenerates the Apple-target notices, while the
-separate Apple evidence job checks live listeners with `lsof`. Notice
+shared macOS notice gate regenerates the Apple-target notices. The live-listener
+check with `lsof` is local-only through
+`sh apple/scripts/capture-dioxus-evidence.sh`; no CI job performs it. Notice
 comparison stays on macOS because
 `cargo-about` 0.9.1 is not byte-stable for Apple target selection across host
 operating systems. This is diagnostic evidence, not a product backend or App

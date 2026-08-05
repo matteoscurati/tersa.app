@@ -3,7 +3,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Create a redacted, commit-bound manifest for a CI evidence directory."""
+"""Create a redacted, commit-bound manifest for a local evidence directory."""
 
 from __future__ import annotations
 

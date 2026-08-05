@@ -93,24 +93,28 @@ or application setting.
 ## Evidence contract
 
 The shared macOS notice gate first regenerates and compares target-specific
-third-party notices. The dedicated `mime-apple-evidence` CI job then:
+third-party notices. MIME Apple diagnostic evidence is local-only through
+`sh apple/scripts/verify-mime-feasibility.sh`. After the locked portable
+cross-builds and macOS archive exist, that script:
 
-1. cross-builds the locked portable diagnostic for macOS, iOS device, and iOS
-   simulator;
-2. archives the native macOS and iOS targets and builds the simulator target;
-3. exports current Rust sanitizer output into the macOS app resource;
-4. checks signed entitlements, the exact diagnostic-only ATS exception, in-app
+1. exports current Rust sanitizer output into the macOS app resource;
+2. checks signed entitlements, the exact diagnostic-only ATS exception, in-app
    transport-control behavior, listeners, native policy flags, action,
    response, and new-window denial, independently derived output hashes, and
    website data;
-5. uploads only aggregate text and JSON evidence.
+3. writes only aggregate text and JSON evidence locally.
 
-The separate `mime-parser-fuzz` Linux job installs the exact nightly and fuzz
-driver, validates the independent fuzz lock against its isolated license,
-source, and advisory policy, replays every seed, performs the fixed finite fuzz
-run, binds aggregate evidence to the immutable source commit, and retains it
-for 90 days. It does not modify application notices or the shipping dependency
-graph.
+It is not merge-blocking CI and does not upload retained artifacts.
+
+MIME parser fuzz evidence is local-only through `sh scripts/verify-mime-fuzz.sh`
+once the pinned nightly and fuzz driver are installed. That script pins the
+nightly toolchain and cargo-fuzz version, verifies seed count and checksums,
+detects lock mutation, builds the fuzz target, replays every seed, and performs
+the fixed finite fuzz run. It does not validate fuzz formatting, Clippy/lint,
+license, source, or advisory policy. After diagnostic CI retirement, those
+checks are not automated and remain unchecked pending PR4 removal. The script
+does not modify application notices or the shipping dependency graph, and it
+is not merge-blocking CI.
 
 No token, message content, hostile fixture, URL, filesystem path, or raw WebKit
 log is an evidence artifact.

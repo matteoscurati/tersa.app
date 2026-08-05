@@ -51,7 +51,8 @@ The classifier writes exactly one of these outcomes for each probe:
 - `BLANK_AFTER_DENIAL`: the exact denial log is present and final OCR contains
   neither stable core UI marker.
 
-Either enumerated outcome exits successfully so CI can retain evidence. Missing
+Either enumerated outcome exits successfully so the local capture path can
+write evidence; CI does not retain or upload that evidence. Missing
 ARMED, a missing exact denial log, premature process exit, a non-loopback
 listener, or ambiguous final OCR exits nonzero. A blank result is evidence, not
 a success claim. The final screenshot and OCR are captured only after the exact
