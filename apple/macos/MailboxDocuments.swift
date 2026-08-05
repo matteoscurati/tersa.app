@@ -6,8 +6,8 @@ import Foundation
 
 /// One message row in the bridge wire shape.
 ///
-/// Includes provider `preview` and optional offline `bodyText` when a complete
-/// cached message is available.
+/// Includes provider `preview` and optional offline `bodyText` / `bodyHtml`
+/// when a complete cached message is available.
 struct MessageRow: Decodable, Identifiable, Equatable {
     let messageId: String
     let threadId: String
@@ -15,6 +15,7 @@ struct MessageRow: Decodable, Identifiable, Equatable {
     let subject: String
     let preview: String
     let bodyText: String?
+    let bodyHtml: String?
     let receivedAtMillis: Int64
     let unread: Bool
 
@@ -27,12 +28,20 @@ struct MessageRow: Decodable, Identifiable, Equatable {
         Date(timeIntervalSince1970: TimeInterval(receivedAtMillis) / 1_000)
     }
 
-    /// Preferred display body: full cached text when present, else the preview.
+    /// Preferred plain display body: full cached text when present, else preview.
     var displayBody: String {
         if let bodyText, !bodyText.isEmpty {
             return bodyText
         }
         return preview
+    }
+
+    var hasPlainBody: Bool {
+        !(bodyText ?? "").isEmpty || !preview.isEmpty
+    }
+
+    var hasHtmlBody: Bool {
+        !(bodyHtml ?? "").isEmpty
     }
 
     enum CodingKeys: String, CodingKey {
@@ -42,6 +51,7 @@ struct MessageRow: Decodable, Identifiable, Equatable {
         case subject
         case preview
         case bodyText = "body_text"
+        case bodyHtml = "body_html"
         case receivedAtMillis = "received_at_millis"
         case unread
     }

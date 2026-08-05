@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import SwiftUI
+import WebKit
 
 /// One thread over the 2b read C ABI, opened from the inbox or search results.
 /// Exercised only once the store holds data; the loading, empty, and failure
@@ -138,10 +139,18 @@ struct ThreadView: View {
     }
 }
 
-/// Expanded message card: sender, subject, date, and offline body/preview text.
+/// Expanded message card: sender, subject, date, and offline body with plain/HTML toggle.
 @MainActor
 private struct ThreadMessageDetailView: View {
+    enum BodyMode: String, CaseIterable, Identifiable {
+        case plain = "Plain text"
+        case html = "HTML"
+
+        var id: String { rawValue }
+    }
+
     let row: MessageRow
+    @State private var bodyMode: BodyMode = .plain
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -163,16 +172,70 @@ private struct ThreadMessageDetailView: View {
             Text(row.subject)
                 .font(.title3)
                 .fontWeight(.semibold)
+            if row.hasHtmlBody {
+                Picker("Body format", selection: $bodyMode) {
+                    ForEach(availableModes) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 280)
+                .accessibilityLabel("Body format")
+            }
             Divider()
+            bodyContent
+        }
+        .padding(.vertical, 10)
+        .onAppear {
+            // Prefer plain when both exist; fall back to HTML-only messages.
+            if !row.hasPlainBody, row.hasHtmlBody {
+                bodyMode = .html
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var availableModes: [BodyMode] {
+        var modes: [BodyMode] = []
+        if row.hasPlainBody {
+            modes.append(.plain)
+        }
+        if row.hasHtmlBody {
+            modes.append(.html)
+        }
+        if modes.isEmpty {
+            modes.append(.plain)
+        }
+        return modes
+    }
+
+    @ViewBuilder
+    private var bodyContent: some View {
+        switch bodyMode {
+        case .plain:
             Text(row.displayBody.isEmpty ? "No message body is available offline." : row.displayBody)
                 .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .foregroundStyle(row.displayBody.isEmpty ? .secondary : .primary)
+        case .html:
+            if let html = row.bodyHtml, !html.isEmpty {
+                SandboxedMailHTMLView(html: html)
+                    .frame(minHeight: 240, maxHeight: 480)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.25))
+                    )
+                    .accessibilityLabel("HTML message body")
+            } else {
+                Text("No HTML body is available offline.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
         }
-        .padding(.vertical, 10)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
     }
 
     private var accessibilityLabel: String {
@@ -180,7 +243,105 @@ private struct ThreadMessageDetailView: View {
         let dateText = row.receivedDate.formatted(
             .dateTime.month(.abbreviated).day().hour().minute()
         )
-        let body = row.displayBody.isEmpty ? "No message body is available offline" : row.displayBody
+        let body: String
+        switch bodyMode {
+        case .plain:
+            body = row.displayBody.isEmpty ? "No message body is available offline" : row.displayBody
+        case .html:
+            body = row.hasHtmlBody ? "HTML message body" : "No HTML body is available offline"
+        }
         return unreadText + row.from + ", " + row.subject + ", " + dateText + ", " + body
+    }
+}
+
+/// Renders offline HTML mail in a fail-closed WKWebView: no JavaScript, no
+/// navigation away from the document, and content-rule blocking of remote loads.
+@MainActor
+private struct SandboxedMailHTMLView: NSViewRepresentable {
+    let html: String
+
+    func makeNSView(context: Context) -> WKWebView {
+        let preferences = WKWebpagePreferences()
+        preferences.allowsContentJavaScript = false
+
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences = preferences
+        configuration.preferences.isElementFullscreenEnabled = false
+        configuration.websiteDataStore = .nonPersistent()
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = context.coordinator
+        webView.setValue(false, forKey: "drawsBackground")
+        context.coordinator.installContentBlocker(on: webView)
+        context.coordinator.load(html: html, in: webView)
+        return webView
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.load(html: html, in: webView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        private var lastHTML: String?
+        private var contentRuleList: WKContentRuleList?
+
+        func installContentBlocker(on webView: WKWebView) {
+            // Block all subresource/network fetches; the document itself is loaded
+            // from a string with a nil base URL.
+            let rules = """
+            [{
+              "trigger": { "url-filter": ".*" },
+              "action": { "type": "block" }
+            }]
+            """
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "tersa.mail.html.offline.block-all",
+                encodedContentRuleList: rules
+            ) { [weak self, weak webView] list, _ in
+                guard let list, let webView else { return }
+                self?.contentRuleList = list
+                webView.configuration.userContentController.add(list)
+            }
+        }
+
+        func load(html: String, in webView: WKWebView) {
+            guard lastHTML != html else { return }
+            lastHTML = html
+            // nil baseURL prevents relative network resolution from a local origin.
+            webView.loadHTMLString(html, baseURL: nil)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            // Allow only the initial string document load. Cancel link clicks and
+            // any navigation to a remote/local URL.
+            if navigationAction.navigationType == .other {
+                decisionHandler(.allow)
+                return
+            }
+            decisionHandler(.cancel)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            // The offline HTML document itself is allowed; subresources are
+            // blocked by content rules and cancelled here as belt-and-suspenders.
+            if navigationResponse.isForMainFrame {
+                decisionHandler(.allow)
+            } else {
+                decisionHandler(.cancel)
+            }
+        }
     }
 }

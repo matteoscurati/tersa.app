@@ -252,8 +252,9 @@ fn push_limit(output: &mut String, limit: u16) {
 
 /// Writes the message rows in document order with the stable field parity.
 ///
-/// Includes `preview` and optional `body_text` so the macOS UI can render
-/// message content offline. The CLI keeps its own metadata-only encoder.
+/// Includes `preview` and optional `body_text` / `body_html` so the macOS UI
+/// can render message content offline in plain or sandboxed HTML mode. The CLI
+/// keeps its own metadata-only encoder.
 fn push_rows(output: &mut String, rows: &[MessageRowViewModel]) {
     output.push_str(",\"messages\":[");
     for (index, row) in rows.iter().enumerate() {
@@ -273,6 +274,10 @@ fn push_rows(output: &mut String, rows: &[MessageRowViewModel]) {
         if let Some(body_text) = &row.body_text {
             output.push_str(",\"body_text\":");
             push_json_string(output, body_text);
+        }
+        if let Some(body_html) = &row.body_html {
+            output.push_str(",\"body_html\":");
+            push_json_string(output, body_html);
         }
         output.push_str(",\"received_at_millis\":");
         // Writing to a String cannot fail.
@@ -493,6 +498,7 @@ mod tests {
             subject: String::new(),
             preview: String::new(),
             body_text: None,
+            body_html: None,
             received_at_millis: 7,
             unread: false,
         };
