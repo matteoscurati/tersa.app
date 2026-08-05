@@ -4,25 +4,21 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Generates or verifies complete target-specific license inventories for the
-# Apple diagnostic applications.
+# Apple product and retained diagnostic applications.
 set -eu
 
 mode=${1:---check}
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 apple_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
 workspace_dir=$(CDPATH='' cd -- "${apple_dir}/.." && pwd)
-slint_config="${workspace_dir}/about.toml"
-dioxus_config="${workspace_dir}/about-dioxus.toml"
 bridge_config="${workspace_dir}/about-bridge.toml"
 sqlcipher_config="${workspace_dir}/about-sqlcipher.toml"
 search_config="${workspace_dir}/about-search.toml"
 mime_config="${workspace_dir}/about-mime.toml"
 blob_config="${workspace_dir}/about-blob.toml"
 renderer="${script_dir}/render-third-party-notices.py"
-supplemental="${apple_dir}/licenses/rust-skia-notices.txt"
 sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
 
-python3 "${script_dir}/verify-rust-skia-notices.py" "$supplemental"
 python3 "${script_dir}/verify-sqlcipher-notices.py" \
   "$sqlcipher_supplemental" "${workspace_dir}/Cargo.lock"
 
@@ -65,19 +61,6 @@ generate_notice() {
   rm -f "$json_file"
 }
 
-generate_notice THIRD_PARTY_NOTICES-macos.txt "macOS arm64" \
-  apps/slint-spike/Cargo.toml "$supplemental" "$slint_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-ios.txt "iOS arm64 device and simulator targets" \
-  apps/slint-spike/Cargo.toml "$supplemental" "$slint_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
-generate_notice THIRD_PARTY_NOTICES-dioxus-macos.txt "macOS arm64" \
-  apps/dioxus-spike/Cargo.toml - "$dioxus_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-dioxus-ios.txt \
-  "iOS arm64 device and simulator targets" \
-  apps/dioxus-spike/Cargo.toml - "$dioxus_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
 # The macOS app links libtersa_mailbox_sync_ffi_macos.a (which re-exports the
 # bridge and pulls the full sync-engine closure), so its bundled notices must be
 # generated from the FFI crate's manifest, not the bare bridge. The output
@@ -117,14 +100,6 @@ generate_notice THIRD_PARTY_NOTICES-blob-ios.txt "iOS arm64 blob diagnostic targ
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
 if [ "$mode" = "--check" ]; then
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-ios.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-dioxus-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-dioxus-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-dioxus-ios.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-macos.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-ios.txt" \

@@ -31,11 +31,13 @@ they share one commit and crash-safety protocol. Its declarations of
 target cfg `cfg(target_os = "macos")`. Untargeted, iOS-only, or iOS-inclusive
 forms fail the policy check.
 
-The present SQLCipher and AEAD diagnostic owner sets, plus Slint and Dioxus
-isolation, remain unchanged. Gmail and network dependency exclusivity is not
-yet enforceable because exact Gmail crates have not been selected and pinned.
-This ADR deliberately adds no generic dependency-name pattern for network
-dependencies.
+The present SQLCipher and AEAD diagnostic owner sets remain unchanged. The
+Slint and Dioxus isolation clause is historical: those diagnostic UI spikes
+and their isolation boundaries were later removed under ADR-0025 (PR2) and
+are superseded by that decision. Gmail and network dependency exclusivity is
+not yet enforceable because exact Gmail crates have not been selected and
+pinned. This ADR deliberately adds no generic dependency-name pattern for
+network dependencies.
 
 ## Consequences
 

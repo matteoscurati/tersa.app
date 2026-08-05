@@ -66,8 +66,7 @@ license is not present in the shipping graph.
 
 ## Native Apple boundary
 
-The Swift policy is independent of Dioxus and Wry. Both Apple targets compile
-the same policy with:
+Both Apple targets compile the same reviewed policy source with:
 
 - `WKWebsiteDataStore.nonPersistent()`;
 - `WKWebpagePreferences.allowsContentJavaScript = false`;

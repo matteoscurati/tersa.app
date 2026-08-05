@@ -2,14 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Local-only Dioxus physical-device signing configuration.
+// Local-only Apple signing and OAuth configuration placeholders.
 // Copy this file to apple/local.xcconfig. Never commit the populated copy.
-// Do not add TERSA_EVIDENCE_COMMIT; the capture script owns that exact binding.
+// Pass the populated file to xcodebuild with:
+//   -xcconfig apple/local.xcconfig
+// Do not store secrets in the repository, issue trackers, or shared logs.
 
-TERSA_DIOXUS_DEVICE_EVIDENCE_OPT_IN = NO
-TERSA_DIOXUS_CODE_SIGNING_ALLOWED = YES
-TERSA_DIOXUS_CODE_SIGNING_REQUIRED = YES
-TERSA_DIOXUS_DEVELOPMENT_TEAM = REPLACE_WITH_LOCAL_TEAM
-TERSA_DIOXUS_CODE_SIGN_STYLE = Automatic
-TERSA_DIOXUS_CODE_SIGN_IDENTITY = Apple Development
-TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER =
+// Signing team and identity for local Apple Development builds only.
+// Leave these unset for ordinary unsigned local builds.
+// DEVELOPMENT_TEAM =
+// CODE_SIGN_IDENTITY = Apple Development
+// CODE_SIGNING_ALLOWED = YES
+
+// Public OAuth client configuration injected through Xcode build settings.
+// These values are not authentication secrets.
+// TERSA_OAUTH_CLIENT_ID = your-client-id.apps.googleusercontent.com
+// TERSA_OAUTH_REDIRECT_SCHEME = app.tersa.oauth.your-local-scheme
+
+// Optional non-confidential Desktop client secret for local token exchange.
+// Prefer environment injection when possible. Never commit a populated value.
+// TERSA_OAUTH_CLIENT_SECRET =

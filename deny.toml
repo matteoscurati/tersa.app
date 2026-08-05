@@ -1,6 +1,6 @@
 [graph]
 # tersa.app ships Apple binaries only. Filtering the graph prevents unrelated
-# Linux, Android, and Windows backend packages locked by portable UI crates from
+# Linux, Android, and Windows backend packages locked by portable crates from
 # being treated as shipped dependencies.
 targets = [
     "aarch64-apple-darwin",
@@ -12,18 +12,53 @@ targets = [
 version = 2
 yanked = "deny"
 unmaintained = "all"
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "Slint 1.16.1 pins paste through its image stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0192", reason = "Slint 1.16.1 pins ttf-parser through its text stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0206", reason = "Slint 1.16.1 pins rustybuzz through its SVG stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0194", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (wayland-scanner requires ^0.39, so unbumpable without a Slint release using >=0.41; Slint 1.17 needs Rust 1.92 and still resolves 0.39.4); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0195", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (see RUSTSEC-2026-0194); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
-]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+# Permanent retirement boundary: the removed M0 Slint/Dioxus diagnostic UI
+# runtimes and their webview/windowing stack must not re-enter the workspace
+# graph. Explicit crate names only (cargo-deny has no package globs).
+deny = [
+    # Slint runtime and published family crates from the retired lock graph.
+    { crate = "slint" },
+    { crate = "slint-build" },
+    { crate = "slint-macros" },
+    { crate = "i-slint-backend-linuxkms" },
+    { crate = "i-slint-backend-selector" },
+    { crate = "i-slint-backend-winit" },
+    { crate = "i-slint-common" },
+    { crate = "i-slint-compiler" },
+    { crate = "i-slint-core" },
+    { crate = "i-slint-core-macros" },
+    { crate = "i-slint-renderer-skia" },
+    { crate = "i-slint-renderer-software" },
+    # Dioxus core/runtime family packages from the retired diagnostic path.
+    { crate = "dioxus" },
+    { crate = "dioxus-asset-resolver" },
+    { crate = "dioxus-cli-config" },
+    { crate = "dioxus-config-macros" },
+    { crate = "dioxus-core" },
+    { crate = "dioxus-core-macro" },
+    { crate = "dioxus-core-types" },
+    { crate = "dioxus-desktop" },
+    { crate = "dioxus-document" },
+    { crate = "dioxus-history" },
+    { crate = "dioxus-hooks" },
+    { crate = "dioxus-html" },
+    { crate = "dioxus-html-internal-macro" },
+    { crate = "dioxus-interpreter-js" },
+    { crate = "dioxus-rsx" },
+    { crate = "dioxus-signals" },
+    { crate = "dioxus-stores" },
+    { crate = "dioxus-stores-macro" },
+    # Webview/windowing and asset runtime used by the retired Dioxus path.
+    { crate = "manganis" },
+    { crate = "tao" },
+    { crate = "tao-macros" },
+    { crate = "wry" },
+]
 
 [licenses]
 version = 2
@@ -37,19 +72,6 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
-]
-
-exceptions = [
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-selector" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-winit" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-common" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-compiler" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core-macros" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-renderer-skia" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-build" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-macros" },
 ]
 
 [sources]

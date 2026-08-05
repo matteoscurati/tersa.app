@@ -1,5 +1,11 @@
 # Dioxus physical-device input and accessibility harness
 
+> **Historical retirement (ADR-0025 / PR2):** The Slint/Dioxus implementation,
+> schemes, evidence helpers, vendor/patch assets, and notice paths were removed
+> in PR2 under ADR-0025. Commands and path instructions below are historical and
+> no longer executable. This document remains only until PR5 consolidates M0
+> history.
+
 ## Purpose and non-claim
 
 This opt-in harness prepares device-signed, exact-head observations for

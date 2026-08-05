@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted.
+Accepted. Durable product constraints A3, A4, A5, and A9 remain in force.
+The M0/Slint/Dioxus diagnostic gate program and toolkit-isolation machinery
+described historically below are retired by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+gate-register validator remains transitional only while
+`docs/m0/gate-register.json` is still tracked (PR5 owns register removal).
 
 ## Decisions
 
@@ -11,9 +16,9 @@ Accepted.
   be an MVP dependency.
 - **A4 — production licensing.** Production dependencies must be
   OSI-approved unless a separate accepted legal ADR authorizes a narrow
-  exception. Slint's royalty-free license is diagnostic-only. The
-  [ADR 0004](adr-0004-slint-binary-license.md) badge and attribution remain
-  while distributable Slint diagnostic binaries exist.
+  exception. Historical note: Slint's royalty-free license was diagnostic-only
+  under [ADR 0004](adr-0004-slint-binary-license.md); those diagnostic binaries
+  and the README badge attribution path are retired and no longer apply.
 - **A5 — cache boundary.** The default encrypted-cache budgets are 2 GiB on
   iOS and 10 GiB on macOS, configurable per account. These are product
   constraints, not evidence or a pass. Full-mailbox offline is excluded from
@@ -22,7 +27,9 @@ Accepted.
   AppKit widgets are not required. A custom UI must expose native
   UIAccessibility/NSAccessibility and pass VoiceOver, Dynamic Type, Full
   Keyboard Access, Switch Control, physical input, lifecycle, performance, and
-  signed-distribution gates. Neither Slint nor Dioxus is production-approved.
+  signed-distribution gates. Historical note: neither the retired Slint nor
+  Dioxus M0 diagnostics was production-approved; production UI selection is
+  governed by later ADRs (including ADR-0020).
 
 ## Gate governance
 
@@ -64,7 +71,7 @@ validation plus negative mutation self-tests, until the gate register is
 removed in PR5. The policy job does not own the gate validator. Contributors
 must run the same command locally before `cargo xtask verify`.
 
-Diagnostic-only UI isolation is enforced by `xtask` dependency-boundary checks:
-Slint and Dioxus may occur only in their respective spike packages, not in the
-production crates or Apple bridge. `cargo deny` is complementary license and
-supply-chain policy; it is not sufficient to enforce that runtime isolation.
+Historical note: diagnostic-only Slint/Dioxus isolation was previously enforced
+by `xtask` dependency-boundary checks against the retired spike packages. Those
+packages and guards are removed; durable product dependency boundaries for the
+active workspace remain enforced by `xtask` and `cargo deny`.

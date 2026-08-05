@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted for the M0 diagnostic feasibility spike; legal review remains open.
+Historical and retired. The M0 Slint diagnostic implementation, license
+exceptions, badge attribution, and related notices were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+decision body below is retained as historical record only; no Slint diagnostic
+binary remains in tree.
 
 ## Decision
 

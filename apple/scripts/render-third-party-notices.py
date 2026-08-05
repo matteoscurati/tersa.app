@@ -13,9 +13,6 @@ from pathlib import Path
 from typing import Any
 
 
-RUST_SKIA_CRATES = {"skia-bindings", "skia-safe"}
-
-
 def normalize_newlines(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -35,7 +32,7 @@ def render(data: dict[str, Any], target: str, supplemental: str) -> str:
         "tersa.app third-party notices",
         "================================",
         "",
-        "This file lists the third-party Rust packages linked into the diagnostic",
+        "This file lists the third-party Rust packages linked into the selected",
         "application for this target selection:",
         f"- {target}",
         "",
@@ -60,11 +57,7 @@ def render(data: dict[str, Any], target: str, supplemental: str) -> str:
 
     normalized_licenses = []
     for license_item in data["licenses"]:
-        used_by = [
-            item
-            for item in license_item["used_by"]
-            if item["crate"]["name"] not in RUST_SKIA_CRATES
-        ]
+        used_by = list(license_item["used_by"])
         if used_by:
             normalized_licenses.append((license_item, sorted(used_by, key=used_by_key)))
 

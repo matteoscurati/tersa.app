@@ -13,8 +13,6 @@ and feasibility adapters:
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
 | `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-keychain-macos` on macOS, `tersa-presentation` |
-| `tersa-slint-spike` | Apple-only diagnostic Slint executable | `tersa-presentation` |
-| `tersa-dioxus-spike` | Apple-only diagnostic Dioxus executable | `tersa-presentation` |
 | `tersa-sqlcipher-spike` | Apple-only diagnostic encrypted-storage executable | None |
 | `tersa-search-spike` | Apple-only SQLCipher FTS5 and fixed-size-chunk Tantivy diagnostic | None |
 | `tersa-mime-spike` | Portable bounded MIME and deny-by-default HTML diagnostic | None |
@@ -36,13 +34,13 @@ distinction. This source-only activation changes no signing, distribution, or
 product gate.
 
 Executable adapters may depend on these layers, but the layers must never
-depend on an executable, Apple API, or UI framework. `tersa-slint-spike` and
-`tersa-dioxus-spike` are the only workspace crates allowed to depend on their
-respective UI runtimes. `tersa-sqlcipher-spike`, `tersa-search-spike`, and
-`tersa-store-sqlcipher-macos` are the only crates allowed to depend on
-`rusqlite` or `libsqlite3-sys`; Tantivy is
-exclusive to `tersa-search-spike`, pinned to 0.26.1, and may not reach
-`memmap2`, `tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
+depend on an executable, Apple API, or UI framework. Historical note: the
+retired M0 Slint and Dioxus diagnostic executables previously owned exclusive
+UI-runtime edges; those packages are removed. `tersa-sqlcipher-spike`,
+`tersa-search-spike`, and `tersa-store-sqlcipher-macos` are the only crates
+allowed to depend on `rusqlite` or `libsqlite3-sys`; Tantivy is exclusive to
+`tersa-search-spike`, pinned to 0.26.1, and may not reach `memmap2`,
+`tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
 `mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
 `tersa-mime-spike`. The portable MIME and blob M0 spikes are exceptions to the
 Apple target gate: Linux CI exercises their deterministic tests, while the

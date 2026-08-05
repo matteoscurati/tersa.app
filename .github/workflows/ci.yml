@@ -43,8 +43,6 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py
       - name: Self-test M0 gate validator
         run: python3 scripts/verify-m0-gates.py --self-test
-      - name: Self-test evidence-manifest helper
-        run: python3 scripts/write-evidence-manifest.py --self-test
       - name: Check pull request DCO sign-offs
         if: github.event_name == 'pull_request'
         run: >-
@@ -304,10 +302,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
-      - name: Prepare verified rust-skia archive
-        run: |
-          skia_url=$(sh apple/scripts/prepare-verified-skia.sh aarch64-apple-darwin)
-          printf 'SKIA_BINARIES_URL=%s\n' "$skia_url" >> "$GITHUB_ENV"
       - name: Run baseline verification
         run: cargo run --locked --package xtask -- verify
 
@@ -334,39 +328,7 @@ jobs:
       - name: Check dependency licenses and sources
         run: cargo deny check
       - name: Check Rust security advisories
-        # cargo-audit cannot derive target reachability from Cargo.lock. These
-        # time-bounded ignores cover existing Apple-reachable findings plus
-        # Dioxus/Wry dependencies that the verifier proves unreachable from the
-        # macOS, iOS device, and iOS simulator graphs. The Dioxus diagnostic
-        # remains rejected for production.
-        run: >-
-          cargo audit
-          --deny warnings
-          --ignore RUSTSEC-2024-0370
-          --ignore RUSTSEC-2024-0411
-          --ignore RUSTSEC-2024-0412
-          --ignore RUSTSEC-2024-0413
-          --ignore RUSTSEC-2024-0414
-          --ignore RUSTSEC-2024-0415
-          --ignore RUSTSEC-2024-0416
-          --ignore RUSTSEC-2024-0418
-          --ignore RUSTSEC-2024-0419
-          --ignore RUSTSEC-2024-0420
-          --ignore RUSTSEC-2024-0429
-          --ignore RUSTSEC-2024-0436
-          --ignore RUSTSEC-2025-0057
-          --ignore RUSTSEC-2025-0141
-          --ignore RUSTSEC-2026-0097
-          --ignore RUSTSEC-2026-0192
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
-          --ignore RUSTSEC-2026-0206
-      - name: Enforce temporary Slint advisory review deadline
-        shell: bash
-        run: '[[ "$(date -u +%F)" < "2026-08-15" ]]'
-      - name: Enforce temporary Dioxus advisory review deadline
-        shell: bash
-        run: '[[ "$(date -u +%F)" < "2026-08-15" ]]'
+        run: cargo audit --deny warnings
       - name: Check feature combinations
         run: cargo hack check --locked --workspace --feature-powerset --all-targets
       - name: Check spelling
