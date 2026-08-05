@@ -243,6 +243,7 @@ struct InboxView: View {
                 .accessibilityHidden(true)
             Text("The inbox could not be loaded")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
             Text(failure.message)
                 .font(.callout)
                 .foregroundStyle(.secondary)

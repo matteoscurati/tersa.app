@@ -128,6 +128,12 @@ targets:
       - path: macos/ConnectionOperationDeadline.swift
       - path: macos/ConnectionState.swift
       - path: macos/DisconnectIntentStore.swift
+      # Composer view (SwiftUI-only, no FFI) for the focus-traversal helper
+      # tests; mailbox documents and read state for the stale-search guard
+      # tests. Pure presentation logic only — no worker or ABI bootstrap.
+      - path: macos/ComposerView.swift
+      - path: macos/MailboxDocuments.swift
+      - path: macos/MailboxReadState.swift
       - path: macos/MailboxLifecyclePresentation.swift
       - path: macos/TokenBrokerProtocol.swift
       - path: macos/TokenBrokerClient.swift

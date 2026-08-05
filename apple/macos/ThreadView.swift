@@ -77,6 +77,7 @@ struct ThreadView: View {
                 .accessibilityHidden(true)
             Text("No messages in this thread")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -109,6 +110,7 @@ struct ThreadView: View {
                 .accessibilityHidden(true)
             Text("The thread could not be loaded")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
             Text(failure.message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
