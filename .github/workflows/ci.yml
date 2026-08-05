@@ -118,7 +118,9 @@ jobs:
       # Launch TersaMac first so the critical path acquires shared Rust build
       # resources (apple/build/rust + Cargo lock) before the shorter iOS path.
       # Both lanes buffer to separate logs (no live streaming of multi-MB Xcode
-      # output); EXIT/INT/TERM traps flush any available logs on cancel/failure.
+      # output). Full logs flush only on trap/failure; the all-success path emits
+      # a concise summary so Actions does not upload multi-thousand-line success
+      # buffers. Index-store generation is disabled on ephemeral CI runners.
       - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
@@ -129,6 +131,7 @@ jobs:
           _logs_flushed=0
 
           # Idempotent dump: safe if a log is missing; never masks caller status.
+          # Invoked only from traps and the non-zero child-status path.
           flush_logs() {
             if [ "${_logs_flushed}" -ne 0 ]; then
               return 0
@@ -158,6 +161,7 @@ jobs:
             xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
               -configuration Debug -destination 'platform=macOS,arch=arm64' \
               -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO \
               TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
               TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
           ) >"$macos_log" 2>&1 &
@@ -169,6 +173,7 @@ jobs:
               -configuration Debug -sdk iphonesimulator \
               -destination 'generic/platform=iOS Simulator' \
               -derivedDataPath apple/build/DerivedData-ios CODE_SIGNING_ALLOWED=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO \
               TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
               TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
           ) >"$ios_log" 2>&1 &
@@ -177,20 +182,24 @@ jobs:
           macos_status=0
           ios_status=0
 
-          # Always wait for both even if one failed.
+          # Always wait for both even if one failed; decide only after both land.
           wait "$macos_pid" || macos_status=$?
           wait "$ios_pid" || ios_status=$?
 
-          # Normal path: dump once, then clear traps so EXIT does not re-dump.
-          flush_logs
-          trap - EXIT INT TERM
-
-          if [ "$macos_status" -ne 0 ]; then
-            exit "$macos_status"
-          fi
-          if [ "$ios_status" -ne 0 ]; then
+          # Failure path: dump both full logs once for cross-lane context, then
+          # clear traps and exit with deterministic status priority (macOS first).
+          if [ "$macos_status" -ne 0 ] || [ "$ios_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$macos_status" -ne 0 ]; then
+              exit "$macos_status"
+            fi
             exit "$ios_status"
           fi
+
+          # Success path: no full-log upload; disarm traps and summarize.
+          trap - EXIT INT TERM
+          echo "Apple product: macOS tests and iOS simulator build succeeded."
       - name: Verify built Rust bridge symbols
         run: |
           nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
@@ -371,9 +380,10 @@ jobs:
   # rustdoc) with the same flags, run sequentially on the default Cargo target
   # directory so artifacts are reused. Notices may overlap that sequence as the
   # sole background task; both lanes buffer to separate logs (no live streaming
-  # of multi-MB Cargo output) with EXIT/INT/TERM flush traps. `cargo xtask
-  # ci-macos` remains the developer entry point and must stay equivalent.
-  # Static tests pin that equivalence.
+  # of multi-MB Cargo output). Full logs flush only on trap/failure; the
+  # all-success path emits a concise selected-lane summary. EXIT/INT/TERM traps
+  # retain full diagnostics. `cargo xtask ci-macos` remains the developer entry
+  # point and must stay equivalent. Static tests pin that equivalence.
   macos_quality:
     name: macOS quality
     needs: changes
@@ -405,6 +415,7 @@ jobs:
           _logs_flushed=0
 
           # Idempotent dump: safe if a log is missing; never masks caller status.
+          # Invoked only from traps and the non-zero child-status path.
           flush_logs() {
             if [ "${_logs_flushed}" -ne 0 ]; then
               return 0
@@ -436,7 +447,7 @@ jobs:
           # sequential Rust suite. Clippy → tests → doctests → rustdoc share the
           # default Cargo target directory (no per-lane target override) so
           # artifacts are reused exactly as in `cargo xtask ci-macos`. Both lanes
-          # buffer to separate logs; traps flush them on timeout/cancel/failure.
+          # buffer to separate logs; full dumps occur only on trap/failure.
           if [ "$RUN_NOTICES" = "true" ]; then
             (
               set -euo pipefail
@@ -463,20 +474,31 @@ jobs:
             ) >"$rust_log" 2>&1 || rust_status=$?
           fi
 
-          # Always wait for notices even if Rust failed.
+          # Always wait for notices even if Rust failed; decide after both land.
           if [ -n "$notices_pid" ]; then
             wait "$notices_pid" || notices_status=$?
           fi
 
-          # Normal path: dump once, then clear traps so EXIT does not re-dump.
-          flush_logs
-          trap - EXIT INT TERM
-
-          if [ "$rust_status" -ne 0 ]; then
-            exit "$rust_status"
-          fi
-          if [ "$notices_status" -ne 0 ]; then
+          # Failure path: dump every available full log once for cross-lane
+          # context, then clear traps and exit with deterministic priority
+          # (Rust before notices).
+          if [ "$rust_status" -ne 0 ] || [ "$notices_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$rust_status" -ne 0 ]; then
+              exit "$rust_status"
+            fi
             exit "$notices_status"
+          fi
+
+          # Success path: no full-log upload; disarm traps and summarize lanes.
+          trap - EXIT INT TERM
+          if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then
+            echo "macOS quality: Rust suite and third-party notices succeeded."
+          elif [ "$RUN_RUST" = "true" ]; then
+            echo "macOS quality: Rust suite succeeded."
+          else
+            echo "macOS quality: third-party notices succeeded."
           fi
 
   ci_gate:

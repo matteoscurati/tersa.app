@@ -646,6 +646,8 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("-destination 'platform=macOS,arch=arm64'", apple)
         self.assertIn("-destination 'generic/platform=iOS Simulator'", apple)
         self.assertIn("CODE_SIGNING_ALLOWED=NO", apple)
+        # Index-store generation is not product coverage on ephemeral CI runners.
+        self.assertEqual(apple.count("COMPILER_INDEX_STORE_ENABLE=NO"), 2)
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* test")
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* build")
         self.assertIn("set -euo pipefail", apple)
@@ -684,38 +686,61 @@ class ChangeScopeTests(unittest.TestCase):
         macos_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac"
         )
+        macos_index = apple.index("COMPILER_INDEX_STORE_ENABLE=NO", macos_xcode)
         macos_bg = apple.index(') >"$macos_log" 2>&1 &')
         macos_pid = apple.index("macos_pid=$!")
         ios_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS"
         )
+        ios_index = apple.index("COMPILER_INDEX_STORE_ENABLE=NO", ios_xcode)
         ios_bg = apple.index(') >"$ios_log" 2>&1 &')
         ios_pid = apple.index("ios_pid=$!")
         self.assertLess(trap_exit, macos_xcode)
-        self.assertLess(macos_xcode, macos_bg)
+        self.assertLess(macos_xcode, macos_index)
+        self.assertLess(macos_index, macos_bg)
         self.assertLess(macos_bg, macos_pid)
         self.assertLess(macos_pid, ios_xcode)
-        self.assertLess(ios_xcode, ios_bg)
+        self.assertLess(ios_xcode, ios_index)
+        self.assertLess(ios_index, ios_bg)
         self.assertLess(ios_bg, ios_pid)
         # Both lanes redirect-background (exactly two).
         self.assertEqual(apple.count(" 2>&1 &"), 2)
-        # Unconditional waits for both, single normal dump, trap cleanup, exits.
+        # Unconditional waits for both; capture statuses before deciding.
         wait_macos = apple.index('wait "$macos_pid" || macos_status=$?')
         wait_ios = apple.index('wait "$ios_pid" || ios_status=$?')
-        # Normal-path flush after waits; flag/trap cleanup prevents double dump.
-        flush_after_wait = apple.index("\n          flush_logs\n", wait_ios)
-        trap_clear = apple.index("trap - EXIT INT TERM", flush_after_wait)
-        fail_macos = apple.index('if [ "$macos_status" -ne 0 ]; then')
-        fail_ios = apple.index('if [ "$ios_status" -ne 0 ]; then')
+        # Failure path: dump both full logs once before trap cleanup / status exit.
+        failure_gate = apple.index(
+            'if [ "$macos_status" -ne 0 ] || [ "$ios_status" -ne 0 ]; then',
+            wait_ios,
+        )
+        flush_on_fail = apple.index("\n            flush_logs\n", failure_gate)
+        trap_clear_fail = apple.index("trap - EXIT INT TERM", flush_on_fail)
+        fail_macos = apple.index(
+            'if [ "$macos_status" -ne 0 ]; then',
+            trap_clear_fail,
+        )
+        exit_macos = apple.index('exit "$macos_status"', fail_macos)
+        exit_ios = apple.index('exit "$ios_status"', exit_macos)
+        # Success path: disarm traps without full dump; one concise summary only.
+        trap_clear_ok = apple.index("trap - EXIT INT TERM", exit_ios)
+        success_summary = apple.index(
+            'echo "Apple product: macOS tests and iOS simulator build succeeded."',
+            trap_clear_ok,
+        )
         self.assertLess(ios_pid, wait_macos)
         self.assertLess(wait_macos, wait_ios)
-        self.assertLess(wait_ios, flush_after_wait)
-        self.assertLess(flush_after_wait, trap_clear)
-        self.assertLess(trap_clear, fail_macos)
-        self.assertLess(fail_macos, fail_ios)
-        # Exactly one normal-path flush_logs call (definition + trap bodies excluded
-        # by matching the bare invocation line after waits).
-        self.assertEqual(apple.count("\n          flush_logs\n"), 1)
+        self.assertLess(wait_ios, failure_gate)
+        self.assertLess(failure_gate, flush_on_fail)
+        self.assertLess(flush_on_fail, trap_clear_fail)
+        self.assertLess(trap_clear_fail, fail_macos)
+        self.assertLess(fail_macos, exit_macos)
+        self.assertLess(exit_macos, exit_ios)
+        self.assertLess(exit_ios, trap_clear_ok)
+        self.assertLess(trap_clear_ok, success_summary)
+        # Full logs only in the failure branch (not on the all-success path).
+        # Definition + trap bodies are excluded by matching the indented call.
+        self.assertEqual(apple.count("\n            flush_logs\n"), 1)
+        self.assertEqual(apple.count("\n          flush_logs\n"), 0)
         self.assertNotIn("Build unsigned macOS debug application", workflow)
         self.assertIn("name: Verify built Rust bridge symbols", workflow)
         self.assertIn(
@@ -865,7 +890,7 @@ class ChangeScopeTests(unittest.TestCase):
             job,
         )
         self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
-        self.assertIn('if [ "$notices_status" -ne 0 ]; then', job)
+        self.assertIn('exit "$notices_status"', job)
         # Traps arm before launch; notices starts before sequential Rust suite;
         # only one background `&` for the notices subshell.
         trap_exit = job.index(
@@ -875,20 +900,49 @@ class ChangeScopeTests(unittest.TestCase):
         rust_seq = job.index('echo "Running Clippy check..."')
         rust_redirect = job.index(') >"$rust_log" 2>&1 || rust_status=$?')
         wait_notices = job.index('wait "$notices_pid" || notices_status=$?')
-        flush_after_wait = job.index("\n          flush_logs\n", wait_notices)
-        trap_clear = job.index("trap - EXIT INT TERM", flush_after_wait)
-        fail_rust = job.index('if [ "$rust_status" -ne 0 ]; then')
-        fail_notices = job.index('if [ "$notices_status" -ne 0 ]; then')
+        # Failure path: dump both available full logs once before trap cleanup.
+        failure_gate = job.index(
+            'if [ "$rust_status" -ne 0 ] || [ "$notices_status" -ne 0 ]; then',
+            wait_notices,
+        )
+        flush_on_fail = job.index("\n            flush_logs\n", failure_gate)
+        trap_clear_fail = job.index("trap - EXIT INT TERM", flush_on_fail)
+        fail_rust = job.index('if [ "$rust_status" -ne 0 ]; then', trap_clear_fail)
+        exit_rust = job.index('exit "$rust_status"', fail_rust)
+        exit_notices = job.index('exit "$notices_status"', exit_rust)
+        # Success path: disarm traps without full dump; one concise selected-lane
+        # summary (both lanes, Rust-only, or notices-only).
+        trap_clear_ok = job.index("trap - EXIT INT TERM", exit_notices)
+        summary_both = job.index(
+            'echo "macOS quality: Rust suite and third-party notices succeeded."',
+            trap_clear_ok,
+        )
+        summary_rust = job.index(
+            'echo "macOS quality: Rust suite succeeded."',
+            summary_both,
+        )
+        summary_notices = job.index(
+            'echo "macOS quality: third-party notices succeeded."',
+            summary_rust,
+        )
         self.assertLess(trap_exit, notices_bg)
         self.assertLess(notices_bg, rust_seq)
         self.assertLess(rust_seq, rust_redirect)
         self.assertLess(rust_redirect, wait_notices)
-        self.assertLess(wait_notices, flush_after_wait)
-        self.assertLess(flush_after_wait, trap_clear)
-        self.assertLess(trap_clear, fail_rust)
-        self.assertLess(fail_rust, fail_notices)
+        self.assertLess(wait_notices, failure_gate)
+        self.assertLess(failure_gate, flush_on_fail)
+        self.assertLess(flush_on_fail, trap_clear_fail)
+        self.assertLess(trap_clear_fail, fail_rust)
+        self.assertLess(fail_rust, exit_rust)
+        self.assertLess(exit_rust, exit_notices)
+        self.assertLess(exit_notices, trap_clear_ok)
+        self.assertLess(trap_clear_ok, summary_both)
+        self.assertLess(summary_both, summary_rust)
+        self.assertLess(summary_rust, summary_notices)
         self.assertEqual(job.count(" 2>&1 &"), 1)
-        self.assertEqual(job.count("\n          flush_logs\n"), 1)
+        # Full logs only in the failure branch (not on the all-success path).
+        self.assertEqual(job.count("\n            flush_logs\n"), 1)
+        self.assertEqual(job.count("\n          flush_logs\n"), 0)
         self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
         self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
