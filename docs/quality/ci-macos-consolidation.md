@@ -10,10 +10,12 @@ supply-chain, notice, and DCO coverage while reducing macOS fanout.
 Performance-oriented orchestration (inlined `ci-macos` cargo commands on one
 default Cargo target directory, notices overlapping that sequential Rust suite,
 parallel Apple macOS test / iOS simulator build) removes measured cold-start
-and serial overhead without dropping checks. It does **not** claim that the
-acceptance budget has been measured or passed. Budget pass/fail requires a
-representative exact-head pull-request run after this change lands. Until that
-run exists, treat the budgets below as targets only.
+and serial overhead without dropping checks. The acceptance budgets below were
+met by one exact-head full-fanout sample (see
+[Exact-head sample (measured)](#exact-head-sample-measured)). That sample is
+not a long-run statistical guarantee: aggregate macOS headroom was only three
+seconds under the 220-second budget. Re-measure with the procedure below after
+material workflow or runner changes.
 
 ## Baseline (pre-consolidation)
 
@@ -26,13 +28,34 @@ Representative full-fanout pull request **#106**, GitHub Actions run
 | Concurrent macOS jobs | 3 (`Apple product`, `Rust (macOS)`, `Third-party notices`) |
 | Aggregate macOS job seconds | approximately 248 |
 
-## Acceptance budgets (post-consolidation targets)
+## Acceptance budgets (post-consolidation)
 
 | Budget | Limit |
 | --- | --- |
-| Wall-clock | ≤ 3:00 |
+| Wall-clock | ≤ 3:00 (180 seconds) |
 | Concurrent macOS jobs | ≤ 2 |
 | Aggregate macOS job seconds | ≤ 220 |
+
+## Exact-head sample (measured)
+
+One passing exact-head full-fanout sample from GitHub Actions run
+**30997714456** at head
+`9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69` (all six visible jobs green):
+
+| Metric | Value |
+| --- | --- |
+| Head commit | `9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69` |
+| Wall-clock | 132 seconds |
+| `Apple product` job duration | 101 seconds |
+| `macOS quality` job duration | 116 seconds |
+| Aggregate macOS job seconds | 217 |
+| Concurrent macOS jobs | exactly 2 |
+| Visible jobs | exactly 6 (all green) |
+| Aggregate macOS headroom vs 220 s | 3 seconds |
+
+This is a single sample, not a multi-run distribution. The three-second
+aggregate headroom means small runner or suite regressions can breach the
+budget; re-run the measurement procedure after material changes.
 
 ## Coverage matrix and ownership
 
@@ -40,8 +63,8 @@ Representative full-fanout pull request **#106**, GitHub Actions run
 | --- | --- | --- |
 | Change scope, DCO, classifier/unit contracts | `Detect change scope` | Always required; fail-closed draft/DCO semantics unchanged |
 | Architecture, format, check, Clippy, tests, doctests, rustdoc | `Rust (Linux)` via `cargo xtask verify` | Portable full baseline |
-| Clippy, tests, doctests, rustdoc (host) | `macOS quality` when `rust_macos` | Workflow runs the exact `ci-macos` cargo sequence directly (no cold xtask compile): Clippy, tests, doctests, then warning-denied rustdoc, strictly sequential on the default Cargo target directory so artifacts are reused. `cargo xtask ci-macos` remains the developer entry point with identical flags. No architecture, format, or separate `cargo check` |
-| Third-party notices (`cargo-about`) | `macOS quality` when `notices` | Install `cargo-about` when selected; fetch and `--check` are the sole background task and may overlap the sequential Rust suite when both classifier outputs are true |
+| Clippy, tests, doctests, rustdoc (host) | `macOS quality` when `rust_macos` | Workflow runs the exact `ci-macos` cargo sequence directly (no cold xtask compile): Clippy, tests, doctests, then warning-denied rustdoc, strictly sequential on the default Cargo target directory so artifacts are reused. Both selected lanes are background children with interruptible `wait`. `cargo xtask ci-macos` remains the developer entry point with identical flags. No architecture, format, or separate `cargo check` |
+| Third-party notices (`cargo-about`) | `macOS quality` when `notices` | Install `cargo-about` when selected; fetch and `--check` run as a background child and may overlap the sequential Rust suite when both classifier outputs are true |
 | Product Apple build/test/symbols | `Apple product` | Complete TersaMac tests and TersaIOS simulator build may run concurrently with distinct DerivedData paths; symbol inventories and the FFI probe stay after both succeed |
 | Licenses, advisories, feature powerset, spelling | `Policy and supply chain` | Unchanged |
 | Aggregate required status | `CI gate` | Sole required aggregate; optional lanes may be `skipped` |
@@ -58,6 +81,8 @@ Apple product, and gate.
 
 ## Exact-head measurement procedure
 
+Use this procedure for any future budget claim or re-measurement:
+
 1. Open or update a pull request whose merge-base diff selects full fanout (for
    example a workflow or other executable CI control change).
 2. Use the **exact head commit** of that pull request; do not compare against a
@@ -69,9 +94,11 @@ Apple product, and gate.
    macOS runner (`Apple product` and `macOS quality` after consolidation).
 6. Count concurrent macOS jobs as the number of macOS runner jobs present in the
    run (selected jobs only; skipped jobs do not count toward aggregate seconds).
+7. Confirm exactly six visible jobs and that all selected lanes are green.
 
-Do not claim budget pass until this procedure is completed for a representative
-exact-head full-fanout run and the three budgets above are met.
+Record the Actions run ID, head SHA, wall-clock, per-job macOS durations,
+aggregate macOS seconds, and concurrent macOS job count. Compare against the
+acceptance budgets above.
 
 ## Future cache policy
 

@@ -119,8 +119,9 @@ jobs:
       # resources (apple/build/rust + Cargo lock) before the shorter iOS path.
       # Both lanes buffer to separate logs (no live streaming of multi-MB Xcode
       # output). Full logs flush only on trap/failure; the all-success path emits
-      # a concise summary so Actions does not upload multi-thousand-line success
-      # buffers. Index-store generation is disabled on ephemeral CI runners.
+      # a concise summary plus extracted TersaMac test evidence so Actions does
+      # not upload multi-thousand-line success buffers. Index-store generation is
+      # disabled on ephemeral CI runners.
       - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
@@ -197,9 +198,22 @@ jobs:
             exit "$ios_status"
           fi
 
-          # Success path: no full-log upload; disarm traps and summarize.
+          # Success path: no full-log upload; disarm traps, summarize, and emit
+          # concise TersaMac test-count evidence (non-fatal if format changes).
           trap - EXIT INT TERM
           echo "Apple product: macOS tests and iOS simulator build succeeded."
+          tersa_mac_summary=""
+          if [ -f "$macos_log" ]; then
+            tersa_mac_summary="$(
+              grep -E 'Executed [0-9]+ tests?, with [0-9]+ failures' "$macos_log" \
+                | tail -n 1
+            )" || true
+          fi
+          if [ -n "$tersa_mac_summary" ]; then
+            echo "TersaMac tests: $tersa_mac_summary"
+          else
+            echo "TersaMac tests: summary unavailable (log format changed)."
+          fi
       - name: Verify built Rust bridge symbols
         run: |
           nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
@@ -378,12 +392,13 @@ jobs:
   # ~14s compiling the dependency-heavy xtask binary. The shell sequence below
   # is the exact `ci-macos` coverage (Clippy, tests, doctests, warning-denied
   # rustdoc) with the same flags, run sequentially on the default Cargo target
-  # directory so artifacts are reused. Notices may overlap that sequence as the
-  # sole background task; both lanes buffer to separate logs (no live streaming
-  # of multi-MB Cargo output). Full logs flush only on trap/failure; the
-  # all-success path emits a concise selected-lane summary. EXIT/INT/TERM traps
-  # retain full diagnostics. `cargo xtask ci-macos` remains the developer entry
-  # point and must stay equivalent. Static tests pin that equivalence.
+  # directory so artifacts are reused. Notices may overlap that sequence; both
+  # selected lanes run as background children with interruptible `wait` so
+  # EXIT/INT/TERM traps can flush buffered logs on timeout/cancellation. Full
+  # logs flush only on trap/failure; the all-success path emits a concise
+  # selected-lane summary plus extracted Cargo test-result evidence.
+  # `cargo xtask ci-macos` remains the developer entry point and must stay
+  # equivalent. Static tests pin that equivalence.
   macos_quality:
     name: macOS quality
     needs: changes
@@ -439,15 +454,17 @@ jobs:
           trap 'flush_logs || true; trap - EXIT; exit 130' INT
           trap 'flush_logs || true; trap - EXIT; exit 143' TERM
 
+          rust_pid=""
           notices_pid=""
-          notices_status=0
           rust_status=0
+          notices_status=0
 
-          # Notices is the only background task: fetch/generation may overlap the
-          # sequential Rust suite. Clippy → tests → doctests → rustdoc share the
-          # default Cargo target directory (no per-lane target override) so
-          # artifacts are reused exactly as in `cargo xtask ci-macos`. Both lanes
-          # buffer to separate logs; full dumps occur only on trap/failure.
+          # Both selected lanes are background children so `wait` is interruptible
+          # and EXIT/INT/TERM can flush buffered logs on timeout/cancellation.
+          # Notices fetch/generation may overlap the sequential Rust suite.
+          # Clippy → tests → doctests → rustdoc share the default Cargo target
+          # directory (no per-lane target override) so artifacts are reused
+          # exactly as in `cargo xtask ci-macos`. Full dumps only on trap/failure.
           if [ "$RUN_NOTICES" = "true" ]; then
             (
               set -euo pipefail
@@ -458,7 +475,7 @@ jobs:
           fi
 
           if [ "$RUN_RUST" = "true" ]; then
-            # Foreground sequential suite on the default target dir; buffer output.
+            # Background sequential suite on the default target dir; buffer output.
             (
               set -euo pipefail
               echo "Running Clippy check..."
@@ -471,10 +488,15 @@ jobs:
               export RUSTDOCFLAGS="--deny warnings"
               cargo doc --locked --workspace --no-deps --all-features
               echo "macOS CI verification passed."
-            ) >"$rust_log" 2>&1 || rust_status=$?
+            ) >"$rust_log" 2>&1 &
+            rust_pid=$!
           fi
 
-          # Always wait for notices even if Rust failed; decide after both land.
+          # Always wait/reap both selected children even if one failed; decide
+          # only after both land. Interruptible wait lets traps flush on signal.
+          if [ -n "$rust_pid" ]; then
+            wait "$rust_pid" || rust_status=$?
+          fi
           if [ -n "$notices_pid" ]; then
             wait "$notices_pid" || notices_status=$?
           fi
@@ -491,7 +513,8 @@ jobs:
             exit "$notices_status"
           fi
 
-          # Success path: no full-log upload; disarm traps and summarize lanes.
+          # Success path: no full-log upload; disarm traps, summarize lanes, and
+          # emit one final ok summary per test phase (non-fatal if format changes).
           trap - EXIT INT TERM
           if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then
             echo "macOS quality: Rust suite and third-party notices succeeded."
@@ -499,6 +522,41 @@ jobs:
             echo "macOS quality: Rust suite succeeded."
           else
             echo "macOS quality: third-party notices succeeded."
+          fi
+          if [ "$RUN_RUST" = "true" ]; then
+            # Phase windows use the existing suite markers so normal tests and
+            # doc-tests cannot hide each other. Empty/missing/format-change
+            # results print an explicit unavailable line and never fail success.
+            tests_summary=""
+            doctests_summary=""
+            if [ -f "$rust_log" ]; then
+              tests_summary="$(
+                awk '
+                  $0 == "Running tests check..." { in_phase=1; next }
+                  $0 == "Running documentation tests check..." { in_phase=0 }
+                  in_phase && index($0, "test result: ok.") { last=$0 }
+                  END { if (last != "") print last }
+                ' "$rust_log"
+              )" || true
+              doctests_summary="$(
+                awk '
+                  $0 == "Running documentation tests check..." { in_phase=1; next }
+                  $0 == "Running documentation check..." { in_phase=0 }
+                  in_phase && index($0, "test result: ok.") { last=$0 }
+                  END { if (last != "") print last }
+                ' "$rust_log"
+              )" || true
+            fi
+            if [ -n "$tests_summary" ]; then
+              echo "Cargo tests: $tests_summary"
+            else
+              echo "Cargo tests: summary unavailable (log format changed)."
+            fi
+            if [ -n "$doctests_summary" ]; then
+              echo "Cargo doc-tests: $doctests_summary"
+            else
+              echo "Cargo doc-tests: summary unavailable (log format changed)."
+            fi
           fi
 
   ci_gate:

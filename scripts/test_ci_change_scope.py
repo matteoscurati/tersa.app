@@ -176,23 +176,33 @@ RETIRED_ARCHITECTURE_OPERATIONAL_CLAIMS = (
 )
 
 
+# Executable-looking ``cargo`` token: not part of ``cargo-about`` / ``mycargo``,
+# and still matched when bare at end of line (folded YAML scalars such as
+# ``run: >-`` / ``cargo`` / ``build ...``).
+_CARGO_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])cargo(?![A-Za-z0-9_-])")
+
+
 def _macos_quality_cargo_inventory(job_text: str) -> list[str]:
     """Ordered inventory of executable-looking cargo lines in a job body.
 
-    Non-comment lines containing the token ``cargo `` are collected. Only two
-    prefixes before that token are normalized: empty (block-scalar shell) and
-    exact ``run: `` (single-line YAML ``run`` scalar). Any other prefix keeps
+    Non-comment lines containing an executable-looking ``cargo`` token at a
+    token boundary are collected, including bare end-of-line ``cargo`` (folded
+    YAML scalars). Only two prefixes before that token are normalized: empty
+    (block-scalar shell) and exact ``run: `` (single-line YAML ``run`` scalar).
+    Any other prefix — tabs, quotes, env assignments, command wrappers — keeps
     the full stripped line so exact equality against the pinned sequence fails
-    rather than silently dropping execution modifiers.
+    rather than silently dropping execution modifiers. Non-command strings such
+    as ``cargo-about`` are not matched.
     """
     inventory: list[str] = []
     for raw_line in job_text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        cargo_at = stripped.find("cargo ")
-        if cargo_at < 0:
+        match = _CARGO_TOKEN_RE.search(stripped)
+        if match is None:
             continue
+        cargo_at = match.start()
         prefix = stripped[:cargo_at]
         if prefix == "" or prefix == "run: ":
             inventory.append(stripped[cargo_at:])
@@ -746,11 +756,24 @@ class ChangeScopeTests(unittest.TestCase):
         )
         exit_macos = apple.index('exit "$macos_status"', fail_macos)
         exit_ios = apple.index('exit "$ios_status"', exit_macos)
-        # Success path: disarm traps without full dump; one concise summary only.
+        # Success path: disarm traps without full dump; concise summary plus
+        # extracted TersaMac test-count evidence (not the full buffered log).
         trap_clear_ok = apple.index("trap - EXIT INT TERM", exit_ios)
         success_summary = apple.index(
             'echo "Apple product: macOS tests and iOS simulator build succeeded."',
             trap_clear_ok,
+        )
+        tersa_mac_extract = apple.index(
+            "grep -E 'Executed [0-9]+ tests?, with [0-9]+ failures' \"$macos_log\"",
+            success_summary,
+        )
+        tersa_mac_echo = apple.index(
+            'echo "TersaMac tests: $tersa_mac_summary"',
+            tersa_mac_extract,
+        )
+        tersa_mac_fallback = apple.index(
+            'echo "TersaMac tests: summary unavailable (log format changed)."',
+            tersa_mac_echo,
         )
         self.assertLess(ios_pid, wait_macos)
         self.assertLess(wait_macos, wait_ios)
@@ -762,10 +785,16 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(exit_macos, exit_ios)
         self.assertLess(exit_ios, trap_clear_ok)
         self.assertLess(trap_clear_ok, success_summary)
+        self.assertLess(success_summary, tersa_mac_extract)
+        self.assertLess(tersa_mac_extract, tersa_mac_echo)
+        self.assertLess(tersa_mac_echo, tersa_mac_fallback)
         # Full logs only in the failure branch (not on the all-success path).
         # Definition + trap bodies are excluded by matching the indented call.
         self.assertEqual(apple.count("\n            flush_logs\n"), 1)
         self.assertEqual(apple.count("\n          flush_logs\n"), 0)
+        # Success path must not cat the full buffered logs.
+        self.assertNotIn('cat "$macos_log"', apple[trap_clear_ok:])
+        self.assertNotIn('cat "$ios_log"', apple[trap_clear_ok:])
         self.assertNotIn("Build unsigned macOS debug application", workflow)
         self.assertIn("name: Verify built Rust bridge symbols", workflow)
         self.assertIn(
@@ -883,14 +912,20 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("doc_status", job)
         self.assertNotIn("clippy.log", job)
         self.assertNotIn("tests.log", job)
-        # Notices is the sole background PID; Rust is foreground sequential on the
-        # default target dir, buffered to its own log (no live multi-MB tee).
+        # Two-child topology: both Rust and notices are background children with
+        # interruptible wait (Bash defers traps while a foreground command runs,
+        # so the old `) >"$rust_log" 2>&1 || rust_status=$?` shape is forbidden).
         self.assertIn('rust_log="$log_dir/rust.log"', job)
         self.assertIn('notices_log="$log_dir/notices.log"', job)
+        self.assertIn("rust_pid=$!", job)
         self.assertIn("notices_pid=$!", job)
+        self.assertIn('wait "$rust_pid" || rust_status=$?', job)
         self.assertIn('wait "$notices_pid" || notices_status=$?', job)
-        self.assertIn(') >"$rust_log" 2>&1 || rust_status=$?', job)
+        self.assertIn(') >"$rust_log" 2>&1 &', job)
         self.assertIn(') >"$notices_log" 2>&1 &', job)
+        # Reject the old foreground Rust suite shape.
+        self.assertNotIn(') >"$rust_log" 2>&1 || rust_status=$?', job)
+        self.assertNotIn(') >"$rust_log" 2>&1 ||', job)
         # No live full-output streaming (buffered redirect only).
         self.assertNotIn("| tee", job)
         self.assertNotIn("tee \"", job)
@@ -917,13 +952,16 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
         self.assertIn('exit "$notices_status"', job)
         # Traps arm before launch; notices starts before sequential Rust suite;
-        # only one background `&` for the notices subshell.
+        # both children background; unconditional waits/reaps; Rust-first status.
         trap_exit = job.index(
             """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT"""
         )
         notices_bg = job.index(') >"$notices_log" 2>&1 &')
+        notices_pid = job.index("notices_pid=$!")
         rust_seq = job.index('echo "Running Clippy check..."')
-        rust_redirect = job.index(') >"$rust_log" 2>&1 || rust_status=$?')
+        rust_bg = job.index(') >"$rust_log" 2>&1 &')
+        rust_pid = job.index("rust_pid=$!")
+        wait_rust = job.index('wait "$rust_pid" || rust_status=$?')
         wait_notices = job.index('wait "$notices_pid" || notices_status=$?')
         # Failure path: dump both available full logs once before trap cleanup.
         failure_gate = job.index(
@@ -935,8 +973,8 @@ class ChangeScopeTests(unittest.TestCase):
         fail_rust = job.index('if [ "$rust_status" -ne 0 ]; then', trap_clear_fail)
         exit_rust = job.index('exit "$rust_status"', fail_rust)
         exit_notices = job.index('exit "$notices_status"', exit_rust)
-        # Success path: disarm traps without full dump; one concise selected-lane
-        # summary (both lanes, Rust-only, or notices-only).
+        # Success path: disarm traps without full dump; concise selected-lane
+        # summary plus one final ok summary per test phase (not full logs).
         trap_clear_ok = job.index("trap - EXIT INT TERM", exit_notices)
         summary_both = job.index(
             'echo "macOS quality: Rust suite and third-party notices succeeded."',
@@ -950,10 +988,63 @@ class ChangeScopeTests(unittest.TestCase):
             'echo "macOS quality: third-party notices succeeded."',
             summary_rust,
         )
+        # Phase-specific extracts: normal tests then doc-tests, each with a
+        # non-fatal fallback. Must not scrape the whole log and tail only the
+        # final crates (which often hide the normal test phase).
+        tests_phase_start = job.index(
+            '$0 == "Running tests check..." { in_phase=1; next }',
+            summary_notices,
+        )
+        tests_phase_end = job.index(
+            '$0 == "Running documentation tests check..." { in_phase=0 }',
+            tests_phase_start,
+        )
+        tests_ok_match = job.index(
+            'in_phase && index($0, "test result: ok.") { last=$0 }',
+            tests_phase_end,
+        )
+        tests_extract_nonfatal = job.index(')" || true', tests_ok_match)
+        doctests_phase_start = job.index(
+            '$0 == "Running documentation tests check..." { in_phase=1; next }',
+            tests_extract_nonfatal,
+        )
+        doctests_phase_end = job.index(
+            '$0 == "Running documentation check..." { in_phase=0 }',
+            doctests_phase_start,
+        )
+        doctests_ok_match = job.index(
+            'in_phase && index($0, "test result: ok.") { last=$0 }',
+            doctests_phase_end,
+        )
+        doctests_extract_nonfatal = job.index(')" || true', doctests_ok_match)
+        tests_echo = job.index(
+            'echo "Cargo tests: $tests_summary"',
+            doctests_extract_nonfatal,
+        )
+        tests_fallback = job.index(
+            'echo "Cargo tests: summary unavailable (log format changed)."',
+            tests_echo,
+        )
+        doctests_echo = job.index(
+            'echo "Cargo doc-tests: $doctests_summary"',
+            tests_fallback,
+        )
+        doctests_fallback = job.index(
+            'echo "Cargo doc-tests: summary unavailable (log format changed)."',
+            doctests_echo,
+        )
+        # Reject the old whole-log tail approach that hid normal-test evidence.
+        self.assertNotIn("tail -n 4", job)
+        self.assertNotIn("cargo_ok_lines", job)
+        self.assertNotIn('grep -F \'test result: ok.\' "$rust_log"', job)
+        self.assertNotIn('printf \'%s\\n\' "$cargo_ok_lines"', job)
         self.assertLess(trap_exit, notices_bg)
-        self.assertLess(notices_bg, rust_seq)
-        self.assertLess(rust_seq, rust_redirect)
-        self.assertLess(rust_redirect, wait_notices)
+        self.assertLess(notices_bg, notices_pid)
+        self.assertLess(notices_pid, rust_seq)
+        self.assertLess(rust_seq, rust_bg)
+        self.assertLess(rust_bg, rust_pid)
+        self.assertLess(rust_pid, wait_rust)
+        self.assertLess(wait_rust, wait_notices)
         self.assertLess(wait_notices, failure_gate)
         self.assertLess(failure_gate, flush_on_fail)
         self.assertLess(flush_on_fail, trap_clear_fail)
@@ -964,10 +1055,30 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(trap_clear_ok, summary_both)
         self.assertLess(summary_both, summary_rust)
         self.assertLess(summary_rust, summary_notices)
-        self.assertEqual(job.count(" 2>&1 &"), 1)
+        self.assertLess(summary_notices, tests_phase_start)
+        self.assertLess(tests_phase_start, tests_phase_end)
+        self.assertLess(tests_phase_end, tests_ok_match)
+        self.assertLess(tests_ok_match, tests_extract_nonfatal)
+        self.assertLess(tests_extract_nonfatal, doctests_phase_start)
+        self.assertLess(doctests_phase_start, doctests_phase_end)
+        self.assertLess(doctests_phase_end, doctests_ok_match)
+        self.assertLess(doctests_ok_match, doctests_extract_nonfatal)
+        self.assertLess(doctests_extract_nonfatal, tests_echo)
+        self.assertLess(tests_echo, tests_fallback)
+        self.assertLess(tests_fallback, doctests_echo)
+        self.assertLess(doctests_echo, doctests_fallback)
+        # Exactly two background children (Rust + notices).
+        self.assertEqual(job.count(" 2>&1 &"), 2)
         # Full logs only in the failure branch (not on the all-success path).
         self.assertEqual(job.count("\n            flush_logs\n"), 1)
         self.assertEqual(job.count("\n          flush_logs\n"), 0)
+        # Success path must not cat the full buffered logs.
+        self.assertNotIn('cat "$rust_log"', job[trap_clear_ok:])
+        self.assertNotIn('cat "$notices_log"', job[trap_clear_ok:])
+        # Unavailable fallbacks must not fail a successful job.
+        success_path = job[trap_clear_ok:]
+        self.assertNotIn("exit 1", success_path)
+        self.assertEqual(success_path.count("|| true"), 2)
         self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
         self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
@@ -1051,17 +1162,30 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("fn ci_macos()", xtask)
 
     def test_macos_quality_cargo_inventory_prefix_rules(self) -> None:
-        """Bare and run: normalize; any other prefix stays full-line."""
+        """Bare and run: normalize; other prefixes, folds, tabs, quotes fail-closed."""
         sample = "\n".join(
             (
+                # Allowed current shapes (normalize).
                 "              cargo fetch --locked",
                 "        run: cargo clippy --locked --workspace",
+                # Folded YAML scalar: bare cargo at end of physical line.
+                "        run: >-",
+                "          cargo",
+                "          build --release --locked",
+                # Tab between run: and cargo (must not normalize as run: ).
+                "        run:\tcargo test --locked",
+                # Quoted / modified cargo (keep full line).
+                "        'cargo' build",
+                '        "cargo" test',
                 "        FOO=1 cargo build --release",
                 "        env cargo test",
                 "        command: cargo doc",
                 "        sh -c 'cargo check'",
+                # Comments and non-command strings must not match.
                 "        # cargo ignored as comment",
+                "        # cargo",
                 "        tool: cargo-about@0.9.1",
+                "        uses: cargo-about@0.9.1",
                 "        run: env cargo build",
             )
         )
@@ -1070,6 +1194,11 @@ class ChangeScopeTests(unittest.TestCase):
             [
                 "cargo fetch --locked",
                 "cargo clippy --locked --workspace",
+                # Bare end-of-line cargo from folded scalar (breaks exact pin).
+                "cargo",
+                "run:\tcargo test --locked",
+                "'cargo' build",
+                '"cargo" test',
                 "FOO=1 cargo build --release",
                 "env cargo test",
                 "command: cargo doc",
@@ -1077,6 +1206,55 @@ class ChangeScopeTests(unittest.TestCase):
                 "run: env cargo build",
             ],
         )
+        # cargo-about and comment-only cargo must never enter the inventory.
+        self.assertNotIn("cargo-about", "\n".join(_macos_quality_cargo_inventory(sample)))
+        # Allowed workflow lines alone still normalize to the bare cargo command.
+        self.assertEqual(
+            _macos_quality_cargo_inventory(
+                "              cargo test --locked --workspace --all-targets --all-features\n"
+            ),
+            ["cargo test --locked --workspace --all-targets --all-features"],
+        )
+        self.assertEqual(
+            _macos_quality_cargo_inventory(
+                "        run: cargo doc --locked --workspace --no-deps --all-features\n"
+            ),
+            ["cargo doc --locked --workspace --no-deps --all-features"],
+        )
+        # Folded bare `cargo` alone is inventoried and would fail exact equality.
+        self.assertEqual(_macos_quality_cargo_inventory("          cargo\n"), ["cargo"])
+        # Non-command identifier must not match.
+        self.assertEqual(
+            _macos_quality_cargo_inventory("        tool: cargo-about@0.9.1\n"),
+            [],
+        )
+
+    def test_ci_macos_consolidation_doc_records_measured_exact_head_sample(self) -> None:
+        """Budget is measured; stale unmeasured claims must not return."""
+        doc = (ROOT / "docs" / "quality" / "ci-macos-consolidation.md").read_text(
+            encoding="utf-8"
+        )
+        # Exact-head sample evidence from Actions run 30997714456.
+        self.assertIn("30997714456", doc)
+        self.assertIn("9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69", doc)
+        self.assertIn("132 seconds", doc)
+        self.assertIn("101 seconds", doc)
+        self.assertIn("116 seconds", doc)
+        self.assertIn("217", doc)
+        self.assertIn("exactly 2", doc)
+        self.assertIn("exactly 6", doc)
+        self.assertIn("3 seconds", doc)
+        self.assertIn("Exact-head sample (measured)", doc)
+        self.assertIn("Exact-head measurement procedure", doc)
+        # Stale "unmeasured" budget claims must not return.
+        for stale in (
+            "does **not** claim that the\nacceptance budget has been measured",
+            "treat the budgets below as targets only",
+            "Budget pass/fail requires a\nrepresentative exact-head pull-request run after this change lands",
+            "unmeasured",
+        ):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, doc)
 
     def test_workflow_forbids_cache_artifact_and_manual_triggers(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
