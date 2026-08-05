@@ -9187,6 +9187,18 @@ fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &m
 }
 
 fn check_hmac_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+    // Root workspace still pins hmac =0.12.1 for the active Keychain/HKDF graph,
+    // but no member declares it directly after blob-spike retirement. Enforce the
+    // resolved version here; the manifest pin alone cannot validate transitive
+    // resolution after that direct consumer left the graph.
+    let hmac_versions: Vec<String> = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == "hmac")
+        .map(|package| package.version.to_string())
+        .collect();
+    violations.extend(hmac_resolved_version_violations(&hmac_versions, target));
+
     let Some(resolve) = &metadata.resolve else {
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
         return;
@@ -9219,6 +9231,31 @@ fn check_hmac_dependency_graph(metadata: &Metadata, target: &str, violations: &m
         &dependencies,
         target,
     ));
+}
+
+/// Target-aware HMAC resolved-version policy.
+///
+/// On `aarch64-apple-darwin`, the active Keychain/HKDF product graph requires
+/// HMAC: absence is a violation, and any present resolution must be exactly one
+/// package at 0.12.1. On iOS filter platforms, absence is allowed if future
+/// target scoping removes untargeted Keychain/HKDF reachability; when HMAC is
+/// present it must still be exactly one package at 0.12.1.
+fn hmac_resolved_version_violations(versions: &[String], target: &str) -> Vec<String> {
+    if versions.is_empty() {
+        return if is_macos_architecture_target(target) {
+            vec![format!(
+                "resolved hmac for {target} must be exactly one package at 0.12.1"
+            )]
+        } else {
+            Vec::new()
+        };
+    }
+    if versions.len() == 1 && versions[0] == "0.12.1" {
+        return Vec::new();
+    }
+    vec![format!(
+        "resolved hmac for {target} must be exactly one package at 0.12.1"
+    )]
 }
 
 fn hmac_dependency_graph_violations(
@@ -9956,9 +9993,9 @@ mod tests {
         future_macos_store_dependency_violation, gmail_dependency_graph_violations,
         gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
         hmac_dependency_graph_violations, hmac_manifest_dependency_violations,
-        is_macos_architecture_target, keychain_direct_dependency_set_violations,
-        keychain_mutation_boundary_violations, macos_client_xpc_wiring_violations,
-        macos_only_resolved_package_presence_violations,
+        hmac_resolved_version_violations, is_macos_architecture_target,
+        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
+        macos_client_xpc_wiring_violations, macos_only_resolved_package_presence_violations,
         mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
@@ -17514,6 +17551,61 @@ final class BrokerSyncSecrets: @unchecked Sendable {
         assert!(names.contains("tersa-application"));
         assert!(!names.contains("url"));
         assert!(!names.contains("cc"));
+    }
+
+    #[test]
+    fn hmac_resolved_version_is_target_aware() {
+        assert!(
+            hmac_resolved_version_violations(&["0.12.1".to_owned()], "aarch64-apple-darwin",)
+                .is_empty(),
+            "exact HMAC 0.12.1 on macOS must pass"
+        );
+        assert_eq!(
+            hmac_resolved_version_violations(&[], "aarch64-apple-darwin"),
+            vec!["resolved hmac for aarch64-apple-darwin must be exactly one package at 0.12.1"],
+            "missing HMAC on macOS must fail closed"
+        );
+        assert_eq!(
+            hmac_resolved_version_violations(&["0.12.0".to_owned()], "aarch64-apple-darwin",),
+            vec!["resolved hmac for aarch64-apple-darwin must be exactly one package at 0.12.1"],
+            "alternate HMAC version on macOS must fail closed"
+        );
+        assert_eq!(
+            hmac_resolved_version_violations(
+                &["0.12.1".to_owned(), "0.13.0".to_owned()],
+                "aarch64-apple-darwin",
+            ),
+            vec!["resolved hmac for aarch64-apple-darwin must be exactly one package at 0.12.1"],
+            "multiple HMAC versions on macOS must fail closed"
+        );
+
+        for ios_target in ["aarch64-apple-ios", "aarch64-apple-ios-sim"] {
+            assert!(
+                hmac_resolved_version_violations(&[], ios_target).is_empty(),
+                "HMAC absence on {ios_target} is allowed"
+            );
+            assert!(
+                hmac_resolved_version_violations(&["0.12.1".to_owned()], ios_target).is_empty(),
+                "exact HMAC 0.12.1 on {ios_target} must pass when present"
+            );
+            assert_eq!(
+                hmac_resolved_version_violations(&["0.13.0".to_owned()], ios_target),
+                vec![format!(
+                    "resolved hmac for {ios_target} must be exactly one package at 0.12.1"
+                )],
+                "alternate HMAC version on {ios_target} must fail closed"
+            );
+            assert_eq!(
+                hmac_resolved_version_violations(
+                    &["0.12.1".to_owned(), "0.12.1".to_owned()],
+                    ios_target,
+                ),
+                vec![format!(
+                    "resolved hmac for {ios_target} must be exactly one package at 0.12.1"
+                )],
+                "multiple HMAC packages on {ios_target} must fail closed"
+            );
+        }
     }
 
     #[test]

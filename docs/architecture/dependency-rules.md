@@ -39,7 +39,7 @@ and blob diagnostic executables were likewise removed by ADR-0025 housekeeping
 graph by `deny.toml`. The production store `tersa-store-sqlcipher-macos` is the
 direct SQLCipher owner; authorized composition crates may reach
 `rusqlite`/`libsqlite3-sys` only through the reviewed owner set enforced by
-`xtask`. `mail-parser` 0.11.5 and `ammonia` 4.1.3 remain pinned exactly and
+`xtask`. `mail-parser` 0.11.5 and `ammonia` 4.1.4 remain pinned exactly and
 exclusive to the retained `tersa-mime-spike`. Linux CI exercises that portable
 MIME diagnostic's deterministic tests; product Apple CI does not cover spike
 cross-builds. `hmac` 0.12.1 is pinned exactly and may be reached by
