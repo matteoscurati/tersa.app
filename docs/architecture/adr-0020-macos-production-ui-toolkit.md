@@ -22,9 +22,9 @@ interception, and runtime footprint unresolved. The existing `TersaMac`
 target is already a minimal AppKit shell with a Rust static-library link.
 
 The governing macOS accessibility and performance bar is the
-[macOS Phase 1 acceptance protocol](../m0/macos-phase-1-acceptance-protocol.md)
-(`P1-MACOS-001`), not the mobile-inclusive checklist in ADR-0006 A9. This ADR
-references that protocol and does not restate A9's list or any thresholds.
+[macOS acceptance protocol](../quality/macos-acceptance.md), not the
+mobile-inclusive checklist in ADR-0006 A9. This ADR references that protocol and
+does not restate A9's list or any thresholds.
 
 ## Decision
 
@@ -83,10 +83,10 @@ rationale; they do not assert that those diagnostic assets still exist.
 
 ## Non-claims
 
-This ADR passes, reopens, closes, downgrades, or edits no gate;
-`gate-register.json` is unchanged, `ui_baseline_approved` stays false, and
-`M1-UI-001` stays blocked. No `M0-SLINT-*` or `M0-DIOXUS-*` gate is closed,
-reopened, or downgraded.
+This ADR passes, reopens, closes, downgrades, or edits no acceptance claim;
+the mobile-inclusive production UI baseline stays unapproved, and M1 stays
+blocked. No historical M0 Slint or Dioxus gate is closed, reopened, or
+downgraded by this ADR.
 
 This ADR makes no signing, notarization, or distribution claim and records no
 `P1-MACOS-001`, `P1-MACOS-002`, or `P1-MACOS-003` evidence. This is

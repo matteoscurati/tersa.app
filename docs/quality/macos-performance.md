@@ -1,13 +1,14 @@
-# macOS Step-4 performance harness
+# macOS performance harness
 
 ## Scope
 
 This is the protocol-grade collection mechanism for macOS performance data and
 the unsigned pre-measurement runner required by Step 4 of the macOS-first plan.
-It does not pass `M0-CACHE-001`, `P1-MACOS-001`, `P1-MACOS-002`, or
-`P1-MACOS-003`. The final gates still require the exact release-equivalent
-Developer ID candidate, the manual UI observations below, immutable retained
-evidence, and an independent reviewer.
+It does not pass UI acceptance, release acceptance, or the Phase 1 aggregate.
+Those claims still require the exact release-equivalent Developer ID candidate,
+the manual UI observations in the
+[macOS acceptance protocol](macos-acceptance.md), immutable retained evidence,
+and an independent reviewer.
 
 Run the privacy-safe unsigned probe on an Apple Silicon Mac:
 
@@ -58,19 +59,21 @@ notarization identifier.
 
 ## Release-equivalent completion
 
-For `P1-MACOS-001`, use the exact Developer ID candidate and the canonical
-[macOS Phase 1 acceptance protocol](macos-phase-1-acceptance-protocol.md). After
-one warm-up, record at least five runs for every metric. Instruments or an
-equivalent Apple tool must supply cached-inbox interactive cold start, inbox
-scroll frame pacing and bounded materialization, idle inbox RSS, and live
-sync/index peak RSS. The automated query and size collection may be reused only
-when it runs against that same immutable candidate and its result is included
-in the retained, redacted evidence manifest.
+For macOS UI acceptance performance evidence, use the exact Developer ID
+candidate and the canonical
+[macOS acceptance protocol](macos-acceptance.md). After one warm-up, record at
+least five runs for every metric. Instruments or an equivalent Apple tool must
+supply cached-inbox interactive cold start, inbox scroll frame pacing and
+bounded materialization, idle inbox RSS, and live sync/index peak RSS. The
+automated query and size collection may be reused only when it runs against that
+same immutable candidate and its result is included in the retained, redacted
+evidence manifest.
 
-A development or unsigned result is a merge-time tripwire, never a gate status.
-A breach blocks the pull request until fixed or accepted by an independent
-reviewer with the conditions recorded. A distribution-signed threshold miss
-fails the gate unless a separately accepted ADR changes the budget.
+A development or unsigned result is a merge-time tripwire, never an acceptance
+status. A breach blocks the pull request until fixed or accepted by an
+independent reviewer with the conditions recorded. A distribution-signed
+threshold miss fails acceptance unless a separately accepted ADR changes the
+budget.
 
 ## Size-budget baseline
 

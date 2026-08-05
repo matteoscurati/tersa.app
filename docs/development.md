@@ -4,7 +4,7 @@
 
 - macOS 15 or later, or a current Linux distribution, for shared-core work
 - Rust 1.91.1, installed automatically through `rust-toolchain.toml`
-- Xcode 26 for Apple application work beginning in M0 PR3
+- Xcode 26 for Apple application work
 
 The supported release targets are arm64 macOS 15 or later and iOS/iPadOS 18 or
 later. Linux is a continuous-integration target for the platform-independent
@@ -24,26 +24,12 @@ advisory checks, feature-powerset checks, DCO validation, and spelling checks.
 The xtask architecture check enforces active product dependency boundaries on
 every supported Apple target.
 
-While the frozen M0 gate register remains tracked, keep the product-gate
-validator and its self-test available:
-
-```sh
-python3 scripts/verify-m0-gates.py
-python3 scripts/verify-m0-gates.py --self-test
-```
-
-CI runs `python3 scripts/verify-m0-gates.py --self-test` in the lightweight
-change-scope job. That mode performs full register validation plus negative
-mutation self-tests; the policy job does not own it. Contributors should run
-the same `--self-test` command locally before `cargo xtask verify`. The
-validator is not an active product lane; it stays only while the register is
-still in tree and retires with that register in the documentation PR. Adding a
-gate, changing a minimum evidence tier, or changing the attestation schema
-still requires a matching validator update and independent exact-head review;
-editing the JSON alone fails closed. For physical-device or signed-distribution
-evidence, follow the
-[physical-device and distribution protocol](m0/physical-device-and-distribution-protocol.md),
-including its commit-bound locator and review-retention rules.
+For physical-device or signed-distribution evidence, follow the
+[Apple physical-device and distribution protocol](release/apple-distribution.md),
+including its commit-bound locator and review-retention rules. macOS UI and
+release acceptance are defined by the
+[macOS acceptance protocol](quality/macos-acceptance.md) and the
+[macOS performance harness](quality/macos-performance.md).
 
 ### CI execution modes
 
@@ -52,11 +38,10 @@ schedule no CI runners; changing the pull request to ready-for-review triggers
 the required path-scoped product CI. Subsequent ready pull-request commits
 supersede an older in-progress run through the per-PR concurrency group. Every
 ready pull request runs the lightweight classifier job (deterministic
-control-script tests, retained-helper self-tests, DCO validation, and change
-scope), then only the path-scoped active lanes that apply, and finally the
-required `CI gate`. Documentation, workflow, and exact self-tested CI-control
-changes stop at the classifier and gate, so their required run normally
-finishes in seconds.
+control-script tests, DCO validation, and change scope), then only the
+path-scoped active lanes that apply, and finally the required `CI gate`.
+Documentation, workflow, and exact self-tested CI-control changes stop at the
+classifier and gate, so their required run normally finishes in seconds.
 
 The five path-scoped active lanes are:
 
@@ -102,16 +87,15 @@ and any relevant security or binary-size impact.
 See [Dependency rules](architecture/dependency-rules.md) before adding a new
 crate or changing an internal edge.
 
-## OAuth PKCE feasibility
+## OAuth PKCE
 
-The M0 adapter proves authorization request generation and native callback
-transport without real Google credentials. Official builds inject public OAuth
-client identifiers and the registered iOS callback scheme as Xcode build
-settings; they are not secrets. Some Google Desktop clients also require their
-issued client secret at the token endpoint even with PKCE. For an installed
-native app this is non-confidential client configuration, not an authentication
-boundary; inject it only through ignored local or release configuration and
-never commit or log it. An unconfigured build fails closed.
+Official builds inject public OAuth client identifiers and the registered iOS
+callback scheme as Xcode build settings; they are not secrets. Some Google
+Desktop clients also require their issued client secret at the token endpoint
+even with PKCE. For an installed native app this is non-confidential client
+configuration, not an authentication boundary; inject it only through ignored
+local or release configuration and never commit or log it. An unconfigured build
+fails closed.
 
 ```sh
 xcodebuild ... \
@@ -119,19 +103,14 @@ xcodebuild ... \
   TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.ci
 ```
 
-The combined local verifier `sh apple/scripts/verify-oauth-feasibility.sh` is
-obsolete after the ADR-0024 token-broker cutover: it still expects
-`TersaOAuthClientID` and `_tersa_oauth_macos_begin` in TersaMac plus retired
-archive inputs that product CI no longer produces. Do not use it as a current
-local route; PR5 will remove it. Its historical scope covered archived symbols
-and injected Info.plist values, ad-hoc signing of a macOS archive copy with the
-exact five-key production entitlement shape for static signing evidence, and a
-separately signed runnable loopback probe limited to App Sandbox plus network
-client and server entitlements: an ad-hoc identity cannot authorize the
-production team-bound Keychain access group, so that probe proved only the
-OAuth sandbox networking subset. Signed same-team Keychain interoperability
-remains a later distribution gate. Neither current product CI nor local
-verification covers that obsolete combined macOS OAuth surface.
+The product macOS path is governed by
+[ADR 0023](architecture/adr-0023-step3-oauth-and-bounded-sync.md) and
+[ADR 0024](architecture/adr-0024-macos-token-process-isolation.md). The bridge
+`legacy-oauth` feature remains required for the active iOS begin/finish/cancel
+exports and still carries the legacy macOS begin/poll surface for source
+completeness; the product macOS archive rejects that legacy surface through its
+closed contract. Ad-hoc signing is not production proof and does not substitute
+for Developer ID, notarization, or independently reviewed distribution evidence.
 
 Rust tests exercise the deterministic callback, negative state machine, bounded
 HTTP parser, static responses, speculative-connection recovery, absolute read
@@ -190,45 +169,28 @@ wrong-group probes in an Apple Development build, then the Developer ID signed
 and notarized release candidate — is a separate evidence step tracked by
 ADR 0024 Items 5 and 6.
 
-## Retired SQLCipher, search, and blob diagnostics
+## Retired M0 diagnostics
 
-Historical note: the M0 SQLCipher, encrypted-search/Tantivy, and crash-safe
-blob diagnostics (executables, verifiers, about configs, and diagnostic notice
-outputs) were removed by ADR-0025 housekeeping (PR3). Their detailed studies
-remain as non-executable historical records until PR5 consolidation:
+The M0 diagnostic program is retired. A short
+[historical summary](history/m0-summary.md) consolidates what the spikes
+learned. Active product SQLCipher remains the production store adapter. Product
+mailbox search remains the bounded application/store search path. No production
+blob implementation, Tantivy replacement, MIME renderer, `SafeHtml`
+implementation, restricted WKWebView, parser, or fuzz harness is claimed by that
+retirement. Hostile-content handling remains a product security requirement.
 
-- [SQLCipher feasibility](m0/sqlcipher-feasibility.md)
-- [Encrypted search feasibility](m0/search-feasibility.md)
-- [Crash-safe blob feasibility](m0/blob-feasibility.md)
-- [ADR 0011](architecture/adr-0011-sqlcipher-schema-and-migration-ownership.md)
-  and [ADR 0012](architecture/adr-0012-chunked-blob-format.md) (historical)
-
-Active product SQLCipher remains the production store adapter. Product mailbox
-search remains the bounded application/store search path. No production blob
-implementation or Tantivy replacement is claimed by this retirement.
-
-## Retired MIME and hostile HTML diagnostics
-
-Historical note: the M0 MIME/hostile-HTML diagnostic (portable spike, Apple
-WKWebView targets, finite host fuzz project, verifiers, about config, and
-diagnostic notice outputs) was removed by ADR-0025 housekeeping (PR4).
-`ammonia` and `mail-parser` are banned from the active workspace graph by
-`deny.toml`. No active MIME renderer, `SafeHtml` implementation, restricted
-WKWebView, parser, or fuzz harness remains in the product tree. Hostile-content
-handling remains a product security requirement tracked by the open
-`M0-MIME-001` gate. The detailed study remains a non-executable historical
-record until PR5 consolidation:
-
-- [MIME and hostile HTML feasibility](m0/mime-html-feasibility.md)
+Preserved architectural decisions include
+[ADR 0011](architecture/adr-0011-sqlcipher-schema-and-migration-ownership.md),
+[ADR 0012](architecture/adr-0012-chunked-blob-format.md), and the OAuth path in
+[ADR 0023](architecture/adr-0023-step3-oauth-and-bounded-sync.md) and
+[ADR 0024](architecture/adr-0024-macos-token-process-isolation.md).
 
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
 arm64 macOS 15 and iOS/iPadOS 18. `TersaMac` and `TersaIOS` are the product
-bridge targets. Historical note: the retired M0 Slint and Dioxus Apple schemes
-and their evidence helpers were removed by ADR-0025 housekeeping (PR2); the
-retired M0 MIME Apple schemes were removed by ADR-0025 housekeeping (PR4); full
-M0 study consolidation is deferred to PR5.
+bridge targets. Historical M0 diagnostic schemes and helpers were removed under
+ADR-0025; see the [M0 historical summary](history/m0-summary.md).
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
 product artifacts:

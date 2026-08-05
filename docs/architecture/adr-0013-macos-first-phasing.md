@@ -15,10 +15,12 @@ M0 evidence does not approve a production UI baseline.
 
 The product can reduce integration risk by first delivering a bounded macOS
 path. That path must not reinterpret host diagnostics as iPhone or iPad
-evidence, weaken the existing M0 gates, or let a desktop UI decision decide the
-mobile toolkit. The existing [product constraints](adr-0006-product-constraints.md),
-[dependency rules](dependency-rules.md), and [M0 gate register](../m0/gate-register.json)
-remain authoritative until later governance work explicitly changes them.
+evidence, weaken mobile-inclusive requirements, or let a desktop UI decision
+decide the mobile toolkit. The existing
+[product constraints](adr-0006-product-constraints.md) and
+[dependency rules](dependency-rules.md) remain authoritative. Retired M0
+diagnostic context is summarized in the
+[M0 historical summary](../history/m0-summary.md).
 
 ## Decision
 
@@ -97,9 +99,9 @@ The load-bearing split is explicit: Steps 2 through 4 source and development
 work may start before the credential block, but it produces only
 ad-hoc/development evidence that can never count toward `P1-MACOS-001`,
 `P1-MACOS-002`, or `P1-MACOS-003`, or toward any distribution-signed closure,
-which remain Developer-ID/notarization-only per the macOS Phase 1 acceptance
-protocol. Roadmap item 7 remains open until PR 33b, and ADR-0019's PR 33b
-preconditions are unchanged.
+which remain Developer-ID/notarization-only per the
+[macOS acceptance protocol](../quality/macos-acceptance.md). Roadmap item 7
+remains open until PR 33b, and ADR-0019's PR 33b preconditions are unchanged.
 
 The phrase "only after its own gates pass" in item 9 above (roadmap item 8)
 governs gate-closure claims and signed release artifacts, not the start of

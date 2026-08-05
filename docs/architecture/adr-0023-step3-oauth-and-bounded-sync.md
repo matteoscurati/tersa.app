@@ -85,11 +85,13 @@ token deletion, and mailbox purge. The original decomposition's separate
 post-revoke re-connect exercise was not part of the final owner-approved
 connect → sync → disconnect run and is not claimed as live evidence.
 
-This completion is delivery evidence, not an `M0-OAUTH-001` pass: the local run
-did not produce the immutable retained artifact and independent evidence
-attestation required by the gate register. It also does not exercise the
-deferred distinct token/root Keychain-group barrier, Developer ID signing,
-notarization, accessibility, or the Step-4 performance harness.
+This completion is delivery evidence, not distribution-signed acceptance: the
+local run did not produce the immutable retained artifact and independent
+evidence attestation required by the
+[Apple physical-device and distribution protocol](../release/apple-distribution.md).
+It also does not exercise the deferred distinct token/root Keychain-group
+barrier, Developer ID signing, notarization, accessibility, or the Step-4
+performance harness.
 
 ### Client-secret posture (amends an M0 invariant, empirically resolved)
 
@@ -102,10 +104,10 @@ installed app (RFC 8252 §8.5). It is build-injected alongside the client ID,
 stored in zeroizing runtime configuration, and sent only to the token endpoint;
 it is never treated as an authentication boundary, committed, or logged. A
 Desktop client that does not require it may leave the setting absent. This ADR
-therefore amends the
-[OAuth/PKCE feasibility](../m0/oauth-pkce-feasibility.md) deferred-work invariant
+therefore amends the historical M0 OAuth deferred-work invariant
 "exchange the validated code **without a client secret**" to "without a
-**confidential** secret", so the plan holds under either outcome: any secret sent is
+**confidential** secret" (see the [M0 historical summary](../history/m0-summary.md)),
+so the plan holds under either outcome: any secret sent is
 a build-injected non-confidential value carried alongside the client ID and used
 only at the token endpoint. The alternative — an iOS-type client with no secret —
 would force a reversed-client-ID custom-scheme redirect and discard the reviewed

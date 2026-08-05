@@ -3,50 +3,31 @@
 tersa.app is delivered as installable vertical slices. A failed gate changes
 the architecture or stops dependent work; it is not accepted as temporary debt.
 
-## M0 — Feasibility and governance
+## M0 — Feasibility and governance (historical)
 
-Validate Apple distribution, the selected UI candidate on physical devices,
-OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
-security policy, and Google API compliance.
+M0 validated Apple distribution readiness, UI candidates, OAuth PKCE, encrypted
+storage, search, hostile MIME/HTML handling, licenses, security policy, and
+Google API compliance through diagnostic spikes. That program is retired.
 
-Historical note: the M0 SQLCipher, encrypted-search/Tantivy, and crash-safe
-blob diagnostics proved host-side feasibility constraints and then were removed
-from the tree by ADR-0025 housekeeping (PR3). Their detailed studies remain
-non-executable historical records until PR5 consolidation; they do not claim a
-production blob implementation or a Tantivy replacement. Active product
-SQLCipher is the production macOS store. Active product search is the bounded
-mailbox search path. Storage, search-device, and blob product gates that remain
-open stay open on the still-tracked register until PR5.
-
-Historical note: the M0 MIME/hostile-HTML diagnostic (portable spike, Apple
-WKWebView targets, finite host fuzz project, verifiers, about config, and
-diagnostic notices) proved host-side bounded parsing and containment
-constraints and then was removed from the tree by ADR-0025 housekeeping (PR4).
-Its detailed study remains a non-executable historical record until PR5
-consolidation; it does not claim an active MIME renderer, `SafeHtml`
-implementation, restricted WKWebView, parser, or diagnostic in the product
-graph. Hostile MIME/HTML handling remains a product security requirement.
-`M0-MIME-001` therefore remains open at its device-signed evidence requirement.
+The [M0 historical summary](history/m0-summary.md) consolidates results and
+limits. Active product SQLCipher is the production macOS store. Active product
+search is the bounded mailbox search path. Hostile MIME/HTML handling remains a
+product security requirement with no active parser, sanitizer, `SafeHtml`,
+restricted WKWebView, renderer, or fuzz harness in the product graph.
 
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. A development-signed macOS run also completed
 real consumer authorization, code exchange, group-scoped Keychain persistence,
-read-only Gmail sync, confirmed revoke, and local purge. `M0-OAUTH-001` remains
-open because that run was not captured as the immutable retained, independently
-attested device-signed evidence the register requires. Workspace authorization,
-physical-device browser lifecycle, and Google restricted-scope verification
-remain unproven.
+read-only Gmail sync, confirmed revoke, and local purge. That run is not
+immutable retained, independently attested device-signed evidence. Workspace
+authorization, physical-device browser lifecycle, and Google restricted-scope
+verification remain unproven. Current product OAuth work follows
+[ADR 0023](architecture/adr-0023-step3-oauth-and-bounded-sync.md) and
+[ADR 0024](architecture/adr-0024-macos-token-process-isolation.md).
 
-Historical note: the M0 Slint and Dioxus UI diagnostics are retired from the
-tree (ADR-0025 housekeeping PR2). The M0 SQLCipher, search/Tantivy, and blob
-diagnostics are retired from the tree (ADR-0025 housekeeping PR3). The M0
-MIME/hostile-HTML and fuzz diagnostics are retired from the tree (ADR-0025
-housekeeping PR4). Their production gates did not pass as device-signed product
-evidence; ADR history and the still-tracked M0 studies preserve those outcomes.
-M1 remains blocked because no production UI baseline has passed; the
-authoritative [M0 gate register](m0/gate-register.json) records current
-HEAD-checkable evidence and the cache measurement gate. Full M0 study
-consolidation is deferred to PR5.
+M1 remains blocked because no production UI baseline has passed device-signed
+product evidence. Removed M0 gate IDs and statuses are historical only and are
+no longer an authoritative live register.
 
 ## Phase 1 — macOS-first product path
 
@@ -93,6 +74,10 @@ the credential block never satisfies `P1-MACOS-001`, `P1-MACOS-002`, or
 Performance and lightweightness are governed as a primary constraint with
 early per-slice measurement in the
 [performance ADR](architecture/adr-0022-performance-primary-constraint.md).
+Active acceptance and release evidence follow the
+[macOS acceptance protocol](quality/macos-acceptance.md),
+[macOS performance harness](quality/macos-performance.md), and
+[Apple physical-device and distribution protocol](release/apple-distribution.md).
 
 The target slice connects one account, synchronizes a bounded recent mailbox,
 shows an encrypted cached inbox and thread, supports the planned bounded
@@ -101,18 +86,17 @@ read-only CLI. It retains the existing product boundaries: no required
 proprietary backend, encrypted local persistence, shared Rust core, open source,
 and Gmail through the official API.
 
-This phase does not pass, delete, or downgrade M0 gates. A macOS baseline never
-satisfies `M1-UI-001` and never changes the mobile-inclusive
-`ui_baseline_approved` flag. The current cache budgets remain constraints, not
-passes. The real Google consumer flow is implemented and has run successfully
-under an Apple Development signature. Its formal gate and Google verification
-remain open until qualifying reviewed evidence exists.
+A macOS baseline never satisfies the mobile-inclusive production UI baseline.
+The current cache budgets remain constraints, not passes. The real Google
+consumer flow is implemented and has run successfully under an Apple Development
+signature. Formal distribution-signed acceptance and Google verification remain
+open until qualifying reviewed evidence exists.
 
-The bootstrap-source implementation does not edit or pass the M0 gate register,
-add a new executable, Xcode, signing, entitlement, package, or distribution
-surface, or imply OAuth, token, network, or real-account behavior. Its fake and
-deterministic evidence cannot satisfy runtime, signing, App Group, Data
-Protection Keychain interoperability, UI, or release gates. The canonical
+The bootstrap-source implementation does not add a new executable, Xcode,
+signing, entitlement, package, or distribution surface, or imply OAuth, token,
+network, or real-account behavior. Its fake and deterministic evidence cannot
+satisfy runtime, signing, App Group, Data Protection Keychain interoperability,
+UI, or release acceptance. The canonical
 `AccountId`, fixed `default` profile, existing `tersa-keychain-macos` provisioner,
 and direct validated read-write SQLCipher composition are mandatory; no
 production override or second provisioning channel is permitted. The only new
@@ -249,10 +233,10 @@ performance; TestFlight and App Store release work; best-effort background
 refresh; and closure of the existing device-signed mobile gates.
 
 No Phase 1 source, host, macOS UI, signing, or notarization evidence can close
-a Phase 2 device-signed mobile gate. M1 remains blocked in the authoritative
-[M0 gate register](m0/gate-register.json) until its existing mobile-inclusive
-requirements are independently satisfied; this roadmap does not imply that it
-is unblocked or passed.
+a Phase 2 device-signed mobile gate. M1 remains blocked until its
+mobile-inclusive requirements are independently satisfied; this roadmap does
+not imply that it is unblocked or passed. See the
+[M0 historical summary](history/m0-summary.md) for retired diagnostic context.
 
 ## Platform MVP completion
 

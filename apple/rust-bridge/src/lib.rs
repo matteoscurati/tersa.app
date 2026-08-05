@@ -63,9 +63,7 @@ pub use mailbox::{
 
 #[cfg(all(target_os = "macos", feature = "legacy-oauth"))]
 #[doc(inline)]
-pub use oauth::{
-    tersa_oauth_macos_begin, tersa_oauth_macos_entitlement_probe, tersa_oauth_macos_poll,
-};
+pub use oauth::{tersa_oauth_macos_begin, tersa_oauth_macos_poll};
 
 #[cfg(test)]
 #[cfg_attr(

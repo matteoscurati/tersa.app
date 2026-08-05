@@ -34,9 +34,7 @@ RETIRED_SCOPE_NAMES = (
     "full_evidence",
     "run_full_evidence",
 )
-# Helper script names stay out of this list: the changes job intentionally
-# self-tests the transitional verify-m0-gates helper while the frozen register
-# remains tracked.
+# Retired diagnostic CI routes, validators, and evidence helpers must not return.
 RETIRED_WORKFLOW_TOKENS = (
     "workflow_dispatch",
     "evidence_suite",
@@ -70,6 +68,7 @@ RETIRED_WORKFLOW_TOKENS = (
     "mime-parser-fuzz-evidence",
     "crash-safe-aead-blob-feasibility-evidence",
     "verify-oauth-feasibility.sh",
+    "verify-m0-gates.py",
     "capture-slint-evidence.sh",
     "capture-dioxus-evidence.sh",
     "capture-dioxus-device-evidence.sh",
@@ -112,39 +111,25 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     "After creating the unsigned base archives, run:",
     "```sh\nsh apple/scripts/verify-oauth-feasibility.sh\n```",
 )
-# Present-tense operational claims only. Past-tense historical run locators
-# (for example owner-attested dates) stay allowed in the M0 study records.
-M0_FEASIBILITY_DOCS = (
-    ROOT / "docs" / "m0" / "ui-feasibility.md",
-    ROOT / "docs" / "m0" / "dioxus-ui-feasibility.md",
-    ROOT / "docs" / "m0" / "mime-html-feasibility.md",
-    ROOT / "docs" / "m0" / "blob-feasibility.md",
-    ROOT / "docs" / "m0" / "oauth-pkce-feasibility.md",
-    ROOT / "docs" / "m0" / "search-feasibility.md",
+# Active product docs that must not reintroduce retired operational CI routes.
+ACTIVE_PRODUCT_DOCS = (
+    ROOT / "docs" / "history" / "m0-summary.md",
+    ROOT / "docs" / "quality" / "macos-acceptance.md",
+    ROOT / "docs" / "quality" / "macos-performance.md",
+    ROOT / "docs" / "release" / "apple-distribution.md",
+    ROOT / "docs" / "development.md",
 )
-RETIRED_M0_OPERATIONAL_CLAIMS = (
+RETIRED_PRODUCT_DOC_OPERATIONAL_CLAIMS = (
+    "verify-m0-gates.py",
+    "gate-register.json",
+    "docs/m0/",
     "slint-apple-evidence",
     "dioxus-apple-evidence",
     "mime-apple-evidence",
     "mime-parser-fuzz",
     "blob-apple-evidence",
-    "CI owns the simulator",
-    "The separate Dioxus Apple CI job",
-    "artifact upload",
-    "retains the aggregate artifact for 90 days",
-    "binds aggregate evidence to the immutable source commit",
-    "binds `result.txt` to the source commit",
-    "CI treats screenshots",
-    "uses `lsof` against both live processes",
-    "It builds the macOS, iOS device, and iOS simulator targets",
-    "CI uses a public non-functional client identifier",
-    "The CI host profile",
-    # Retired MIME/fuzz operational CI claims must not re-enter historical studies.
-    "validates the independent fuzz lock against its isolated license, source, and advisory policy",
-    # Combined OAuth verifier is stale after the ADR-0024 token-broker cutover.
-    "deterministic fake callbacks through\n`sh apple/scripts/verify-oauth-feasibility.sh`",
-    # Notice CI compares committed apple/licenses sources, not Xcode packages.
-    "compares them byte-for-byte with the resources packaged by Xcode",
+    "verify-oauth-feasibility.sh",
+    "actions/upload-artifact@",
 )
 # Architecture docs that still carry operational CI/local evidence claims.
 ARCHITECTURE_REGRESSION_DOCS = (
@@ -158,6 +143,7 @@ RETIRED_ARCHITECTURE_OPERATIONAL_CLAIMS = (
     "while Apple CI\ncross-builds the same locked graphs",
     "so CI can retain evidence",
     "CI's policy job runs the Python gate validator",
+    "python3 scripts/verify-m0-gates.py --self-test",
 )
 
 
@@ -365,8 +351,28 @@ class ChangeScopeTests(unittest.TestCase):
             ("performance reporter stays in its tested control lane", ["scripts/macos-performance-report.py"], set()),
             ("performance tests stay in the control lane", ["scripts/test_macos_performance_report.py"], set()),
             (
-                "transitional M0 gate helper stays in the control lane",
+                "retired M0 gate helper fails closed through unknown-path fallback",
                 ["scripts/verify-m0-gates.py"],
+                ALL,
+            ),
+            (
+                "consolidated M0 history is docs-only",
+                ["docs/history/m0-summary.md"],
+                set(),
+            ),
+            (
+                "active macOS acceptance protocol is docs-only",
+                ["docs/quality/macos-acceptance.md"],
+                set(),
+            ),
+            (
+                "active macOS performance protocol is docs-only",
+                ["docs/quality/macos-performance.md"],
+                set(),
+            ),
+            (
+                "active Apple distribution protocol is docs-only",
+                ["docs/release/apple-distribution.md"],
                 set(),
             ),
             (
@@ -490,8 +496,7 @@ class ChangeScopeTests(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py",
             changes_job,
         )
-        self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
-        self.assertEqual(workflow.count("verify-m0-gates.py"), 1)
+        self.assertNotIn("verify-m0-gates.py", workflow)
         self.assertNotIn("write-evidence-manifest.py", workflow)
         self.assertNotIn("prepare-verified-skia.sh", workflow)
         self.assertNotIn("rust-skia", workflow)
@@ -507,12 +512,15 @@ class ChangeScopeTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertNotIn(token, development)
 
-    def test_m0_feasibility_docs_drop_retired_operational_ci_claims(self) -> None:
-        for path in M0_FEASIBILITY_DOCS:
+    def test_active_product_docs_drop_retired_operational_ci_claims(self) -> None:
+        for path in ACTIVE_PRODUCT_DOCS:
             text = path.read_text(encoding="utf-8")
-            for claim in RETIRED_M0_OPERATIONAL_CLAIMS:
+            for claim in RETIRED_PRODUCT_DOC_OPERATIONAL_CLAIMS:
                 with self.subTest(path=path.name, claim=claim):
                     self.assertNotIn(claim, text)
+
+    def test_retired_m0_validator_is_not_a_control_path(self) -> None:
+        self.assertNotIn("scripts/verify-m0-gates.py", MODULE.CI_CONTROL_PATHS)
 
     def test_architecture_docs_drop_retired_operational_ci_claims(self) -> None:
         for path in ARCHITECTURE_REGRESSION_DOCS:

@@ -8,6 +8,7 @@ one at https://mozilla.org/MPL/2.0/.
 
 - Status: Accepted
 - Date: 2026-08-05
+- Amended: 2026-08-05 (PR5 consolidation completed)
 
 ## Context
 
@@ -35,38 +36,37 @@ chain checks, active third-party notices, and the required `CI gate`. Manual
 evidence-manifest creation, artifact uploads, and the manual evidence gate are
 removed.
 
-One standalone helper remains only as a transitional dependency for a tracked
-consumer that a later pull request still owns:
+Housekeeping pull requests removed spike crates, Apple diagnostic targets, the
+frozen gate register, the register validator, the obsolete combined OAuth
+verifier, and the dedicated entitlement-probe example/export. The fifth and
+final consolidation PR records that completion: one short
+[historical summary](../history/m0-summary.md) replaces the detailed M0 study
+corpus, and still-valid product protocols live under
+[docs/quality/](../quality/macos-acceptance.md) and
+[docs/release/](../release/apple-distribution.md).
 
-- `scripts/verify-m0-gates.py`, retained until the frozen gate register is
-  removed with the documentation PR.
-
-Its cheap self-test stays in the lightweight change-scope job so the retained
-script cannot rot while still tracked. That self-test does not make the helper
-an active CI product lane, and CI no longer creates or uploads evidence
-manifests. The evidence-manifest helper was removed with the Dioxus capture path
-in PR2.
-
-Detailed spike sources, schemes, and packaging will be removed in follow-up
-pull requests. The following remain preserved:
+The following remain preserved:
 
 - architectural decision records that capture the learning;
 - security and governance controls that still apply to the product;
 - production SQLCipher and store decisions and code;
 - product third-party notice generation;
 - acceptance, performance, and distribution protocols;
-- a short historical summary of the diagnostic program where still useful.
+- a short historical summary of the diagnostic program.
+
+This consolidation does not claim that release, accessibility, or
+distribution-signed acceptance gates have passed.
 
 ## Consequences
 
 - Pull requests and the merge queue exercise only active product validation
   lanes.
-- GitHub Actions no longer creates or uploads diagnostic evidence manifests;
-  the M0 gate validator remains a transitional script until PR 5 removes its
-  tracked register owner.
-- Later housekeeping pull requests can delete spike crates and Apple diagnostic
-  targets without first reworking CI classification.
+- GitHub Actions no longer creates or uploads diagnostic evidence manifests,
+  and no M0 gate validator remains in the tree.
+- Spike crates and Apple diagnostic targets are gone; product behavior, Rust
+  FFI contracts, database behavior, OAuth product flows, Keychain, and UI code
+  are unchanged by this retirement decision.
 - Temporary audit ignores and review deadlines that still cover reachable or
-  transitional spike dependencies remain until those sources are removed.
+  transitional spike dependencies remain only if those sources still exist.
 - This decision does not change product behavior, Rust FFI, database behavior,
   OAuth, Keychain, or user interface code.
