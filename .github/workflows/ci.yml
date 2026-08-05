@@ -117,26 +117,50 @@ jobs:
       # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
       # Launch TersaMac first so the critical path acquires shared Rust build
       # resources (apple/build/rust + Cargo lock) before the shorter iOS path.
-      # Stream TersaMac live through tee inside a pipefail subshell (PID + wait
-      # propagate xcodebuild status); isolate only the independent iOS build log.
+      # Both lanes buffer to separate logs (no live streaming of multi-MB Xcode
+      # output); EXIT/INT/TERM traps flush any available logs on cancel/failure.
       - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/apple-product-logs"
+          macos_log="$log_dir/macos-test.log"
+          ios_log="$log_dir/ios-build.log"
           mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          # Idempotent dump: safe if a log is missing; never masks caller status.
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$macos_log" ]; then
+              echo "----- macOS test -----"
+              cat "$macos_log" || true
+            fi
+            if [ -f "$ios_log" ]; then
+              echo "----- iOS simulator build -----"
+              cat "$ios_log" || true
+            fi
+            return 0
+          }
+
+          # Flush before process termination; re-exit with the original status so
+          # the trap cannot mask child failures. INT/TERM clear EXIT first to
+          # avoid a second flush/exit from the EXIT handler.
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
 
           # Critical path first: claim shared Rust resources ahead of iOS.
-          # tee is inside the pipefail subshell so wait on macos_pid reflects
-          # xcodebuild failure, not tee success, while stdout stays live.
           (
             set -euo pipefail
             xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
               -configuration Debug -destination 'platform=macOS,arch=arm64' \
               -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
               TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
-              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test \
-              2>&1 | tee "$log_dir/macos-test.log"
-          ) &
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
+          ) >"$macos_log" 2>&1 &
           macos_pid=$!
 
           (
@@ -147,18 +171,19 @@ jobs:
               -derivedDataPath apple/build/DerivedData-ios CODE_SIGNING_ALLOWED=NO \
               TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
               TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
-          ) >"$log_dir/ios-build.log" 2>&1 &
+          ) >"$ios_log" 2>&1 &
           ios_pid=$!
 
           macos_status=0
           ios_status=0
 
-          # Always wait for both even if one failed, then emit the iOS log.
+          # Always wait for both even if one failed.
           wait "$macos_pid" || macos_status=$?
           wait "$ios_pid" || ios_status=$?
 
-          echo "----- iOS simulator build -----"
-          cat "$log_dir/ios-build.log"
+          # Normal path: dump once, then clear traps so EXIT does not re-dump.
+          flush_logs
+          trap - EXIT INT TERM
 
           if [ "$macos_status" -ne 0 ]; then
             exit "$macos_status"
@@ -345,8 +370,10 @@ jobs:
   # is the exact `ci-macos` coverage (Clippy, tests, doctests, warning-denied
   # rustdoc) with the same flags, run sequentially on the default Cargo target
   # directory so artifacts are reused. Notices may overlap that sequence as the
-  # sole background task. `cargo xtask ci-macos` remains the developer entry
-  # point and must stay equivalent. Static tests pin that equivalence.
+  # sole background task; both lanes buffer to separate logs (no live streaming
+  # of multi-MB Cargo output) with EXIT/INT/TERM flush traps. `cargo xtask
+  # ci-macos` remains the developer entry point and must stay equivalent.
+  # Static tests pin that equivalence.
   macos_quality:
     name: macOS quality
     needs: changes
@@ -372,7 +399,34 @@ jobs:
         run: |
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/macos-quality-logs"
+          rust_log="$log_dir/rust.log"
+          notices_log="$log_dir/notices.log"
           mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          # Idempotent dump: safe if a log is missing; never masks caller status.
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$rust_log" ]; then
+              echo "----- Rust suite -----"
+              cat "$rust_log" || true
+            fi
+            if [ -f "$notices_log" ]; then
+              echo "----- third-party notices -----"
+              cat "$notices_log" || true
+            fi
+            return 0
+          }
+
+          # Flush before process termination; re-exit with the original status so
+          # the trap cannot mask child failures. INT/TERM clear EXIT first to
+          # avoid a second flush/exit from the EXIT handler.
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
 
           notices_pid=""
           notices_status=0
@@ -381,20 +435,19 @@ jobs:
           # Notices is the only background task: fetch/generation may overlap the
           # sequential Rust suite. Clippy → tests → doctests → rustdoc share the
           # default Cargo target directory (no per-lane target override) so
-          # artifacts are reused exactly as in `cargo xtask ci-macos`. Stream the
-          # long Rust suite live; isolate only notices so timeout/cancel still
-          # leave foreground diagnostics in the Actions log.
+          # artifacts are reused exactly as in `cargo xtask ci-macos`. Both lanes
+          # buffer to separate logs; traps flush them on timeout/cancel/failure.
           if [ "$RUN_NOTICES" = "true" ]; then
             (
               set -euo pipefail
               cargo fetch --locked
               sh apple/scripts/generate-third-party-notices.sh --check
-            ) >"$log_dir/notices.log" 2>&1 &
+            ) >"$notices_log" 2>&1 &
             notices_pid=$!
           fi
 
           if [ "$RUN_RUST" = "true" ]; then
-            # Foreground streaming: no redirect; status captured so notices wait.
+            # Foreground sequential suite on the default target dir; buffer output.
             (
               set -euo pipefail
               echo "Running Clippy check..."
@@ -407,18 +460,17 @@ jobs:
               export RUSTDOCFLAGS="--deny warnings"
               cargo doc --locked --workspace --no-deps --all-features
               echo "macOS CI verification passed."
-            ) || rust_status=$?
+            ) >"$rust_log" 2>&1 || rust_status=$?
           fi
 
-          # Always wait for notices even if Rust failed, then emit its log.
+          # Always wait for notices even if Rust failed.
           if [ -n "$notices_pid" ]; then
             wait "$notices_pid" || notices_status=$?
           fi
 
-          if [ "$RUN_NOTICES" = "true" ]; then
-            echo "----- third-party notices -----"
-            cat "$log_dir/notices.log"
-          fi
+          # Normal path: dump once, then clear traps so EXIT does not re-dump.
+          flush_logs
+          trap - EXIT INT TERM
 
           if [ "$rust_status" -ne 0 ]; then
             exit "$rust_status"

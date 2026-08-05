@@ -620,8 +620,8 @@ class ChangeScopeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         jobs = dict(self._workflow_job_blocks(workflow))
         apple = jobs["apple_product"]
-        # Parallel step: macOS-first launch, live TersaMac stream, isolated iOS
-        # build. Distinct DerivedData + deterministic dual-status propagation.
+        # Parallel step: macOS-first launch, both lanes buffered to separate logs
+        # with EXIT/INT/TERM flush traps. Distinct DerivedData + dual statuses.
         self.assertIn("Test macOS and build iOS simulator in parallel", apple)
         self.assertIn(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac",
@@ -638,48 +638,74 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("CODE_SIGNING_ALLOWED=NO", apple)
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* test")
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* build")
-        # Topology: macOS launches first (claims shared Rust resources), then iOS.
-        # Both are background PIDs with unconditional waits and dual failure exit.
-        self.assertIn("macos_pid=$!", apple)
-        self.assertIn("ios_pid=$!", apple)
-        self.assertIn('wait "$macos_pid" || macos_status=$?', apple)
-        self.assertIn('wait "$ios_pid" || ios_status=$?', apple)
-        self.assertIn(') >"$log_dir/ios-build.log" 2>&1 &', apple)
-        self.assertIn('cat "$log_dir/ios-build.log"', apple)
-        # Live TersaMac diagnostics: tee inside the pipefail subshell so wait on
-        # macos_pid propagates xcodebuild status (not bare tee success).
-        self.assertIn('2>&1 | tee "$log_dir/macos-test.log"', apple)
         self.assertIn("set -euo pipefail", apple)
-        # Reject outer `) 2>&1 | tee ... &` where $! would be tee, not xcodebuild.
-        self.assertNotIn(") 2>&1 | tee", apple)
+        # Separate buffered logs (no live tee of multi-MB Xcode output).
+        self.assertIn('macos_log="$log_dir/macos-test.log"', apple)
+        self.assertIn('ios_log="$log_dir/ios-build.log"', apple)
+        self.assertIn(') >"$macos_log" 2>&1 &', apple)
+        self.assertIn(') >"$ios_log" 2>&1 &', apple)
+        # No live full-output streaming (buffered redirect only).
+        self.assertNotIn("| tee", apple)
+        self.assertNotIn("tee \"", apple)
+        self.assertNotIn("tee '", apple)
+        # flush_logs: idempotent, missing-log safe, status-preserving traps.
+        self.assertIn("flush_logs()", apple)
+        self.assertIn('if [ -f "$macos_log" ]; then', apple)
+        self.assertIn('if [ -f "$ios_log" ]; then', apple)
+        self.assertIn('cat "$macos_log" || true', apple)
+        self.assertIn('cat "$ios_log" || true', apple)
+        self.assertIn('if [ "${_logs_flushed}" -ne 0 ]; then', apple)
+        self.assertIn(
+            """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT""",
+            apple,
+        )
+        self.assertIn(
+            """trap 'flush_logs || true; trap - EXIT; exit 130' INT""",
+            apple,
+        )
+        self.assertIn(
+            """trap 'flush_logs || true; trap - EXIT; exit 143' TERM""",
+            apple,
+        )
+        # Topology: traps arm before launch; macOS first, then iOS; both PIDs.
+        trap_exit = apple.index(
+            """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT"""
+        )
         macos_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac"
         )
-        macos_tee = apple.index('2>&1 | tee "$log_dir/macos-test.log"')
+        macos_bg = apple.index(') >"$macos_log" 2>&1 &')
         macos_pid = apple.index("macos_pid=$!")
         ios_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS"
         )
-        ios_bg = apple.index(') >"$log_dir/ios-build.log" 2>&1 &')
+        ios_bg = apple.index(') >"$ios_log" 2>&1 &')
         ios_pid = apple.index("ios_pid=$!")
-        self.assertLess(macos_xcode, macos_tee)
-        self.assertLess(macos_tee, macos_pid)
+        self.assertLess(trap_exit, macos_xcode)
+        self.assertLess(macos_xcode, macos_bg)
+        self.assertLess(macos_bg, macos_pid)
         self.assertLess(macos_pid, ios_xcode)
         self.assertLess(ios_xcode, ios_bg)
         self.assertLess(ios_bg, ios_pid)
-        # Isolated iOS log only (one redirect-background); macOS uses tee.
-        self.assertEqual(apple.count(" 2>&1 &"), 1)
-        # Unconditional waits for both, then iOS log, then deterministic exits.
+        # Both lanes redirect-background (exactly two).
+        self.assertEqual(apple.count(" 2>&1 &"), 2)
+        # Unconditional waits for both, single normal dump, trap cleanup, exits.
         wait_macos = apple.index('wait "$macos_pid" || macos_status=$?')
         wait_ios = apple.index('wait "$ios_pid" || ios_status=$?')
-        cat_ios = apple.index('cat "$log_dir/ios-build.log"')
+        # Normal-path flush after waits; flag/trap cleanup prevents double dump.
+        flush_after_wait = apple.index("\n          flush_logs\n", wait_ios)
+        trap_clear = apple.index("trap - EXIT INT TERM", flush_after_wait)
         fail_macos = apple.index('if [ "$macos_status" -ne 0 ]; then')
         fail_ios = apple.index('if [ "$ios_status" -ne 0 ]; then')
         self.assertLess(ios_pid, wait_macos)
         self.assertLess(wait_macos, wait_ios)
-        self.assertLess(wait_ios, cat_ios)
-        self.assertLess(cat_ios, fail_macos)
+        self.assertLess(wait_ios, flush_after_wait)
+        self.assertLess(flush_after_wait, trap_clear)
+        self.assertLess(trap_clear, fail_macos)
         self.assertLess(fail_macos, fail_ios)
+        # Exactly one normal-path flush_logs call (definition + trap bodies excluded
+        # by matching the bare invocation line after waits).
+        self.assertEqual(apple.count("\n          flush_logs\n"), 1)
         self.assertNotIn("Build unsigned macOS debug application", workflow)
         self.assertIn("name: Verify built Rust bridge symbols", workflow)
         self.assertIn(
@@ -797,29 +823,62 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("doc_status", job)
         self.assertNotIn("clippy.log", job)
         self.assertNotIn("tests.log", job)
-        # Notices is the sole background PID; Rust streams live in the foreground.
-        # Always wait/emit notices even if Rust fails, then propagate both statuses.
+        # Notices is the sole background PID; Rust is foreground sequential on the
+        # default target dir, buffered to its own log (no live multi-MB tee).
+        self.assertIn('rust_log="$log_dir/rust.log"', job)
+        self.assertIn('notices_log="$log_dir/notices.log"', job)
         self.assertIn("notices_pid=$!", job)
         self.assertIn('wait "$notices_pid" || notices_status=$?', job)
-        self.assertIn(') || rust_status=$?', job)
-        self.assertNotIn("rust.log", job)
-        self.assertIn('cat "$log_dir/notices.log"', job)
+        self.assertIn(') >"$rust_log" 2>&1 || rust_status=$?', job)
+        self.assertIn(') >"$notices_log" 2>&1 &', job)
+        # No live full-output streaming (buffered redirect only).
+        self.assertNotIn("| tee", job)
+        self.assertNotIn("tee \"", job)
+        self.assertNotIn("tee '", job)
+        # flush_logs: idempotent, missing-log safe, status-preserving traps.
+        self.assertIn("flush_logs()", job)
+        self.assertIn('if [ -f "$rust_log" ]; then', job)
+        self.assertIn('if [ -f "$notices_log" ]; then', job)
+        self.assertIn('cat "$rust_log" || true', job)
+        self.assertIn('cat "$notices_log" || true', job)
+        self.assertIn('if [ "${_logs_flushed}" -ne 0 ]; then', job)
+        self.assertIn(
+            """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT""",
+            job,
+        )
+        self.assertIn(
+            """trap 'flush_logs || true; trap - EXIT; exit 130' INT""",
+            job,
+        )
+        self.assertIn(
+            """trap 'flush_logs || true; trap - EXIT; exit 143' TERM""",
+            job,
+        )
         self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
         self.assertIn('if [ "$notices_status" -ne 0 ]; then', job)
-        # Notices starts before the sequential Rust suite so fetch/generation can
-        # overlap; only one background `&` for the notices subshell.
-        notices_bg = job.index(') >"$log_dir/notices.log" 2>&1 &')
+        # Traps arm before launch; notices starts before sequential Rust suite;
+        # only one background `&` for the notices subshell.
+        trap_exit = job.index(
+            """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT"""
+        )
+        notices_bg = job.index(') >"$notices_log" 2>&1 &')
         rust_seq = job.index('echo "Running Clippy check..."')
+        rust_redirect = job.index(') >"$rust_log" 2>&1 || rust_status=$?')
         wait_notices = job.index('wait "$notices_pid" || notices_status=$?')
-        cat_notices = job.index('cat "$log_dir/notices.log"')
+        flush_after_wait = job.index("\n          flush_logs\n", wait_notices)
+        trap_clear = job.index("trap - EXIT INT TERM", flush_after_wait)
         fail_rust = job.index('if [ "$rust_status" -ne 0 ]; then')
         fail_notices = job.index('if [ "$notices_status" -ne 0 ]; then')
+        self.assertLess(trap_exit, notices_bg)
         self.assertLess(notices_bg, rust_seq)
-        self.assertLess(rust_seq, wait_notices)
-        self.assertLess(wait_notices, cat_notices)
-        self.assertLess(cat_notices, fail_rust)
+        self.assertLess(rust_seq, rust_redirect)
+        self.assertLess(rust_redirect, wait_notices)
+        self.assertLess(wait_notices, flush_after_wait)
+        self.assertLess(flush_after_wait, trap_clear)
+        self.assertLess(trap_clear, fail_rust)
         self.assertLess(fail_rust, fail_notices)
         self.assertEqual(job.count(" 2>&1 &"), 1)
+        self.assertEqual(job.count("\n          flush_logs\n"), 1)
         self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
         self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
