@@ -541,7 +541,7 @@ jobs:
             # doc-tests cannot hide each other. Aggregate every crate's
             # `test result: ok.` summary inside the window (count + sum of
             # passed/failed) instead of keeping only the final line. Empty,
-            # missing, or unparseable phases print an explicit unavailable line
+            # missing, or unparsable phases print an explicit unavailable line
             # and never fail success. Awk is macOS/BSD/POSIX-compatible (no
             # GNU three-argument match).
             tests_summary=""
@@ -559,7 +559,7 @@ jobs:
                       if ($i ~ /^failed/) line_failed = $(i-1)
                     }
                     if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
-                      unparseable = 1
+                      unparsable = 1
                       next
                     }
                     summaries++
@@ -567,7 +567,7 @@ jobs:
                     failed += line_failed + 0
                   }
                   END {
-                    if (!unparseable && summaries > 0)
+                    if (!unparsable && summaries > 0)
                       print "summaries=" summaries " passed=" passed " failed=" failed
                   }
                 ' "$rust_log"
@@ -584,7 +584,7 @@ jobs:
                       if ($i ~ /^failed/) line_failed = $(i-1)
                     }
                     if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
-                      unparseable = 1
+                      unparsable = 1
                       next
                     }
                     summaries++
@@ -592,7 +592,7 @@ jobs:
                     failed += line_failed + 0
                   }
                   END {
-                    if (!unparseable && summaries > 0)
+                    if (!unparsable && summaries > 0)
                       print "summaries=" summaries " passed=" passed " failed=" failed
                   }
                 ' "$rust_log"

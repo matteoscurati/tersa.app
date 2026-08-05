@@ -256,7 +256,7 @@ def _named_step_env_entries(job_text: str, step_name: str) -> dict[str, str]:
             body = line[10:]
             key, sep, value = body.partition(": ")
             if not sep or not key:
-                raise AssertionError(f"unparseable env entry in {step_name}: {line!r}")
+                raise AssertionError(f"unparsable env entry in {step_name}: {line!r}")
             entries[key] = value
             continue
         if line.startswith("        ") and not line.startswith("         "):
@@ -278,7 +278,7 @@ in_phase && index($0, "test result: ok.") {
     if ($i ~ /^failed/) line_failed = $(i-1)
   }
   if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
-    unparseable = 1
+    unparsable = 1
     next
   }
   summaries++
@@ -286,7 +286,7 @@ in_phase && index($0, "test result: ok.") {
   failed += line_failed + 0
 }
 END {
-  if (!unparseable && summaries > 0)
+  if (!unparsable && summaries > 0)
     print "summaries=" summaries " passed=" passed " failed=" failed
 }
 """
@@ -1199,8 +1199,8 @@ class ChangeScopeTests(unittest.TestCase):
             'if ($i ~ /^failed/) line_failed = $(i-1)',
             tests_field_parse,
         )
-        tests_unparseable = job.index("unparseable = 1", tests_failed_parse)
-        tests_summaries_inc = job.index("summaries++", tests_unparseable)
+        tests_unparsable = job.index("unparsable = 1", tests_failed_parse)
+        tests_summaries_inc = job.index("summaries++", tests_unparsable)
         tests_print = job.index(
             'print "summaries=" summaries " passed=" passed " failed=" failed',
             tests_summaries_inc,
@@ -1226,8 +1226,8 @@ class ChangeScopeTests(unittest.TestCase):
             'if ($i ~ /^failed/) line_failed = $(i-1)',
             doctests_field_parse,
         )
-        doctests_unparseable = job.index("unparseable = 1", doctests_failed_parse)
-        doctests_summaries_inc = job.index("summaries++", doctests_unparseable)
+        doctests_unparsable = job.index("unparsable = 1", doctests_failed_parse)
+        doctests_summaries_inc = job.index("summaries++", doctests_unparsable)
         doctests_print = job.index(
             'print "summaries=" summaries " passed=" passed " failed=" failed',
             doctests_summaries_inc,
@@ -1287,8 +1287,8 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(tests_phase_end, tests_aggregate)
         self.assertLess(tests_aggregate, tests_field_parse)
         self.assertLess(tests_field_parse, tests_failed_parse)
-        self.assertLess(tests_failed_parse, tests_unparseable)
-        self.assertLess(tests_unparseable, tests_summaries_inc)
+        self.assertLess(tests_failed_parse, tests_unparsable)
+        self.assertLess(tests_unparsable, tests_summaries_inc)
         self.assertLess(tests_summaries_inc, tests_print)
         self.assertLess(tests_print, tests_extract_nonfatal)
         self.assertLess(tests_extract_nonfatal, doctests_phase_start)
@@ -1296,8 +1296,8 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(doctests_phase_end, doctests_aggregate)
         self.assertLess(doctests_aggregate, doctests_field_parse)
         self.assertLess(doctests_field_parse, doctests_failed_parse)
-        self.assertLess(doctests_failed_parse, doctests_unparseable)
-        self.assertLess(doctests_unparseable, doctests_summaries_inc)
+        self.assertLess(doctests_failed_parse, doctests_unparsable)
+        self.assertLess(doctests_unparsable, doctests_summaries_inc)
         self.assertLess(doctests_summaries_inc, doctests_print)
         self.assertLess(doctests_print, doctests_extract_nonfatal)
         self.assertLess(doctests_extract_nonfatal, tests_echo)
@@ -1614,7 +1614,7 @@ class ChangeScopeTests(unittest.TestCase):
             )
         )
         empty_log = "Running tests check...\nRunning documentation tests check...\n"
-        unparseable_log = "\n".join(
+        unparsable_log = "\n".join(
             (
                 "Running tests check...",
                 "test result: ok. not-a-number passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
@@ -1660,9 +1660,9 @@ class ChangeScopeTests(unittest.TestCase):
             run_phase_awk(tests_prefix, doctests_log),
             "",
         )
-        # Empty / unparseable phases emit nothing (workflow prints unavailable).
+        # Empty / unparsable phases emit nothing (workflow prints unavailable).
         self.assertEqual(run_phase_awk(tests_prefix, empty_log), "")
-        self.assertEqual(run_phase_awk(tests_prefix, unparseable_log), "")
+        self.assertEqual(run_phase_awk(tests_prefix, unparsable_log), "")
         # Last-line-only logic would wrongly report only the final crate.
         last_only = subprocess.run(
             [
