@@ -85,10 +85,18 @@ struct ThreadView: View {
     }
 
     private func threadList(_ rows: [MessageRow]) -> some View {
-        List(rows) { row in
-            ThreadMessageDetailView(row: row)
+        GeometryReader { proxy in
+            List(rows) { row in
+                ThreadMessageDetailView(
+                    row: row,
+                    // Leave room for list chrome + message headers; body grows with the window.
+                    availableBodyHeight: max(240, proxy.size.height - 140)
+                )
+                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+            }
+            .listStyle(.plain)
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
-        .listStyle(.plain)
         .accessibilityLabel("Thread")
         .accessibilityValue(String(rows.count) + (rows.count == 1 ? " message" : " messages"))
     }
@@ -150,6 +158,8 @@ private struct ThreadMessageDetailView: View {
     }
 
     let row: MessageRow
+    /// Height budget for the body region; tracks the parent GeometryReader on resize.
+    let availableBodyHeight: CGFloat
     @State private var bodyMode: BodyMode = .plain
 
     var body: some View {
@@ -186,6 +196,7 @@ private struct ThreadMessageDetailView: View {
             bodyContent
         }
         .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
             // Prefer plain when both exist; fall back to HTML-only messages.
             if !row.hasPlainBody, row.hasHtmlBody {
@@ -222,8 +233,8 @@ private struct ThreadMessageDetailView: View {
         case .html:
             if let html = row.bodyHtml, !html.isEmpty {
                 SandboxedMailHTMLView(html: html)
-                    .frame(minHeight: 240, maxHeight: 480)
                     .frame(maxWidth: .infinity)
+                    .frame(height: availableBodyHeight)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
@@ -271,6 +282,7 @@ private struct SandboxedMailHTMLView: NSViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
+        webView.autoresizingMask = [.width, .height]
         webView.setValue(false, forKey: "drawsBackground")
         context.coordinator.installContentBlocker(on: webView)
         context.coordinator.load(html: html, in: webView)
@@ -310,10 +322,53 @@ private struct SandboxedMailHTMLView: NSViewRepresentable {
         }
 
         func load(html: String, in webView: WKWebView) {
-            guard lastHTML != html else { return }
-            lastHTML = html
+            let wrapped = Self.wrapForFlexibleWidth(html)
+            guard lastHTML != wrapped else { return }
+            lastHTML = wrapped
             // nil baseURL prevents relative network resolution from a local origin.
-            webView.loadHTMLString(html, baseURL: nil)
+            webView.loadHTMLString(wrapped, baseURL: nil)
+        }
+
+        /// Injects a viewport + fluid layout so HTML reflows when the host view resizes.
+        private static func wrapForFlexibleWidth(_ html: String) -> String {
+            let headInjection = """
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+            html, body {
+              margin: 0;
+              padding: 8px;
+              max-width: 100%;
+              overflow-x: auto;
+              overflow-wrap: anywhere;
+              word-break: break-word;
+              box-sizing: border-box;
+              font-family: -apple-system, system-ui, sans-serif;
+            }
+            img, table, video, iframe {
+              max-width: 100% !important;
+              height: auto !important;
+            }
+            * { box-sizing: border-box; }
+            </style>
+            """
+            if let headRange = html.range(of: "<head", options: .caseInsensitive),
+               let headClose = html[headRange.lowerBound...].range(of: ">")
+            {
+                var result = html
+                result.insert(contentsOf: headInjection, at: headClose.upperBound)
+                return result
+            }
+            if let htmlRange = html.range(of: "<html", options: .caseInsensitive),
+               let htmlClose = html[htmlRange.lowerBound...].range(of: ">")
+            {
+                var result = html
+                result.insert(
+                    contentsOf: "<head>\(headInjection)</head>",
+                    at: htmlClose.upperBound
+                )
+                return result
+            }
+            return "<!DOCTYPE html><html><head>\(headInjection)</head><body>\(html)</body></html>"
         }
 
         func webView(
