@@ -34,9 +34,11 @@ probe, not production search and not an iPhone performance result.
 
 ## Profiles and remaining device gate
 
-The CI host profile contains 10,000 messages and at least 128 MiB of normalized
-text. The opt-in manual host profile contains 100,000 messages and at least
-2 GiB. Both are explicitly labeled `NOT A DEVICE-GATE RESULT`.
+The default host profile contains 10,000 messages and at least 128 MiB of
+normalized text. The opt-in manual host profile contains 100,000 messages and
+at least 2 GiB. Both are explicitly labeled `NOT A DEVICE-GATE RESULT`. Host
+profile evidence is local-only through
+`sh apple/scripts/verify-search-feasibility.sh`; it is not merge-blocking CI.
 
 Locked Rust 1.91.1 builds for macOS arm64, iOS arm64, and iOS simulator arm64
 are required. They do not prove iOS runtime behavior, durability,

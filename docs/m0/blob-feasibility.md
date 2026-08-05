@@ -80,11 +80,12 @@ IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
   --package tersa-blob-spike --target aarch64-apple-ios-sim
 ```
 
-The shared macOS notice gate regenerates all target-specific notices. The
-dedicated `blob-apple-evidence` job cross-builds the release diagnostic for
-macOS, iOS device, and iOS simulator, runs the macOS arm64 process-crash
-protocol, binds `result.txt` to the source commit, and retains the aggregate
-artifact for 90 days.
+The shared macOS notice gate regenerates all target-specific notices. Blob
+feasibility evidence is local-only through
+`sh apple/scripts/verify-blob-feasibility.sh`. That script builds and runs the
+macOS arm64 process-crash protocol and accepts only its exact aggregate
+result. It is not merge-blocking CI and does not upload or retain CI artifacts.
+iOS device and simulator targets remain compile evidence only.
 
 ## Non-claims and remaining gates
 

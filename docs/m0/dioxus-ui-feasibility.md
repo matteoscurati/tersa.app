@@ -63,9 +63,10 @@ the spike.
 
 `dioxus-desktop` starts one private WebSocket listener on an ephemeral
 `127.0.0.1` port. It creates 256-byte random client and server keys, compares
-the client key in constant time, and returns the server key to the WebView. CI
-pins those source invariants and uses `lsof` against both live processes to
-reject wildcard or IPv6-any listeners.
+the client key in constant time, and returns the server key to the WebView.
+`python3 apple/scripts/verify-dioxus-runtime.py` pins those source invariants
+locally. The live-listener check with `lsof` is local-only through
+`sh apple/scripts/capture-dioxus-evidence.sh`; no CI job performs it.
 
 This socket is not a backend and carries only synthetic UI edits in the spike.
 It is nevertheless a network server from the operating system's perspective.
@@ -181,9 +182,10 @@ signing, distribution, or production suitability. All physical-device gaps
 remain open, this gate is not passed, and neither UI candidate is approved.
 
 The local CoreSimulator runtime remains unavailable because the installed
-framework is 1051.54 while Xcode 26.6 requires 1051.55. The separate Dioxus
-Apple CI job owns simulator launch evidence. Every physical-device criterion
-remains open regardless of simulator success.
+framework is 1051.54 while Xcode 26.6 requires 1051.55. Local
+`sh apple/scripts/capture-dioxus-evidence.sh` owns simulator launch evidence
+when the runtime is available; it is not merge-blocking CI. Every
+physical-device criterion remains open regardless of simulator success.
 
 See [ADR 0005](../architecture/adr-0005-dioxus-diagnostic-runtime.md) for the
 production blockers and adoption decision, [ADR 0007](../architecture/adr-0007-dioxus-local-ephemeral-fork.md)

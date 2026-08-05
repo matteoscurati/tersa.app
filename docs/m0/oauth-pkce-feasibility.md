@@ -27,11 +27,14 @@ requires.
 
 ## Evidence boundary
 
-CI uses a public non-functional client identifier, a public test callback
-scheme, and deterministic fake callbacks. It builds the macOS, iOS device, and
-iOS simulator targets, verifies exported bridge symbols and Info.plist values,
-and executes an ad-hoc-signed macOS sandbox probe that needs both inbound and
-outbound loopback networking.
+Current product CI covers the unsigned macOS test, iOS simulator build, and
+bridge-symbol verification. Local OAuth feasibility evidence uses a public
+non-functional client identifier, a public test callback scheme, and
+deterministic fake callbacks through
+`sh apple/scripts/verify-oauth-feasibility.sh`. That local-only script verifies
+exported bridge symbols and Info.plist values and executes an ad-hoc-signed
+macOS sandbox probe that needs both inbound and outbound loopback networking.
+It is not merge-blocking CI.
 
 On 2026-08-01, Step 3f exercised a Release/arm64 build signed with an Apple
 Development identity and the full committed production entitlements. The

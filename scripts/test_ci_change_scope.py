@@ -85,6 +85,34 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     "gh workflow run CI",
     "Apple evidence job",
 )
+# Present-tense operational claims only. Past-tense historical run locators
+# (for example owner-attested dates) stay allowed in the M0 study records.
+M0_FEASIBILITY_DOCS = (
+    ROOT / "docs" / "m0" / "ui-feasibility.md",
+    ROOT / "docs" / "m0" / "dioxus-ui-feasibility.md",
+    ROOT / "docs" / "m0" / "mime-html-feasibility.md",
+    ROOT / "docs" / "m0" / "blob-feasibility.md",
+    ROOT / "docs" / "m0" / "oauth-pkce-feasibility.md",
+    ROOT / "docs" / "m0" / "search-feasibility.md",
+)
+RETIRED_M0_OPERATIONAL_CLAIMS = (
+    "slint-apple-evidence",
+    "dioxus-apple-evidence",
+    "mime-apple-evidence",
+    "mime-parser-fuzz",
+    "blob-apple-evidence",
+    "CI owns the simulator",
+    "The separate Dioxus Apple CI job",
+    "artifact upload",
+    "retains the aggregate artifact for 90 days",
+    "binds aggregate evidence to the immutable source commit",
+    "binds `result.txt` to the source commit",
+    "CI treats screenshots",
+    "uses `lsof` against both live processes",
+    "It builds the macOS, iOS device, and iOS simulator targets",
+    "CI uses a public non-functional client identifier",
+    "The CI host profile",
+)
 
 
 class ChangeScopeTests(unittest.TestCase):
@@ -331,6 +359,13 @@ class ChangeScopeTests(unittest.TestCase):
         for token in RETIRED_DEVELOPMENT_DOC_TOKENS:
             with self.subTest(token=token):
                 self.assertNotIn(token, development)
+
+    def test_m0_feasibility_docs_drop_retired_operational_ci_claims(self) -> None:
+        for path in M0_FEASIBILITY_DOCS:
+            text = path.read_text(encoding="utf-8")
+            for claim in RETIRED_M0_OPERATIONAL_CLAIMS:
+                with self.subTest(path=path.name, claim=claim):
+                    self.assertNotIn(claim, text)
 
     def test_optional_baselines_remain_visible_to_the_required_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
