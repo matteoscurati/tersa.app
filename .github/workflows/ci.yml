@@ -17,6 +17,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # setup-rust-toolchain already exports CARGO_INCREMENTAL=0 and
+  # CARGO_PROFILE_DEV_DEBUG=0. Also strip test-profile debuginfo so cold
+  # `cargo test` / doctest link steps do not pay full debug overhead.
+  # Does not change which tests run or their assertions.
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   changes:
@@ -115,8 +120,13 @@ jobs:
       # macOS test (~79s) and iOS simulator build (~24s) are independent once the
       # project exists. Separate DerivedData paths avoid Xcode races; Rust archives
       # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
-      # Launch TersaMac first so the critical path acquires shared Rust build
-      # resources (apple/build/rust + Cargo lock) before the shorter iOS path.
+      # Both xcodebuild processes share apple/build/rust (immutable build script
+      # sets CARGO_TARGET_DIR), so Cargo target-dir lock ordering matters. Launch
+      # TersaMac first, then poll until both macOS Rust archives exist (mailbox-
+      # sync and token-broker) or macOS has exited before starting the shorter
+      # iOS path. Waiting for both archives — not merely the first lock grab —
+      # prevents iOS from interleaving between the two host Cargo builds.
+      # Bounded so a hung pre-cargo phase cannot stall forever.
       # Both lanes buffer to separate logs (no live streaming of multi-MB Xcode
       # output). Full logs flush only on trap/failure; the all-success path emits
       # a concise summary plus extracted TersaMac test evidence so Actions does
@@ -156,7 +166,7 @@ jobs:
           trap 'flush_logs || true; trap - EXIT; exit 130' INT
           trap 'flush_logs || true; trap - EXIT; exit 143' TERM
 
-          # Critical path first: claim shared Rust resources ahead of iOS.
+          # Critical path first: start macOS so it can claim shared Rust resources.
           (
             set -euo pipefail
             xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
@@ -167,6 +177,21 @@ jobs:
               TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
           ) >"$macos_log" 2>&1 &
           macos_pid=$!
+
+          # Deterministic handoff: do not start iOS until macOS has finished both
+          # host Rust archive builds (shared CARGO_TARGET_DIR) or has exited.
+          # 600 * 0.2s = 120s budget; timeout still launches iOS (best-effort).
+          mailbox_archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+          token_archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
+          _cargo_claim_attempts=0
+          while [ "$_cargo_claim_attempts" -lt 600 ]; do
+            if { [ -f "$mailbox_archive" ] && [ -f "$token_archive" ]; } \
+              || ! kill -0 "$macos_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+            _cargo_claim_attempts=$((_cargo_claim_attempts + 1))
+          done
 
           (
             set -euo pipefail
@@ -214,111 +239,160 @@ jobs:
           else
             echo "TersaMac tests: summary unavailable (log format changed)."
           fi
-      - name: Verify built Rust bridge symbols
-        run: |
-          nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
-            | grep -F '_tersa_apple_bridge_version'
-          nm -gU apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
-            | grep -F '_tersa_apple_bridge_version'
-      - name: Verify macOS mailbox-sync FFI archive symbols
+      # Four independent post-build probes (bridge dylibs, mailbox archive,
+      # token-broker archive, C link-and-run). Parallel children with buffered
+      # per-probe logs; every prior command and assertion is preserved. Full
+      # logs flush only on trap/failure; success is a concise summary.
+      - name: Verify built symbols, archives, and FFI probe
         run: |
           set -euo pipefail
-          # ADR-0024 production cutover: the macOS app links ONLY this archive,
-          # which must now define exactly the 12-symbol broker-only contract
-          # (the legacy oauth-macos exports and the retired *_begin entry points
-          # are gone). Assert the closed export inventory in the archive so dead
-          # stripping cannot hide a missing entry point and no extra `_tersa_`
-          # text symbol can slip in.
-          archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
-          test -f "$archive"
-          symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
-          printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
-          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 12
-          for expected in \
-            _tersa_apple_bridge_version \
-            _tersa_macos_bootstrap_default_account \
-            _tersa_macos_mailbox_read_inbox \
-            _tersa_macos_mailbox_read_thread \
-            _tersa_macos_mailbox_search \
-            _tersa_mailbox_macos_broker_disconnect_finalize \
-            _tersa_mailbox_macos_broker_disconnect_prepare \
-            _tersa_mailbox_macos_broker_subject_get \
-            _tersa_mailbox_macos_broker_subject_store \
-            _tersa_mailbox_macos_broker_sync_begin \
-            _tersa_mailbox_macos_lifecycle_get \
-            _tersa_mailbox_macos_sync_poll
-          do
-            printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
-              echo "missing defined text symbol: $expected" >&2
-              exit 1
-            }
-          done
-          # Negative checks: nothing from the retired oauth-macos FFI surface may
-          # remain in the archive, neither as a global symbol nor as an embedded
-          # string. A no-match is success; any match is a hard failure.
-          if nm -g "$archive" | grep -F '_tersa_oauth_macos_' > /dev/null; then
-            echo "archive must not contain any _tersa_oauth_macos_ global symbol:" >&2
-            nm -g "$archive" | grep -F '_tersa_oauth_macos_' >&2
-            exit 1
-          fi
-          for banned in \
-            _tersa_mailbox_macos_sync_begin \
-            _tersa_mailbox_macos_connect_begin \
-            _tersa_mailbox_macos_disconnect_begin
-          do
-            if nm -g "$archive" | grep -F "$banned" > /dev/null; then
-              echo "archive must not contain retired global symbol: $banned" >&2
+          log_dir="${RUNNER_TEMP}/apple-symbol-logs"
+          bridge_log="$log_dir/bridge-symbols.log"
+          mailbox_log="$log_dir/mailbox-archive.log"
+          token_log="$log_dir/token-broker-archive.log"
+          probe_log="$log_dir/ffi-probe.log"
+          mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$bridge_log" ]; then
+              echo "----- built Rust bridge symbols -----"
+              cat "$bridge_log" || true
+            fi
+            if [ -f "$mailbox_log" ]; then
+              echo "----- macOS mailbox-sync FFI archive -----"
+              cat "$mailbox_log" || true
+            fi
+            if [ -f "$token_log" ]; then
+              echo "----- macOS token-broker FFI archive -----"
+              cat "$token_log" || true
+            fi
+            if [ -f "$probe_log" ]; then
+              echo "----- mailbox-sync FFI C probe -----"
+              cat "$probe_log" || true
+            fi
+            return 0
+          }
+
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
+
+          (
+            set -euo pipefail
+            nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
+              | grep -F '_tersa_apple_bridge_version'
+            nm -gU apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
+              | grep -F '_tersa_apple_bridge_version'
+          ) >"$bridge_log" 2>&1 &
+          bridge_pid=$!
+
+          (
+            set -euo pipefail
+            # ADR-0024 production cutover: the macOS app links ONLY this archive,
+            # which must now define exactly the 12-symbol broker-only contract
+            # (the legacy oauth-macos exports and the retired *_begin entry points
+            # are gone). Assert the closed export inventory in the archive so dead
+            # stripping cannot hide a missing entry point and no extra `_tersa_`
+            # text symbol can slip in.
+            archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+            test -f "$archive"
+            symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
+            printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
+            test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 12
+            for expected in \
+              _tersa_apple_bridge_version \
+              _tersa_macos_bootstrap_default_account \
+              _tersa_macos_mailbox_read_inbox \
+              _tersa_macos_mailbox_read_thread \
+              _tersa_macos_mailbox_search \
+              _tersa_mailbox_macos_broker_disconnect_finalize \
+              _tersa_mailbox_macos_broker_disconnect_prepare \
+              _tersa_mailbox_macos_broker_subject_get \
+              _tersa_mailbox_macos_broker_subject_store \
+              _tersa_mailbox_macos_broker_sync_begin \
+              _tersa_mailbox_macos_lifecycle_get \
+              _tersa_mailbox_macos_sync_poll
+            do
+              printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
+                echo "missing defined text symbol: $expected" >&2
+                exit 1
+              }
+            done
+            # Negative checks: nothing from the retired oauth-macos FFI surface may
+            # remain in the archive, neither as a global symbol nor as an embedded
+            # string. A no-match is success; any match is a hard failure.
+            if nm -g "$archive" | grep -F '_tersa_oauth_macos_' > /dev/null; then
+              echo "archive must not contain any _tersa_oauth_macos_ global symbol:" >&2
+              nm -g "$archive" | grep -F '_tersa_oauth_macos_' >&2
               exit 1
             fi
-          done
-          for banned_string in oauth_token DataProtectionRefreshTokenStore; do
-            if strings "$archive" | grep -F "$banned_string" > /dev/null; then
-              echo "archive must not embed string: $banned_string" >&2
-              exit 1
-            fi
-          done
-      - name: Verify macOS token-broker FFI archive symbols
-        run: |
-          set -euo pipefail
-          # Source-level xtask guards pin this crate's own five exports; the
-          # linked static archive must still reject any sixth `_tersa_` text
-          # export pulled in transitively from dependencies.
-          archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
-          test -f "$archive"
-          symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
-          printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
-          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 5
-          for expected in \
-            _tersa_token_broker_begin_authorization \
-            _tersa_token_broker_complete_authorization \
-            _tersa_token_broker_refresh_access_token \
-            _tersa_token_broker_revoke_provider_grant \
-            _tersa_token_broker_delete_stored_tokens
-          do
-            printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
-              echo "missing defined text symbol: $expected" >&2
-              exit 1
-            }
-          done
-      - name: Link and execute the mailbox-sync FFI C probe
-        run: |
-          set -euo pipefail
-          # A real Swift call site now pulls these symbols into the linked app
-          # binary; this probe proves the mailbox-sync FFI archive LINKS as a
-          # single archive (its own symbols AND the re-exported bridge ones
-          # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
-          # return their expected status. NOTE: static C↔Rust linking resolves by
-          # symbol NAME only, so this does NOT verify argument/return ABI — a
-          # widened return or an added parameter is invisible here (and poll(0)
-          # short-circuits to -8 before reading any argument). ABI shape is
-          # pinned per-side (the canonical header + the Rust export inventory);
-          # this step is the single-archive link-and-run proof. The
-          # pointer-taking begins are exercised through the app itself; their
-          # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
-          # defined behavior, never a violable contract.
-          archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
-          test -f "$archive"
-          cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'
+            for banned in \
+              _tersa_mailbox_macos_sync_begin \
+              _tersa_mailbox_macos_connect_begin \
+              _tersa_mailbox_macos_disconnect_begin
+            do
+              if nm -g "$archive" | grep -F "$banned" > /dev/null; then
+                echo "archive must not contain retired global symbol: $banned" >&2
+                exit 1
+              fi
+            done
+            for banned_string in oauth_token DataProtectionRefreshTokenStore; do
+              if strings "$archive" | grep -F "$banned_string" > /dev/null; then
+                echo "archive must not embed string: $banned_string" >&2
+                exit 1
+              fi
+            done
+          ) >"$mailbox_log" 2>&1 &
+          mailbox_pid=$!
+
+          (
+            set -euo pipefail
+            # Source-level xtask guards pin this crate's own five exports; the
+            # linked static archive must still reject any sixth `_tersa_` text
+            # export pulled in transitively from dependencies.
+            archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
+            test -f "$archive"
+            symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
+            printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
+            test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 5
+            for expected in \
+              _tersa_token_broker_begin_authorization \
+              _tersa_token_broker_complete_authorization \
+              _tersa_token_broker_refresh_access_token \
+              _tersa_token_broker_revoke_provider_grant \
+              _tersa_token_broker_delete_stored_tokens
+            do
+              printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
+                echo "missing defined text symbol: $expected" >&2
+                exit 1
+              }
+            done
+          ) >"$token_log" 2>&1 &
+          token_pid=$!
+
+          (
+            set -euo pipefail
+            # A real Swift call site now pulls these symbols into the linked app
+            # binary; this probe proves the mailbox-sync FFI archive LINKS as a
+            # single archive (its own symbols AND the re-exported bridge ones
+            # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
+            # return their expected status. NOTE: static C↔Rust linking resolves by
+            # symbol NAME only, so this does NOT verify argument/return ABI — a
+            # widened return or an added parameter is invisible here (and poll(0)
+            # short-circuits to -8 before reading any argument). ABI shape is
+            # pinned per-side (the canonical header + the Rust export inventory);
+            # this step is the single-archive link-and-run proof. The
+            # pointer-taking begins are exercised through the app itself; their
+            # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
+            # defined behavior, never a violable contract.
+            archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+            test -f "$archive"
+            cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'
           #include <stdint.h>
           uint32_t tersa_apple_bridge_version(void);
           int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
@@ -333,10 +407,42 @@ jobs:
               return 0;
           }
           C
-          cc "$RUNNER_TEMP/ffi_probe.c" "$archive" \
-            -framework Security -framework Foundation \
-            -o "$RUNNER_TEMP/ffi_probe"
-          "$RUNNER_TEMP/ffi_probe"
+            cc "$RUNNER_TEMP/ffi_probe.c" "$archive" \
+              -framework Security -framework Foundation \
+              -o "$RUNNER_TEMP/ffi_probe"
+            "$RUNNER_TEMP/ffi_probe"
+          ) >"$probe_log" 2>&1 &
+          probe_pid=$!
+
+          bridge_status=0
+          mailbox_status=0
+          token_status=0
+          probe_status=0
+
+          # Always reap every child; decide only after all land.
+          wait "$bridge_pid" || bridge_status=$?
+          wait "$mailbox_pid" || mailbox_status=$?
+          wait "$token_pid" || token_status=$?
+          wait "$probe_pid" || probe_status=$?
+
+          if [ "$bridge_status" -ne 0 ] || [ "$mailbox_status" -ne 0 ] \
+            || [ "$token_status" -ne 0 ] || [ "$probe_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$bridge_status" -ne 0 ]; then
+              exit "$bridge_status"
+            fi
+            if [ "$mailbox_status" -ne 0 ]; then
+              exit "$mailbox_status"
+            fi
+            if [ "$token_status" -ne 0 ]; then
+              exit "$token_status"
+            fi
+            exit "$probe_status"
+          fi
+
+          trap - EXIT INT TERM
+          echo "Apple product: built symbols, archives, and FFI probe succeeded."
 
   rust_linux:
     name: Rust (Linux)

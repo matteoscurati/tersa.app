@@ -1186,8 +1186,9 @@ class ChangeScopeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         jobs = dict(self._workflow_job_blocks(workflow))
         apple = jobs["apple_product"]
-        # Parallel step: macOS-first launch, both lanes buffered to separate logs
-        # with EXIT/INT/TERM flush traps. Distinct DerivedData + dual statuses.
+        # Parallel step: macOS-first launch with bounded Cargo claim wait, both
+        # lanes buffered to separate logs with EXIT/INT/TERM flush traps.
+        # Distinct DerivedData + dual statuses.
         self.assertIn("Test macOS and build iOS simulator in parallel", apple)
         self.assertIn(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac",
@@ -1235,7 +1236,8 @@ class ChangeScopeTests(unittest.TestCase):
             """trap 'flush_logs || true; trap - EXIT; exit 143' TERM""",
             apple,
         )
-        # Topology: traps arm before launch; macOS first, then iOS; both PIDs.
+        # Topology: traps arm before launch; macOS first; bounded wait for both
+        # host Rust archives (shared CARGO_TARGET_DIR); then iOS; both PIDs.
         trap_exit = apple.index(
             """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT"""
         )
@@ -1245,6 +1247,27 @@ class ChangeScopeTests(unittest.TestCase):
         macos_index = apple.index("COMPILER_INDEX_STORE_ENABLE=NO", macos_xcode)
         macos_bg = apple.index(') >"$macos_log" 2>&1 &')
         macos_pid = apple.index("macos_pid=$!")
+        cargo_mailbox = apple.index(
+            'mailbox_archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"',
+            macos_pid,
+        )
+        cargo_token = apple.index(
+            'token_archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"',
+            cargo_mailbox,
+        )
+        cargo_budget = apple.index(
+            'while [ "$_cargo_claim_attempts" -lt 600 ]; do',
+            cargo_token,
+        )
+        cargo_both = apple.index(
+            '[ -f "$mailbox_archive" ] && [ -f "$token_archive" ]',
+            cargo_budget,
+        )
+        cargo_dead = apple.index(
+            '! kill -0 "$macos_pid" 2>/dev/null',
+            cargo_both,
+        )
+        cargo_sleep = apple.index("sleep 0.2", cargo_dead)
         ios_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS"
         )
@@ -1255,12 +1278,18 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(macos_xcode, macos_index)
         self.assertLess(macos_index, macos_bg)
         self.assertLess(macos_bg, macos_pid)
-        self.assertLess(macos_pid, ios_xcode)
+        self.assertLess(macos_pid, cargo_mailbox)
+        self.assertLess(cargo_mailbox, cargo_token)
+        self.assertLess(cargo_token, cargo_budget)
+        self.assertLess(cargo_budget, cargo_both)
+        self.assertLess(cargo_both, cargo_dead)
+        self.assertLess(cargo_dead, cargo_sleep)
+        self.assertLess(cargo_sleep, ios_xcode)
         self.assertLess(ios_xcode, ios_index)
         self.assertLess(ios_index, ios_bg)
         self.assertLess(ios_bg, ios_pid)
-        # Both lanes redirect-background (exactly two).
-        self.assertEqual(apple.count(" 2>&1 &"), 2)
+        # xcodebuild lanes (2) + four independent post-build probes (4).
+        self.assertEqual(apple.count(" 2>&1 &"), 6)
         # Unconditional waits for both; capture statuses before deciding.
         wait_macos = apple.index('wait "$macos_pid" || macos_status=$?')
         wait_ios = apple.index('wait "$ios_pid" || ios_status=$?')
@@ -1309,15 +1338,33 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertLess(success_summary, tersa_mac_extract)
         self.assertLess(tersa_mac_extract, tersa_mac_echo)
         self.assertLess(tersa_mac_echo, tersa_mac_fallback)
-        # Full logs only in the failure branch (not on the all-success path).
+        # Full logs only in failure branches (xcodebuild + post-build probes).
         # Definition + trap bodies are excluded by matching the indented call.
-        self.assertEqual(apple.count("\n            flush_logs\n"), 1)
+        self.assertEqual(apple.count("\n            flush_logs\n"), 2)
         self.assertEqual(apple.count("\n          flush_logs\n"), 0)
-        # Success path must not cat the full buffered logs.
-        self.assertNotIn('cat "$macos_log"', apple[trap_clear_ok:])
-        self.assertNotIn('cat "$ios_log"', apple[trap_clear_ok:])
+        # xcodebuild success path must not cat the full buffered logs.
+        xcode_success = apple[trap_clear_ok:apple.index(
+            "name: Verify built symbols, archives, and FFI probe",
+            trap_clear_ok,
+        )]
+        self.assertNotIn('cat "$macos_log"', xcode_success)
+        self.assertNotIn('cat "$ios_log"', xcode_success)
         self.assertNotIn("Build unsigned macOS debug application", workflow)
-        self.assertIn("name: Verify built Rust bridge symbols", workflow)
+        # Post-build: one fail-closed parallel step preserves every prior probe.
+        self.assertIn("name: Verify built symbols, archives, and FFI probe", workflow)
+        self.assertNotIn("name: Verify built Rust bridge symbols", workflow)
+        self.assertNotIn(
+            "name: Verify macOS mailbox-sync FFI archive symbols",
+            workflow,
+        )
+        self.assertNotIn(
+            "name: Verify macOS token-broker FFI archive symbols",
+            workflow,
+        )
+        self.assertNotIn(
+            "name: Link and execute the mailbox-sync FFI C probe",
+            workflow,
+        )
         self.assertIn(
             "apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
             workflow,
@@ -1326,6 +1373,62 @@ class ChangeScopeTests(unittest.TestCase):
             "apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib",
             workflow,
         )
+        self.assertIn(') >"$bridge_log" 2>&1 &', apple)
+        self.assertIn(') >"$mailbox_log" 2>&1 &', apple)
+        self.assertIn(') >"$token_log" 2>&1 &', apple)
+        self.assertIn(') >"$probe_log" 2>&1 &', apple)
+        self.assertIn("bridge_pid=$!", apple)
+        self.assertIn("mailbox_pid=$!", apple)
+        self.assertIn("token_pid=$!", apple)
+        self.assertIn("probe_pid=$!", apple)
+        self.assertIn('wait "$bridge_pid" || bridge_status=$?', apple)
+        self.assertIn('wait "$mailbox_pid" || mailbox_status=$?', apple)
+        self.assertIn('wait "$token_pid" || token_status=$?', apple)
+        self.assertIn('wait "$probe_pid" || probe_status=$?', apple)
+        # Probe status priority: bridge → mailbox → token → probe.
+        probe_fail_gate = apple.index(
+            'if [ "$bridge_status" -ne 0 ] || [ "$mailbox_status" -ne 0 ]',
+        )
+        probe_flush = apple.index("\n            flush_logs\n", probe_fail_gate)
+        probe_clear = apple.index("trap - EXIT INT TERM", probe_flush)
+        exit_bridge = apple.index('exit "$bridge_status"', probe_clear)
+        exit_mailbox = apple.index('exit "$mailbox_status"', exit_bridge)
+        exit_token = apple.index('exit "$token_status"', exit_mailbox)
+        exit_probe = apple.index('exit "$probe_status"', exit_token)
+        probe_ok = apple.index(
+            'echo "Apple product: built symbols, archives, and FFI probe succeeded."',
+            exit_probe,
+        )
+        self.assertLess(probe_fail_gate, probe_flush)
+        self.assertLess(probe_flush, probe_clear)
+        self.assertLess(probe_clear, exit_bridge)
+        self.assertLess(exit_bridge, exit_mailbox)
+        self.assertLess(exit_mailbox, exit_token)
+        self.assertLess(exit_token, exit_probe)
+        self.assertLess(exit_probe, probe_ok)
+        # Every prior symbol/archive/FFI command remains executable coverage.
+        self.assertIn("grep -F '_tersa_apple_bridge_version'", apple)
+        self.assertIn(
+            'archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"',
+            apple,
+        )
+        self.assertIn(
+            'archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"',
+            apple,
+        )
+        self.assertIn('test "$(printf \'%s\\n\' "$symbols" | grep -c .)" -eq 12', apple)
+        self.assertIn('test "$(printf \'%s\\n\' "$symbols" | grep -c .)" -eq 5', apple)
+        self.assertIn("_tersa_oauth_macos_", apple)
+        self.assertIn("_tersa_mailbox_macos_sync_begin", apple)
+        self.assertIn("oauth_token DataProtectionRefreshTokenStore", apple)
+        self.assertIn("_tersa_token_broker_begin_authorization", apple)
+        self.assertIn('cat > "$RUNNER_TEMP/ffi_probe.c" <<\'C\'', apple)
+        self.assertIn("tersa_mailbox_macos_sync_poll(0) != -8", apple)
+        self.assertIn(
+            'cc "$RUNNER_TEMP/ffi_probe.c" "$archive"',
+            apple,
+        )
+        self.assertIn('"$RUNNER_TEMP/ffi_probe"', apple)
         # Shared DerivedData must not return (would race under parallel xcodebuild).
         self.assertNotIn("-derivedDataPath apple/build/DerivedData ", apple)
         self.assertNotIn("apple/build/DerivedData/Build/Products/", workflow)
@@ -2071,10 +2174,11 @@ class ChangeScopeTests(unittest.TestCase):
         jobs = dict(self._workflow_job_blocks(workflow))
         job = jobs["macos_quality"]
 
-        # Workflow-level env is exactly the two global diagnostic settings.
+        # Workflow-level env: diagnostics plus test-profile debug strip.
         expected_workflow_env = {
             "CARGO_TERM_COLOR": "always",
             "RUST_BACKTRACE": "1",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
         }
         self.assertEqual(_workflow_level_env_entries(workflow), expected_workflow_env)
         # Extra workflow-level RUSTFLAGS must fail the pin.
@@ -2090,6 +2194,19 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn(
             "RUSTFLAGS",
             _workflow_level_env_entries(with_workflow_rustflags),
+        )
+        # Dropping the test-profile strip must also fail the pin.
+        without_test_debug = workflow.replace(
+            "  CARGO_PROFILE_TEST_DEBUG: 0\n",
+            "",
+        )
+        self.assertNotEqual(
+            _workflow_level_env_entries(without_test_debug),
+            expected_workflow_env,
+        )
+        self.assertNotIn(
+            "CARGO_PROFILE_TEST_DEBUG",
+            _workflow_level_env_entries(without_test_debug),
         )
 
         # macos_quality must not declare a job-level env map.

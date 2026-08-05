@@ -9,9 +9,11 @@ supply-chain, notice, and DCO coverage while reducing macOS fanout.
 
 Performance-oriented orchestration (inlined `ci-macos` cargo commands on one
 default Cargo target directory, notices overlapping that sequential Rust suite,
-parallel Apple macOS test / iOS simulator build) removes measured cold-start
-and serial overhead without dropping checks. The normative exact-head sample
-met the acceptance budgets (see
+workflow-level `CARGO_PROFILE_TEST_DEBUG=0`, parallel Apple macOS test / iOS
+simulator build after a bounded wait for both macOS Rust archives, and parallel
+post-build symbol/archive/FFI probes) removes measured cold-start and serial
+overhead without dropping checks. The normative exact-head sample met
+the acceptance budgets (see
 [Exact-head sample (measured)](#exact-head-sample-measured)), but
 identical-workflow re-runs on a later head showed aggregate macOS times both
 under and over the 220-second budget (see
@@ -94,7 +96,7 @@ as describing this distribution.
 | Architecture, format, check, Clippy, tests, doctests, rustdoc | `Rust (Linux)` via `cargo xtask verify` | Portable full baseline |
 | Clippy, tests, doctests, rustdoc (host) | `macOS quality` when `rust_macos` | Workflow runs the exact `ci-macos` cargo sequence directly (no cold xtask compile): Clippy, tests, doctests, then warning-denied rustdoc, strictly sequential on the default Cargo target directory so artifacts are reused. Both selected lanes are background children with interruptible `wait`. `cargo xtask ci-macos` remains the developer entry point with identical flags. No architecture, format, or separate `cargo check` |
 | Third-party notices (`cargo-about`) | `macOS quality` when `notices` | Install `cargo-about` when selected; fetch and `--check` run as a background child and may overlap the sequential Rust suite when both classifier outputs are true |
-| Product Apple build/test/symbols | `Apple product` | Complete TersaMac tests and TersaIOS simulator build may run concurrently with distinct DerivedData paths; symbol inventories and the FFI probe stay after both succeed |
+| Product Apple build/test/symbols | `Apple product` | Complete TersaMac tests and TersaIOS simulator build may run concurrently with distinct DerivedData paths after a bounded wait for both macOS Rust archives (shared `CARGO_TARGET_DIR`); independent symbol inventories and the FFI probe run after both succeed, in one fail-closed parallel step |
 | Licenses, advisories, feature powerset, spelling | `Policy and supply chain` | Unchanged |
 | Aggregate required status | `CI gate` | Sole required aggregate; optional lanes may be `skipped` |
 
