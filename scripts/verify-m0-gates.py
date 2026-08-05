@@ -303,6 +303,16 @@ def validate_xtask_isolation(errors: list[str]) -> None:
         "tersa-blob-spike",
         "tantivy",
         "chacha20poly1305",
+        # Retired MIME/hostile-HTML diagnostic isolation (PR4). Marker set
+        # covers removed xtask constructs and package names only. Durable
+        # deny.toml bans for ammonia/mail-parser are not treated as live hooks.
+        "check_mime_dependency",
+        "check_mime_dependency_graph",
+        "tersa-mime-spike",
+        "TersaMimeMac",
+        "TersaMimeIOS",
+        "ammonia",
+        "mail-parser",
     ):
         if marker in source:
             error(

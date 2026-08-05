@@ -21,8 +21,8 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
-The xtask architecture check enforces active product and retained MIME
-diagnostic dependency boundaries on every supported Apple target.
+The xtask architecture check enforces active product dependency boundaries on
+every supported Apple target.
 
 While the frozen M0 gate register remains tracked, keep the product-gate
 validator and its self-test available:
@@ -207,88 +207,31 @@ Active product SQLCipher remains the production store adapter. Product mailbox
 search remains the bounded application/store search path. No production blob
 implementation or Tantivy replacement is claimed by this retirement.
 
-## MIME and hostile HTML feasibility
+## Retired MIME and hostile HTML diagnostics
 
-The portable M0 diagnostic owns the exact-pinned `mail-parser` and `ammonia`
-dependencies. It accepts only synthetic fixtures, applies deterministic byte,
-header, tree, part, charset, transfer-decoding, and display limits, and exposes
-sanitized markup only through `SafeHtml`. The native Apple diagnostic is a
-separate Swift target.
+Historical note: the M0 MIME/hostile-HTML diagnostic (portable spike, Apple
+WKWebView targets, finite host fuzz project, verifiers, about config, and
+diagnostic notice outputs) was removed by ADR-0025 housekeeping (PR4).
+`ammonia` and `mail-parser` are banned from the active workspace graph by
+`deny.toml`. No active MIME renderer, `SafeHtml` implementation, restricted
+WKWebView, parser, or fuzz harness remains in the product tree. Hostile-content
+handling remains a product security requirement tracked by the open
+`M0-MIME-001` gate. The detailed study remains a non-executable historical
+record until PR5 consolidation:
 
-```sh
-rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-cargo test --locked --package tersa-mime-spike
-cargo build --locked --release --package tersa-mime-spike \
-  --target aarch64-apple-darwin
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
-  --package tersa-mime-spike --target aarch64-apple-ios
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
-  --package tersa-mime-spike --target aarch64-apple-ios-sim
-```
-
-The deterministic host fuzz regression is a standalone Cargo project with its
-own lockfile. It pins nightly `2026-07-14`, `cargo-fuzz` 0.13.2, and
-`libfuzzer-sys` 0.4.13. Install the exact toolchain and driver, then run its
-finite verifier:
-
-```sh
-rustup toolchain install nightly-2026-07-14 --profile minimal \
-  --component clippy --component rust-src --component rustfmt
-cargo install cargo-fuzz --version 0.13.2 --locked
-sh scripts/verify-mime-fuzz.sh
-cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-cargo deny --locked --manifest-path fuzz/Cargo.toml \
-  --config fuzz/deny.toml check
-cargo audit --file fuzz/Cargo.lock --deny warnings
-```
-
-The verifier first replays every committed seed, then requests 10,000 total
-libFuzzer target executions, including corpus initialization, in one process
-with a fixed seed, a 512 KiB maximum input, and fixed per-input timeout and RSS
-limits. Each input runs the public parser twice and checks typed-result
-equality, conservative HTML expansion, and deterministic CID placeholder
-invariants. Its aggregate evidence is written below the ignored `fuzz/target`
-directory and contains no input, content, or path.
-
-The fuzz project is excluded from the root workspace and application notice
-generation. Its isolated supply-chain policy permits NCSA only because
-`libfuzzer-sys` requires it; neither dependency nor that license enters a
-shipping application graph.
-
-After generating the Apple project and creating the `TersaMimeMac` archive,
-run:
-
-```sh
-sh apple/scripts/verify-mime-feasibility.sh
-```
-
-The verifier replaces the bundled synthetic fixture with current Rust
-sanitizer output, ad-hoc signs the macOS archive with App Sandbox and network
-client entitlements, proves literal-loopback transport with an unblocked in-app
-WKWebView control, resets the canary, and then requires zero protected
-WKWebView canary hits, zero TCP listeners, zero website data records, disabled
-content JavaScript, attached block rules, and denied action, response, and
-new-window paths. Evidence contains only aggregate counts and hashes. Every result is
-labeled `NOT A DEVICE-GATE RESULT`: macOS is the only runtime exercised, while
-iOS device and simulator commands are locked cross-build evidence.
-
-Read [the MIME and hostile HTML feasibility record](m0/mime-html-feasibility.md)
-before changing parser limits, sanitizer output, WebKit configuration,
-entitlements, or evidence claims.
+- [MIME and hostile HTML feasibility](m0/mime-html-feasibility.md)
 
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
 arm64 macOS 15 and iOS/iPadOS 18. `TersaMac` and `TersaIOS` are the product
-bridge targets. `TersaMimeMac` and `TersaMimeIOS` compile the native
-hostile-content policy diagnostic and are not production targets. Historical
-note: the retired M0 Slint and Dioxus Apple schemes and their evidence helpers
-were removed by ADR-0025 housekeeping (PR2); full M0 study consolidation is
-deferred to PR5.
+bridge targets. Historical note: the retired M0 Slint and Dioxus Apple schemes
+and their evidence helpers were removed by ADR-0025 housekeeping (PR2); the
+retired M0 MIME Apple schemes were removed by ADR-0025 housekeeping (PR4); full
+M0 study consolidation is deferred to PR5.
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
-product and retained MIME diagnostic artifacts:
+product artifacts:
 
 The checked wrapper is the only supported XcodeGen entry point. It passes
 `--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
@@ -310,33 +253,14 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
   -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeMac \
-  -configuration Release -destination 'generic/platform=macOS' \
-  -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO archive \
-  -archivePath apple/build/TersaMimeMac.xcarchive
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeIOS \
-  -configuration Release -sdk iphonesimulator \
-  -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeIOS \
-  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-  -derivedDataPath apple/build/DerivedDataMime CODE_SIGNING_ALLOWED=NO archive \
-  -archivePath apple/build/TersaMimeIOS.xcarchive
 ```
 
 The generated `apple/Tersa.xcodeproj` is intentionally ignored. The project
 build phase creates the Rust static library in `apple/build/rust`; it is also
 ignored with all local Apple build products.
 
-The Rust bridge and the MIME diagnostic are root workspace members and are
-therefore covered by `cargo xtask verify` and the repository supply-chain
-checks. The standalone fuzz project is deliberately excluded.
-Local `sh scripts/verify-mime-fuzz.sh` covers only the finite fuzz path; its
-formatting, Clippy/lint, license, source, and advisory policies are not
-automated after diagnostic CI retirement and remain unchecked pending PR4
-removal. Root workspace policy still rejects fuzz dependencies entering the
-workspace graph. Only the Apple
+The Rust bridge is a root workspace member and is therefore covered by
+`cargo xtask verify` and the repository supply-chain checks. Only the Apple
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`
@@ -345,7 +269,7 @@ The base macOS target declares both sandbox network client and server
 entitlements: future Google token/API traffic needs outbound networking, while
 the desktop OAuth redirect requires the narrowly bound loopback listener.
 Regenerate or verify the complete Rust and native dependency license
-inventories for active product and retained MIME diagnostic targets with:
+inventories for active product targets with:
 
 ```sh
 sh apple/scripts/generate-third-party-notices.sh --write

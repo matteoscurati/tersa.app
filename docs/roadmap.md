@@ -18,22 +18,15 @@ SQLCipher is the production macOS store. Active product search is the bounded
 mailbox search path. Storage, search-device, and blob product gates that remain
 open stay open on the still-tracked register until PR5.
 
-The hostile-content diagnostic now bounds encoded input, headers, MIME depth,
-part count, and decoded display bytes before producing a typed `SafeHtml`
-value. It excludes attachment bodies, strips every URL-bearing attribute, and
-preserves CID references only as inert metadata. A separate native macOS probe
-loads Rust-sanitized and raw hostile controls in a nonpersistent WKWebView with
-JavaScript disabled, block-all network rules, navigation denial, no server
-entitlement, an in-app transport-control loopback canary, and website-data
-residue checks. iOS device and simulator artifacts are compile evidence only.
-The synthetic corpus is now supplemented by a deterministic finite host fuzz
-regression: every seed is replayed before a fixed-seed budget of 10,000 total
-libFuzzer target executions, including corpus initialization, and each input
-must produce the same typed result twice while respecting output and CID
-invariants. This does not establish exhaustive parser safety, sustained fuzz
-coverage, memory-pressure behavior, WebKit device behavior, physical-iPhone
-containment, accessibility, or a production renderer. `M0-MIME-001` therefore
-remains open at its device-signed evidence requirement.
+Historical note: the M0 MIME/hostile-HTML diagnostic (portable spike, Apple
+WKWebView targets, finite host fuzz project, verifiers, about config, and
+diagnostic notices) proved host-side bounded parsing and containment
+constraints and then was removed from the tree by ADR-0025 housekeeping (PR4).
+Its detailed study remains a non-executable historical record until PR5
+consolidation; it does not claim an active MIME renderer, `SafeHtml`
+implementation, restricted WKWebView, parser, or diagnostic in the product
+graph. Hostile MIME/HTML handling remains a product security requirement.
+`M0-MIME-001` therefore remains open at its device-signed evidence requirement.
 
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. A development-signed macOS run also completed
@@ -46,13 +39,14 @@ remain unproven.
 
 Historical note: the M0 Slint and Dioxus UI diagnostics are retired from the
 tree (ADR-0025 housekeeping PR2). The M0 SQLCipher, search/Tantivy, and blob
-diagnostics are retired from the tree (ADR-0025 housekeeping PR3). Their
-production gates did not pass as device-signed product evidence; ADR history
-and the still-tracked M0 studies preserve those outcomes. M1 remains blocked
-because no production UI baseline has passed; the authoritative
-[M0 gate register](m0/gate-register.json) records current HEAD-checkable
-evidence and the cache measurement gate. Full M0 study consolidation is deferred
-to PR5.
+diagnostics are retired from the tree (ADR-0025 housekeeping PR3). The M0
+MIME/hostile-HTML and fuzz diagnostics are retired from the tree (ADR-0025
+housekeeping PR4). Their production gates did not pass as device-signed product
+evidence; ADR history and the still-tracked M0 studies preserve those outcomes.
+M1 remains blocked because no production UI baseline has passed; the
+authoritative [M0 gate register](m0/gate-register.json) records current
+HEAD-checkable evidence and the cache measurement gate. Full M0 study
+consolidation is deferred to PR5.
 
 ## Phase 1 — macOS-first product path
 

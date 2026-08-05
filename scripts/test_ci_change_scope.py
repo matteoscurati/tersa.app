@@ -100,8 +100,14 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     "Manual evidence gate",
     "gh workflow run CI",
     "Apple evidence job",
-    # Temporary unautomated fuzz policy gap pending PR4 removal.
-    "checked through its own locked verifier and deny policy",
+    # Retired MIME/fuzz diagnostic runbooks and package names must not return.
+    "tersa-mime-spike",
+    "TersaMimeMac",
+    "TersaMimeIOS",
+    "verify-mime-feasibility.sh",
+    "verify-mime-fuzz.sh",
+    "cargo-fuzz",
+    "libfuzzer-sys",
     # Combined OAuth verifier is obsolete after ADR-0024; do not recommend it.
     "After creating the unsigned base archives, run:",
     "```sh\nsh apple/scripts/verify-oauth-feasibility.sh\n```",
@@ -133,7 +139,7 @@ RETIRED_M0_OPERATIONAL_CLAIMS = (
     "It builds the macOS, iOS device, and iOS simulator targets",
     "CI uses a public non-functional client identifier",
     "The CI host profile",
-    # Fuzz verifier does not automate license/source/advisory policy.
+    # Retired MIME/fuzz operational CI claims must not re-enter historical studies.
     "validates the independent fuzz lock against its isolated license, source, and advisory policy",
     # Combined OAuth verifier is stale after the ADR-0024 token-broker cutover.
     "deterministic fake callbacks through\n`sh apple/scripts/verify-oauth-feasibility.sh`",
@@ -211,7 +217,7 @@ class ChangeScopeTests(unittest.TestCase):
                 {"rust_linux", "policy", "product_apple"},
             ),
             (
-                "retired spike entitlements use generic Apple entitlement routing",
+                "retired MIME entitlements use generic Apple entitlement routing",
                 ["apple/mime-macos/TersaMimeMac.entitlements"],
                 {"rust_linux", "policy", "product_apple"},
             ),
@@ -232,8 +238,18 @@ class ChangeScopeTests(unittest.TestCase):
                 ALL,
             ),
             (
-                "fuzz paths fail closed without a named diagnostic lane",
+                "retired fuzz paths fail closed without a named diagnostic lane",
                 ["fuzz/fuzz_targets/mime_display.rs"],
+                ALL,
+            ),
+            (
+                "retired MIME spike source fails closed without a named diagnostic lane",
+                ["apps/mime-spike/src/main.rs"],
+                ALL,
+            ),
+            (
+                "retired MIME spike manifest fails closed without a named diagnostic lane",
+                ["apps/mime-spike/Cargo.toml"],
                 ALL,
             ),
             ("notices are isolated", ["apple/licenses/sqlcipher-notices.txt"], {"notices"}),
@@ -264,6 +280,11 @@ class ChangeScopeTests(unittest.TestCase):
                 ALL,
             ),
             (
+                "retired MIME diagnostic notice config fails closed",
+                ["about-mime.toml"],
+                ALL,
+            ),
+            (
                 "retired sqlcipher spike source fails closed without a named diagnostic lane",
                 ["apps/sqlcipher-spike/src/main.rs"],
                 ALL,
@@ -291,6 +312,11 @@ class ChangeScopeTests(unittest.TestCase):
             (
                 "retired blob diagnostic notice output stays notices-only",
                 ["apple/licenses/THIRD_PARTY_NOTICES-blob-macos.txt"],
+                {"notices"},
+            ),
+            (
+                "retired MIME diagnostic notice output stays notices-only",
+                ["apple/licenses/THIRD_PARTY_NOTICES-mime-macos.txt"],
                 {"notices"},
             ),
             (

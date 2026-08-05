@@ -1,7 +1,5 @@
 [workspace]
-exclude = ["fuzz"]
 members = [
-    "apps/mime-spike",
     "apple/rust-bridge",
     "adapters/gmail-rest-macos",
     "adapters/keychain-macos",

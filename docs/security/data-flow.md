@@ -20,15 +20,16 @@ flowchart LR
     CORE --> DB[SQLCipher account store]
     CORE --> BLOBS[Chunked encrypted blobs]
     CORE --> SEARCH[Encrypted search]
-    CORE --> MIME[Bounded MIME and SafeHtml]
-    MIME --> WEBKIT[Nonpersistent restricted WKWebView]
+    CORE --> MIME[Planned hostile MIME/HTML boundary]
+    MIME --> WEBKIT[Planned restricted render surface]
     CORE --> EXPORT[Explicit user export]
     CORE --> DIAG[Redacted local diagnostics]
 ```
 
 The diagram is the intended production boundary, not an implementation claim.
-The authoritative gate register determines which individual edges have only
-diagnostic evidence.
+No active MIME renderer, `SafeHtml` implementation, restricted WKWebView,
+parser, or diagnostic currently implements those edges. The authoritative gate
+register determines which individual edges remain open.
 
 ## Flow inventory
 
@@ -40,7 +41,7 @@ diagnostic evidence.
 | Structured storage | Account-bound message envelopes and cached bodies | Per-account SQLCipher; exact schema and integrity validation; persistent encrypted WAL; in-memory temp policy; envelope-only read capability separate from complete-body/mutation authority | The macOS account store, strict reader, fixed-profile bootstrap composition, and descriptor-relative fresh-failure cleanup are implemented; global store, drafts, pending operations, File Protection evidence, signed runtime, and device evidence remain planned |
 | Blob storage | Attachments, inline images, thumbnails, parser results | Future product format remains undecided; the retired M0 candidate used versioned XChaCha20-Poly1305 chunks with authenticated metadata and same-directory publication | No production blob implementation; historical M0 host diagnostic retired in PR3; production manifest, keys, eviction, File Protection, backup, disk-full handling, and device runtime planned |
 | Search | Cached subject, addresses, body text, attachment text, query metadata | Bounded product mailbox search over cached metadata; no Tantivy full-text engine in the active product graph | Product bounded search is active; historical Tantivy host diagnostic retired in PR3; physical-device budget for any future full-text engine remains a separate decision |
-| MIME and HTML | Untrusted raw message and inline resources | Pre-parse limits; typed sanitized HTML; nonpersistent WKWebView; no JavaScript, forms, downloads, navigation, remote network, or persistent website data | Rust/macOS diagnostic; iOS device and production renderer planned |
+| MIME and HTML | Untrusted raw message and inline resources | Planned pre-parse limits; typed sanitized output; deny-by-default rendering; no automatic remote fetch; no JavaScript, forms, downloads, navigation, or persistent website data | Planned product responsibility; historical M0 host diagnostic retired in PR4; no active renderer/parser in the product graph; device-signed evidence remains open |
 | Export, share, and clipboard | User-selected attachment or text | Explicit user action and destination preview; data is declassified after leaving the app; never an internal cache | Planned |
 | Logs and evidence | Durations, counts, error classes, artifact digests | No content, addresses, query strings, credentials, paths, stable user IDs, or raw fixtures; encrypted local logs where retained | Synthetic aggregate diagnostics only |
 

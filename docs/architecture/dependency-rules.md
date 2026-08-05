@@ -4,7 +4,7 @@ tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
 The workspace has four shared architectural layers plus active platform
-adapters and the retained MIME diagnostic:
+adapters:
 
 | Crate | Responsibility | Allowed workspace dependencies |
 |---|---|---|
@@ -13,7 +13,6 @@ adapters and the retained MIME diagnostic:
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
 | `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-keychain-macos` on macOS, `tersa-presentation` |
-| `tersa-mime-spike` | Portable bounded MIME and deny-by-default HTML diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
 | `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-application`, `tersa-presentation`, `tersa-store-sqlcipher-macos` |
@@ -36,16 +35,16 @@ retired M0 Slint and Dioxus diagnostic executables previously owned exclusive
 UI-runtime edges; those packages are removed. The M0 SQLCipher, search/Tantivy,
 and blob diagnostic executables were likewise removed by ADR-0025 housekeeping
 (PR3); `tantivy` and `chacha20poly1305` are banned from the active workspace
-graph by `deny.toml`. The production store `tersa-store-sqlcipher-macos` is the
-direct SQLCipher owner; authorized composition crates may reach
-`rusqlite`/`libsqlite3-sys` only through the reviewed owner set enforced by
-`xtask`. `mail-parser` 0.11.5 and `ammonia` 4.1.4 remain pinned exactly and
-exclusive to the retained `tersa-mime-spike`. Linux CI exercises that portable
-MIME diagnostic's deterministic tests; product Apple CI does not cover spike
-cross-builds. `hmac` 0.12.1 is pinned exactly and may be reached by
-`tersa-keychain-macos` through HKDF and by the authorized macOS composition and
-CLI chains through Keychain. New workspace crates must be added explicitly to
-the policy in `xtask`; an unknown crate fails CI.
+graph by `deny.toml`. The M0 MIME/hostile-HTML diagnostic executable and
+isolated fuzz project were removed by ADR-0025 housekeeping (PR4); `ammonia`
+and `mail-parser` are banned from the active workspace graph by `deny.toml`.
+No active MIME renderer or parser package remains. The production store
+`tersa-store-sqlcipher-macos` is the direct SQLCipher owner; authorized
+composition crates may reach `rusqlite`/`libsqlite3-sys` only through the
+reviewed owner set enforced by `xtask`. `hmac` 0.12.1 is pinned exactly and may
+be reached by `tersa-keychain-macos` through HKDF and by the authorized macOS
+composition and CLI chains through Keychain. New workspace crates must be added
+explicitly to the policy in `xtask`; an unknown crate fails CI.
 
 ## macOS production account store
 

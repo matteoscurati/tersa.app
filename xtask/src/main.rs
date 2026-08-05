@@ -242,7 +242,6 @@ fn check_architecture() -> TaskResult {
 
         for dependency in &package.dependencies {
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
-            check_mime_dependency(&package_name, dependency, &mut violations);
             check_hmac_dependency(&package_name, dependency, &mut violations);
             check_gmail_dependency(&package_name, dependency, &mut violations);
             check_keychain_dependency(&package_name, dependency, &mut violations);
@@ -8058,7 +8057,6 @@ fn allowed_target_entitlement_path(target: &str, path: &str) -> bool {
         ("TersaMac", TERSA_MAC_ENTITLEMENTS)
             | ("TersaMacTokenBroker", TERSA_MAC_TOKEN_BROKER_ENTITLEMENTS)
             | ("TersaIOS", "ios/TersaIOS.entitlements")
-            | ("TersaMimeMac", "mime-macos/TersaMimeMac.entitlements")
     )
 }
 
@@ -8154,15 +8152,6 @@ fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> 
             "CODE_SIGN_ENTITLEMENTS",
         ] => {
             matches!(value, StrictYamlValue::String(value) if value == "ios/TersaIOS.entitlements")
-        }
-        [
-            "targets",
-            "TersaMimeMac",
-            "settings",
-            "base",
-            "CODE_SIGN_ENTITLEMENTS",
-        ] => {
-            matches!(value, StrictYamlValue::String(value) if value == "mime-macos/TersaMimeMac.entitlements")
         }
         _ => false,
     }
@@ -8476,7 +8465,6 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
             .other_options(target_metadata_options(target))
             .exec()?;
         check_sqlcipher_dependency_graph(&dependency_graph, target, violations);
-        check_mime_dependency_graph(&dependency_graph, target, violations);
         check_hmac_dependency_graph(&dependency_graph, target, violations);
         check_gmail_dependency_graph(&dependency_graph, target, violations);
         check_retrieval_crates_off_tokio_graph(&dependency_graph, target, violations);
@@ -9139,53 +9127,6 @@ fn target_metadata_options(target: &str) -> Vec<String> {
     ]
 }
 
-fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
-    const MIME_SPIKE: &str = "tersa-mime-spike";
-    const MIME_PACKAGES: [&str; 2] = ["ammonia", "mail-parser"];
-    let Some(resolve) = &metadata.resolve else {
-        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
-        return;
-    };
-    let package_names: BTreeMap<String, String> = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.to_string(), package.name.to_string()))
-        .collect();
-    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
-        .nodes
-        .iter()
-        .map(|node| {
-            (
-                node.id.to_string(),
-                node.deps
-                    .iter()
-                    .map(|dependency| dependency.pkg.to_string())
-                    .collect(),
-            )
-        })
-        .collect();
-    let mime_packages: BTreeSet<String> = package_names
-        .iter()
-        .filter_map(|(id, name)| MIME_PACKAGES.contains(&name.as_str()).then_some(id.clone()))
-        .collect();
-    for member in &metadata.workspace_members {
-        let member_id = member.to_string();
-        let Some(member_name) = package_names.get(&member_id) else {
-            violations.push(format!(
-                "workspace member `{member_id}` is absent from the resolved package graph"
-            ));
-            continue;
-        };
-        if member_name != MIME_SPIKE
-            && dependency_reaches(&member_id, &mime_packages, &dependencies)
-        {
-            violations.push(format!(
-                "{member_name} reaches a MIME parser dependency outside {MIME_SPIKE} for {target}"
-            ));
-        }
-    }
-}
-
 fn check_hmac_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
     // Root workspace still pins hmac =0.12.1 for the active Keychain/HKDF graph,
     // but no member declares it directly after blob-spike retirement. Enforce the
@@ -9606,35 +9547,6 @@ fn sqlcipher_manifest_dependency_violations(
     violations
 }
 
-fn check_mime_dependency(
-    package_name: &str,
-    dependency: &cargo_metadata::Dependency,
-    violations: &mut Vec<String>,
-) {
-    const MIME_SPIKE: &str = "tersa-mime-spike";
-    let expected = match dependency.name.as_str() {
-        "ammonia" => Some("=4.1.4"),
-        "mail-parser" => Some("=0.11.5"),
-        _ => None,
-    };
-    let Some(expected) = expected else {
-        return;
-    };
-    if package_name != MIME_SPIKE {
-        violations.push(format!(
-            "{package_name} -> {} (MIME parsing is exclusive to {MIME_SPIKE})",
-            dependency.name
-        ));
-    }
-    if dependency.req.to_string() != expected {
-        violations.push(format!(
-            "{package_name} -> {} must pin exactly {}",
-            dependency.name,
-            expected.trim_start_matches('=')
-        ));
-    }
-}
-
 fn check_hmac_dependency(
     package_name: &str,
     dependency: &cargo_metadata::Dependency,
@@ -9830,7 +9742,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "tersa-cli-macos",
             BTreeSet::from(["tersa-application", "tersa-domain", "tersa-keychain-macos"]),
         ),
-        ("tersa-mime-spike", BTreeSet::new()),
         (
             "tersa-store-sqlcipher-macos",
             BTreeSet::from(["tersa-application", "tersa-domain"]),
@@ -16981,11 +16892,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
     fn no_longer_reports_cli_as_a_reserved_boundary() {
         let resolved = BTreeMap::from([(
             "tersa-cli-macos".to_owned(),
-            BTreeSet::from([
-                "tersa-application".to_owned(),
-                "tersa-platform".to_owned(),
-                "tersa-mime-spike".to_owned(),
-            ]),
+            BTreeSet::from(["tersa-application".to_owned(), "tersa-platform".to_owned()]),
         )]);
 
         assert!(reserved_future_policy_violations(&resolved).is_empty());
