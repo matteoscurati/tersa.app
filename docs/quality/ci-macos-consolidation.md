@@ -10,11 +10,13 @@ supply-chain, notice, and DCO coverage while reducing macOS fanout.
 Performance-oriented orchestration (inlined `ci-macos` cargo commands on one
 default Cargo target directory, notices overlapping that sequential Rust suite,
 parallel Apple macOS test / iOS simulator build) removes measured cold-start
-and serial overhead without dropping checks. The acceptance budgets below were
-met by one exact-head full-fanout sample (see
-[Exact-head sample (measured)](#exact-head-sample-measured)). That sample is
-not a long-run statistical guarantee: aggregate macOS headroom was eight
-seconds under the 220-second budget, and runner variance can still breach it.
+and serial overhead without dropping checks. The normative exact-head sample
+met the acceptance budgets (see
+[Exact-head sample (measured)](#exact-head-sample-measured)), but
+identical-workflow re-runs on a later head showed aggregate macOS times both
+under and over the 220-second budget (see
+[Identical-workflow variance](#identical-workflow-variance)). The eight-second
+headroom on the normative sample does **not** describe the distribution.
 Re-measure with the procedure below after material workflow or runner changes.
 
 ## Baseline (pre-consolidation)
@@ -59,9 +61,30 @@ changes only this quality document and the static documentation-contract
 assertions that pin it; it does not change workflow bytes, job topology,
 commands, or macOS workload. No future commit hash is claimed here.
 
-This is a single sample, not a multi-run distribution. The eight-second
-aggregate headroom means runner variance or small suite regressions can still
-breach the budget; re-run the measurement procedure after material changes.
+This normative sample met the budgets with eight seconds of aggregate headroom.
+That headroom is a single-sample observation, not a distributional claim: it
+does not describe typical, best-case, or worst-case identical-workflow behavior.
+See [Identical-workflow variance](#identical-workflow-variance) for same-workflow
+evidence that includes a budget breach.
+
+## Identical-workflow variance
+
+Same consolidated workflow topology and commands were also observed on final
+pull-request head evidence from GitHub Actions run **31002144453** (all six
+visible jobs green on both attempts; functional checks passed):
+
+| Attempt | Wall-clock | `Apple product` | `macOS quality` | Aggregate macOS | vs 220 s budget |
+| --- | --- | --- | --- | --- | --- |
+| attempt 1 | 148 seconds | 129 seconds | 116 seconds | 245 seconds | **breach** (green functional checks) |
+| attempt 2 (single allowed same-SHA rerun) | 104 seconds | 86 seconds | 90 seconds | 176 seconds | within budget |
+
+Observed identical-workflow aggregate range on this evidence: **176–245 seconds**.
+
+Attempt 1 breached the aggregate budget despite green functional checks. The one
+permitted same-SHA attempt 2 rerun landed at 176 seconds and confirmed **runner
+variance** rather than hiding the breach: both outcomes are retained here. Do
+not interpret the normative sample’s eight-second headroom (run **31001855133**)
+as describing this distribution.
 
 ## Coverage matrix and ownership
 

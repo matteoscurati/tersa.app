@@ -268,6 +268,361 @@ def _named_step_env_entries(job_text: str, step_name: str) -> dict[str, str]:
     return entries
 
 
+def _named_step_sibling_keys(job_text: str, step_name: str) -> list[str]:
+    """Ordered top-level keys of a named step (``name``, ``env``, ``run``, ...).
+
+    Detects added ``if:``, ``continue-on-error:``, ``shell:``, ``with:``, or any
+    other sibling that could bypass or re-shell the pinned ``run: |`` block.
+    """
+    header = f"      - name: {step_name}"
+    lines = job_text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line == header:
+            start = index
+            break
+    if start is None:
+        raise AssertionError(f"step not found: {step_name}")
+
+    keys = ["name"]
+    for line in lines[start + 1 :]:
+        if line.startswith("      - name: "):
+            break
+        # Next job id at two-space indent ends the job (and therefore the step).
+        if (
+            line.startswith("  ")
+            and not line.startswith("    ")
+            and line.rstrip().endswith(":")
+            and not line.strip().startswith("#")
+        ):
+            break
+        # Step-level key: exactly eight spaces then ``key:``.
+        if line.startswith("        ") and not line.startswith("         "):
+            body = line[8:].rstrip()
+            if not body or body.startswith("#"):
+                continue
+            key, sep, _ = body.partition(":")
+            if not sep or not key or key != key.strip() or " " in key:
+                raise AssertionError(
+                    f"unparsable step sibling key in {step_name}: {line!r}"
+                )
+            keys.append(key)
+    return keys
+
+
+def _named_step_block_scalar_script(job_text: str, step_name: str) -> str:
+    """Extract the ``run: |`` block-scalar body for a named step (no YAML dep).
+
+    Returns the raw indented script text under ``run: |``. Stops at the next
+    step, job, or step-level sibling key. Does not evaluate shell.
+    """
+    header = f"      - name: {step_name}"
+    lines = job_text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line == header:
+            start = index + 1
+            break
+    if start is None:
+        raise AssertionError(f"step not found: {step_name}")
+
+    run_start: int | None = None
+    for index, line in enumerate(lines[start:], start=start):
+        if line.startswith("      - name: "):
+            break
+        if line == "        run: |":
+            run_start = index + 1
+            break
+    if run_start is None:
+        raise AssertionError(f"run: | block not found in step: {step_name}")
+
+    body: list[str] = []
+    for line in lines[run_start:]:
+        if line.startswith("      - name: "):
+            break
+        if (
+            line.startswith("  ")
+            and not line.startswith("    ")
+            and line.rstrip().endswith(":")
+            and not line.strip().startswith("#")
+        ):
+            break
+        # Block-scalar content is indented deeper than the step key column.
+        if line.startswith("          ") or not line.strip():
+            body.append(line)
+            continue
+        if line.startswith("        ") and not line.startswith("         "):
+            # Sibling step key ends the scalar.
+            break
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        raise AssertionError(
+            f"unexpected run block line in {step_name}: {line!r}"
+        )
+    return "\n".join(body)
+
+
+def _executable_physical_lines(script: str) -> list[str]:
+    """Ordered non-comment executable physical lines of a shell script.
+
+    Normalizes only common leading indentation and trailing whitespace. Blank
+    and comment-only lines are dropped so comments may change without failing
+    the pin; every control, command, heredoc, exit, conditional, wrapper,
+    marker, awk, trap, or redirection line remains and is compared exactly.
+    """
+    raw_lines = script.splitlines()
+    non_blank = [line for line in raw_lines if line.strip()]
+    if not non_blank:
+        return []
+
+    def leading_spaces(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    min_indent = min(leading_spaces(line) for line in non_blank)
+    executable: list[str] = []
+    for line in raw_lines:
+        trimmed = line.rstrip()
+        if not trimmed.strip():
+            continue
+        if len(trimmed) >= min_indent and trimmed[:min_indent] == (" " * min_indent):
+            content = trimmed[min_indent:]
+        else:
+            content = trimmed.lstrip(" ")
+        if content.lstrip().startswith("#"):
+            continue
+        executable.append(content)
+    return executable
+
+
+def _workflow_level_env_entries(workflow: str) -> dict[str, str]:
+    """Exact top-level workflow ``env`` map (before ``jobs:``)."""
+    lines = workflow.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line == "env:":
+            start = index + 1
+            break
+    if start is None:
+        raise AssertionError("workflow-level env: not found")
+
+    entries: dict[str, str] = {}
+    for line in lines[start:]:
+        if not line.startswith(" ") and line.rstrip().endswith(":"):
+            # Next top-level key (for example jobs:).
+            break
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        if line.startswith("  ") and not line.startswith("   "):
+            body = line[2:]
+            key, sep, value = body.partition(": ")
+            if not sep or not key:
+                raise AssertionError(f"unparsable workflow env entry: {line!r}")
+            entries[key] = value
+            continue
+        raise AssertionError(f"unexpected workflow env line: {line!r}")
+    return entries
+
+
+def _job_has_job_level_env(job_text: str) -> bool:
+    """True when the job declares a job-level ``env:`` key (not step env)."""
+    for line in job_text.splitlines():
+        if line == "    env:":
+            return True
+    return False
+
+
+def _xtask_fn_body(xtask: str, fn_name: str) -> str:
+    """Body text of ``fn <name>() -> TaskResult { ... }`` (brace-balanced)."""
+    header = f"fn {fn_name}() -> TaskResult {{"
+    start = xtask.index(header) + len(header)
+    depth = 1
+    index = start
+    while index < len(xtask) and depth > 0:
+        char = xtask[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    if depth != 0:
+        raise AssertionError(f"unbalanced braces in fn {fn_name}")
+    return xtask[start : index - 1]
+
+
+def _cargo_arg_lists(fn_body: str) -> list[list[str]]:
+    """Ordered ``cargo(&[...])`` argument arrays from an xtask function body."""
+    return [
+        re.findall(r'"([^"]*)"', args_block)
+        for args_block in re.findall(
+            r"cargo\(\s*\[(.*?)\]\s*\)",
+            fn_body,
+            flags=re.DOTALL,
+        )
+    ]
+
+
+# Exact ordered executable physical lines of the ``Run macOS quality checks``
+# ``run: |`` block. The pin is the current workflow script with relative
+# indentation preserved; blank and comment-only lines are omitted because the
+# normalizer drops them. Any added/removed/changed control, command, heredoc,
+# exit, conditional, wrapper, marker, awk, trap, or redirection line fails the
+# equality check. No hash is used so the pin remains independently readable.
+_MACOS_QUALITY_RUN_SCRIPT_PIN = r"""
+set -euo pipefail
+log_dir="${RUNNER_TEMP}/macos-quality-logs"
+rust_log="$log_dir/rust.log"
+notices_log="$log_dir/notices.log"
+mkdir -p "$log_dir"
+_logs_flushed=0
+flush_logs() {
+  if [ "${_logs_flushed}" -ne 0 ]; then
+    return 0
+  fi
+  _logs_flushed=1
+  if [ -f "$rust_log" ]; then
+    echo "----- Rust suite -----"
+    cat "$rust_log" || true
+  fi
+  if [ -f "$notices_log" ]; then
+    echo "----- third-party notices -----"
+    cat "$notices_log" || true
+  fi
+  return 0
+}
+trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+trap 'flush_logs || true; trap - EXIT; exit 130' INT
+trap 'flush_logs || true; trap - EXIT; exit 143' TERM
+if [ "$RUN_RUST" != "true" ] && [ "$RUN_NOTICES" != "true" ]; then
+  echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true (RUN_RUST=${RUN_RUST:-}; RUN_NOTICES=${RUN_NOTICES:-}); refusing no-op success." >&2
+  trap - EXIT INT TERM
+  exit 1
+fi
+rust_pid=""
+notices_pid=""
+rust_status=0
+notices_status=0
+if [ "$RUN_NOTICES" = "true" ]; then
+  (
+    set -euo pipefail
+    cargo fetch --locked
+    sh apple/scripts/generate-third-party-notices.sh --check
+  ) >"$notices_log" 2>&1 &
+  notices_pid=$!
+fi
+if [ "$RUN_RUST" = "true" ]; then
+  (
+    set -euo pipefail
+    echo "Running Clippy check..."
+    cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+    echo "Running tests check..."
+    cargo test --locked --workspace --all-targets --all-features
+    echo "Running documentation tests check..."
+    cargo test --locked --workspace --doc --all-features
+    echo "Running documentation check..."
+    export RUSTDOCFLAGS="--deny warnings"
+    cargo doc --locked --workspace --no-deps --all-features
+    echo "macOS CI verification passed."
+  ) >"$rust_log" 2>&1 &
+  rust_pid=$!
+fi
+if [ -n "$rust_pid" ]; then
+  wait "$rust_pid" || rust_status=$?
+fi
+if [ -n "$notices_pid" ]; then
+  wait "$notices_pid" || notices_status=$?
+fi
+if [ "$rust_status" -ne 0 ] || [ "$notices_status" -ne 0 ]; then
+  flush_logs
+  trap - EXIT INT TERM
+  if [ "$rust_status" -ne 0 ]; then
+    exit "$rust_status"
+  fi
+  exit "$notices_status"
+fi
+trap - EXIT INT TERM
+if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then
+  echo "macOS quality: Rust suite and third-party notices succeeded."
+elif [ "$RUN_RUST" = "true" ]; then
+  echo "macOS quality: Rust suite succeeded."
+elif [ "$RUN_NOTICES" = "true" ]; then
+  echo "macOS quality: third-party notices succeeded."
+else
+  echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true; refusing no-op success." >&2
+  exit 1
+fi
+if [ "$RUN_RUST" = "true" ]; then
+  tests_summary=""
+  doctests_summary=""
+  if [ -f "$rust_log" ]; then
+    tests_summary="$(
+      awk '
+        $0 == "Running tests check..." { in_phase=1; next }
+        $0 == "Running documentation tests check..." { in_phase=0 }
+        in_phase && index($0, "test result: ok.") {
+          line_passed = ""
+          line_failed = ""
+          for (i = 2; i <= NF; i++) {
+            if ($i ~ /^passed/) line_passed = $(i-1)
+            if ($i ~ /^failed/) line_failed = $(i-1)
+          }
+          if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+            unparsable = 1
+            next
+          }
+          summaries++
+          passed += line_passed + 0
+          failed += line_failed + 0
+        }
+        END {
+          if (!unparsable && summaries > 0)
+            print "summaries=" summaries " passed=" passed " failed=" failed
+        }
+      ' "$rust_log"
+    )" || true
+    doctests_summary="$(
+      awk '
+        $0 == "Running documentation tests check..." { in_phase=1; next }
+        $0 == "Running documentation check..." { in_phase=0 }
+        in_phase && index($0, "test result: ok.") {
+          line_passed = ""
+          line_failed = ""
+          for (i = 2; i <= NF; i++) {
+            if ($i ~ /^passed/) line_passed = $(i-1)
+            if ($i ~ /^failed/) line_failed = $(i-1)
+          }
+          if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+            unparsable = 1
+            next
+          }
+          summaries++
+          passed += line_passed + 0
+          failed += line_failed + 0
+        }
+        END {
+          if (!unparsable && summaries > 0)
+            print "summaries=" summaries " passed=" passed " failed=" failed
+        }
+      ' "$rust_log"
+    )" || true
+  fi
+  if [ -n "$tests_summary" ]; then
+    echo "Cargo tests: $tests_summary"
+  else
+    echo "Cargo tests: summary unavailable (log format changed)."
+  fi
+  if [ -n "$doctests_summary" ]; then
+    echo "Cargo doc-tests: $doctests_summary"
+  else
+    echo "Cargo doc-tests: summary unavailable (log format changed)."
+  fi
+fi
+"""
+
+MACOS_QUALITY_RUN_EXECUTABLE_LINES = tuple(
+    _executable_physical_lines(_MACOS_QUALITY_RUN_SCRIPT_PIN)
+)
+
+
 # POSIX/BSD-compatible Cargo phase aggregation (mirrors workflow awk field parse).
 _CARGO_PHASE_AGGREGATE_AWK = r"""
 in_phase && index($0, "test result: ok.") {
@@ -1354,20 +1709,10 @@ class ChangeScopeTests(unittest.TestCase):
         """Pin workflow cargo invocations as exactly equivalent to xtask ci-macos."""
         workflow = WORKFLOW.read_text(encoding="utf-8")
         xtask = (ROOT / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
-        # Locate the ci_macos function body in xtask.
-        start = xtask.index("fn ci_macos() -> TaskResult {")
-        end = xtask.index("\nfn cargo<", start)
-        body = xtask[start:end]
+        body = _xtask_fn_body(xtask, "ci_macos")
 
         # Extract ordered cargo(&[...]) argument arrays (formatting-tolerant).
-        cargo_arg_lists = [
-            re.findall(r'"([^"]*)"', args_block)
-            for args_block in re.findall(
-                r"cargo\(\s*\[(.*?)\]\s*\)",
-                body,
-                flags=re.DOTALL,
-            )
-        ]
+        cargo_arg_lists = _cargo_arg_lists(body)
         self.assertEqual(len(cargo_arg_lists), 4)
         xtask_commands = ["cargo " + " ".join(args) for args in cargo_arg_lists]
         # Exact ordered reconstruction must match the four workflow pins. Removing
@@ -1410,6 +1755,59 @@ class ChangeScopeTests(unittest.TestCase):
         # Developer-facing command remains implemented in xtask.
         self.assertIn('Some("ci-macos")', xtask)
         self.assertIn("fn ci_macos()", xtask)
+
+    def test_xtask_verify_retains_portable_checks_absent_from_ci_macos(self) -> None:
+        """Linux verify keeps architecture/fmt/check that justify thinner macOS."""
+        xtask = (ROOT / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
+        verify_body = _xtask_fn_body(xtask, "verify")
+        ci_macos_body = _xtask_fn_body(xtask, "ci_macos")
+
+        # Portable checks appear in verify in order before Clippy/tests/doc/rustdoc.
+        arch_at = verify_body.index("check_architecture()?")
+        first_cargo_at = verify_body.index("cargo(")
+        self.assertLess(arch_at, first_cargo_at)
+
+        verify_cargo = _cargo_arg_lists(verify_body)
+        self.assertEqual(len(verify_cargo), 6)
+        verify_commands = ["cargo " + " ".join(args) for args in verify_cargo]
+        # Exact ordered portable trio, then Clippy/tests/doc-tests/rustdoc.
+        self.assertEqual(
+            verify_commands,
+            [
+                "cargo fmt --all --check",
+                "cargo check --locked --workspace --all-targets --all-features",
+                "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+                "cargo test --locked --workspace --all-targets --all-features",
+                "cargo test --locked --workspace --doc --all-features",
+                "cargo doc --locked --workspace --no-deps --all-features",
+            ],
+        )
+        self.assertEqual(verify_cargo[0], ["fmt", "--all", "--check"])
+        self.assertEqual(
+            verify_cargo[1],
+            ["check", "--locked", "--workspace", "--all-targets", "--all-features"],
+        )
+
+        # Exact ci_macos equivalence: only the four host suite commands.
+        ci_macos_cargo = _cargo_arg_lists(ci_macos_body)
+        self.assertEqual(
+            ["cargo " + " ".join(args) for args in ci_macos_cargo],
+            [
+                "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+                "cargo test --locked --workspace --all-targets --all-features",
+                "cargo test --locked --workspace --doc --all-features",
+                "cargo doc --locked --workspace --no-deps --all-features",
+            ],
+        )
+        # The three portable checks must remain absent from ci_macos.
+        self.assertNotIn("check_architecture", ci_macos_body)
+        self.assertNotIn(["fmt", "--all", "--check"], ci_macos_cargo)
+        self.assertNotIn(
+            ["check", "--locked", "--workspace", "--all-targets", "--all-features"],
+            ci_macos_cargo,
+        )
+        self.assertTrue(all(args and args[0] != "fmt" for args in ci_macos_cargo))
+        self.assertTrue(all(args and args[0] != "check" for args in ci_macos_cargo))
 
     def test_macos_quality_cargo_inventory_prefix_rules(self) -> None:
         """Bare and run: normalize; other prefixes, folds, tabs, quotes fail-closed."""
@@ -1553,6 +1951,206 @@ class ChangeScopeTests(unittest.TestCase):
                 "cargo doc --locked --workspace --no-deps --all-features",
             ],
         )
+
+    def test_macos_quality_run_executable_lines_match_exact_pin(self) -> None:
+        """Every non-comment executable physical line of the run block is pinned."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        script = _named_step_block_scalar_script(job, "Run macOS quality checks")
+        actual = _executable_physical_lines(script)
+        self.assertEqual(tuple(actual), MACOS_QUALITY_RUN_EXECUTABLE_LINES)
+        # Pin is non-empty and includes the load-bearing suite markers.
+        self.assertGreater(len(MACOS_QUALITY_RUN_EXECUTABLE_LINES), 50)
+        self.assertIn("set -euo pipefail", MACOS_QUALITY_RUN_EXECUTABLE_LINES)
+        self.assertIn(
+            """trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT""",
+            MACOS_QUALITY_RUN_EXECUTABLE_LINES,
+        )
+        # Nested suite commands keep relative indent after normalization.
+        self.assertTrue(
+            any(
+                line.lstrip()
+                == "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings"
+                for line in MACOS_QUALITY_RUN_EXECUTABLE_LINES
+            ),
+            msg="pinned executable lines must include the Clippy suite command",
+        )
+        # Comment-only edits to the live script must not fail the pin.
+        with_comment = script.replace(
+            "          set -euo pipefail\n",
+            "          set -euo pipefail\n"
+            "          # comment-only change must not fail the executable pin\n",
+        )
+        self.assertEqual(
+            tuple(_executable_physical_lines(with_comment)),
+            MACOS_QUALITY_RUN_EXECUTABLE_LINES,
+        )
+        # Blank-line insertion is also ignored.
+        with_blank = script.replace(
+            "          set -euo pipefail\n",
+            "          set -euo pipefail\n\n",
+        )
+        self.assertEqual(
+            tuple(_executable_physical_lines(with_blank)),
+            MACOS_QUALITY_RUN_EXECUTABLE_LINES,
+        )
+
+    def test_macos_quality_run_executable_lines_reject_shell_neutralization(
+        self,
+    ) -> None:
+        """if-false wrappers, heredocs, and early exit 0 fail full-line equality."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        script = _named_step_block_scalar_script(job, "Run macOS quality checks")
+        baseline = tuple(_executable_physical_lines(script))
+        self.assertEqual(baseline, MACOS_QUALITY_RUN_EXECUTABLE_LINES)
+
+        # Multi-line neutralization: wrap the suite in a never-taken branch.
+        if_false = script.replace(
+            "          set -euo pipefail\n",
+            "          set -euo pipefail\n"
+            "          if false; then\n",
+            1,
+        )
+        # Close the wrapper just before the natural end of the script body.
+        if_false = if_false.rstrip("\n") + "\n          fi\n"
+        self.assertNotEqual(
+            tuple(_executable_physical_lines(if_false)),
+            MACOS_QUALITY_RUN_EXECUTABLE_LINES,
+        )
+        self.assertIn(
+            "if false; then",
+            _executable_physical_lines(if_false),
+        )
+        self.assertIn("fi", _executable_physical_lines(if_false)[-1:])
+
+        # Heredoc that swallows a cargo command so the pin line vanishes.
+        heredoc = script.replace(
+            "              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings\n",
+            "              cat <<'EOF'\n"
+            "              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings\n"
+            "              EOF\n",
+        )
+        heredoc_lines = _executable_physical_lines(heredoc)
+        self.assertNotEqual(tuple(heredoc_lines), MACOS_QUALITY_RUN_EXECUTABLE_LINES)
+        self.assertTrue(
+            any("cat <<'EOF'" in line or "cat <<EOF" in line for line in heredoc_lines)
+            or any(line.strip() == "EOF" for line in heredoc_lines),
+            msg=f"heredoc markers missing from mutated inventory: {heredoc_lines!r}",
+        )
+
+        # Early success: exit 0 before any suite work.
+        early_exit = script.replace(
+            "          set -euo pipefail\n",
+            "          set -euo pipefail\n"
+            "          exit 0\n",
+        )
+        early_lines = _executable_physical_lines(early_exit)
+        self.assertNotEqual(tuple(early_lines), MACOS_QUALITY_RUN_EXECUTABLE_LINES)
+        self.assertIn("exit 0", early_lines)
+
+        # Cargo-only inventory still cannot see if-false neutralization alone when
+        # cargo lines remain present — full executable equality is the guard.
+        if_false_cargo_only = _macos_quality_cargo_inventory(
+            "              if false; then\n"
+            "              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings\n"
+            "              fi\n"
+        )
+        self.assertEqual(
+            if_false_cargo_only,
+            [
+                "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+            ],
+        )
+
+    def test_macos_quality_mapping_and_step_keys_reject_bypasses(self) -> None:
+        """Workflow/job/step mapping pins close env and step-level bypasses."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+
+        # Workflow-level env is exactly the two global diagnostic settings.
+        expected_workflow_env = {
+            "CARGO_TERM_COLOR": "always",
+            "RUST_BACKTRACE": "1",
+        }
+        self.assertEqual(_workflow_level_env_entries(workflow), expected_workflow_env)
+        # Extra workflow-level RUSTFLAGS must fail the pin.
+        with_workflow_rustflags = workflow.replace(
+            "  RUST_BACKTRACE: 1\n",
+            "  RUST_BACKTRACE: 1\n"
+            "  RUSTFLAGS: --cap-lints=allow\n",
+        )
+        self.assertNotEqual(
+            _workflow_level_env_entries(with_workflow_rustflags),
+            expected_workflow_env,
+        )
+        self.assertIn(
+            "RUSTFLAGS",
+            _workflow_level_env_entries(with_workflow_rustflags),
+        )
+
+        # macos_quality must not declare a job-level env map.
+        self.assertFalse(_job_has_job_level_env(job))
+        with_job_env = job.replace(
+            "    timeout-minutes: 15\n",
+            "    timeout-minutes: 15\n"
+            "    env:\n"
+            "      RUSTFLAGS: --cap-lints=allow\n",
+        )
+        self.assertTrue(_job_has_job_level_env(with_job_env))
+
+        # Named step siblings are exactly name, env, run (no if / shell / …).
+        expected_keys = ["name", "env", "run"]
+        self.assertEqual(
+            _named_step_sibling_keys(job, "Run macOS quality checks"),
+            expected_keys,
+        )
+        # Step-level if: ${{ false }} must fail the sibling-key pin.
+        with_step_if = job.replace(
+            "      - name: Run macOS quality checks\n",
+            "      - name: Run macOS quality checks\n"
+            "        if: ${{ false }}\n",
+        )
+        self.assertNotEqual(
+            _named_step_sibling_keys(with_step_if, "Run macOS quality checks"),
+            expected_keys,
+        )
+        self.assertEqual(
+            _named_step_sibling_keys(with_step_if, "Run macOS quality checks"),
+            ["name", "if", "env", "run"],
+        )
+        # continue-on-error and shell overrides are also rejected.
+        with_continue = job.replace(
+            "      - name: Run macOS quality checks\n",
+            "      - name: Run macOS quality checks\n"
+            "        continue-on-error: true\n",
+        )
+        self.assertIn(
+            "continue-on-error",
+            _named_step_sibling_keys(with_continue, "Run macOS quality checks"),
+        )
+        with_shell = job.replace(
+            "        run: |\n",
+            "        shell: bash\n"
+            "        run: |\n",
+        )
+        # Only the quality-checks step uses this env+run shape; still assert.
+        self.assertIn(
+            "shell",
+            _named_step_sibling_keys(with_shell, "Run macOS quality checks"),
+        )
+
+        # Ordinary job-level if: on macos_quality (classifier gate) remains.
+        self.assertIn(
+            "if: ${{ needs.changes.outputs.rust_macos == 'true' || needs.changes.outputs.notices == 'true' }}",
+            job,
+        )
+        # Other jobs may still use job-level env (Apple product) without failing.
+        apple = jobs["apple_product"]
+        self.assertTrue(_job_has_job_level_env(apple))
 
     def test_macos_quality_selector_fail_closed_without_selected_lanes(self) -> None:
         """Job must not claim notices success when neither selector is true."""
@@ -1707,11 +2305,11 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("last=$0", job)
 
     def test_ci_macos_consolidation_doc_records_measured_exact_head_sample(self) -> None:
-        """Budget is measured; stale unmeasured claims must not return."""
+        """Budget is measured; identical-workflow variance must stay visible."""
         doc = (ROOT / "docs" / "quality" / "ci-macos-consolidation.md").read_text(
             encoding="utf-8"
         )
-        # Exact-head sample evidence from Actions run 31001855133.
+        # Normative exact-head sample evidence from Actions run 31001855133.
         self.assertIn("31001855133", doc)
         self.assertIn("a0c8a91f7f3606ef4139bd84005e3f8894694e98", doc)
         self.assertIn("127 seconds", doc)
@@ -1723,12 +2321,45 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("8 seconds", doc)
         self.assertIn("Exact-head sample (measured)", doc)
         self.assertIn("Exact-head measurement procedure", doc)
+        self.assertIn("Identical-workflow variance", doc)
+        # Baseline, budgets, coverage matrix, and self-reference remain.
+        self.assertIn("Baseline (pre-consolidation)", doc)
+        self.assertIn("Acceptance budgets (post-consolidation)", doc)
+        self.assertIn("Coverage matrix and ownership", doc)
+        self.assertIn("30977712430", doc)
+        self.assertIn("≤ 220", doc)
+        # Final-head same-workflow evidence (run 31002144453): both attempts.
+        self.assertIn("31002144453", doc)
+        self.assertIn("148 seconds", doc)
+        self.assertIn("129 seconds", doc)
+        self.assertIn("116 seconds", doc)
+        self.assertIn("245 seconds", doc)
+        self.assertIn("104 seconds", doc)
+        self.assertIn("86 seconds", doc)
+        self.assertIn("90 seconds", doc)
+        self.assertIn("176 seconds", doc)
+        # Range may use ASCII hyphen or en-dash.
+        self.assertTrue(
+            "176-245" in doc or "176–245" in doc,
+            msg="expected identical-workflow aggregate range 176-245",
+        )
+        self.assertIn("attempt 1", doc)
+        self.assertIn("attempt 2", doc)
+        self.assertRegex(doc, r"(?i)breach")
+        # Phrase may wrap across Markdown lines (for example bold `runner\nvariance`).
+        self.assertRegex(doc, r"(?i)runner\s+variance")
+        self.assertRegex(doc, r"(?i)identical[- ]workflow")
+        # Must not claim the 8-second sample headroom describes the distribution.
+        self.assertNotIn("sample headroom describes the distribution", doc)
+        self.assertNotIn(
+            "The eight-second\naggregate headroom means runner variance or small suite regressions can still\nbreach the budget; re-run the measurement procedure after material changes.",
+            doc,
+        )
         # Superseded normative sample (run 30997714456) must not remain.
         for superseded in (
             "30997714456",
             "9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69",
             "132 seconds",
-            "116 seconds",
             "3 seconds",
         ):
             with self.subTest(superseded=superseded):
