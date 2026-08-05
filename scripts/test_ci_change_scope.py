@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
@@ -619,8 +620,8 @@ class ChangeScopeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         jobs = dict(self._workflow_job_blocks(workflow))
         apple = jobs["apple_product"]
-        # Parallel step keeps complete TersaMac test + TersaIOS simulator build
-        # with distinct DerivedData directories and deterministic failure propagation.
+        # Parallel step: stream long TersaMac test live; background only independent
+        # iOS build. Distinct DerivedData + deterministic dual-status propagation.
         self.assertIn("Test macOS and build iOS simulator in parallel", apple)
         self.assertIn(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac",
@@ -637,12 +638,30 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("CODE_SIGNING_ALLOWED=NO", apple)
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* test")
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* build")
-        self.assertIn('wait "$macos_pid" || macos_status=$?', apple)
+        # Topology: iOS is the sole background PID; macOS streams in the foreground.
+        self.assertIn("ios_pid=$!", apple)
+        self.assertNotIn("macos_pid", apple)
         self.assertIn('wait "$ios_pid" || ios_status=$?', apple)
-        self.assertIn('cat "$log_dir/macos-test.log"', apple)
+        self.assertIn(') || macos_status=$?', apple)
+        self.assertIn(') >"$log_dir/ios-build.log" 2>&1 &', apple)
+        self.assertNotIn("macos-test.log", apple)
         self.assertIn('cat "$log_dir/ios-build.log"', apple)
-        self.assertIn('if [ "$macos_status" -ne 0 ]; then', apple)
-        self.assertIn('if [ "$ios_status" -ne 0 ]; then', apple)
+        # iOS starts before the foreground macOS suite so they still overlap.
+        ios_bg = apple.index(') >"$log_dir/ios-build.log" 2>&1 &')
+        macos_fg = apple.index(
+            "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac"
+        )
+        self.assertLess(ios_bg, macos_fg)
+        self.assertEqual(apple.count(" 2>&1 &"), 1)
+        # Unconditional wait/log for iOS, then propagate both exit statuses.
+        wait_ios = apple.index('wait "$ios_pid" || ios_status=$?')
+        cat_ios = apple.index('cat "$log_dir/ios-build.log"')
+        fail_macos = apple.index('if [ "$macos_status" -ne 0 ]; then')
+        fail_ios = apple.index('if [ "$ios_status" -ne 0 ]; then')
+        self.assertLess(macos_fg, wait_ios)
+        self.assertLess(wait_ios, cat_ios)
+        self.assertLess(cat_ios, fail_macos)
+        self.assertLess(fail_macos, fail_ios)
         self.assertNotIn("Build unsigned macOS debug application", workflow)
         self.assertIn("name: Verify built Rust bridge symbols", workflow)
         self.assertIn(
@@ -760,20 +779,28 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertNotIn("doc_status", job)
         self.assertNotIn("clippy.log", job)
         self.assertNotIn("tests.log", job)
-        # Notices is the sole background PID; wait even if Rust fails, emit logs,
-        # then deterministically propagate rust then notices failures.
+        # Notices is the sole background PID; Rust streams live in the foreground.
+        # Always wait/emit notices even if Rust fails, then propagate both statuses.
         self.assertIn("notices_pid=$!", job)
         self.assertIn('wait "$notices_pid" || notices_status=$?', job)
-        self.assertIn(') >"$log_dir/rust.log" 2>&1 || rust_status=$?', job)
-        self.assertIn('cat "$log_dir/rust.log"', job)
+        self.assertIn(') || rust_status=$?', job)
+        self.assertNotIn("rust.log", job)
         self.assertIn('cat "$log_dir/notices.log"', job)
         self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
         self.assertIn('if [ "$notices_status" -ne 0 ]; then', job)
         # Notices starts before the sequential Rust suite so fetch/generation can
         # overlap; only one background `&` for the notices subshell.
-        notices_bg = job.index(") >\"$log_dir/notices.log\" 2>&1 &")
-        rust_seq = job.index("echo \"Running Clippy check...\"")
+        notices_bg = job.index(') >"$log_dir/notices.log" 2>&1 &')
+        rust_seq = job.index('echo "Running Clippy check..."')
+        wait_notices = job.index('wait "$notices_pid" || notices_status=$?')
+        cat_notices = job.index('cat "$log_dir/notices.log"')
+        fail_rust = job.index('if [ "$rust_status" -ne 0 ]; then')
+        fail_notices = job.index('if [ "$notices_status" -ne 0 ]; then')
         self.assertLess(notices_bg, rust_seq)
+        self.assertLess(rust_seq, wait_notices)
+        self.assertLess(wait_notices, cat_notices)
+        self.assertLess(cat_notices, fail_rust)
+        self.assertLess(fail_rust, fail_notices)
         self.assertEqual(job.count(" 2>&1 &"), 1)
         self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
         self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
@@ -804,25 +831,37 @@ class ChangeScopeTests(unittest.TestCase):
         start = xtask.index("fn ci_macos() -> TaskResult {")
         end = xtask.index("\nfn cargo<", start)
         body = xtask[start:end]
-        for fragment in (
-            '"clippy"',
-            '"--locked"',
-            '"--workspace"',
-            '"--all-targets"',
-            '"--all-features"',
-            '"--deny"',
-            '"warnings"',
-            '"test"',
-            '"--doc"',
-            '"doc"',
-            '"--no-deps"',
-            '"RUSTDOCFLAGS"',
-            '"--deny warnings"',
-        ):
-            with self.subTest(fragment=fragment):
-                self.assertIn(fragment, body)
+
+        # Extract ordered cargo(&[...]) argument arrays (formatting-tolerant).
+        cargo_arg_lists = [
+            re.findall(r'"([^"]*)"', args_block)
+            for args_block in re.findall(
+                r"cargo\(\s*\[(.*?)\]\s*\)",
+                body,
+                flags=re.DOTALL,
+            )
+        ]
+        self.assertEqual(len(cargo_arg_lists), 4)
+        xtask_commands = ["cargo " + " ".join(args) for args in cargo_arg_lists]
+        # Exact ordered reconstruction must match the four workflow pins. Removing
+        # --locked / --all-targets / --all-features from any cargo call fails here.
+        pinned_commands = [
+            "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+            "cargo test --locked --workspace --all-targets --all-features",
+            "cargo test --locked --workspace --doc --all-features",
+            "cargo doc --locked --workspace --no-deps --all-features",
+        ]
+        self.assertEqual(xtask_commands, pinned_commands)
+
         jobs = dict(self._workflow_job_blocks(workflow))
         job = jobs["macos_quality"]
+        positions = [job.index(command) for command in pinned_commands]
+        self.assertEqual(positions, sorted(positions))
+
+        # rustdoc environment equivalence (workflow export vs xtask Command::env).
+        self.assertIn('.env("RUSTDOCFLAGS", "--deny warnings")', body)
+        self.assertIn('export RUSTDOCFLAGS="--deny warnings"', job)
+
         # Workflow must not reintroduce architecture/format/check on macOS.
         for banned in (
             "cargo fmt",

@@ -115,21 +115,13 @@ jobs:
       # macOS test (~79s) and iOS simulator build (~24s) are independent once the
       # project exists. Separate DerivedData paths avoid Xcode races; Rust archives
       # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
+      # Stream the longer TersaMac test live; isolate only the independent iOS build
+      # in a background log so timeout/cancel still leave foreground diagnostics.
       - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/apple-product-logs"
           mkdir -p "$log_dir"
-
-          (
-            set -euo pipefail
-            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
-              -configuration Debug -destination 'platform=macOS,arch=arm64' \
-              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
-              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
-              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
-          ) >"$log_dir/macos-test.log" 2>&1 &
-          macos_pid=$!
 
           (
             set -euo pipefail
@@ -144,11 +136,19 @@ jobs:
 
           macos_status=0
           ios_status=0
-          wait "$macos_pid" || macos_status=$?
+          # Foreground streaming: live Actions log for the long TersaMac suite.
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
+              -configuration Debug -destination 'platform=macOS,arch=arm64' \
+              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
+          ) || macos_status=$?
+
+          # Always wait for iOS even if macOS failed, then emit its isolated log.
           wait "$ios_pid" || ios_status=$?
 
-          echo "----- macOS test -----"
-          cat "$log_dir/macos-test.log"
           echo "----- iOS simulator build -----"
           cat "$log_dir/ios-build.log"
 
@@ -373,7 +373,9 @@ jobs:
           # Notices is the only background task: fetch/generation may overlap the
           # sequential Rust suite. Clippy → tests → doctests → rustdoc share the
           # default Cargo target directory (no per-lane target override) so
-          # artifacts are reused exactly as in `cargo xtask ci-macos`.
+          # artifacts are reused exactly as in `cargo xtask ci-macos`. Stream the
+          # long Rust suite live; isolate only notices so timeout/cancel still
+          # leave foreground diagnostics in the Actions log.
           if [ "$RUN_NOTICES" = "true" ]; then
             (
               set -euo pipefail
@@ -384,6 +386,7 @@ jobs:
           fi
 
           if [ "$RUN_RUST" = "true" ]; then
+            # Foreground streaming: no redirect; status captured so notices wait.
             (
               set -euo pipefail
               echo "Running Clippy check..."
@@ -396,18 +399,14 @@ jobs:
               export RUSTDOCFLAGS="--deny warnings"
               cargo doc --locked --workspace --no-deps --all-features
               echo "macOS CI verification passed."
-            ) >"$log_dir/rust.log" 2>&1 || rust_status=$?
+            ) || rust_status=$?
           fi
 
-          # Always wait for notices even if Rust failed, then emit complete logs.
+          # Always wait for notices even if Rust failed, then emit its log.
           if [ -n "$notices_pid" ]; then
             wait "$notices_pid" || notices_status=$?
           fi
 
-          if [ "$RUN_RUST" = "true" ]; then
-            echo "----- Clippy, tests, documentation tests, and rustdoc -----"
-            cat "$log_dir/rust.log"
-          fi
           if [ "$RUN_NOTICES" = "true" ]; then
             echo "----- third-party notices -----"
             cat "$log_dir/notices.log"
