@@ -111,6 +111,16 @@ RETIRED_DEVELOPMENT_DOC_TOKENS = (
     # Combined OAuth verifier is obsolete after ADR-0024; do not recommend it.
     "After creating the unsigned base archives, run:",
     "```sh\nsh apple/scripts/verify-oauth-feasibility.sh\n```",
+    # Retired standalone lane names and pre-consolidation classifier promises.
+    # Keep these narrow so historical/baseline docs and legitimate local guidance
+    # (for example notice-script runbooks) are not falsely matched.
+    "Rust (macOS)",
+    "Third-party notices",
+    "five path-scoped active lanes",
+    "Documentation, workflow, and exact self-tested CI-control changes stop",
+    "self-tested control paths avoid build jobs",
+    "xtask-only changes run the portable",
+    "A dedicated macOS lane owns",
 )
 # Active product docs that must not reintroduce retired operational CI routes.
 ACTIVE_PRODUCT_DOCS = (
@@ -932,8 +942,18 @@ class ChangeScopeTests(unittest.TestCase):
 
         jobs = dict(self._workflow_job_blocks(workflow))
         job = jobs["macos_quality"]
-        positions = [job.index(command) for command in pinned_commands]
-        self.assertEqual(positions, sorted(positions))
+        # Exact executable Cargo lines (trimmed content starting with `cargo `).
+        # Equality catches appended, removed, reordered, or replaced flags; the
+        # conditional notices path contributes the leading `cargo fetch --locked`.
+        workflow_cargo_lines = [
+            line.strip()
+            for line in job.splitlines()
+            if line.strip().startswith("cargo ")
+        ]
+        self.assertEqual(
+            workflow_cargo_lines,
+            ["cargo fetch --locked", *pinned_commands],
+        )
 
         # rustdoc environment equivalence (workflow export vs xtask Command::env).
         self.assertIn('.env("RUSTDOCFLAGS", "--deny warnings")', body)
