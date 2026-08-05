@@ -15,9 +15,9 @@ post-build symbol/archive/FFI probes) removes measured cold-start and serial
 overhead without dropping checks. The normative exact-head sample met
 the acceptance budgets (see
 [Exact-head sample (measured)](#exact-head-sample-measured)), but
-identical-workflow re-runs on a later head showed aggregate macOS times both
+identical-workflow re-runs on the same head showed aggregate macOS times both
 under and over the 220-second budget (see
-[Identical-workflow variance](#identical-workflow-variance)). The eight-second
+[Identical-workflow variance](#identical-workflow-variance)). The six-second
 headroom on the normative sample does **not** describe the distribution.
 Re-measure with the procedure below after material workflow or runner changes.
 
@@ -43,19 +43,19 @@ Representative full-fanout pull request **#106**, GitHub Actions run
 ## Exact-head sample (measured)
 
 One passing exact-head full-fanout sample from GitHub Actions run
-**31001855133** at head
-`a0c8a91f7f3606ef4139bd84005e3f8894694e98` (all six visible jobs green):
+**31006449858** (attempt 2, the single allowed same-SHA rerun) at head
+`639b6e81d88316572e3ef2eab4c3cb3f3f506504` (all six visible jobs green):
 
 | Metric | Value |
 | --- | --- |
-| Head commit | `a0c8a91f7f3606ef4139bd84005e3f8894694e98` |
-| Wall-clock | 127 seconds |
-| `Apple product` job duration | 101 seconds |
-| `macOS quality` job duration | 111 seconds |
-| Aggregate macOS job seconds | 212 |
+| Head commit | `639b6e81d88316572e3ef2eab4c3cb3f3f506504` |
+| Wall-clock | 132 seconds |
+| `Apple product` job duration | 98 seconds |
+| `macOS quality` job duration | 116 seconds |
+| Aggregate macOS job seconds | 214 |
 | Concurrent macOS jobs | exactly 2 |
 | Visible jobs | exactly 6 (all green) |
-| Aggregate macOS headroom vs 220 s | 8 seconds |
+| Aggregate macOS headroom vs 220 s | 6 seconds |
 
 The sample head is the exact commit whose tree contains the shipped executable
 workflow bytes measured by that run. The later commit that records this sample
@@ -63,7 +63,7 @@ changes only this quality document and the static documentation-contract
 assertions that pin it; it does not change workflow bytes, job topology,
 commands, or macOS workload. No future commit hash is claimed here.
 
-This normative sample met the budgets with eight seconds of aggregate headroom.
+This normative sample met the budgets with six seconds of aggregate headroom.
 That headroom is a single-sample observation, not a distributional claim: it
 does not describe typical, best-case, or worst-case identical-workflow behavior.
 See [Identical-workflow variance](#identical-workflow-variance) for same-workflow
@@ -71,22 +71,23 @@ evidence that includes a budget breach.
 
 ## Identical-workflow variance
 
-Same consolidated workflow topology and commands were also observed on final
-pull-request head evidence from GitHub Actions run **31002144453** (all six
-visible jobs green on both attempts; functional checks passed):
+Same optimized workflow topology and commands were observed on exact-head
+evidence from GitHub Actions run **31006449858** at head
+`639b6e81d88316572e3ef2eab4c3cb3f3f506504` (all six visible jobs green on both
+attempts; functional checks passed):
 
 | Attempt | Wall-clock | `Apple product` | `macOS quality` | Aggregate macOS | vs 220 s budget |
 | --- | --- | --- | --- | --- | --- |
-| attempt 1 | 148 seconds | 129 seconds | 116 seconds | 245 seconds | **breach** (green functional checks) |
-| attempt 2 (single allowed same-SHA rerun) | 104 seconds | 86 seconds | 90 seconds | 176 seconds | within budget |
+| attempt 1 | 139 seconds | 114 seconds | 111 seconds | 225 seconds | **breach** (green functional checks) |
+| attempt 2 (single allowed same-SHA rerun) | 132 seconds | 98 seconds | 116 seconds | 214 seconds | within budget |
 
-Observed identical-workflow aggregate range on this evidence: **176–245 seconds**.
+Observed identical-workflow aggregate range on this evidence: **214–225 seconds**.
 
 Attempt 1 breached the aggregate budget despite green functional checks. The one
-permitted same-SHA attempt 2 rerun landed at 176 seconds and confirmed **runner
+permitted same-SHA attempt 2 rerun landed at 214 seconds and confirmed **runner
 variance** rather than hiding the breach: both outcomes are retained here. Do
-not interpret the normative sample’s eight-second headroom (run **31001855133**)
-as describing this distribution.
+not interpret the normative sample’s six-second headroom (run **31006449858**
+attempt 2) as describing this distribution.
 
 ## Coverage matrix and ownership
 

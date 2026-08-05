@@ -2426,16 +2426,19 @@ class ChangeScopeTests(unittest.TestCase):
         doc = (ROOT / "docs" / "quality" / "ci-macos-consolidation.md").read_text(
             encoding="utf-8"
         )
-        # Normative exact-head sample evidence from Actions run 31001855133.
-        self.assertIn("31001855133", doc)
-        self.assertIn("a0c8a91f7f3606ef4139bd84005e3f8894694e98", doc)
-        self.assertIn("127 seconds", doc)
-        self.assertIn("101 seconds", doc)
-        self.assertIn("111 seconds", doc)
-        self.assertIn("212", doc)
+        # Normative exact-head sample: run 31006449858 attempt 2 at optimization head.
+        self.assertIn("31006449858", doc)
+        self.assertIn("639b6e81d88316572e3ef2eab4c3cb3f3f506504", doc)
+        self.assertIn("132 seconds", doc)
+        self.assertIn("98 seconds", doc)
+        self.assertIn("116 seconds", doc)
+        self.assertIn("214", doc)
         self.assertIn("exactly 2", doc)
         self.assertIn("exactly 6", doc)
-        self.assertIn("8 seconds", doc)
+        # Prefer anchored forms: "6 seconds" is a substring of "116 seconds".
+        self.assertIn("| 6 seconds", doc)
+        self.assertIn("six seconds of aggregate headroom", doc)
+        self.assertIn("six-second", doc)
         self.assertIn("Exact-head sample (measured)", doc)
         self.assertIn("Exact-head measurement procedure", doc)
         self.assertIn("Identical-workflow variance", doc)
@@ -2445,20 +2448,18 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("Coverage matrix and ownership", doc)
         self.assertIn("30977712430", doc)
         self.assertIn("≤ 220", doc)
-        # Final-head same-workflow evidence (run 31002144453): both attempts.
-        self.assertIn("31002144453", doc)
-        self.assertIn("148 seconds", doc)
-        self.assertIn("129 seconds", doc)
+        # Same-head variance evidence (run 31006449858): both attempts.
+        self.assertIn("139 seconds", doc)
+        self.assertIn("114 seconds", doc)
+        self.assertIn("111 seconds", doc)
+        self.assertIn("225 seconds", doc)
+        self.assertIn("98 seconds", doc)
         self.assertIn("116 seconds", doc)
-        self.assertIn("245 seconds", doc)
-        self.assertIn("104 seconds", doc)
-        self.assertIn("86 seconds", doc)
-        self.assertIn("90 seconds", doc)
-        self.assertIn("176 seconds", doc)
+        self.assertIn("214 seconds", doc)
         # Range may use ASCII hyphen or en-dash.
         self.assertTrue(
-            "176-245" in doc or "176–245" in doc,
-            msg="expected identical-workflow aggregate range 176-245",
+            "214-225" in doc or "214–225" in doc,
+            msg="expected identical-workflow aggregate range 214-225",
         )
         self.assertIn("attempt 1", doc)
         self.assertIn("attempt 2", doc)
@@ -2466,18 +2467,34 @@ class ChangeScopeTests(unittest.TestCase):
         # Phrase may wrap across Markdown lines (for example bold `runner\nvariance`).
         self.assertRegex(doc, r"(?i)runner\s+variance")
         self.assertRegex(doc, r"(?i)identical[- ]workflow")
-        # Must not claim the 8-second sample headroom describes the distribution.
+        # Must not claim the sample headroom describes the distribution.
         self.assertNotIn("sample headroom describes the distribution", doc)
         self.assertNotIn(
             "The eight-second\naggregate headroom means runner variance or small suite regressions can still\nbreach the budget; re-run the measurement procedure after material changes.",
             doc,
         )
-        # Superseded normative sample (run 30997714456) must not remain.
+        # Superseded normative samples and older variance runs must not remain.
+        # Avoid bare "8 seconds" / "3 seconds": they are substrings of current
+        # durations such as "98 seconds".
         for superseded in (
             "30997714456",
             "9c7ecad2169b9b9b31f4ab30e2fb47f775fcac69",
-            "132 seconds",
-            "3 seconds",
+            "31001855133",
+            "a0c8a91f7f3606ef4139bd84005e3f8894694e98",
+            "31002144453",
+            "127 seconds",
+            "101 seconds",
+            "148 seconds",
+            "129 seconds",
+            "245 seconds",
+            "104 seconds",
+            "86 seconds",
+            "90 seconds",
+            "176 seconds",
+            "eight-second",
+            "eight seconds",
+            "| 8 seconds",
+            "| 3 seconds",
         ):
             with self.subTest(superseded=superseded):
                 self.assertNotIn(superseded, doc)
