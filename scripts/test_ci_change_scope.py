@@ -617,21 +617,45 @@ class ChangeScopeTests(unittest.TestCase):
 
     def test_product_lane_keeps_pr_macos_tests_ios_simulator_and_built_symbols(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        start = workflow.index("      - name: Test unsigned macOS debug application")
-        end = workflow.index("      - name: Build unsigned iOS simulator debug application", start)
-        macos_step = workflow[start:end]
-        self.assertIn(" xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac", macos_step)
-        self.assertTrue(macos_step.rstrip().endswith("test"))
+        jobs = dict(self._workflow_job_blocks(workflow))
+        apple = jobs["apple_product"]
+        # Parallel step keeps complete TersaMac test + TersaIOS simulator build
+        # with distinct DerivedData directories and deterministic failure propagation.
+        self.assertIn("Test macOS and build iOS simulator in parallel", apple)
+        self.assertIn(
+            "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac",
+            apple,
+        )
+        self.assertIn(
+            "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS",
+            apple,
+        )
+        self.assertIn("-derivedDataPath apple/build/DerivedData-macos", apple)
+        self.assertIn("-derivedDataPath apple/build/DerivedData-ios", apple)
+        self.assertIn("-destination 'platform=macOS,arch=arm64'", apple)
+        self.assertIn("-destination 'generic/platform=iOS Simulator'", apple)
+        self.assertIn("CODE_SIGNING_ALLOWED=NO", apple)
+        self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* test")
+        self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* build")
+        self.assertIn('wait "$macos_pid" || macos_status=$?', apple)
+        self.assertIn('wait "$ios_pid" || ios_status=$?', apple)
+        self.assertIn('cat "$log_dir/macos-test.log"', apple)
+        self.assertIn('cat "$log_dir/ios-build.log"', apple)
+        self.assertIn('if [ "$macos_status" -ne 0 ]; then', apple)
+        self.assertIn('if [ "$ios_status" -ne 0 ]; then', apple)
         self.assertNotIn("Build unsigned macOS debug application", workflow)
         self.assertIn("name: Verify built Rust bridge symbols", workflow)
         self.assertIn(
-            "apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
+            "apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib",
             workflow,
         )
         self.assertIn(
-            "apple/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib",
+            "apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib",
             workflow,
         )
+        # Shared DerivedData must not return (would race under parallel xcodebuild).
+        self.assertNotIn("-derivedDataPath apple/build/DerivedData ", apple)
+        self.assertNotIn("apple/build/DerivedData/Build/Products/", workflow)
         for retired_step in (
             "Build unsigned iOS device debug application",
             "Archive unsigned macOS debug application",
@@ -687,15 +711,58 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertEqual(job.count("uses: actions/checkout@"), 1)
         self.assertEqual(job.count("uses: actions-rust-lang/setup-rust-toolchain@"), 1)
         self.assertEqual(job.count("cache: false"), 1)
-        self.assertIn(
-            "cargo run --locked --package xtask -- ci-macos",
-            job,
-        )
+        # Cold CI inlines the `ci-macos` command sequence; do not compile xtask.
+        self.assertNotIn("cargo run --locked --package xtask -- ci-macos", job)
         self.assertNotIn("cargo run --locked --package xtask -- verify", job)
         self.assertNotIn("cargo check --", job)
-        self.assertIn("if: ${{ needs.changes.outputs.rust_macos == 'true' }}", job)
+        self.assertNotIn("cargo fmt", job)
+        self.assertNotIn("architecture", job)
+        # Exact `ci-macos` / `verify`-subset flags (no weakened filters).
+        self.assertIn(
+            "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings",
+            job,
+        )
+        self.assertIn(
+            "cargo test --locked --workspace --all-targets --all-features",
+            job,
+        )
+        self.assertIn(
+            "cargo test --locked --workspace --doc --all-features",
+            job,
+        )
+        self.assertIn(
+            'RUSTDOCFLAGS="--deny warnings"',
+            job,
+        )
+        self.assertIn(
+            "cargo doc --locked --workspace --no-deps --all-features",
+            job,
+        )
+        # Distinct cargo target dirs for concurrent Clippy vs tests.
+        self.assertIn(
+            'CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"',
+            job,
+        )
+        self.assertIn(
+            'CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-test"',
+            job,
+        )
+        # Failure propagation: wait for every background lane, emit full logs, exit.
+        self.assertIn('wait "$clippy_pid" || clippy_status=$?', job)
+        self.assertIn('wait "$tests_pid" || tests_status=$?', job)
+        self.assertIn('wait "$notices_pid" || notices_status=$?', job)
+        self.assertIn('cat "$log_dir/clippy.log"', job)
+        self.assertIn('cat "$log_dir/tests.log"', job)
+        self.assertIn('cat "$log_dir/notices.log"', job)
+        self.assertIn('if [ "$clippy_status" -ne 0 ]; then', job)
+        self.assertIn('if [ "$tests_status" -ne 0 ]; then', job)
+        self.assertIn('if [ "$doc_status" -ne 0 ]; then', job)
+        self.assertIn('if [ "$notices_status" -ne 0 ]; then', job)
+        self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
+        self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
         self.assertIn("tool: cargo-about@0.9.1", job)
+        self.assertIn("cargo fetch --locked", job)
         self.assertIn("sh apple/scripts/generate-third-party-notices.sh --check", job)
         # No second complete verify / full Rust suite on macOS; at most two macOS jobs.
         macos_jobs = [
@@ -711,6 +778,47 @@ class ChangeScopeTests(unittest.TestCase):
             2,
         )
         self.assertEqual(workflow.count("runs-on: macos-"), 2)
+
+    def test_workflow_macos_quality_commands_match_xtask_ci_macos(self) -> None:
+        """Pin workflow cargo invocations as exactly equivalent to xtask ci-macos."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        xtask = (ROOT / "xtask" / "src" / "main.rs").read_text(encoding="utf-8")
+        # Locate the ci_macos function body in xtask.
+        start = xtask.index("fn ci_macos() -> TaskResult {")
+        end = xtask.index("\nfn cargo<", start)
+        body = xtask[start:end]
+        for fragment in (
+            '"clippy"',
+            '"--locked"',
+            '"--workspace"',
+            '"--all-targets"',
+            '"--all-features"',
+            '"--deny"',
+            '"warnings"',
+            '"test"',
+            '"--doc"',
+            '"doc"',
+            '"--no-deps"',
+            '"RUSTDOCFLAGS"',
+            '"--deny warnings"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, body)
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        # Workflow must not reintroduce architecture/format/check on macOS.
+        for banned in (
+            "cargo fmt",
+            "cargo check --",
+            "cargo run --locked --package xtask -- verify",
+            "cargo run --locked --package xtask -- architecture",
+            "cargo run --locked --package xtask -- ci-macos",
+        ):
+            with self.subTest(banned=banned):
+                self.assertNotIn(banned, job)
+        # Developer-facing command remains implemented in xtask.
+        self.assertIn('Some("ci-macos")', xtask)
+        self.assertIn("fn ci_macos()", xtask)
 
     def test_workflow_forbids_cache_artifact_and_manual_triggers(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

@@ -112,26 +112,57 @@ jobs:
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
       - name: Generate Apple project
         run: sh apple/scripts/generate-project.sh
-      - name: Test unsigned macOS debug application
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
-          -configuration Debug -destination 'platform=macOS,arch=arm64'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
-      - name: Build unsigned iOS simulator debug application
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
-          -configuration Debug -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
+      # macOS test (~79s) and iOS simulator build (~24s) are independent once the
+      # project exists. Separate DerivedData paths avoid Xcode races; Rust archives
+      # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
+      - name: Test macOS and build iOS simulator in parallel
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/apple-product-logs"
+          mkdir -p "$log_dir"
+
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
+              -configuration Debug -destination 'platform=macOS,arch=arm64' \
+              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
+          ) >"$log_dir/macos-test.log" 2>&1 &
+          macos_pid=$!
+
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
+              -configuration Debug -sdk iphonesimulator \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath apple/build/DerivedData-ios CODE_SIGNING_ALLOWED=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
+          ) >"$log_dir/ios-build.log" 2>&1 &
+          ios_pid=$!
+
+          macos_status=0
+          ios_status=0
+          wait "$macos_pid" || macos_status=$?
+          wait "$ios_pid" || ios_status=$?
+
+          echo "----- macOS test -----"
+          cat "$log_dir/macos-test.log"
+          echo "----- iOS simulator build -----"
+          cat "$log_dir/ios-build.log"
+
+          if [ "$macos_status" -ne 0 ]; then
+            exit "$macos_status"
+          fi
+          if [ "$ios_status" -ne 0 ]; then
+            exit "$ios_status"
+          fi
       - name: Verify built Rust bridge symbols
         run: |
-          nm -gU apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
+          nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
             | grep -F '_tersa_apple_bridge_version'
-          nm -gU apple/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
+          nm -gU apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
             | grep -F '_tersa_apple_bridge_version'
       - name: Verify macOS mailbox-sync FFI archive symbols
         run: |
@@ -300,6 +331,12 @@ jobs:
   # Single macOS quality job: checkout and toolchain once, then run the macOS
   # Rust suite and/or third-party notices based on the distinct classifier
   # outputs `rust_macos` and `notices`. Avoids a second full `verify` on macOS.
+  #
+  # Cold CI bypasses `cargo run -p xtask -- ci-macos` so the job does not spend
+  # ~14s compiling the dependency-heavy xtask binary. The shell sequence below
+  # is the exact `ci-macos` coverage (Clippy, tests, doctests, warning-denied
+  # rustdoc) with the same flags; `cargo xtask ci-macos` remains the developer
+  # entry point and must stay equivalent. Static tests pin that equivalence.
   macos_quality:
     name: macOS quality
     needs: changes
@@ -313,20 +350,102 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
-      - name: Run macOS Rust verification
-        if: ${{ needs.changes.outputs.rust_macos == 'true' }}
-        run: cargo run --locked --package xtask -- ci-macos
       - name: Install notice generator
         if: ${{ needs.changes.outputs.notices == 'true' }}
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
           tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        if: ${{ needs.changes.outputs.notices == 'true' }}
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        if: ${{ needs.changes.outputs.notices == 'true' }}
-        run: sh apple/scripts/generate-third-party-notices.sh --check
+      - name: Run macOS quality checks
+        env:
+          RUN_RUST: ${{ needs.changes.outputs.rust_macos }}
+          RUN_NOTICES: ${{ needs.changes.outputs.notices }}
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/macos-quality-logs"
+          mkdir -p "$log_dir"
+
+          clippy_pid=""
+          tests_pid=""
+          notices_pid=""
+          clippy_status=0
+          tests_status=0
+          notices_status=0
+          doc_status=0
+
+          if [ "$RUN_RUST" = "true" ]; then
+            # Distinct target dirs so Clippy and tests never race on one tree.
+            # Coverage and flags match `cargo xtask ci-macos` exactly.
+            (
+              set -euo pipefail
+              export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"
+              echo "Running Clippy check..."
+              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+            ) >"$log_dir/clippy.log" 2>&1 &
+            clippy_pid=$!
+
+            (
+              set -euo pipefail
+              export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-test"
+              echo "Running tests check..."
+              cargo test --locked --workspace --all-targets --all-features
+              echo "Running documentation tests check..."
+              cargo test --locked --workspace --doc --all-features
+            ) >"$log_dir/tests.log" 2>&1 &
+            tests_pid=$!
+          fi
+
+          if [ "$RUN_NOTICES" = "true" ]; then
+            (
+              set -euo pipefail
+              cargo fetch --locked
+              sh apple/scripts/generate-third-party-notices.sh --check
+            ) >"$log_dir/notices.log" 2>&1 &
+            notices_pid=$!
+          fi
+
+          if [ -n "$clippy_pid" ]; then
+            wait "$clippy_pid" || clippy_status=$?
+          fi
+          if [ -n "$tests_pid" ]; then
+            wait "$tests_pid" || tests_status=$?
+          fi
+          if [ -n "$notices_pid" ]; then
+            wait "$notices_pid" || notices_status=$?
+          fi
+
+          if [ "$RUN_RUST" = "true" ]; then
+            echo "----- Clippy -----"
+            cat "$log_dir/clippy.log"
+            echo "----- tests and documentation tests -----"
+            cat "$log_dir/tests.log"
+          fi
+          if [ "$RUN_NOTICES" = "true" ]; then
+            echo "----- third-party notices -----"
+            cat "$log_dir/notices.log"
+          fi
+
+          if [ "$RUN_RUST" = "true" ] && [ "$clippy_status" -eq 0 ] && [ "$tests_status" -eq 0 ]; then
+            echo "Running documentation check..."
+            export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"
+            export RUSTDOCFLAGS="--deny warnings"
+            cargo doc --locked --workspace --no-deps --all-features || doc_status=$?
+            if [ "$doc_status" -eq 0 ]; then
+              echo "macOS CI verification passed."
+            fi
+          fi
+
+          if [ "$clippy_status" -ne 0 ]; then
+            exit "$clippy_status"
+          fi
+          if [ "$tests_status" -ne 0 ]; then
+            exit "$tests_status"
+          fi
+          if [ "$doc_status" -ne 0 ]; then
+            exit "$doc_status"
+          fi
+          if [ "$notices_status" -ne 0 ]; then
+            exit "$notices_status"
+          fi
 
   ci_gate:
     name: CI gate
