@@ -116,8 +116,26 @@ ACTIVE_PRODUCT_DOCS = (
     ROOT / "docs" / "history" / "m0-summary.md",
     ROOT / "docs" / "quality" / "macos-acceptance.md",
     ROOT / "docs" / "quality" / "macos-performance.md",
+    ROOT / "docs" / "quality" / "ci-macos-consolidation.md",
     ROOT / "docs" / "release" / "apple-distribution.md",
     ROOT / "docs" / "development.md",
+)
+# Visible full-fanout product jobs (plus scope/gate) after macOS consolidation.
+FULL_FANOUT_JOB_IDS = (
+    "changes",
+    "apple_product",
+    "rust_linux",
+    "policy",
+    "macos_quality",
+    "ci_gate",
+)
+RETIRED_MACOS_JOB_IDS = (
+    "notices",
+    "rust_macos",
+)
+RETIRED_MACOS_JOB_NAMES = (
+    "Third-party notices",
+    "Rust (macOS)",
 )
 RETIRED_PRODUCT_DOC_OPERATIONAL_CLAIMS = (
     "verify-m0-gates.py",
@@ -342,14 +360,53 @@ class ChangeScopeTests(unittest.TestCase):
                 {"rust_linux", "policy", "product_apple"},
             ),
             ("docs stay out", ["docs/development.md"], set()),
-            ("xtask runs the portable baseline and policy", ["xtask/src/main.rs"], {"rust_linux", "policy"}),
-            ("workflow stays out", [".github/workflows/ci.yml"], set()),
-            ("DCO checker stays in the control lane", ["scripts/check-dco.py"], set()),
-            ("DCO tests stay in the control lane", ["scripts/test_check_dco.py"], set()),
-            ("scope classifier stays in the control lane", ["scripts/ci-change-scope.py"], set()),
-            ("scope tests stay in the control lane", ["scripts/test_ci_change_scope.py"], set()),
-            ("performance reporter stays in its tested control lane", ["scripts/macos-performance-report.py"], set()),
-            ("performance tests stay in the control lane", ["scripts/test_macos_performance_report.py"], set()),
+            ("xtask is executable CI control and fans out", ["xtask/src/main.rs"], ALL),
+            ("xtask cargo manifest is executable CI control and fans out", ["xtask/Cargo.toml"], ALL),
+            ("workflow control fans out", [".github/workflows/ci.yml"], ALL),
+            (
+                "other workflow files fan out",
+                [".github/workflows/release.yml"],
+                ALL,
+            ),
+            ("DCO checker is executable CI control and fans out", ["scripts/check-dco.py"], ALL),
+            ("DCO tests are executable CI control and fan out", ["scripts/test_check_dco.py"], ALL),
+            ("scope classifier is executable CI control and fans out", ["scripts/ci-change-scope.py"], ALL),
+            ("scope tests are executable CI control and fan out", ["scripts/test_ci_change_scope.py"], ALL),
+            (
+                "performance reporter is executable CI control and fans out",
+                ["scripts/macos-performance-report.py"],
+                ALL,
+            ),
+            (
+                "performance tests are executable CI control and fan out",
+                ["scripts/test_macos_performance_report.py"],
+                ALL,
+            ),
+            (
+                "GitHub issue templates stay lightweight",
+                [".github/ISSUE_TEMPLATE/bug_report.md"],
+                set(),
+            ),
+            (
+                "GitHub pull request template stays lightweight",
+                [".github/PULL_REQUEST_TEMPLATE.md"],
+                set(),
+            ),
+            (
+                "GitHub CODEOWNERS stays lightweight",
+                [".github/CODEOWNERS"],
+                set(),
+            ),
+            (
+                "GitHub composite actions fail closed through full fanout",
+                [".github/actions/ci/action.yml"],
+                ALL,
+            ),
+            (
+                "unknown GitHub control path fails closed through full fanout",
+                [".github/unknown-control.yml"],
+                ALL,
+            ),
             (
                 "retired M0 gate helper fails closed through unknown-path fallback",
                 ["scripts/verify-m0-gates.py"],
@@ -371,6 +428,11 @@ class ChangeScopeTests(unittest.TestCase):
                 set(),
             ),
             (
+                "active CI macOS consolidation protocol is docs-only",
+                ["docs/quality/ci-macos-consolidation.md"],
+                set(),
+            ),
+            (
                 "active Apple distribution protocol is docs-only",
                 ["docs/release/apple-distribution.md"],
                 set(),
@@ -388,7 +450,7 @@ class ChangeScopeTests(unittest.TestCase):
             (
                 "multiple product paths union scopes",
                 ["apple/licenses/sqlcipher-notices.txt", "xtask/src/main.rs"],
-                {"rust_linux", "policy", "notices"},
+                ALL,
             ),
         )
         for label, paths, expected in cases:
@@ -480,8 +542,18 @@ class ChangeScopeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         for output in ACTIVE_OUTPUTS:
             self.assertIn(f"      {output}: ${{{{ steps.scope.outputs.{output} }}}}", workflow)
+        # Per-lane jobs keep direct output gates; macOS quality ORs rust_macos and notices.
+        for output in ("rust_linux", "policy", "product_apple"):
             self.assertIn(f"if: ${{{{ needs.changes.outputs.{output} == 'true' }}}}", workflow)
+        self.assertIn(
+            "if: ${{ needs.changes.outputs.rust_macos == 'true' || needs.changes.outputs.notices == 'true' }}",
+            workflow,
+        )
         self.assertNotIn("matrix:\n        os: [ubuntu-24.04, macos-15]", workflow)
+        for job_id in RETIRED_MACOS_JOB_IDS:
+            self.assertNotIn(f"\n  {job_id}:\n", workflow)
+        for job_name in RETIRED_MACOS_JOB_NAMES:
+            self.assertNotIn(f"name: {job_name}", workflow)
 
     def test_workflow_keeps_dco_in_the_required_control_job(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -531,10 +603,17 @@ class ChangeScopeTests(unittest.TestCase):
 
     def test_optional_baselines_remain_visible_to_the_required_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        needs = "needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]"
+        needs = "needs: [changes, apple_product, rust_linux, policy, macos_quality]"
         self.assertEqual(workflow.count(needs), 1)
-        for result in ("RUST_LINUX_RESULT", "RUST_MACOS_RESULT", "POLICY_RESULT"):
+        for result in (
+            "APPLE_PRODUCT_RESULT",
+            "RUST_LINUX_RESULT",
+            "POLICY_RESULT",
+            "MACOS_QUALITY_RESULT",
+        ):
             self.assertEqual(workflow.count(f'case "${result}" in'), 1)
+        self.assertNotIn("NOTICES_RESULT", workflow)
+        self.assertNotIn("RUST_MACOS_RESULT", workflow)
 
     def test_product_lane_keeps_pr_macos_tests_ios_simulator_and_built_symbols(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -561,6 +640,102 @@ class ChangeScopeTests(unittest.TestCase):
             "Verify OAuth PKCE and sandbox feasibility",
         ):
             self.assertNotIn(f"- name: {retired_step}", workflow)
+
+    def test_workflow_jobs_match_full_fanout_inventory(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs_start = workflow.index("\njobs:\n")
+        jobs_section = workflow[jobs_start + len("\njobs:\n") :]
+        job_ids = []
+        for line in jobs_section.splitlines():
+            if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+                job_ids.append(line.strip()[:-1])
+        # Exactly the six visible jobs: scope, Linux, policy, macOS quality,
+        # Apple product, and gate — no unclassified extra lane.
+        self.assertEqual(job_ids, list(FULL_FANOUT_JOB_IDS))
+
+    def test_every_workflow_job_has_an_explicit_timeout(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job_blocks = self._workflow_job_blocks(workflow)
+        self.assertEqual([job_id for job_id, _ in job_blocks], list(FULL_FANOUT_JOB_IDS))
+        for job_id, block in job_blocks:
+            with self.subTest(job=job_id):
+                self.assertRegex(block, r"(?m)^    timeout-minutes: \d+$")
+
+    def _workflow_job_blocks(self, workflow: str) -> list[tuple[str, str]]:
+        jobs_start = workflow.index("\njobs:\n")
+        jobs_section = workflow[jobs_start + len("\njobs:\n") :]
+        job_blocks: list[tuple[str, str]] = []
+        current_id: str | None = None
+        current_lines: list[str] = []
+        for line in jobs_section.splitlines():
+            if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+                if current_id is not None:
+                    job_blocks.append((current_id, "\n".join(current_lines)))
+                current_id = line.strip()[:-1]
+                current_lines = [line]
+            elif current_id is not None:
+                current_lines.append(line)
+        if current_id is not None:
+            job_blocks.append((current_id, "\n".join(current_lines)))
+        return job_blocks
+
+    def test_macos_quality_consolidates_rust_and_notices_without_duplicate_setup(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = dict(self._workflow_job_blocks(workflow))
+        job = jobs["macos_quality"]
+        self.assertIn("name: macOS quality", job)
+        self.assertEqual(job.count("uses: actions/checkout@"), 1)
+        self.assertEqual(job.count("uses: actions-rust-lang/setup-rust-toolchain@"), 1)
+        self.assertEqual(job.count("cache: false"), 1)
+        self.assertIn(
+            "cargo run --locked --package xtask -- ci-macos",
+            job,
+        )
+        self.assertNotIn("cargo run --locked --package xtask -- verify", job)
+        self.assertNotIn("cargo check --", job)
+        self.assertIn("if: ${{ needs.changes.outputs.rust_macos == 'true' }}", job)
+        self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)
+        self.assertIn("tool: cargo-about@0.9.1", job)
+        self.assertIn("sh apple/scripts/generate-third-party-notices.sh --check", job)
+        # No second complete verify / full Rust suite on macOS; at most two macOS jobs.
+        macos_jobs = [
+            block for _job_id, block in self._workflow_job_blocks(workflow) if "runs-on: macos-" in block
+        ]
+        self.assertEqual(len(macos_jobs), 2)
+        self.assertEqual(
+            sum("cargo run --locked --package xtask -- verify" in block for block in macos_jobs),
+            0,
+        )
+        self.assertEqual(
+            sum(block.count("uses: actions-rust-lang/setup-rust-toolchain@") for block in macos_jobs),
+            2,
+        )
+        self.assertEqual(workflow.count("runs-on: macos-"), 2)
+
+    def test_workflow_forbids_cache_artifact_and_manual_triggers(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("actions/cache@", workflow)
+        self.assertNotIn("Swatinem/rust-cache@", workflow)
+        self.assertNotIn("actions/upload-artifact@", workflow)
+        self.assertNotIn("workflow_dispatch", workflow)
+        self.assertNotIn("\n  push:\n", workflow)
+        # Every setup-rust-toolchain invocation must disable cache.
+        rust_setup_count = workflow.count("uses: actions-rust-lang/setup-rust-toolchain@")
+        self.assertEqual(workflow.count("          cache: false\n"), rust_setup_count)
+        self.assertGreater(rust_setup_count, 0)
+
+    def test_executable_ci_control_paths_select_full_fanout(self) -> None:
+        control_paths = sorted(MODULE.CI_CONTROL_PATHS) + [
+            ".github/workflows/ci.yml",
+            ".github/workflows/any-workflow.yml",
+            "xtask/src/main.rs",
+            "xtask/Cargo.toml",
+        ]
+        for path in control_paths:
+            with self.subTest(path=path):
+                scope = MODULE.classify([path])
+                actual = {name for name in NAMES if getattr(scope, name)}
+                self.assertEqual(actual, ALL)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,20 @@ class Scope:
 # metadata at CI runtime.
 SHARED_UI_CRATES = ("crates/domain/", "crates/application/", "crates/presentation/")
 APPLE_ADAPTERS = "adapters/"
-DOCS_ONLY_PREFIXES = ("docs/", ".github/")
+# Non-executable documentation stays lightweight. Executable CI control inputs
+# (workflow YAML, composite actions, classifier/DCO/performance scripts and their
+# tests) fail closed to every product lane so a control-plane change cannot skip
+# the lanes it alters.
+DOCS_ONLY_PREFIXES = ("docs/",)
+# Explicit non-executable GitHub metadata. Markdown under .github/ is already
+# lightweight via the .md suffix; unrecognised .github/ paths fail closed.
+GITHUB_LIGHTWEIGHT_PATHS = {
+    ".github/CODEOWNERS",
+}
+GITHUB_LIGHTWEIGHT_PREFIXES = (
+    ".github/ISSUE_TEMPLATE/",
+    ".github/PULL_REQUEST_TEMPLATE/",
+)
 CI_CONTROL_PATHS = {
     "scripts/check-dco.py",
     "scripts/ci-change-scope.py",
@@ -51,6 +64,7 @@ FULL_FANOUT_PREFIXES = (
     "apple/build/",
     "vendor/",
     "patches/",
+    ".github/workflows/",
 )
 
 
@@ -85,7 +99,20 @@ def classify(paths: Iterable[str]) -> Scope:
         if path in FULL_FANOUT_PATHS or path.startswith(FULL_FANOUT_PREFIXES):
             enable_all(scope)
             continue
-        if path in CI_CONTROL_PATHS or path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
+        if path in CI_CONTROL_PATHS:
+            # Executable CI control scripts and their tests alter how lanes are
+            # selected or enforced; fail closed to every active product scope.
+            enable_all(scope)
+            continue
+        if path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
+            continue
+        if path in GITHUB_LIGHTWEIGHT_PATHS or path.startswith(GITHUB_LIGHTWEIGHT_PREFIXES):
+            # Issue/PR templates and CODEOWNERS are non-executable metadata.
+            continue
+        if path.startswith(".github/"):
+            # Workflow YAML already matched FULL_FANOUT_PREFIXES. Composite
+            # actions and any other unrecognised GitHub control input fail closed.
+            enable_all(scope)
             continue
         if path.endswith("/Cargo.toml"):
             scope.enable("rust_linux", "policy", "notices")
@@ -121,7 +148,10 @@ def classify(paths: Iterable[str]) -> Scope:
             scope.enable("rust_linux", "rust_macos", "policy")
             continue
         if path.startswith("xtask/"):
-            scope.enable("rust_linux", "policy")
+            # xtask implements both `verify` and `ci-macos`, so any path under
+            # xtask/ is an executable CI control input. Fail closed to every
+            # active product scope, including macOS quality.
+            enable_all(scope)
             continue
         if path.startswith("apple/"):
             scope.enable("product_apple")

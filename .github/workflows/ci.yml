@@ -251,48 +251,12 @@ jobs:
             -o "$RUNNER_TEMP/ffi_probe"
           "$RUNNER_TEMP/ffi_probe"
 
-  notices:
-    name: Third-party notices
-    needs: changes
-    if: ${{ needs.changes.outputs.notices == 'true' }}
-    runs-on: macos-15
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
-
   rust_linux:
     name: Rust (Linux)
     needs: changes
     if: ${{ needs.changes.outputs.rust_linux == 'true' }}
     runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-      - name: Run baseline verification
-        run: cargo run --locked --package xtask -- verify
-
-  rust_macos:
-    name: Rust (macOS)
-    needs: changes
-    if: ${{ needs.changes.outputs.rust_macos == 'true' }}
-    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -308,6 +272,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.policy == 'true' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -332,35 +297,61 @@ jobs:
       - name: Check spelling
         run: typos
 
+  # Single macOS quality job: checkout and toolchain once, then run the macOS
+  # Rust suite and/or third-party notices based on the distinct classifier
+  # outputs `rust_macos` and `notices`. Avoids a second full `verify` on macOS.
+  macos_quality:
+    name: macOS quality
+    needs: changes
+    if: ${{ needs.changes.outputs.rust_macos == 'true' || needs.changes.outputs.notices == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+      - name: Run macOS Rust verification
+        if: ${{ needs.changes.outputs.rust_macos == 'true' }}
+        run: cargo run --locked --package xtask -- ci-macos
+      - name: Install notice generator
+        if: ${{ needs.changes.outputs.notices == 'true' }}
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
+      - name: Fetch locked dependencies
+        if: ${{ needs.changes.outputs.notices == 'true' }}
+        run: cargo fetch --locked
+      - name: Check target-specific third-party notices
+        if: ${{ needs.changes.outputs.notices == 'true' }}
+        run: sh apple/scripts/generate-third-party-notices.sh --check
+
   ci_gate:
     name: CI gate
-    needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
+    needs: [changes, apple_product, rust_linux, policy, macos_quality]
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Require the selected validation lane
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
-          NOTICES_RESULT: ${{ needs.notices.result }}
           RUST_LINUX_RESULT: ${{ needs.rust_linux.result }}
-          RUST_MACOS_RESULT: ${{ needs.rust_macos.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
+          MACOS_QUALITY_RESULT: ${{ needs.macos_quality.result }}
         run: |
           set -euo pipefail
           printf '%s\n' \
             "changes=$CHANGES_RESULT" \
             "apple_product=$APPLE_PRODUCT_RESULT" \
-            "notices=$NOTICES_RESULT" \
             "rust_linux=$RUST_LINUX_RESULT" \
-            "rust_macos=$RUST_MACOS_RESULT" \
-            "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+            "policy=$POLICY_RESULT" \
+            "macos_quality=$MACOS_QUALITY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$CHANGES_RESULT" = success
           case "$APPLE_PRODUCT_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$NOTICES_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
@@ -368,11 +359,11 @@ jobs:
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          case "$RUST_MACOS_RESULT" in
+          case "$POLICY_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          case "$POLICY_RESULT" in
+          case "$MACOS_QUALITY_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
