@@ -1,5 +1,11 @@
 # M0 Dioxus WebView UI feasibility evidence
 
+> **Historical retirement (ADR-0025 / PR2):** The Slint/Dioxus implementation,
+> schemes, evidence helpers, vendor/patch assets, and notice paths were removed
+> in PR2 under ADR-0025. Commands and path instructions below are historical and
+> no longer executable. This document remains only until PR5 consolidates M0
+> history.
+
 ## Scope and verdict
 
 `tersa-dioxus-spike` is an Apple-only diagnostic mock built with Dioxus 0.7.9,

@@ -35,8 +35,8 @@ RETIRED_SCOPE_NAMES = (
     "run_full_evidence",
 )
 # Helper script names stay out of this list: the changes job intentionally
-# self-tests the transitional verify-m0-gates and write-evidence-manifest
-# helpers while their tracked consumers remain.
+# self-tests the transitional verify-m0-gates helper while the frozen register
+# remains tracked.
 RETIRED_WORKFLOW_TOKENS = (
     "workflow_dispatch",
     "evidence_suite",
@@ -72,6 +72,22 @@ RETIRED_WORKFLOW_TOKENS = (
     "verify-oauth-feasibility.sh",
     "capture-slint-evidence.sh",
     "capture-dioxus-evidence.sh",
+    "capture-dioxus-device-evidence.sh",
+    "build-slint-executable.sh",
+    "build-dioxus-executable.sh",
+    "prepare-verified-skia.sh",
+    "verify-rust-skia-notices.py",
+    "verify-dioxus-runtime.py",
+    "verify-dioxus-vendor.py",
+    "verify-dioxus-device-evidence.py",
+    "write-evidence-manifest.py",
+    "rust-skia",
+    "SKIA_BINARIES_URL",
+    "TersaSlintMac",
+    "TersaSlintIOS",
+    "TersaDioxusMac",
+    "TersaDioxusIOS",
+    "2026-08-15",
     "verify-sqlcipher-feasibility.sh",
     "verify-search-feasibility.sh",
     "verify-mime-feasibility.sh",
@@ -145,6 +161,21 @@ class ChangeScopeTests(unittest.TestCase):
         for retired in RETIRED_SCOPE_NAMES:
             self.assertNotIn(retired, NAMES)
 
+    def test_retired_ui_helpers_are_not_control_paths(self) -> None:
+        for retired in (
+            "scripts/write-evidence-manifest.py",
+            "apple/scripts/prepare-verified-skia.sh",
+            "apple/scripts/verify-rust-skia-notices.py",
+            "apple/scripts/verify-dioxus-runtime.py",
+            "apple/scripts/build-slint-executable.sh",
+            "apple/scripts/build-dioxus-executable.sh",
+            "apple/scripts/capture-slint-evidence.sh",
+            "apple/scripts/capture-dioxus-evidence.sh",
+            "apple/scripts/capture-dioxus-device-evidence.sh",
+        ):
+            with self.subTest(path=retired):
+                self.assertNotIn(retired, MODULE.CI_CONTROL_PATHS)
+
     def test_path_table(self) -> None:
         cases = (
             ("empty input fails closed", [], ALL),
@@ -202,11 +233,16 @@ class ChangeScopeTests(unittest.TestCase):
                 ["fuzz/fuzz_targets/mime_display.rs"],
                 ALL,
             ),
-            ("notices are isolated", ["apple/licenses/rust-skia-notices.txt"], {"notices"}),
+            ("notices are isolated", ["apple/licenses/sqlcipher-notices.txt"], {"notices"}),
             ("product notice config", ["about-bridge.toml"], {"product_apple", "notices"}),
             (
                 "retired spike notice config fails closed",
                 ["about.toml"],
+                ALL,
+            ),
+            (
+                "retired dioxus notice config fails closed",
+                ["about-dioxus.toml"],
                 ALL,
             ),
             (
@@ -260,13 +296,18 @@ class ChangeScopeTests(unittest.TestCase):
                 set(),
             ),
             (
-                "transitional evidence-manifest helper stays in the control lane",
+                "retired evidence-manifest helper is not a control path",
                 ["scripts/write-evidence-manifest.py"],
-                set(),
+                ALL,
+            ),
+            (
+                "retired rust-skia notice path fails closed",
+                ["apple/licenses/rust-skia-notices.txt"],
+                {"notices"},
             ),
             (
                 "multiple product paths union scopes",
-                ["apple/licenses/rust-skia-notices.txt", "xtask/src/main.rs"],
+                ["apple/licenses/sqlcipher-notices.txt", "xtask/src/main.rs"],
                 {"rust_linux", "policy", "notices"},
             ),
         )
@@ -376,9 +417,14 @@ class ChangeScopeTests(unittest.TestCase):
             changes_job,
         )
         self.assertIn("python3 scripts/verify-m0-gates.py --self-test", changes_job)
-        self.assertIn("python3 scripts/write-evidence-manifest.py --self-test", changes_job)
         self.assertEqual(workflow.count("verify-m0-gates.py"), 1)
-        self.assertEqual(workflow.count("write-evidence-manifest.py"), 1)
+        self.assertNotIn("write-evidence-manifest.py", workflow)
+        self.assertNotIn("prepare-verified-skia.sh", workflow)
+        self.assertNotIn("rust-skia", workflow)
+        self.assertNotIn("SKIA_BINARIES_URL", workflow)
+        self.assertNotIn("TersaSlint", workflow)
+        self.assertNotIn("TersaDioxus", workflow)
+        self.assertNotIn("2026-08-15", workflow)
         self.assertNotIn("cargo run --locked --package xtask -- dco", workflow)
 
     def test_development_doc_drops_retired_manual_ci_interface(self) -> None:

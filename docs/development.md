@@ -21,9 +21,8 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
-The xtask architecture check is the enforcement point for direct and transitive
-diagnostic-only Slint and Dioxus dependency isolation on every supported Apple
-target; `cargo deny` alone cannot establish that runtime boundary.
+The xtask architecture check enforces active product and retained-diagnostic
+dependency boundaries on every supported Apple target.
 
 While the frozen M0 gate register remains tracked, keep the product-gate
 validator and its self-test available:
@@ -268,7 +267,7 @@ The portable M0 diagnostic owns the exact-pinned `mail-parser` and `ammonia`
 dependencies. It accepts only synthetic fixtures, applies deterministic byte,
 header, tree, part, charset, transfer-decoding, and display limits, and exposes
 sanitized markup only through `SafeHtml`. The native Apple diagnostic is a
-separate Swift target and does not use Dioxus or Wry.
+separate Swift target.
 
 ```sh
 rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
@@ -335,19 +334,19 @@ entitlements, or evidence claims.
 ## Apple bootstrap
 
 The Apple bootstrap requires Xcode 26 and XcodeGen 2.45.4. It supports only
-arm64 macOS 15 and iOS/iPadOS 18. The existing bridge targets intentionally
-contain no product UI. The separate `TersaSlintMac` and `TersaSlintIOS` schemes
-package the M0 diagnostic Slint executable. `TersaDioxusMac` and
-`TersaDioxusIOS` package the fallback WebView diagnostic directly with Cargo.
-`TersaMimeMac` and `TersaMimeIOS` compile the native hostile-content policy.
-None of the six diagnostic schemes is a production target.
+arm64 macOS 15 and iOS/iPadOS 18. `TersaMac` and `TersaIOS` are the product
+bridge targets. `TersaMimeMac` and `TersaMimeIOS` compile the native
+hostile-content policy diagnostic and are not production targets. Historical
+note: the retired M0 Slint and Dioxus Apple schemes and their evidence helpers
+were removed by ADR-0025 housekeeping (PR2); full M0 study consolidation is
+deferred to PR5.
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
-diagnostic artifacts:
+product and retained-diagnostic artifacts:
 
 The checked wrapper is the only supported XcodeGen entry point. It passes
 `--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
-literal until Xcode resolves them; CI and evidence scripts use the same path.
+literal until Xcode resolves them; CI uses the same path.
 The architecture gate inventories every tracked file and rejects a direct
 XcodeGen generation command anywhere outside the byte-exact wrapper.
 
@@ -365,27 +364,6 @@ xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
   -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintMac \
-  -configuration Debug -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaSlintIOS \
-  -configuration Debug -sdk iphonesimulator \
-  -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO build
-
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusMac \
-  -configuration Release -destination 'generic/platform=macOS' \
-  -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive \
-  -archivePath apple/build/TersaDioxusMac.xcarchive
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS \
-  -configuration Release -sdk iphonesimulator \
-  -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project apple/Tersa.xcodeproj -scheme TersaDioxusIOS \
-  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-  -derivedDataPath apple/build/DerivedDataDioxus CODE_SIGNING_ALLOWED=NO archive \
-  -archivePath apple/build/TersaDioxusIOS.xcarchive
 
 xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMimeMac \
   -configuration Release -destination 'generic/platform=macOS' \
@@ -405,9 +383,9 @@ The generated `apple/Tersa.xcodeproj` is intentionally ignored. The project
 build phase creates the Rust static library in `apple/build/rust`; it is also
 ignored with all local Apple build products.
 
-The Rust bridge, both UI spikes, and the MIME diagnostic are root workspace
-members and are therefore covered by `cargo xtask verify` and the repository
-supply-chain checks. The standalone fuzz project is deliberately excluded.
+The Rust bridge and the MIME diagnostic are root workspace members and are
+therefore covered by `cargo xtask verify` and the repository supply-chain
+checks. The standalone fuzz project is deliberately excluded.
 Local `sh scripts/verify-mime-fuzz.sh` covers only the finite fuzz path; its
 formatting, Clippy/lint, license, source, and advisory policies are not
 automated after diagnostic CI retirement and remain unchecked pending PR4
@@ -420,34 +398,16 @@ directory.
 The base macOS target declares both sandbox network client and server
 entitlements: future Google token/API traffic needs outbound networking, while
 the desktop OAuth redirect requires the narrowly bound loopback listener.
-The shared Slint archive helper verifies the target's pinned Skia archive
-before making it available to `skia-bindings`. Both Xcode builds and the
-workspace-wide macOS CI check use this helper. The Xcode build then copies the
-executable only into the requested application bundle. XcodeGen installs the
-target-specific Slint notice or matching `THIRD_PARTY_NOTICES-dioxus-*.txt`
-resource; each evidence script compares its bundled copy byte-for-byte with
-the source. The Slint supplemental
-inventory includes every native third-party component in the pinned Skia
-archive, with source revision, license path, and license SHA-256. Regenerate or
-verify the complete Rust and native dependency license inventories with:
+Regenerate or verify the complete Rust and native dependency license
+inventories for active product and retained diagnostic targets with:
 
 ```sh
 sh apple/scripts/generate-third-party-notices.sh --write
 sh apple/scripts/generate-third-party-notices.sh --check
-python3 apple/scripts/verify-dioxus-runtime.py
 ```
 
-The Dioxus verifier pins the exact 0.7.9 graph, rejects Manganis and devtools,
-allows only the required `tokio_runtime` feature, and checks the private
-WebSocket's loopback bind and mutual-key invariants in the resolved source. The
-shared macOS notice gate regenerates the Apple-target notices. The live-listener
-check with `lsof` is local-only through
-`sh apple/scripts/capture-dioxus-evidence.sh`; no CI job performs it. Notice
-comparison stays on macOS because
-`cargo-about` 0.9.1 is not byte-stable for Apple target selection across host
-operating systems. This is diagnostic evidence, not a product backend or App
-Sandbox claim. See
-[Dioxus UI feasibility](m0/dioxus-ui-feasibility.md) before changing this path.
+Notice comparison stays on macOS because `cargo-about` 0.9.1 is not byte-stable
+for Apple target selection across host operating systems.
 
 Create unsigned archives with:
 

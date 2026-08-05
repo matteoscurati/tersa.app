@@ -74,10 +74,12 @@ implementation and not a signed or notarized release; only ad-hoc or
 development signing is implied, and such evidence can never count toward
 `P1-MACOS-001`, `P1-MACOS-002`, or `P1-MACOS-003`.
 
-Slint and Dioxus remain diagnostic-only under ADR-0004, ADR-0005, and
-ADR-0007 through ADR-0010; their spikes, schemes, gates, and the ADR-0004
-attribution badge are unchanged. ADR-0006 A9's sentence "Neither Slint nor
-Dioxus is production-approved" remains true and is not edited by this ADR.
+The M0 Slint and Dioxus diagnostics (spikes, schemes, gates, and the
+ADR-0004 attribution badge) that this ADR treated as unchanged diagnostic
+context were later retired and removed under ADR-0025 (PR2). This ADR's
+native AppKit/SwiftUI product selection remains unchanged. Historical
+context and non-claims below are retained as history of the selection
+rationale; they do not assert that those diagnostic assets still exist.
 
 ## Non-claims
 

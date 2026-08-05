@@ -24,7 +24,6 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 // Rust guideline compliant 1.0.
 
 type TaskResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-type RuntimeBoundary = (&'static str, fn(&str) -> bool, &'static str);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedDependencyIdentity {
@@ -66,10 +65,9 @@ const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
 const REQWEST_RESOLVED_FEATURES: [&str; 4] =
     ["__native-tls", "__native-tls-alpn", "__tls", "native-tls"];
 const RUSQLITE_RESOLVED_FEATURES: [&str; 3] = ["bundled", "bundled-sqlcipher", "modern_sqlite"];
-const RUSTIX_RESOLVED_FEATURES: [&str; 12] = [
-    "alloc", "default", "event", "fs", "mm", "net", "pipe", "process", "shm", "std", "system",
-    "time",
-];
+// The active product plus retained storage/blob diagnostics resolve only this
+// narrow rustix surface after the Slint/Dioxus runtime graph was retired.
+const RUSTIX_RESOLVED_FEATURES: [&str; 5] = ["alloc", "default", "fs", "process", "std"];
 
 fn main() -> ExitCode {
     match run() {
@@ -247,8 +245,6 @@ fn check_architecture() -> TaskResult {
         violations.extend(protected_package_shape_violations(package, &metadata));
 
         for dependency in &package.dependencies {
-            check_slint_dependency(&package_name, dependency, &mut violations);
-            check_dioxus_dependency(&package_name, dependency, &mut violations);
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
             check_search_dependency(&package_name, dependency, &mut violations);
             check_mime_dependency(&package_name, dependency, &mut violations);
@@ -276,8 +272,14 @@ fn check_architecture() -> TaskResult {
         }
     }
 
-    check_macos_keychain_signing_configuration(&mut violations)?;
-    check_resolved_architecture(&mut violations)?;
+    check_macos_keychain_signing_configuration(&mut violations).map_err(|error| {
+        io::Error::other(format!(
+            "macOS signing and source-surface validation failed: {error}"
+        ))
+    })?;
+    check_resolved_architecture(&mut violations).map_err(|error| {
+        io::Error::other(format!("resolved architecture validation failed: {error}"))
+    })?;
 
     finish_architecture_check(&violations)
 }
@@ -680,12 +682,10 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     let project_generation_wrapper = fs::read_to_string("apple/scripts/generate-project.sh")?;
     let ci = fs::read_to_string(".github/workflows/ci.yml")?;
     let development = fs::read_to_string("docs/development.md")?;
-    let evidence = fs::read_to_string("apple/scripts/capture-dioxus-device-evidence.sh")?;
     violations.extend(project_generation_surface_violations(
         &project_generation_wrapper,
         &ci,
         &development,
-        &evidence,
     ));
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
     violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
@@ -5242,7 +5242,6 @@ fn project_generation_surface_violations(
     wrapper: &str,
     ci: &str,
     development: &str,
-    evidence: &str,
 ) -> Vec<String> {
     let mut violations = Vec::new();
     if wrapper != project_generation_wrapper() {
@@ -5254,11 +5253,6 @@ fn project_generation_surface_violations(
     for (path, document, minimum_wrapper_calls) in [
         (".github/workflows/ci.yml", ci, 1),
         ("docs/development.md", development, 1),
-        (
-            "apple/scripts/capture-dioxus-device-evidence.sh",
-            evidence,
-            1,
-        ),
     ] {
         if contains_xcodegen_generation_invocation(document) {
             violations.push(format!(
@@ -8178,29 +8172,17 @@ fn allowed_sensitive_configuration(path: &[String], value: &StrictYamlValue) -> 
         ] => {
             matches!(value, StrictYamlValue::String(value) if value == "mime-macos/TersaMimeMac.entitlements")
         }
-        ["targets", "TersaDioxusIOS", "settings", "base", key] => {
-            allowed_tersa_dioxus_ios_sensitive_base_setting(key, value)
-        }
         _ => false,
     }
 }
 
 fn allowed_root_sensitive_base_setting(key: &str, value: &StrictYamlValue) -> bool {
     match key {
-        "CODE_SIGNING_ALLOWED"
-        | "CODE_SIGNING_REQUIRED"
-        | "TERSA_DIOXUS_CODE_SIGNING_ALLOWED"
-        | "TERSA_DIOXUS_CODE_SIGNING_REQUIRED" => {
+        "CODE_SIGNING_ALLOWED" | "CODE_SIGNING_REQUIRED" => {
             matches!(value, StrictYamlValue::String(value) if value == "NO")
         }
-        "DEVELOPMENT_TEAM"
-        | "TERSA_DIOXUS_DEVELOPMENT_TEAM"
-        | "TERSA_DIOXUS_CODE_SIGN_IDENTITY"
-        | "TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER" => {
+        "DEVELOPMENT_TEAM" => {
             matches!(value, StrictYamlValue::String(value) if value.is_empty())
-        }
-        "TERSA_DIOXUS_CODE_SIGN_STYLE" => {
-            matches!(value, StrictYamlValue::String(value) if value == "Automatic")
         }
         _ => false,
     }
@@ -8243,30 +8225,6 @@ fn allowed_token_broker_sensitive_configuration(path: &[&str], value: &StrictYam
         }
         ["entitlements", "properties", "keychain-access-groups"] => {
             yaml_exact_string_array(Some(value), TOKEN_SIGNING_GROUP)
-        }
-        _ => false,
-    }
-}
-
-fn allowed_tersa_dioxus_ios_sensitive_base_setting(key: &str, value: &StrictYamlValue) -> bool {
-    match key {
-        "CODE_SIGNING_ALLOWED" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_ALLOWED)")
-        }
-        "CODE_SIGNING_REQUIRED" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGNING_REQUIRED)")
-        }
-        "DEVELOPMENT_TEAM" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_DEVELOPMENT_TEAM)")
-        }
-        "CODE_SIGN_STYLE" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_STYLE)")
-        }
-        "CODE_SIGN_IDENTITY" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_CODE_SIGN_IDENTITY)")
-        }
-        "PROVISIONING_PROFILE_SPECIFIER" => {
-            matches!(value, StrictYamlValue::String(value) if value == "$(TERSA_DIOXUS_PROVISIONING_PROFILE_SPECIFIER)")
         }
         _ => false,
     }
@@ -8533,7 +8491,6 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
         check_retrieval_crates_off_tokio_graph(&dependency_graph, target, violations);
         check_keychain_dependency_graph(&dependency_graph, target, violations);
         check_rustix_dependency_graph(&dependency_graph, target, violations);
-        check_diagnostic_runtime_dependency_graph(&dependency_graph, target, violations);
     }
     Ok(())
 }
@@ -8948,12 +8905,12 @@ fn cli_direct_dependency_set_violations(dependencies: &BTreeSet<&str>) -> Vec<St
 }
 
 /// Asserts the secret-storage and retrieval-only crates never link the async
-/// runtime. A full tokio owner-set does not fit — `dioxus-desktop`'s
-/// `tokio_runtime` feature legitimately pulls tokio into the Dioxus spike — so
-/// this is a targeted denial for exactly the crates whose invariant is "no
-/// ambient async runtime": `tersa-keychain-macos` (secret storage) and the
-/// retrieval-only `tersa-cli-macos`. It fails closed if any future transitive
-/// path (not just reqwest) links tokio into either.
+/// runtime. Authorized tokio owners such as the oauth-sync composition and the
+/// token-broker path remain outside this denial. This is a targeted denial for
+/// exactly the crates whose invariant is "no ambient async runtime":
+/// `tersa-keychain-macos` (secret storage) and the retrieval-only
+/// `tersa-cli-macos`. It fails closed if any future transitive path (not just
+/// reqwest) links tokio into either.
 fn check_retrieval_crates_off_tokio_graph(
     metadata: &Metadata,
     target: &str,
@@ -9144,91 +9101,6 @@ fn target_metadata_options(target: &str) -> Vec<String> {
         "--filter-platform".to_owned(),
         target.to_owned(),
     ]
-}
-
-fn check_diagnostic_runtime_dependency_graph(
-    metadata: &Metadata,
-    target: &str,
-    violations: &mut Vec<String>,
-) {
-    let Some(resolve) = &metadata.resolve else {
-        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
-        return;
-    };
-    let package_names: BTreeMap<String, String> = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.to_string(), package.name.to_string()))
-        .collect();
-    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
-        .nodes
-        .iter()
-        .map(|node| {
-            (
-                node.id.to_string(),
-                node.deps
-                    .iter()
-                    .map(|dependency| dependency.pkg.to_string())
-                    .collect(),
-            )
-        })
-        .collect();
-    let workspace_members: BTreeSet<String> = metadata
-        .workspace_members
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-
-    check_diagnostic_runtime_reachability(
-        &package_names,
-        &workspace_members,
-        &dependencies,
-        target,
-        violations,
-    );
-}
-
-fn check_diagnostic_runtime_reachability(
-    package_names: &BTreeMap<String, String>,
-    workspace_members: &BTreeSet<String>,
-    dependencies: &BTreeMap<String, BTreeSet<String>>,
-    target: &str,
-    violations: &mut Vec<String>,
-) {
-    const RUNTIMES: [RuntimeBoundary; 2] = [
-        (
-            "Slint runtime",
-            is_slint_runtime_dependency,
-            "tersa-slint-spike",
-        ),
-        (
-            "Dioxus runtime",
-            is_dioxus_runtime_dependency,
-            "tersa-dioxus-spike",
-        ),
-    ];
-
-    for (runtime, matches_runtime, allowed_root) in RUNTIMES {
-        let runtime_packages: BTreeSet<String> = package_names
-            .iter()
-            .filter_map(|(id, name)| matches_runtime(name).then_some(id.clone()))
-            .collect();
-        for member_id in workspace_members {
-            let Some(member_name) = package_names.get(member_id) else {
-                violations.push(format!(
-                    "workspace member `{member_id}` is absent from the resolved package graph"
-                ));
-                continue;
-            };
-            if member_name != allowed_root
-                && dependency_reaches(member_id, &runtime_packages, dependencies)
-            {
-                violations.push(format!(
-                    "{member_name} reaches {runtime} outside {allowed_root} for {target}"
-                ));
-            }
-        }
-    }
 }
 
 fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -9658,72 +9530,6 @@ fn dependency_paths(
     stack.pop();
 }
 
-fn check_dioxus_dependency(
-    package_name: &str,
-    dependency: &cargo_metadata::Dependency,
-    violations: &mut Vec<String>,
-) {
-    const DIOXUS_SPIKE: &str = "tersa-dioxus-spike";
-    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
-
-    let dependency_name = dependency.name.as_str();
-    if !is_dioxus_runtime_dependency(dependency_name) {
-        return;
-    }
-
-    if package_name != DIOXUS_SPIKE {
-        violations.push(format!(
-            "{package_name} -> {dependency_name} (Dioxus is exclusive to {DIOXUS_SPIKE})"
-        ));
-    }
-
-    let target = dependency.target.as_ref().map(ToString::to_string);
-    if target.as_deref() != Some(APPLE_TARGET) {
-        violations.push(format!(
-            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
-        ));
-    }
-}
-
-fn is_dioxus_runtime_dependency(dependency_name: &str) -> bool {
-    dependency_name == "dioxus"
-        || dependency_name.starts_with("dioxus-")
-        || matches!(dependency_name, "wry" | "tao" | "manganis")
-}
-
-fn is_slint_runtime_dependency(dependency_name: &str) -> bool {
-    dependency_name == "slint"
-        || dependency_name.starts_with("slint-")
-        || dependency_name.starts_with("i-slint-")
-}
-
-fn check_slint_dependency(
-    package_name: &str,
-    dependency: &cargo_metadata::Dependency,
-    violations: &mut Vec<String>,
-) {
-    const SLINT_SPIKE: &str = "tersa-slint-spike";
-    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
-
-    let dependency_name = dependency.name.as_str();
-    if !is_slint_runtime_dependency(dependency_name) {
-        return;
-    }
-
-    if package_name != SLINT_SPIKE {
-        violations.push(format!(
-            "{package_name} -> {dependency_name} (Slint is exclusive to {SLINT_SPIKE})"
-        ));
-    }
-
-    let target = dependency.target.as_ref().map(ToString::to_string);
-    if target.as_deref() != Some(APPLE_TARGET) {
-        violations.push(format!(
-            "{package_name} -> {dependency_name} must use target `{APPLE_TARGET}`"
-        ));
-    }
-}
-
 fn check_sqlcipher_dependency(
     package_name: &str,
     dependency: &cargo_metadata::Dependency,
@@ -10067,7 +9873,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "tersa-presentation",
             ]),
         ),
-        ("tersa-dioxus-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-blob-spike", BTreeSet::new()),
         (
             "tersa-keychain-macos",
@@ -10083,7 +9888,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             BTreeSet::from(["tersa-application", "tersa-domain", "tersa-keychain-macos"]),
         ),
         ("tersa-mime-spike", BTreeSet::new()),
-        ("tersa-slint-spike", BTreeSet::from(["tersa-presentation"])),
         ("tersa-sqlcipher-spike", BTreeSet::new()),
         (
             "tersa-store-sqlcipher-macos",
@@ -10243,15 +10047,13 @@ mod tests {
         apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
         blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
         bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
-        check_diagnostic_runtime_reachability, cli_direct_dependency_set_violations,
-        cli_keychain_source_violations, collect_entitlement_paths, dependency_policy,
-        expected_apple_c_abi_exports, expected_mailbox_sync_ffi_c_abi_exports,
-        expected_token_broker_ffi_c_abi_exports, future_macos_store_dependency_violation,
-        gmail_dependency_graph_violations, gmail_manifest_dependency_violations,
-        gmail_resolved_feature_violations, is_dioxus_runtime_dependency,
-        is_slint_runtime_dependency, keychain_direct_dependency_set_violations,
-        keychain_mutation_boundary_violations, macos_client_xpc_wiring_violations,
-        mailbox_sync_ffi_direct_dependency_set_violations,
+        cli_direct_dependency_set_violations, cli_keychain_source_violations,
+        collect_entitlement_paths, dependency_policy, expected_apple_c_abi_exports,
+        expected_mailbox_sync_ffi_c_abi_exports, expected_token_broker_ffi_c_abi_exports,
+        future_macos_store_dependency_violation, gmail_dependency_graph_violations,
+        gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
+        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
+        macos_client_xpc_wiring_violations, mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
@@ -10445,24 +10247,6 @@ targets:
         assert_eq!(parse_identity("Example Contributor"), None);
         assert_eq!(parse_identity("<contributor@example.com>"), None);
         assert_eq!(parse_identity("Example <invalid>"), None);
-    }
-
-    #[test]
-    fn recognizes_the_complete_dioxus_runtime_boundary() {
-        assert!(is_dioxus_runtime_dependency("dioxus"));
-        assert!(is_dioxus_runtime_dependency("dioxus-core"));
-        assert!(is_dioxus_runtime_dependency("wry"));
-        assert!(is_dioxus_runtime_dependency("tao"));
-        assert!(!is_dioxus_runtime_dependency("tersa-domain"));
-    }
-
-    #[test]
-    fn recognizes_the_complete_slint_runtime_boundary() {
-        assert!(is_slint_runtime_dependency("slint"));
-        assert!(is_slint_runtime_dependency("slint-build"));
-        assert!(is_slint_runtime_dependency("slint-macros"));
-        assert!(is_slint_runtime_dependency("i-slint-core"));
-        assert!(!is_slint_runtime_dependency("tersa-domain"));
     }
 
     #[test]
@@ -15123,11 +14907,11 @@ targets:
         let wrapper = project_generation_wrapper();
         let ci = "sh apple/scripts/generate-project.sh\n";
         let consumer = "sh apple/scripts/generate-project.sh\n";
-        assert!(project_generation_surface_violations(&wrapper, ci, consumer, consumer).is_empty());
+        assert!(project_generation_surface_violations(&wrapper, ci, consumer).is_empty());
 
         let missing_no_env = wrapper.replace(" --no-env", "");
         assert!(
-            project_generation_surface_violations(&missing_no_env, ci, consumer, consumer)
+            project_generation_surface_violations(&missing_no_env, ci, consumer)
                 .iter()
                 .any(|violation| violation.contains("exact reviewed --no-env wrapper"))
         );
@@ -15136,25 +14920,15 @@ targets:
             " generate --spec apple/project.yml --project apple\n"
         );
         assert!(
-            project_generation_surface_violations(
-                &wrapper,
-                &(ci.to_owned() + direct),
-                consumer,
-                consumer,
-            )
-            .iter()
-            .any(|violation| violation.contains("must not bypass"))
+            project_generation_surface_violations(&wrapper, &(ci.to_owned() + direct), consumer)
+                .iter()
+                .any(|violation| violation.contains("must not bypass"))
         );
         let root_form = "xcodegen --spec apple/project.yml --project apple\n";
         assert!(
-            project_generation_surface_violations(
-                &wrapper,
-                &format!("{ci}{root_form}"),
-                consumer,
-                consumer,
-            )
-            .iter()
-            .any(|violation| violation.contains("must not bypass"))
+            project_generation_surface_violations(&wrapper, &format!("{ci}{root_form}"), consumer)
+                .iter()
+                .any(|violation| violation.contains("must not bypass"))
         );
     }
 
@@ -17701,12 +17475,12 @@ final class BrokerSyncSecrets: @unchecked Sendable {
     fn secret_and_retrieval_crates_fail_closed_on_a_transitive_tokio_path() {
         // A hostile transitive path (e.g. a future `hyper` in tersa-application)
         // links tokio into the CLI and Keychain WITHOUT reqwest. Both must fail
-        // closed, while a legitimate non-denied tokio user (the Dioxus spike, via
-        // dioxus-desktop's tokio_runtime) is not flagged.
+        // closed, while a legitimate non-denied tokio user (the oauth-sync
+        // composition) is not flagged.
         let package_names = BTreeMap::from([
             ("keychain".to_owned(), "tersa-keychain-macos".to_owned()),
             ("cli".to_owned(), "tersa-cli-macos".to_owned()),
-            ("dioxus".to_owned(), "tersa-dioxus-spike".to_owned()),
+            ("oauth".to_owned(), "tersa-oauth-sync-macos".to_owned()),
             ("app".to_owned(), "tersa-application".to_owned()),
             ("hyper".to_owned(), "hyper".to_owned()),
             ("tokio".to_owned(), "tokio".to_owned()),
@@ -17714,7 +17488,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
         let workspace_members = vec![
             "keychain".to_owned(),
             "cli".to_owned(),
-            "dioxus".to_owned(),
+            "oauth".to_owned(),
             "app".to_owned(),
         ];
         let dependencies = BTreeMap::from([
@@ -17722,7 +17496,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ("cli".to_owned(), BTreeSet::from(["keychain".to_owned()])),
             ("app".to_owned(), BTreeSet::from(["hyper".to_owned()])),
             ("hyper".to_owned(), BTreeSet::from(["tokio".to_owned()])),
-            ("dioxus".to_owned(), BTreeSet::from(["tokio".to_owned()])),
+            ("oauth".to_owned(), BTreeSet::from(["tokio".to_owned()])),
         ]);
         let tokio = BTreeSet::from(["tokio".to_owned()]);
         let violations = retrieval_tokio_denial_violations(
@@ -17747,8 +17521,8 @@ final class BrokerSyncSecrets: @unchecked Sendable {
         assert!(
             !violations
                 .iter()
-                .any(|violation| violation.contains("tersa-dioxus-spike")),
-            "the Dioxus spike legitimately uses tokio and must not be flagged: {violations:?}"
+                .any(|violation| violation.contains("tersa-oauth-sync-macos")),
+            "the oauth-sync composition legitimately uses tokio and must not be flagged: {violations:?}"
         );
     }
 
@@ -17997,95 +17771,6 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 "tersa-store-sqlcipher-macos reaches libsqlite3-sys on non-macOS target aarch64-apple-ios",
             ]
         );
-    }
-
-    #[test]
-    fn rejects_indirect_diagnostic_runtime_reachability_from_a_non_spike() {
-        let package_names = BTreeMap::from([
-            ("application".to_owned(), "tersa-application".to_owned()),
-            ("adapter".to_owned(), "diagnostic-adapter".to_owned()),
-            ("slint".to_owned(), "i-slint-core".to_owned()),
-            ("dioxus".to_owned(), "dioxus-core".to_owned()),
-            ("wry".to_owned(), "wry".to_owned()),
-            ("tao".to_owned(), "tao".to_owned()),
-        ]);
-        let workspace_members = BTreeSet::from(["application".to_owned()]);
-        let dependencies = BTreeMap::from([
-            (
-                "application".to_owned(),
-                BTreeSet::from(["adapter".to_owned()]),
-            ),
-            (
-                "adapter".to_owned(),
-                BTreeSet::from([
-                    "slint".to_owned(),
-                    "dioxus".to_owned(),
-                    "wry".to_owned(),
-                    "tao".to_owned(),
-                ]),
-            ),
-        ]);
-        let mut violations = Vec::new();
-
-        check_diagnostic_runtime_reachability(
-            &package_names,
-            &workspace_members,
-            &dependencies,
-            "aarch64-apple-darwin",
-            &mut violations,
-        );
-
-        assert_eq!(
-            violations,
-            vec![
-                "tersa-application reaches Slint runtime outside tersa-slint-spike for aarch64-apple-darwin",
-                "tersa-application reaches Dioxus runtime outside tersa-dioxus-spike for aarch64-apple-darwin",
-            ]
-        );
-    }
-
-    #[test]
-    fn allows_indirect_diagnostic_runtime_reachability_from_its_spike() {
-        let package_names = BTreeMap::from([
-            ("slint-spike".to_owned(), "tersa-slint-spike".to_owned()),
-            ("dioxus-spike".to_owned(), "tersa-dioxus-spike".to_owned()),
-            ("slint-adapter".to_owned(), "slint-adapter".to_owned()),
-            ("dioxus-adapter".to_owned(), "dioxus-adapter".to_owned()),
-            ("slint".to_owned(), "slint".to_owned()),
-            ("dioxus".to_owned(), "dioxus".to_owned()),
-            ("tao".to_owned(), "tao".to_owned()),
-        ]);
-        let workspace_members =
-            BTreeSet::from(["slint-spike".to_owned(), "dioxus-spike".to_owned()]);
-        let dependencies = BTreeMap::from([
-            (
-                "slint-spike".to_owned(),
-                BTreeSet::from(["slint-adapter".to_owned()]),
-            ),
-            (
-                "dioxus-spike".to_owned(),
-                BTreeSet::from(["dioxus-adapter".to_owned()]),
-            ),
-            (
-                "slint-adapter".to_owned(),
-                BTreeSet::from(["slint".to_owned()]),
-            ),
-            (
-                "dioxus-adapter".to_owned(),
-                BTreeSet::from(["dioxus".to_owned(), "tao".to_owned()]),
-            ),
-        ]);
-        let mut violations = Vec::new();
-
-        check_diagnostic_runtime_reachability(
-            &package_names,
-            &workspace_members,
-            &dependencies,
-            "aarch64-apple-ios",
-            &mut violations,
-        );
-
-        assert!(violations.is_empty());
     }
 }
 

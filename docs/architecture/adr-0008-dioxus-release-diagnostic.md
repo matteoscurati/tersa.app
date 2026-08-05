@@ -2,8 +2,10 @@
 
 ## Status
 
-Accepted for the unsigned M0 diagnostic only. M1 remains blocked and
-`ui_baseline_approved` remains false.
+Historical and retired. The unsigned Dioxus Release diagnostic path was removed
+by [ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+decision body below is retained as historical record only. M1 remains blocked
+and `ui_baseline_approved` remains false.
 
 ## Scope
 

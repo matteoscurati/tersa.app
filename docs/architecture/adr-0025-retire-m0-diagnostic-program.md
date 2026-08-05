@@ -35,18 +35,17 @@ chain checks, active third-party notices, and the required `CI gate`. Manual
 evidence-manifest creation, artifact uploads, and the manual evidence gate are
 removed.
 
-Two standalone helpers remain only as transitional dependencies for tracked
-consumers that later pull requests still own:
+One standalone helper remains only as a transitional dependency for a tracked
+consumer that a later pull request still owns:
 
-- `scripts/write-evidence-manifest.py`, retained until the Dioxus device capture
-  path is removed;
 - `scripts/verify-m0-gates.py`, retained until the frozen gate register is
   removed with the documentation PR.
 
-Their cheap self-tests stay in the lightweight change-scope job so the retained
-scripts cannot rot while still tracked. Those self-tests do not make either
-helper an active CI product lane, and CI no longer creates or uploads evidence
-manifests.
+Its cheap self-test stays in the lightweight change-scope job so the retained
+script cannot rot while still tracked. That self-test does not make the helper
+an active CI product lane, and CI no longer creates or uploads evidence
+manifests. The evidence-manifest helper was removed with the Dioxus capture path
+in PR2.
 
 Detailed spike sources, schemes, and packaging will be removed in follow-up
 pull requests. The following remain preserved:
@@ -63,8 +62,8 @@ pull requests. The following remain preserved:
 - Pull requests and the merge queue exercise only active product validation
   lanes.
 - GitHub Actions no longer creates or uploads diagnostic evidence manifests;
-  the standalone manifest helper and M0 gate validator remain transitional
-  scripts until PR 2 and PR 5 remove their tracked capture and register owners.
+  the M0 gate validator remains a transitional script until PR 5 removes its
+  tracked register owner.
 - Later housekeeping pull requests can delete spike crates and Apple diagnostic
   targets without first reworking CI classification.
 - Temporary audit ignores and review deadlines that still cover reachable or

@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted as the design for a host-only diagnostic classifier. This ADR records
-the classifier design only; it records no observed probe result and changes no
-gate status.
+Historical and retired. The Dioxus sandboxed-navigation classifier and its
+diagnostic harness were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+decision body below is retained as historical record only.
 
 ## Context
 

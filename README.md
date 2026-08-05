@@ -2,11 +2,13 @@
 
 tersa.app is a privacy-first, open-source Gmail client for iOS and macOS.
 
-The project is currently in **M0 feasibility work**. It is not yet usable as an
-email client and has no published application builds.
+The project is currently in early product development on the macOS-first path.
+It is not yet usable as a complete email client and has no published application
+builds.
 
-The repository currently contains the shared-core workspace and governance
-foundation. Product behavior is added only after its feasibility gate passes.
+The repository contains the shared Rust core, Apple bridge and product surfaces,
+and retained feasibility diagnostics for storage, search, MIME, and blob paths.
+The M0 Slint and Dioxus UI diagnostics are retired; their ADR history remains.
 
 ## Product boundaries
 
@@ -19,15 +21,13 @@ foundation. Product behavior is added only after its feasibility gate passes.
 
 ## Project status
 
-M0 validates the UI stack, Apple distribution, OAuth, encrypted storage,
-search, MIME handling, security policy, and Google API compliance before
-production feature development begins. See the [roadmap](docs/roadmap.md) for
-the milestone sequence and MVP exclusions.
-
-The accepted [product constraints](docs/architecture/adr-0006-product-constraints.md)
-and authoritative [M0 gate register](docs/m0/gate-register.json) define what
-counts as current evidence. See the [threat model](docs/security/threat-model.md)
-and [security data flow](docs/security/data-flow.md) for the current security
+See the [roadmap](docs/roadmap.md) for the milestone sequence and MVP
+exclusions. The accepted
+[product constraints](docs/architecture/adr-0006-product-constraints.md) and the
+still-tracked [M0 gate register](docs/m0/gate-register.json) define historical
+and remaining evidence requirements. See the
+[threat model](docs/security/threat-model.md) and
+[security data flow](docs/security/data-flow.md) for the current security
 boundaries. Physical-device and signed-distribution closure follows the
 [M0 physical-device and distribution protocol](docs/m0/physical-device-and-distribution-protocol.md).
 
@@ -49,5 +49,3 @@ workflow.
 - Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
 - Repository artifacts follow the [English language policy](docs/governance/language-policy.md).
 - Source code is licensed under the [Mozilla Public License 2.0](LICENSE).
-
-<a href="https://slint.dev"><img src="docs/assets/made-with-slint.svg" alt="Made with Slint" width="120"></a>

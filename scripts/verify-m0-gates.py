@@ -273,7 +273,7 @@ def table_statuses(path: Path, errors: list[str]) -> dict[str, str]:
 
 
 def validate_xtask_isolation(errors: list[str]) -> None:
-    """Ensure the documented diagnostic-only enforcement hook remains present."""
+    """Ensure retired Slint/Dioxus diagnostic isolation hooks stay removed."""
     try:
         source = XTASK_SOURCE.read_text(encoding="utf-8")
     except OSError as exc:
@@ -288,8 +288,11 @@ def validate_xtask_isolation(errors: list[str]) -> None:
         "tersa-slint-spike",
         "tersa-dioxus-spike",
     ):
-        if marker not in source:
-            error(errors, f"xtask dependency isolation is missing marker {marker}")
+        if marker in source:
+            error(
+                errors,
+                f"xtask still contains retired diagnostic isolation marker {marker}",
+            )
 
 
 def validate(data: Any) -> list[str]:

@@ -1,6 +1,6 @@
 [graph]
 # tersa.app ships Apple binaries only. Filtering the graph prevents unrelated
-# Linux, Android, and Windows backend packages locked by portable UI crates from
+# Linux, Android, and Windows backend packages locked by portable crates from
 # being treated as shipped dependencies.
 targets = [
     "aarch64-apple-darwin",
@@ -12,13 +12,6 @@ targets = [
 version = 2
 yanked = "deny"
 unmaintained = "all"
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "Slint 1.16.1 pins paste through its image stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0192", reason = "Slint 1.16.1 pins ttf-parser through its text stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0206", reason = "Slint 1.16.1 pins rustybuzz through its SVG stack; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0194", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (wayland-scanner requires ^0.39, so unbumpable without a Slint release using >=0.41; Slint 1.17 needs Rust 1.92 and still resolves 0.39.4); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
-    { id = "RUSTSEC-2026-0195", reason = "Slint 1.16.1 pins quick-xml 0.39 through its Linux-only wayland-scanner stack (see RUSTSEC-2026-0194); unreachable in the macOS product; revalidate before 2026-08-15 and before closing the production UI gate" },
-]
 
 [bans]
 multiple-versions = "warn"
@@ -37,19 +30,6 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
-]
-
-exceptions = [
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-selector" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-backend-winit" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-common" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-compiler" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-core-macros" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "i-slint-renderer-skia" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-build" },
-    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], name = "slint-macros" },
 ]
 
 [sources]

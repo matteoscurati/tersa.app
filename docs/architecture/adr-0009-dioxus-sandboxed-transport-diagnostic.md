@@ -2,11 +2,10 @@
 
 ## Status
 
-Accepted as the design for collecting host-only M0 diagnostic evidence. The
-immutable exact-head host artifact is recorded and M0-DIOXUS-011 is
-`diagnostic` at the host tier. Independent human attestation remains absent;
-it is required before any signed-tier claim. M1 remains blocked and
-`ui_baseline_approved` remains false.
+Historical and retired. The Dioxus sandboxed-transport diagnostic path was
+removed by [ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping
+(PR2). The decision body below is retained as historical record only. M1 remains
+blocked and `ui_baseline_approved` remains false.
 
 ## Decision
 

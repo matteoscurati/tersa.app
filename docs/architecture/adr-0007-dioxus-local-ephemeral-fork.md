@@ -2,8 +2,10 @@
 
 ## Status
 
-Accepted for M0 source and host diagnostics only. It does not approve a
-production UI baseline or change the M1 block.
+Historical and retired. The local ephemeral `dioxus-desktop` fork, patch, and
+vendor tree were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+decision body below is retained as historical record only.
 
 ## Context
 

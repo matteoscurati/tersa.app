@@ -70,18 +70,13 @@ attested device-signed evidence the register requires. Workspace authorization,
 physical-device browser lifecycle, and Google restricted-scope verification
 remain unproven.
 
-The Slint diagnostic packages successfully, but its production gate failed
-because the locked Winit accessibility adapter is a no-op on iOS. The planned
-Dioxus 0.7.9 fallback also packages successfully and is suitable for continued
-diagnostic work, but it is not a production baseline: persistent WebKit state,
-navigation interception, runtime footprint, and physical-device evidence are
-unresolved. The sandboxed-loopback host diagnostic is recorded, but it is not
-device-signed, distribution, production sandbox compatibility, or sandboxed
-navigation/storage evidence. M0 must resolve those blockers or
-reopen the UI constraint before M1 product screens begin. M1 remains blocked
-because no production UI baseline has passed; the authoritative
+Historical note: the M0 Slint and Dioxus UI diagnostics are retired from the
+tree (ADR-0025 housekeeping PR2). Their production gates did not pass; ADR
+history and the still-tracked M0 studies preserve that outcome. M1 remains
+blocked because no production UI baseline has passed; the authoritative
 [M0 gate register](m0/gate-register.json) records current HEAD-checkable
-evidence and the cache measurement gate.
+evidence and the cache measurement gate. Full M0 study consolidation is deferred
+to PR5.
 
 ## Phase 1 — macOS-first product path
 

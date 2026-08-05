@@ -2,8 +2,11 @@
 
 ## Status
 
-Accepted for an M0 diagnostic spike. Rejected as the production UI baseline
-until every blocking condition below is resolved and independently reviewed.
+Historical and retired. The M0 Dioxus diagnostic implementation, local vendor
+fork, Apple schemes, and related tooling were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR2). The
+decision body below is retained as historical record only; Dioxus remains
+rejected as a production UI baseline.
 
 ## Context
 

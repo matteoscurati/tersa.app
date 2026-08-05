@@ -1,7 +1,7 @@
 tersa.app third-party notices
 ================================
 
-This file lists the third-party Rust packages linked into the diagnostic
+This file lists the third-party Rust packages linked into the selected
 application for this target selection:
 - iOS arm64 MIME diagnostic targets
 
