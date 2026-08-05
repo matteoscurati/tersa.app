@@ -59,24 +59,31 @@ in the table below by the evidence producer.
 
 ## Current capture status
 
+Capture at commit `6dac4efd74b4a08db1ce95162894d05698ee50ee` on 2026-08-05
+(Xcode 26.6, arm64-native, Apple Development identity and team redacted).
+
 | Observation | Result |
 |---|---|
-| Nested XPC inventory and inside-out signing tooling | READY — enforced by `xtask architecture` and unit tests |
-| Native build and Apple Development signature | PENDING re-run at this branch head |
-| Provisioning and entitlement binding (five-key outer set) | PENDING re-run at this branch head |
-| Product launch and App Sandbox container | PENDING re-run at this branch head |
-| Sandbox denial and observation-path control | PENDING re-run at this branch head |
+| Nested XPC inventory and inside-out signing | PASS — exact reviewed `TersaMacTokenBroker.xpc`; three-key broker entitlements; token group redacted |
+| Native build and Apple Development signature | PASS — arm64, strict signature verification, Hardened Runtime |
+| Provisioning and entitlement binding | PASS — current embedded profile; outer five-key set; team values redacted |
+| Product launch and App Sandbox container | PASS — app remained running; `~/Library/Containers/app.tersa.mac` present |
+| Sandbox denial and observation-path control | PASS — sandboxed canary denied outside-container create; unsandboxed control succeeded |
+| Installed application regular-file bytes | 15,086,960 (~14.4 MiB) — under the 16 MiB product budget |
 | VoiceOver-only five-screen walk | PENDING — owner physical walk; no spoken-output claim |
 | Full Keyboard Access-only five-screen walk | PENDING — owner physical walk; no keyboard-navigation claim |
+
+VoiceOver-only and Full Keyboard Access-only walks remain owner-executed. Source
+semantics and screenshots are not substituted for assistive-technology speech or
+physical keyboard evidence. Implementation improvements for those walks stay on
+the queued accessibility pull request and do not belong in this evidence record.
 
 ### Prior Apple Development capture (historical reference)
 
 At commit `beda68b512e32f9cf7be1e4dfacccc81e1acce70` (2026-08-02), an earlier
 form of the capture script recorded PASS for signature, profile binding, launch,
 sandbox container, sandbox denial, and live Gmail connect/disconnect teardown.
-VoiceOver-only and Full Keyboard Access-only walks were not executed on that
-run. That capture predated nested token-broker signing inventory and is not a
-substitute for a re-run at the current product head.
+That capture predated nested token-broker signing inventory.
 
 ## Interactive checklist (owner)
 
