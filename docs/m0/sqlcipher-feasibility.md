@@ -1,14 +1,21 @@
 # M0 SQLCipher storage feasibility evidence
 
+> **Historical record only (PR3).** The M0 SQLCipher diagnostic executable,
+> `apple/scripts/verify-sqlcipher-feasibility.sh`, diagnostic about config, and
+> `THIRD_PARTY_NOTICES-sqlcipher-*` outputs were removed by ADR-0025
+> housekeeping (PR3). Commands and package names below are non-executable
+> historical text pending PR5 consolidation. Active product SQLCipher is
+> `adapters/store-sqlcipher-macos`.
+
 ## Decision
 
-The bounded storage probe passes on arm64 macOS with SQLCipher 4.10.0 community,
-SQLite 3.50.4, and the CommonCrypto provider. The same executable cross-builds
-and links for arm64 macOS, iOS devices, and iOS simulators. This proves the
-selected native dependency can support the encrypted database boundary; it is
+The bounded storage probe passed on arm64 macOS with SQLCipher 4.10.0 community,
+SQLite 3.50.4, and the CommonCrypto provider. The same executable cross-built
+and linked for arm64 macOS, iOS devices, and iOS simulators. That proved the
+selected native dependency could support the encrypted database boundary; it was
 not a production store implementation.
 
-The probe uses `rusqlite` 0.39.0 with default features disabled and only the
+The probe used `rusqlite` 0.39.0 with default features disabled and only the
 `bundled-sqlcipher` feature enabled. Version 0.40.1 was evaluated first but its
 `libsqlite3-sys` 0.38.1 build script requires the `cfg_select` library feature,
 which is unavailable on the repository's pinned Rust 1.91.1 toolchain. M0 keeps
@@ -91,9 +98,11 @@ The ownership and migration boundary is recorded in
 `M0-STORAGE-001` remains open: host migration evidence does not satisfy its
 signed physical-device requirement.
 
-## Reproduce locally
+## Historical reproduction (non-executable)
 
-Install the three Apple Rust targets, then run:
+The following commands are retained only as historical record. The diagnostic
+executable, verifier, about config, and diagnostic notice outputs no longer
+exist in the tree after PR3; do not run them.
 
 ```sh
 sh apple/scripts/verify-sqlcipher-feasibility.sh
@@ -103,5 +112,7 @@ IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
   --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
 ```
 
-CI also verifies the checksum-bound bundled SQLCipher BSD-3-Clause notice and
-byte-for-byte target-specific dependency notices.
+Historically, diagnostic CI also compared checksum-bound SQLCipher notice
+text and diagnostic target-specific dependency notices. Active product notice
+generation still verifies the bundled SQLCipher supplemental notice for the
+production store path; that is unrelated to this retired diagnostic.

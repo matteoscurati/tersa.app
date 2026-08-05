@@ -5,11 +5,11 @@
 
 ## Context
 
-The existing workspace contains diagnostics for UI, SQLCipher, MIME, search,
-and crash-safe AEAD blobs. Those diagnostics are not production adapters. The
-macOS-first implementation needs a fail-closed boundary before any Gmail REST
-or production store crate is introduced, without treating planned crate names
-as present or authorized.
+At acceptance, the workspace still contained diagnostics for UI, SQLCipher,
+MIME, search, and crash-safe AEAD blobs. Those diagnostics were not production
+adapters. The macOS-first implementation needed a fail-closed boundary before
+any Gmail REST or production store crate was introduced, without treating
+planned crate names as present or authorized.
 
 ## Decision
 
@@ -27,17 +27,21 @@ implement those inward-defined ports.
 
 The future macOS store adapter may own both SQLCipher and blob AEAD because
 they share one commit and crash-safety protocol. Its declarations of
-`rusqlite`, `libsqlite3-sys`, `chacha20poly1305`, and `hmac` must use the exact
-target cfg `cfg(target_os = "macos")`. Untargeted, iOS-only, or iOS-inclusive
-forms fail the policy check.
+`rusqlite`, `libsqlite3-sys`, and any future AEAD/HMAC ownership must use the
+exact target cfg `cfg(target_os = "macos")`. Untargeted, iOS-only, or
+iOS-inclusive forms fail the policy check. Historical note: the original text
+also named `chacha20poly1305` because the M0 blob diagnostic owned that pin;
+PR3 retires that package and bans it from the active graph, while production
+HMAC remains the Keychain/HKDF path.
 
-The present SQLCipher and AEAD diagnostic owner sets remain unchanged. The
-Slint and Dioxus isolation clause is historical: those diagnostic UI spikes
-and their isolation boundaries were later removed under ADR-0025 (PR2) and
-are superseded by that decision. Gmail and network dependency exclusivity is
-not yet enforceable because exact Gmail crates have not been selected and
-pinned. This ADR deliberately adds no generic dependency-name pattern for
-network dependencies.
+The SQLCipher and AEAD diagnostic owner sets described at acceptance are
+historical. The Slint and Dioxus isolation clause was retired under ADR-0025
+(PR2). The SQLCipher, search/Tantivy, and blob diagnostic owner sets were
+retired under ADR-0025 housekeeping (PR3); active SQLCipher ownership is the
+production store and its authorized composition chain. Gmail and network
+dependency exclusivity is not yet enforceable because exact Gmail crates have
+not been selected and pinned. This ADR deliberately adds no generic
+dependency-name pattern for network dependencies.
 
 ## Consequences
 

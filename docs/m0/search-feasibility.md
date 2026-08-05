@@ -1,9 +1,16 @@
 # M0 encrypted-search feasibility evidence
 
+> **Historical record only (PR3).** The M0 search/Tantivy diagnostic executable,
+> `apple/scripts/verify-search-feasibility.sh`, diagnostic about config, and
+> `THIRD_PARTY_NOTICES-search-*` outputs were removed by ADR-0025 housekeeping
+> (PR3). Commands and package names below are non-executable historical text
+> pending PR5 consolidation. Active product search is the bounded mailbox
+> search path; this document does not claim a Tantivy replacement.
+
 ## Decision
 
-The bounded Apple diagnostic establishes host-side correctness and privacy
-evidence for SQLCipher FTS5 and Tantivy 0.26.1. It is an isolated feasibility
+The bounded Apple diagnostic established host-side correctness and privacy
+evidence for SQLCipher FTS5 and Tantivy 0.26.1. It was an isolated feasibility
 probe, not production search and not an iPhone performance result.
 
 ## Contract
@@ -34,17 +41,20 @@ probe, not production search and not an iPhone performance result.
 
 ## Profiles and remaining device gate
 
-The default host profile contains 10,000 messages and at least 128 MiB of
-normalized text. The opt-in manual host profile contains 100,000 messages and
-at least 2 GiB. Both are explicitly labeled `NOT A DEVICE-GATE RESULT`. Host
-profile evidence is local-only through
-`sh apple/scripts/verify-search-feasibility.sh`; it is not merge-blocking CI.
+The default host profile contained 10,000 messages and at least 128 MiB of
+normalized text. The opt-in manual host profile contained 100,000 messages and
+at least 2 GiB. Both were explicitly labeled `NOT A DEVICE-GATE RESULT`. Host
+profile evidence was local-only through the retired
+`sh apple/scripts/verify-search-feasibility.sh` path; that path is
+non-executable after PR3 and was never merge-blocking CI.
 
 Locked Rust 1.91.1 builds for macOS arm64, iOS arm64, and iOS simulator arm64
-are required. They do not prove iOS runtime behavior, durability,
-protected-data handling, performance, or a production search architecture.
+were historically required for the diagnostic. They did not prove iOS runtime
+behavior, durability, protected-data handling, performance, or a production
+search architecture.
 
-The M0 physical-iPhone gate remains open. On the target iPhone, the 100,000
-message/2 GiB corpus must demonstrate top-50 query p95 below 150 ms, incremental
-RSS below 40 MiB, and current index bytes below 40% of normalized text. This PR
-does not claim those thresholds have passed.
+The M0 physical-iPhone gate remains open on the still-tracked register. On the
+target iPhone, the 100,000 message/2 GiB corpus must demonstrate top-50 query
+p95 below 150 ms, incremental RSS below 40 MiB, and current index bytes below
+40% of normalized text. This historical record does not claim those thresholds
+have passed, and it does not claim a Tantivy replacement in the product graph.

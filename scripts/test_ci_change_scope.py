@@ -172,6 +172,9 @@ class ChangeScopeTests(unittest.TestCase):
             "apple/scripts/capture-slint-evidence.sh",
             "apple/scripts/capture-dioxus-evidence.sh",
             "apple/scripts/capture-dioxus-device-evidence.sh",
+            "apple/scripts/verify-sqlcipher-feasibility.sh",
+            "apple/scripts/verify-search-feasibility.sh",
+            "apple/scripts/verify-blob-feasibility.sh",
         ):
             with self.subTest(path=retired):
                 self.assertNotIn(retired, MODULE.CI_CONTROL_PATHS)
@@ -244,6 +247,51 @@ class ChangeScopeTests(unittest.TestCase):
                 "retired dioxus notice config fails closed",
                 ["about-dioxus.toml"],
                 ALL,
+            ),
+            (
+                "retired sqlcipher diagnostic notice config fails closed",
+                ["about-sqlcipher.toml"],
+                ALL,
+            ),
+            (
+                "retired search diagnostic notice config fails closed",
+                ["about-search.toml"],
+                ALL,
+            ),
+            (
+                "retired blob diagnostic notice config fails closed",
+                ["about-blob.toml"],
+                ALL,
+            ),
+            (
+                "retired sqlcipher spike source fails closed without a named diagnostic lane",
+                ["apps/sqlcipher-spike/src/main.rs"],
+                ALL,
+            ),
+            (
+                "retired search spike source fails closed without a named diagnostic lane",
+                ["apps/search-spike/src/main.rs"],
+                ALL,
+            ),
+            (
+                "retired blob spike source fails closed without a named diagnostic lane",
+                ["apps/blob-spike/src/main.rs"],
+                ALL,
+            ),
+            (
+                "retired sqlcipher diagnostic notice output stays notices-only",
+                ["apple/licenses/THIRD_PARTY_NOTICES-sqlcipher-macos.txt"],
+                {"notices"},
+            ),
+            (
+                "retired search diagnostic notice output stays notices-only",
+                ["apple/licenses/THIRD_PARTY_NOTICES-search-macos.txt"],
+                {"notices"},
+            ),
+            (
+                "retired blob diagnostic notice output stays notices-only",
+                ["apple/licenses/THIRD_PARTY_NOTICES-blob-macos.txt"],
+                {"notices"},
             ),
             (
                 "shared domain enables product without diagnostic lanes",

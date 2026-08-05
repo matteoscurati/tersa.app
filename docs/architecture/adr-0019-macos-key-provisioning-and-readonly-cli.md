@@ -217,14 +217,15 @@ request `process`. Rustix supplies safe descriptor-relative filesystem,
 advisory-lock, `statat`, and `unlinkat` operations. No direct `libc` dependency,
 handwritten syscall binding, or new unsafe POSIX FFI is authorized.
 
-The exact direct-owner set is the existing portable `tersa-blob-spike`
-diagnostic plus the future macOS-gated Keychain and SQLCipher-store declarations.
-The blob keeps its existing member declaration and inherited `fs`/`std` request
-unchanged. Policy tests must reject a direct `process` request from the blob or
-store. Cargo may unify `process` into a resolved macOS rustix package shared
-with the Keychain member; that graph-level unification does not mean the blob or
-store directly selected the feature. Direct-declaration and resolved-feature
-assertions remain separate.
+At acceptance, the exact direct-owner set included the portable
+`tersa-blob-spike` diagnostic plus the future macOS-gated Keychain and
+SQLCipher-store declarations. Historical note: PR3 retires that diagnostic, so
+active direct rustix owners are only `tersa-keychain-macos` and
+`tersa-store-sqlcipher-macos`. Policy tests must reject a direct `process`
+request from the store. Cargo may unify `process` into a resolved macOS rustix
+package shared with the Keychain member; that graph-level unification does not
+mean the store directly selected the feature. Direct-declaration and
+resolved-feature assertions remain separate.
 
 On `aarch64-apple-darwin`, `tersa-cli-macos` and `tersa-apple-bridge` may reach
 the protected package only through their exact edge to
@@ -238,17 +239,20 @@ third-party rustix reachability must not trigger a false global ban.
 The implementation pull request must update both closed direct-dependency sets
 and enforce exact versions, canonical targets, default-feature states,
 member-requested features, allowed resolved paths, and target-specific resolved
-features in `xtask`. Positive fixtures cover blob, Keychain, store, and both
+features in `xtask`. Positive fixtures cover Keychain, store, and both
 CLI/bridge transitive paths. Negative fixtures cover wrong owners, direct
-`process` on blob/store, direct CLI/bridge declarations, alternate parents,
+`process` on store, direct CLI/bridge declarations, alternate parents,
 ungated or broadened targets, iOS, and non-macOS graphs. This governance
 amendment changes no manifest, active graph, or gate.
 
 The current HKDF release, 0.13.0, resolves HMAC 0.13; 0.12.4 is
 deliberately selected because it uses the already reviewed `hmac =0.12.1`.
-PR 32 narrowly expands the HMAC owner set to `tersa-blob-spike` and
-`tersa-keychain-macos` after checking the exact resolved graph. ChaCha20-
-Poly1305 remains exclusive to `tersa-blob-spike`.
+PR 32 expanded the HMAC owner set to include `tersa-blob-spike` and
+`tersa-keychain-macos` after checking the exact resolved graph. Historical
+note: PR3 removes `tersa-blob-spike` from that set; active HMAC ownership is
+Keychain/HKDF plus the authorized macOS composition chain. ChaCha20-Poly1305
+was exclusive to the retired blob diagnostic and is now banned from the active
+graph.
 
 Before PR 33a, `tersa-keychain-macos` depends inward only on `tersa-platform`.
 PR 33a activates the exact additional edge to
@@ -662,15 +666,18 @@ reachability is allowed solely from `tersa-apple-bridge` through
 `HMAC_OWNERS` or `SQLCIPHER_OWNERS` sets and receives no direct HMAC, HKDF,
 rusqlite, libsqlite3-sys, SQLCipher-store, or other crypto dependency.
 
-The current enforcement points are `check_blob_dependency_graph` and
-`blob_dependency_graph_violations` for HKDF/HMAC, and
+The current enforcement points are `check_hmac_dependency_graph` and
+`hmac_dependency_graph_violations` for HKDF/HMAC, and
 `check_sqlcipher_dependency_graph` and
-`sqlcipher_dependency_graph_violations` for SQLCipher. The implementation may
-refactor those helpers only if exact semantic path tests remain. Positive tests
-must prove both approved bridge paths on `aarch64-apple-darwin`; negative tests
-must reject direct declarations, alternate workspace intermediaries, additional
-workspace path parents, any extra crypto or SQLCipher path, iOS, and every
-non-macOS target. Existing owner rules remain unchanged for all other members.
+`sqlcipher_dependency_graph_violations` for SQLCipher. Historical note: those
+HMAC helpers were previously named under the retired blob diagnostic; PR3
+renames them without weakening production HMAC confinement. The implementation
+may refactor those helpers only if exact semantic path tests remain. Positive
+tests must prove both approved bridge paths on `aarch64-apple-darwin`; negative
+tests must reject direct declarations, alternate workspace intermediaries,
+additional workspace path parents, any extra crypto or SQLCipher path, iOS, and
+every non-macOS target. Existing owner rules remain unchanged for all other
+members.
 
 Only the canonical domain `AccountId` may select an account. Production uses
 only the fixed `default` profile and the fixed paths, Keychain attributes, and

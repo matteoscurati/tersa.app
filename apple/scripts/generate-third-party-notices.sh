@@ -4,7 +4,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Generates or verifies complete target-specific license inventories for the
-# Apple product and retained diagnostic applications.
+# Apple product and retained MIME diagnostic applications.
 set -eu
 
 mode=${1:---check}
@@ -12,10 +12,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 apple_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
 workspace_dir=$(CDPATH='' cd -- "${apple_dir}/.." && pwd)
 bridge_config="${workspace_dir}/about-bridge.toml"
-sqlcipher_config="${workspace_dir}/about-sqlcipher.toml"
-search_config="${workspace_dir}/about-search.toml"
 mime_config="${workspace_dir}/about-mime.toml"
-blob_config="${workspace_dir}/about-blob.toml"
 renderer="${script_dir}/render-third-party-notices.py"
 sqlcipher_supplemental="${apple_dir}/licenses/sqlcipher-notices.txt"
 
@@ -74,29 +71,11 @@ generate_notice THIRD_PARTY_NOTICES-bridge-ios.txt \
   apple/rust-bridge/Cargo.toml - "$bridge_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
-generate_notice THIRD_PARTY_NOTICES-sqlcipher-macos.txt "macOS arm64" \
-  apps/sqlcipher-spike/Cargo.toml "$sqlcipher_supplemental" "$sqlcipher_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-sqlcipher-ios.txt "iOS arm64 device and simulator targets" \
-  apps/sqlcipher-spike/Cargo.toml "$sqlcipher_supplemental" "$sqlcipher_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
-generate_notice THIRD_PARTY_NOTICES-search-macos.txt "macOS arm64 search diagnostic" \
-  apps/search-spike/Cargo.toml "$sqlcipher_supplemental" "$search_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-search-ios.txt "iOS arm64 search diagnostic targets" \
-  apps/search-spike/Cargo.toml "$sqlcipher_supplemental" "$search_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
 generate_notice THIRD_PARTY_NOTICES-mime-macos.txt "macOS arm64 MIME diagnostic" \
   apps/mime-spike/Cargo.toml - "$mime_config" \
   --target aarch64-apple-darwin
 generate_notice THIRD_PARTY_NOTICES-mime-ios.txt "iOS arm64 MIME diagnostic targets" \
   apps/mime-spike/Cargo.toml - "$mime_config" \
-  --target aarch64-apple-ios --target aarch64-apple-ios-sim
-generate_notice THIRD_PARTY_NOTICES-blob-macos.txt "macOS arm64 blob diagnostic" \
-  apps/blob-spike/Cargo.toml - "$blob_config" \
-  --target aarch64-apple-darwin
-generate_notice THIRD_PARTY_NOTICES-blob-ios.txt "iOS arm64 blob diagnostic targets" \
-  apps/blob-spike/Cargo.toml - "$blob_config" \
   --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
 if [ "$mode" = "--check" ]; then
@@ -104,20 +83,8 @@ if [ "$mode" = "--check" ]; then
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-bridge-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-bridge-ios.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-sqlcipher-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-sqlcipher-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-sqlcipher-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-sqlcipher-ios.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-search-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-search-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-search-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-search-ios.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-macos.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-macos.txt"
   cmp "${output_dir}/THIRD_PARTY_NOTICES-mime-ios.txt" \
     "${apple_dir}/licenses/THIRD_PARTY_NOTICES-mime-ios.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-blob-macos.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-blob-macos.txt"
-  cmp "${output_dir}/THIRD_PARTY_NOTICES-blob-ios.txt" \
-    "${apple_dir}/licenses/THIRD_PARTY_NOTICES-blob-ios.txt"
 fi

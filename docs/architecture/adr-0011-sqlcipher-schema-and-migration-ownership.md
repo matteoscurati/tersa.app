@@ -6,7 +6,16 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0011: SQLCipher schema and migration ownership
 
-- Status: Accepted for the M0 host diagnostic
+## Status
+
+Historical and retired. The M0 SQLCipher feasibility executable, verifier, and
+diagnostic notice outputs were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR3). The
+decision body below is retained as historical record only; it does not describe
+the active production store in `adapters/store-sqlcipher-macos`. Production
+SQLCipher ownership is governed by later ADRs and the live dependency policy.
+
+- Former status: Accepted for the M0 host diagnostic
 - Date: 2026-07-15
 
 ## Context
@@ -16,8 +25,8 @@ configuration and account-scoped mail state. A database must never be silently
 claimed when its ownership or schema is unknown, and a crash during an upgrade
 must leave either the old canonical schema or the new canonical schema.
 
-This decision covers only the bounded SQLCipher feasibility executable. The
-schemas are synthetic, illustrative, and intentionally smaller than a product
+This decision covered only the bounded SQLCipher feasibility executable. The
+schemas were synthetic, illustrative, and intentionally smaller than a product
 schema.
 
 ## Decision

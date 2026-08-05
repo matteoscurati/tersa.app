@@ -9,40 +9,14 @@ Validate Apple distribution, the selected UI candidate on physical devices,
 OAuth PKCE, encrypted storage, search, hostile MIME/HTML handling, licenses,
 security policy, and Google API compliance.
 
-The SQLCipher diagnostic now proves CommonCrypto linkage, encrypted main/WAL
-payloads, abrupt-exit recovery, wrong-key rejection, integrity checks, and an
-in-memory temporary-store policy on macOS. It also proves exact synthetic global
-and account schema ownership, contiguous transactional migrations, fresh and
-incremental convergence, no-op latest reopen, and deterministic rollback from
-an uncommitted migration-two WAL on the host. The schema remains illustrative,
-not production. iOS protected-data runtime, Keychain, Data Protection,
-production schema/repositories, migration-history policy, and production key
-handling remain M0 work; `M0-STORAGE-001` remains open.
-
-The portable blob diagnostic now proves a bounded versioned
-XChaCha20-Poly1305 chunk format, authenticated random access, exact-size
-validation, per-account HMAC content identifiers, run-wide nonce uniqueness,
-authenticated same-blob-ID reuse with fail-closed preservation of conflicting
-or corrupt finals, atomic same-directory no-replace hard-link publication, and
-descriptor-bound no-follow rejection of pre-open path swaps, and deterministic
-host process-crash recovery with narrow staging cleanup. It makes
-no cross-logical-blob deduplication claim and is not a production blob store.
-Manifest binding, cross-blob reuse, rollback freshness, filesystem behavior
-beyond the host same-filesystem boundary, key derivation and rotation,
-eviction, disk-full, backup, File Protection, signed-device runtime, and
-performance remain M0 work.
-Concurrent external mutation of an already-open inode also remains outside the
-process-crash diagnostic boundary.
-
-The search diagnostic proves host-side synthetic exact-match sets for SQLCipher
-FTS5 and Tantivy 0.26.1, immutable open handles after delete/replace,
-cross-connection WORM writes with flush-visible generations, blocking and
-nonblocking locks, one writer with concurrent readers, metadata watches,
-re-entrant callback safety, chunk-local range reads, wrong-key rejection, both
-integrity checks, and a retrievable random sentinel with redacted controls.
-Host evidence is not a device-gate result. Physical-iPhone runtime and
-performance, search-index schema/migration ownership, garbage collection,
-backup behavior, and production key handling remain M0 gates.
+Historical note: the M0 SQLCipher, encrypted-search/Tantivy, and crash-safe
+blob diagnostics proved host-side feasibility constraints and then were removed
+from the tree by ADR-0025 housekeeping (PR3). Their detailed studies remain
+non-executable historical records until PR5 consolidation; they do not claim a
+production blob implementation or a Tantivy replacement. Active product
+SQLCipher is the production macOS store. Active product search is the bounded
+mailbox search path. Storage, search-device, and blob product gates that remain
+open stay open on the still-tracked register until PR5.
 
 The hostile-content diagnostic now bounds encoded input, headers, MIME depth,
 part count, and decoded display bytes before producing a typed `SafeHtml`
@@ -71,9 +45,11 @@ physical-device browser lifecycle, and Google restricted-scope verification
 remain unproven.
 
 Historical note: the M0 Slint and Dioxus UI diagnostics are retired from the
-tree (ADR-0025 housekeeping PR2). Their production gates did not pass; ADR
-history and the still-tracked M0 studies preserve that outcome. M1 remains
-blocked because no production UI baseline has passed; the authoritative
+tree (ADR-0025 housekeeping PR2). The M0 SQLCipher, search/Tantivy, and blob
+diagnostics are retired from the tree (ADR-0025 housekeeping PR3). Their
+production gates did not pass as device-signed product evidence; ADR history
+and the still-tracked M0 studies preserve those outcomes. M1 remains blocked
+because no production UI baseline has passed; the authoritative
 [M0 gate register](m0/gate-register.json) records current HEAD-checkable
 evidence and the cache measurement gate. Full M0 study consolidation is deferred
 to PR5.

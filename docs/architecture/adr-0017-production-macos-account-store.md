@@ -82,9 +82,12 @@ and bounds every schema field before allocation. Only SQLite's literal
 `sqlite_` internal-object prefix is excluded from the canonical comparison.
 
 Blob and attachment encryption are intentionally deferred. This adapter does
-not use `chacha20poly1305` or `hmac` until a real blob/attachment port and a
-cross-file commit protocol are accepted. ADR 0011 engine crash evidence remains
-the applicable SQLCipher engine evidence until that protocol exists.
+not use AEAD or HMAC until a real blob/attachment port and a cross-file commit
+protocol are accepted; a future product blob format remains a separate decision
+and is not claimed by the retired M0 blob diagnostic. Historical note:
+ADR 0011's host diagnostic engine-crash evidence remains historical record only
+after PR3; production store crash and integrity behavior is owned by this
+adapter and its tests.
 
 Deterministic adapter tests cover exact schema convergence and no-op reopen,
 wrong-key and foreign/future/noncanonical schema rejection, orphan-sidecar and

@@ -6,7 +6,16 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0012: Candidate chunked encrypted-blob format
 
-- Status: Accepted for the M0 host diagnostic
+## Status
+
+Historical and retired. The M0 crash-safe blob diagnostic executable, verifier,
+ChaCha20-Poly1305 workspace pin, and diagnostic notice outputs were removed by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md) housekeeping (PR3). The
+decision body below is retained as historical record only. It does not claim a
+production blob implementation; any future product blob format remains a
+separate decision.
+
+- Former status: Accepted for the M0 host diagnostic
 - Date: 2026-07-15
 
 ## Context
@@ -17,9 +26,9 @@ bounded-memory streaming and authenticated random access. A crash must not
 publish an incomplete value, and recovery must distinguish private staging
 files from published blobs without broad directory deletion.
 
-This decision covers only the portable, synthetic feasibility executable in
-`apps/blob-spike`. The executable has no workspace dependencies and is not a
-production blob store.
+This decision covered only the portable, synthetic feasibility executable that
+formerly lived in `apps/blob-spike`. That executable had no workspace
+dependencies and was not a production blob store.
 
 ## Decision
 
@@ -107,12 +116,13 @@ staging hard link does not delete the published link.
 
 ## Consequences
 
-- `chacha20poly1305` 0.10.1 and `hmac` 0.12.1 are exact-pinned and exclusive to
-  `tersa-blob-spike`; this ADR does not approve them for production code.
-- `rustix` 1.1.4 is exact-pinned as a direct `tersa-blob-spike` dependency with
-  only its standard-library and filesystem features. It supplies the safe
-  no-follow descriptor operations; it is not exclusive to this diagnostic
-  because unrelated workspace dependency graphs already use it transitively.
+- Historically, `chacha20poly1305` 0.10.1 and a direct `hmac` 0.12.1 pin were
+  exclusive to `tersa-blob-spike`; this ADR never approved them for production
+  code. PR3 removes the diagnostic package and bans `chacha20poly1305` from the
+  active workspace graph. Production HMAC ownership is the Keychain/HKDF path.
+- Historically, `rustix` 1.1.4 was also a direct `tersa-blob-spike` dependency
+  with only its standard-library and filesystem features. Active rustix
+  ownership is the production Keychain and SQLCipher store adapters.
 - Within one account, identical plaintext has the same content identifier and
   therefore reveals content equality. Canonical file length reveals bounded
   blob size.

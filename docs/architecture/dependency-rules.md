@@ -3,8 +3,8 @@
 tersa.app uses inward-facing dependency boundaries so the shared core remains
 independent of Apple frameworks, UI toolkits, storage engines, and transports.
 
-The workspace has four shared architectural layers plus eleven platform
-and feasibility adapters:
+The workspace has four shared architectural layers plus active platform
+adapters and the retained MIME diagnostic:
 
 | Crate | Responsibility | Allowed workspace dependencies |
 |---|---|---|
@@ -13,10 +13,7 @@ and feasibility adapters:
 | `tersa-platform` | Operating-system capability ports | `tersa-domain` |
 | `tersa-presentation` | UI-neutral view models | All three inward layers |
 | `tersa-apple-bridge` | C ABI and Apple capability adapters | `tersa-application`, `tersa-keychain-macos` on macOS, `tersa-presentation` |
-| `tersa-sqlcipher-spike` | Apple-only diagnostic encrypted-storage executable | None |
-| `tersa-search-spike` | Apple-only SQLCipher FTS5 and fixed-size-chunk Tantivy diagnostic | None |
 | `tersa-mime-spike` | Portable bounded MIME and deny-by-default HTML diagnostic | None |
-| `tersa-blob-spike` | Portable crash-safe chunked-AEAD blob diagnostic | None |
 | `tersa-gmail-rest-macos` | macOS Gmail read-only REST adapter | `tersa-application`, `tersa-domain` |
 | `tersa-store-sqlcipher-macos` | macOS account-scoped SQLCipher mailbox store | `tersa-application`, `tersa-domain` |
 | `tersa-keychain-macos` | macOS Data Protection Keychain root-key, fixed App Group profile, and trusted read-only store composition | `tersa-platform`, `tersa-application`, `tersa-presentation`, `tersa-store-sqlcipher-macos` |
@@ -36,21 +33,19 @@ product gate.
 Executable adapters may depend on these layers, but the layers must never
 depend on an executable, Apple API, or UI framework. Historical note: the
 retired M0 Slint and Dioxus diagnostic executables previously owned exclusive
-UI-runtime edges; those packages are removed. `tersa-sqlcipher-spike`,
-`tersa-search-spike`, and `tersa-store-sqlcipher-macos` are the only crates
-allowed to depend on `rusqlite` or `libsqlite3-sys`; Tantivy is exclusive to
-`tersa-search-spike`, pinned to 0.26.1, and may not reach `memmap2`,
-`tempfile`, `lz4_flex`, or `zstd` in any resolved Apple target graph.
-`mail-parser` 0.11.5 and `ammonia` 4.1.3 are pinned exactly and exclusive to
-`tersa-mime-spike`. The portable MIME and blob M0 spikes are exceptions to the
-Apple target gate: Linux CI exercises their deterministic tests, while the
-documented local Apple-target commands cross-build the same locked graphs.
-Product Apple CI does not cover those spike cross-builds.
-`chacha20poly1305` 0.10.1 is pinned exactly
-and exclusive to `tersa-blob-spike`; `hmac` 0.12.1 is pinned exactly and may be
-reached by `tersa-blob-spike`, `tersa-keychain-macos` through HKDF, and the
-macOS-only CLI through its Keychain composition chain. New workspace crates
-must be added explicitly to the policy in `xtask`; an unknown crate fails CI.
+UI-runtime edges; those packages are removed. The M0 SQLCipher, search/Tantivy,
+and blob diagnostic executables were likewise removed by ADR-0025 housekeeping
+(PR3); `tantivy` and `chacha20poly1305` are banned from the active workspace
+graph by `deny.toml`. The production store `tersa-store-sqlcipher-macos` is the
+direct SQLCipher owner; authorized composition crates may reach
+`rusqlite`/`libsqlite3-sys` only through the reviewed owner set enforced by
+`xtask`. `mail-parser` 0.11.5 and `ammonia` 4.1.3 remain pinned exactly and
+exclusive to the retained `tersa-mime-spike`. Linux CI exercises that portable
+MIME diagnostic's deterministic tests; product Apple CI does not cover spike
+cross-builds. `hmac` 0.12.1 is pinned exactly and may be reached by
+`tersa-keychain-macos` through HKDF and by the authorized macOS composition and
+CLI chains through Keychain. New workspace crates must be added explicitly to
+the policy in `xtask`; an unknown crate fails CI.
 
 ## macOS production account store
 
@@ -66,9 +61,9 @@ The adapter must pin `rusqlite` exactly to 0.39.0 under the exact target cfg
 0.39.0 with the exact unified feature set `bundled`, `bundled-sqlcipher`, and
 `modern_sqlite`; extension-loading and hook features fail closed. Version,
 feature, untargeted, iOS-only, and iOS-inclusive deviations are violations.
-Blob/attachment encryption is deliberately deferred:
-this adapter does not own `chacha20poly1305` or `hmac` until a real
-blob/attachment port and cross-file commit protocol are accepted.
+Blob/attachment encryption is deliberately deferred: this adapter does not own
+AEAD or HMAC until a real blob/attachment port and cross-file commit protocol
+are accepted. A future product blob format remains a separate decision.
 
 `tersa-gmail-rest-macos` is active and may depend inward only on
 `tersa-application` and `tersa-domain`. `reqwest` is pinned exactly to 0.13.4,
@@ -193,10 +188,9 @@ not request `process`. Rustix owns the safe descriptor-relative filesystem,
 locking, `statat`, and `unlinkat` operations; no direct `libc`, handwritten syscall
 binding, or unsafe POSIX FFI is authorized.
 
-Direct owners are exactly `tersa-blob-spike`, `tersa-keychain-macos`, and
-`tersa-store-sqlcipher-macos`. The blob declaration and its inherited
-`fs`/`std` request remain unchanged. Cargo may unify `process` into the resolved
-macOS package without making blob or store a direct requester, so manifest and
+Direct owners are exactly `tersa-keychain-macos` and
+`tersa-store-sqlcipher-macos`. Cargo may unify `process` into the resolved
+macOS package without making the store a direct requester, so manifest and
 resolved-feature checks remain separate. CLI and bridge may reach protected
 rustix only through their exact macOS edge to Keychain and then either
 Keychain's direct edge or Keychain-to-store-to-rustix. Direct CLI/bridge
@@ -207,14 +201,17 @@ rule.
 The active policy updates both closed direct sets and enforces exact
 declarations, versions, canonical targets, default-feature states,
 member-requested features, allowed resolved paths, and target graphs in `xtask`.
-Fixtures accept the three owners and both CLI/bridge transitive paths and reject
-direct `process` on blob/store, wrong owners, direct CLI/bridge dependencies,
+Fixtures accept the two owners and both CLI/bridge transitive paths and reject
+direct `process` on store, wrong owners, direct CLI/bridge dependencies,
 alternate parents, broadened targets, iOS, and non-macOS graphs.
 
-The active direct `hmac =0.12.1` owner set is exactly `tersa-blob-spike` and
-`tersa-keychain-macos`; the macOS-only CLI and Apple bridge may reach it only
-through their exact active Keychain composition chains. ChaCha20-Poly1305 remains
-exclusive to `tersa-blob-spike`, including when a crate also reaches HMAC.
+The active HMAC reachability owner set is `tersa-keychain-macos` plus the
+authorized macOS composition chain (`tersa-oauth-sync-macos`,
+`tersa-mailbox-sync-ffi-macos`, and `tersa-token-broker-ffi-macos`); the
+macOS-only CLI and Apple bridge may reach it only through their exact active
+Keychain composition chains. Direct Keychain declaration of `hmac` remains
+forbidden; only resolved HKDF-to-HMAC reachability is allowed. ChaCha20-Poly1305
+is retired from the workspace and banned by cargo-deny.
 `tersa-keychain-macos` may not add a direct domain edge; the macOS-gated
 application and presentation read-composition edges are the reviewed ADR 0021
 exception (the read entries validate opaque bytes and project view models
@@ -295,8 +292,8 @@ through the exact workspace chain from bridge to Keychain adapter to
 bridge is not added to `HMAC_OWNERS` or `SQLCIPHER_OWNERS`, and no direct crypto,
 store, rusqlite, or libsqlite3-sys declaration is authorized.
 
-`blob_dependency_graph_violations` and its
-`check_blob_dependency_graph` caller, plus
+`hmac_dependency_graph_violations` and its
+`check_hmac_dependency_graph` caller, plus
 `sqlcipher_dependency_graph_violations` and its
 `check_sqlcipher_dependency_graph` caller, are the current resolved-graph
 enforcement points. They may be refactored only with semantic tests proving the

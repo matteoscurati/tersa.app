@@ -21,8 +21,8 @@ cargo xtask verify
 This command checks dependency boundaries, formatting, compilation, Clippy,
 tests, and documentation. CI additionally runs dependency licensing and
 advisory checks, feature-powerset checks, DCO validation, and spelling checks.
-The xtask architecture check enforces active product and retained-diagnostic
-dependency boundaries on every supported Apple target.
+The xtask architecture check enforces active product and retained MIME
+diagnostic dependency boundaries on every supported Apple target.
 
 While the frozen M0 gate register remains tracked, keep the product-gate
 validator and its self-test available:
@@ -190,76 +190,22 @@ wrong-group probes in an Apple Development build, then the Developer ID signed
 and notarized release candidate — is a separate evidence step tracked by
 ADR 0024 Items 5 and 6.
 
-## SQLCipher feasibility
+## Retired SQLCipher, search, and blob diagnostics
 
-The M0 encrypted-storage diagnostic is isolated from the shared application
-layers. It uses synthetic data to verify CommonCrypto-backed SQLCipher, WAL
-crash recovery, key rejection, integrity checks, in-memory temporary storage,
-and known-marker absence in controlled files.
+Historical note: the M0 SQLCipher, encrypted-search/Tantivy, and crash-safe
+blob diagnostics (executables, verifiers, about configs, and diagnostic notice
+outputs) were removed by ADR-0025 housekeeping (PR3). Their detailed studies
+remain as non-executable historical records until PR5 consolidation:
 
-```sh
-rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-sh apple/scripts/verify-sqlcipher-feasibility.sh
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
-  --package tersa-sqlcipher-spike --target aarch64-apple-ios
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
-  --package tersa-sqlcipher-spike --target aarch64-apple-ios-sim
-```
+- [SQLCipher feasibility](m0/sqlcipher-feasibility.md)
+- [Encrypted search feasibility](m0/search-feasibility.md)
+- [Crash-safe blob feasibility](m0/blob-feasibility.md)
+- [ADR 0011](architecture/adr-0011-sqlcipher-schema-and-migration-ownership.md)
+  and [ADR 0012](architecture/adr-0012-chunked-blob-format.md) (historical)
 
-The committed result contains no key, sentinel, SQL, path, or raw database.
-Read [the SQLCipher feasibility record](m0/sqlcipher-feasibility.md) before
-changing the dependency, keying boundary, temporary-store policy, or evidence
-claims.
-
-## Crash-safe blob feasibility
-
-The portable M0 blob diagnostic proves a bounded candidate XChaCha20-Poly1305
-chunk format, authenticated random access, per-account HMAC content identifiers,
-exact-size validation, atomic same-directory no-replace hard-link publication,
-descriptor-bound no-follow collision validation, narrow staging cleanup, and
-deterministic process-crash publication using only synthetic data.
-
-```sh
-rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-cargo test --locked --package tersa-blob-spike
-sh apple/scripts/verify-blob-feasibility.sh
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
-  --package tersa-blob-spike --target aarch64-apple-ios
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked --release \
-  --package tersa-blob-spike --target aarch64-apple-ios-sim
-```
-
-The verifier builds and runs the macOS arm64 release executable and accepts
-only its exact three-line aggregate result. The iOS device and simulator builds
-are compile evidence only. Read [the blob feasibility record](m0/blob-feasibility.md)
-and [ADR 0012](architecture/adr-0012-chunked-blob-format.md) before changing the
-format, publication protocol, cryptographic dependencies, or evidence claims.
-
-## Encrypted search feasibility
-
-The M0 search diagnostic is Apple-only and remains explicitly non-production.
-It compares exact message-ID match sets from SQLCipher FTS5 and Tantivy 0.26.1;
-it does not claim ranking-order parity. Tantivy uses a custom fixed-size-chunk
-SQLCipher `Directory`, not memory mapping or temporary index files.
-
-```sh
-rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-sh apple/scripts/verify-search-feasibility.sh
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
-  --release --package tersa-search-spike --target aarch64-apple-ios
-IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo build --locked \
-  --release --package tersa-search-spike --target aarch64-apple-ios-sim
-cargo run --locked --release --package tersa-search-spike \
-  --target aarch64-apple-darwin -- --profile manual
-```
-
-The default host profile uses 10,000 synthetic messages and at least 128 MiB of
-normalized text. The optional manual host profile uses 100,000 messages and at
-least 2 GiB of normalized text; it can consume substantial time and disk. Every
-host result is labeled `NOT A DEVICE-GATE RESULT`. The iOS commands prove only
-that the locked Rust 1.91.1 graph builds; they do not prove runtime behavior or
-production performance. Only the physical-device M0 run can close the iPhone
-gate.
+Active product SQLCipher remains the production store adapter. Product mailbox
+search remains the bounded application/store search path. No production blob
+implementation or Tantivy replacement is claimed by this retirement.
 
 ## MIME and hostile HTML feasibility
 
@@ -342,7 +288,7 @@ were removed by ADR-0025 housekeeping (PR2); full M0 study consolidation is
 deferred to PR5.
 
 Install the Rust targets once, generate the Xcode project, and build unsigned
-product and retained-diagnostic artifacts:
+product and retained MIME diagnostic artifacts:
 
 The checked wrapper is the only supported XcodeGen entry point. It passes
 `--no-env`, so signing placeholders such as `${TeamIdentifierPrefix}` remain
@@ -399,7 +345,7 @@ The base macOS target declares both sandbox network client and server
 entitlements: future Google token/API traffic needs outbound networking, while
 the desktop OAuth redirect requires the narrowly bound loopback listener.
 Regenerate or verify the complete Rust and native dependency license
-inventories for active product and retained diagnostic targets with:
+inventories for active product and retained MIME diagnostic targets with:
 
 ```sh
 sh apple/scripts/generate-third-party-notices.sh --write

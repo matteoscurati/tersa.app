@@ -30,9 +30,7 @@ struct ResolvedDependencyIdentity {
     package_id: PackageId,
 }
 
-const SQLCIPHER_OWNERS: [&str; 8] = [
-    "tersa-search-spike",
-    "tersa-sqlcipher-spike",
+const SQLCIPHER_OWNERS: [&str; 6] = [
     "tersa-store-sqlcipher-macos",
     "tersa-keychain-macos",
     "tersa-cli-macos",
@@ -45,9 +43,7 @@ const SQLCIPHER_OWNERS: [&str; 8] = [
     // store graph) only through the broker-only token store composition.
     "tersa-token-broker-ffi-macos",
 ];
-const BLOB_DIAGNOSTIC_OWNERS: [&str; 1] = ["tersa-blob-spike"];
-const HMAC_OWNERS: [&str; 5] = [
-    "tersa-blob-spike",
+const HMAC_OWNERS: [&str; 4] = [
     "tersa-keychain-macos",
     // 3d: reaches HMAC transitively through the Keychain HKDF key derivation.
     "tersa-oauth-sync-macos",
@@ -65,8 +61,8 @@ const REQWEST_DIRECT_FEATURES: [&str; 1] = ["native-tls"];
 const REQWEST_RESOLVED_FEATURES: [&str; 4] =
     ["__native-tls", "__native-tls-alpn", "__tls", "native-tls"];
 const RUSQLITE_RESOLVED_FEATURES: [&str; 3] = ["bundled", "bundled-sqlcipher", "modern_sqlite"];
-// The active product plus retained storage/blob diagnostics resolve only this
-// narrow rustix surface after the Slint/Dioxus runtime graph was retired.
+// The active product graph resolves only this narrow rustix surface after the
+// Slint/Dioxus and storage/search/blob diagnostic graphs were retired.
 const RUSTIX_RESOLVED_FEATURES: [&str; 5] = ["alloc", "default", "fs", "process", "std"];
 
 fn main() -> ExitCode {
@@ -246,9 +242,8 @@ fn check_architecture() -> TaskResult {
 
         for dependency in &package.dependencies {
             check_sqlcipher_dependency(&package_name, dependency, &mut violations);
-            check_search_dependency(&package_name, dependency, &mut violations);
             check_mime_dependency(&package_name, dependency, &mut violations);
-            check_blob_dependency(&package_name, dependency, &mut violations);
+            check_hmac_dependency(&package_name, dependency, &mut violations);
             check_gmail_dependency(&package_name, dependency, &mut violations);
             check_keychain_dependency(&package_name, dependency, &mut violations);
             violations.extend(protected_keychain_dependency_rename_violations(
@@ -302,9 +297,6 @@ fn protected_package_shape_violations(package: &Package, metadata: &Metadata) ->
     let package_name = package.name.as_str();
     let direct_dependencies = shipped_direct_dependency_names(&package.dependencies);
     let mut violations = Vec::new();
-    if package_name == "tersa-blob-spike" && !direct_dependencies.contains("rustix") {
-        violations.push("tersa-blob-spike must depend directly on exact-pinned rustix".to_owned());
-    }
     if package_name == "tersa-keychain-macos" {
         violations.extend(keychain_direct_dependency_set_violations(
             &direct_dependencies,
@@ -8484,15 +8476,76 @@ fn check_resolved_architecture(violations: &mut Vec<String>) -> TaskResult {
             .other_options(target_metadata_options(target))
             .exec()?;
         check_sqlcipher_dependency_graph(&dependency_graph, target, violations);
-        check_search_dependency_graph(&dependency_graph, target, violations);
         check_mime_dependency_graph(&dependency_graph, target, violations);
-        check_blob_dependency_graph(&dependency_graph, target, violations);
+        check_hmac_dependency_graph(&dependency_graph, target, violations);
         check_gmail_dependency_graph(&dependency_graph, target, violations);
         check_retrieval_crates_off_tokio_graph(&dependency_graph, target, violations);
         check_keychain_dependency_graph(&dependency_graph, target, violations);
         check_rustix_dependency_graph(&dependency_graph, target, violations);
     }
     Ok(())
+}
+
+/// Filter platforms where macOS-scoped product crypto/storage packages must
+/// resolve with their reviewed exact shape. On non-macOS platforms those
+/// packages must be absent from the resolved graph.
+fn is_macos_architecture_target(target: &str) -> bool {
+    target == "aarch64-apple-darwin"
+}
+
+/// Presence policy for packages that ship only on macOS product paths
+/// (`rusqlite`, `libsqlite3-sys`, `rustix`). Absence on macOS is a hard miss;
+/// presence on any non-macOS filter platform fails closed.
+fn macos_only_resolved_package_presence_violations(
+    package_name: &str,
+    is_present: bool,
+    target: &str,
+) -> Vec<String> {
+    match (is_macos_architecture_target(target), is_present) {
+        (true, false) => vec![format!(
+            "resolved dependency graph is missing {package_name}"
+        )],
+        (false, true) => vec![format!(
+            "resolved {package_name} must not appear for non-macOS target {target}"
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// Target-aware rustix resolved-graph policy: exact package and reviewed feature
+/// set on macOS; required absence on non-macOS filter platforms.
+fn rustix_resolved_presence_and_shape_violations(
+    package_count: usize,
+    version: Option<&str>,
+    features: Option<&[String]>,
+    target: &str,
+) -> Vec<String> {
+    if !is_macos_architecture_target(target) {
+        return if package_count == 0 {
+            Vec::new()
+        } else {
+            vec![format!(
+                "resolved rustix must not appear for non-macOS target {target}"
+            )]
+        };
+    }
+    if package_count != 1 || version != Some("1.1.4") {
+        return vec![format!(
+            "resolved rustix for {target} must be exactly one package at 1.1.4"
+        )];
+    }
+    let Some(features) = features else {
+        return vec![format!("resolved rustix node is missing for {target}")];
+    };
+    let actual: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = RUSTIX_RESOLVED_FEATURES.into_iter().collect();
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "resolved rustix features for {target} changed from the reviewed lock graph"
+        )]
+    }
 }
 
 fn check_rustix_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -8505,31 +8558,25 @@ fn check_rustix_dependency_graph(metadata: &Metadata, target: &str, violations: 
         .iter()
         .filter(|package| package.name == "rustix")
         .collect::<Vec<_>>();
-    if rustix.len() != 1 || rustix[0].version.to_string() != "1.1.4" {
-        violations.push(format!(
-            "resolved rustix for {target} must be exactly one package at 1.1.4"
-        ));
-        return;
-    }
-    let id = &rustix[0].id;
-    let Some(node) = resolve.nodes.iter().find(|node| node.id == *id) else {
-        violations.push(format!("resolved rustix node is missing for {target}"));
-        return;
-    };
-    let actual = node
-        .features
-        .iter()
-        .map(ToString::to_string)
-        .collect::<BTreeSet<_>>();
-    let expected = RUSTIX_RESOLVED_FEATURES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    if actual != expected {
-        violations.push(format!(
-            "resolved rustix features for {target} changed from the reviewed lock graph"
-        ));
-    }
+    let version = rustix.first().map(|package| package.version.to_string());
+    let features = rustix.first().and_then(|package| {
+        resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == package.id)
+            .map(|node| {
+                node.features
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+    });
+    violations.extend(rustix_resolved_presence_and_shape_violations(
+        rustix.len(),
+        version.as_deref(),
+        features.as_deref(),
+        target,
+    ));
 }
 
 fn check_gmail_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
@@ -8844,11 +8891,7 @@ fn rustix_manifest_dependency_violations(
     target: Option<&str>,
     features: &[String],
 ) -> Vec<String> {
-    const OWNERS: [&str; 3] = [
-        "tersa-blob-spike",
-        "tersa-keychain-macos",
-        "tersa-store-sqlcipher-macos",
-    ];
+    const OWNERS: [&str; 2] = ["tersa-keychain-macos", "tersa-store-sqlcipher-macos"];
     let mut violations = Vec::new();
     if !OWNERS.contains(&package_name) {
         return vec![format!(
@@ -8863,14 +8906,7 @@ fn rustix_manifest_dependency_violations(
             "{package_name} -> rustix must disable default features"
         ));
     }
-    if package_name == "tersa-blob-spike" {
-        if target.is_some() {
-            violations.push(
-                "tersa-blob-spike -> rustix must keep its existing untargeted declaration"
-                    .to_owned(),
-            );
-        }
-    } else if target != Some(MACOS_STORE_TARGET) {
+    if target != Some(MACOS_STORE_TARGET) {
         violations.push(format!(
             "{package_name} -> rustix must use target `{MACOS_STORE_TARGET}`"
         ));
@@ -9150,7 +9186,7 @@ fn check_mime_dependency_graph(metadata: &Metadata, target: &str, violations: &m
     }
 }
 
-fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
+fn check_hmac_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
     let Some(resolve) = &metadata.resolve else {
         violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
         return;
@@ -9173,7 +9209,7 @@ fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &m
             )
         })
         .collect();
-    violations.extend(blob_dependency_graph_violations(
+    violations.extend(hmac_dependency_graph_violations(
         &package_names,
         &metadata
             .workspace_members
@@ -9185,7 +9221,7 @@ fn check_blob_dependency_graph(metadata: &Metadata, target: &str, violations: &m
     ));
 }
 
-fn blob_dependency_graph_violations(
+fn hmac_dependency_graph_violations(
     package_names: &BTreeMap<String, String>,
     workspace_members: &[String],
     dependencies: &BTreeMap<String, BTreeSet<String>>,
@@ -9193,7 +9229,6 @@ fn blob_dependency_graph_violations(
 ) -> Vec<String> {
     let mut violations = Vec::new();
     let hmac_packages = package_ids_named(package_names, "hmac");
-    let chacha_packages = package_ids_named(package_names, "chacha20poly1305");
     for member_id in workspace_members {
         let Some(member_name) = package_names.get(member_id) else {
             violations.push(format!(
@@ -9223,14 +9258,6 @@ fn blob_dependency_graph_violations(
                 "{member_name} reaches HMAC outside the approved owners for {target}"
             ));
         }
-        if !BLOB_DIAGNOSTIC_OWNERS.contains(&member_name.as_str())
-            && dependency_reaches(member_id, &chacha_packages, dependencies)
-        {
-            violations.push(format!(
-                "{member_name} reaches ChaCha20-Poly1305 outside {} for {target}",
-                BLOB_DIAGNOSTIC_OWNERS[0],
-            ));
-        }
     }
     violations
 }
@@ -9243,72 +9270,6 @@ fn package_ids_named(
         .iter()
         .filter_map(|(id, name)| (name == expected_name).then_some(id.clone()))
         .collect()
-}
-
-fn check_search_dependency_graph(metadata: &Metadata, target: &str, violations: &mut Vec<String>) {
-    const SEARCH_SPIKE: &str = "tersa-search-spike";
-    const FORBIDDEN: [&str; 4] = ["memmap2", "tempfile", "lz4_flex", "zstd"];
-    let Some(resolve) = &metadata.resolve else {
-        violations.push("Cargo metadata did not return a resolved dependency graph".to_owned());
-        return;
-    };
-    let package_names: BTreeMap<String, String> = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.to_string(), package.name.to_string()))
-        .collect();
-    let dependencies: BTreeMap<String, BTreeSet<String>> = resolve
-        .nodes
-        .iter()
-        .map(|node| {
-            (
-                node.id.to_string(),
-                node.deps
-                    .iter()
-                    .map(|dependency| dependency.pkg.to_string())
-                    .collect(),
-            )
-        })
-        .collect();
-    let tantivy: BTreeSet<String> = package_names
-        .iter()
-        .filter_map(|(id, name)| (name == "tantivy").then_some(id.clone()))
-        .collect();
-    for member in &metadata.workspace_members {
-        let member_id = member.to_string();
-        if package_names
-            .get(&member_id)
-            .is_some_and(|name| name != SEARCH_SPIKE)
-            && dependency_reaches(&member_id, &tantivy, &dependencies)
-        {
-            violations.push(format!(
-                "{} reaches tantivy outside {SEARCH_SPIKE}",
-                package_names[&member_id]
-            ));
-        }
-    }
-    let search_id = metadata
-        .workspace_members
-        .iter()
-        .map(ToString::to_string)
-        .find(|id| {
-            package_names
-                .get(id)
-                .is_some_and(|name| name == SEARCH_SPIKE)
-        });
-    if let Some(search_id) = search_id {
-        for forbidden in FORBIDDEN {
-            let targets: BTreeSet<String> = package_names
-                .iter()
-                .filter_map(|(id, name)| (name == forbidden).then_some(id.clone()))
-                .collect();
-            if dependency_reaches(&search_id, &targets, &dependencies) {
-                violations.push(format!(
-                    "{SEARCH_SPIKE} reaches forbidden package {forbidden} for {target}"
-                ));
-            }
-        }
-    }
 }
 
 fn check_sqlcipher_dependency_graph(
@@ -9345,33 +9306,46 @@ fn check_sqlcipher_dependency_graph(
             if package.name != "rusqlite" {
                 return None;
             }
-            if package.version.to_string() != "0.39.0" {
+            // Version exactness is a macOS product-graph requirement. On
+            // non-macOS platforms any resolved rusqlite is already forbidden.
+            if is_macos_architecture_target(target) && package.version.to_string() != "0.39.0" {
                 violations.push("resolved rusqlite must be exactly 0.39.0".to_owned());
             }
             Some(package.id.to_string())
         })
         .collect();
-    if rusqlite_packages.is_empty() {
-        violations.push("resolved dependency graph is missing rusqlite".to_owned());
-    }
-    for node in &resolve.nodes {
-        if rusqlite_packages.contains(&node.id.to_string()) {
-            violations.extend(rusqlite_resolved_feature_violations(
-                &node
-                    .features
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
-                target,
-            ));
+    violations.extend(macos_only_resolved_package_presence_violations(
+        "rusqlite",
+        !rusqlite_packages.is_empty(),
+        target,
+    ));
+    // Feature exactness applies only when rusqlite is required and present on macOS.
+    if is_macos_architecture_target(target) {
+        for node in &resolve.nodes {
+            if rusqlite_packages.contains(&node.id.to_string()) {
+                violations.extend(rusqlite_resolved_feature_violations(
+                    &node
+                        .features
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    target,
+                ));
+            }
         }
     }
     let sqlite_packages: BTreeSet<String> = package_names
         .iter()
         .filter_map(|(id, name)| (name == "libsqlite3-sys").then_some(id.clone()))
         .collect();
+    violations.extend(macos_only_resolved_package_presence_violations(
+        "libsqlite3-sys",
+        !sqlite_packages.is_empty(),
+        target,
+    ));
+    // Absence on non-macOS is the clean state; absence on macOS already reported.
+    // Presence on either target still runs reachability so owner leaks fail closed.
     if sqlite_packages.is_empty() {
-        violations.push("resolved dependency graph is missing libsqlite3-sys".to_owned());
         return;
     }
 
@@ -9437,11 +9411,10 @@ fn sqlcipher_dependency_graph_violations(
                 violations.push(format!(
                     "{member_name} reaches libsqlite3-sys outside the approved Apple SQLCipher owners for {target}"
                 ));
-            } else if matches!(
-                member_name.as_str(),
-                "tersa-store-sqlcipher-macos" | "tersa-keychain-macos" | "tersa-cli-macos"
-            ) && target != "aarch64-apple-darwin"
-            {
+            } else if !is_macos_architecture_target(target) {
+                // Every approved macOS SQLCipher owner (store, Keychain, CLI,
+                // oauth-sync composition, mailbox-sync FFI, token-broker FFI)
+                // must stay unreachable on non-macOS filter platforms.
                 violations.push(format!(
                     "{member_name} reaches libsqlite3-sys on non-macOS target {target}"
                 ));
@@ -9605,37 +9578,6 @@ fn sqlcipher_manifest_dependency_violations(
     violations
 }
 
-fn check_search_dependency(
-    package_name: &str,
-    dependency: &cargo_metadata::Dependency,
-    violations: &mut Vec<String>,
-) {
-    const SEARCH_SPIKE: &str = "tersa-search-spike";
-    const APPLE_TARGET: &str = r#"cfg(any(target_os = "macos", target_os = "ios"))"#;
-    if dependency.name != "tantivy" {
-        return;
-    }
-    if package_name != SEARCH_SPIKE {
-        violations.push(format!(
-            "{package_name} -> tantivy (Tantivy is exclusive to {SEARCH_SPIKE})"
-        ));
-    }
-    if dependency
-        .target
-        .as_ref()
-        .map(ToString::to_string)
-        .as_deref()
-        != Some(APPLE_TARGET)
-    {
-        violations.push(format!(
-            "{package_name} -> tantivy must use target `{APPLE_TARGET}`"
-        ));
-    }
-    if dependency.req.to_string() != "=0.26.1" {
-        violations.push(format!("{package_name} -> tantivy must pin exactly 0.26.1"));
-    }
-}
-
 fn check_mime_dependency(
     package_name: &str,
     dependency: &cargo_metadata::Dependency,
@@ -9665,57 +9607,34 @@ fn check_mime_dependency(
     }
 }
 
-fn check_blob_dependency(
+fn check_hmac_dependency(
     package_name: &str,
     dependency: &cargo_metadata::Dependency,
     violations: &mut Vec<String>,
 ) {
-    violations.extend(blob_manifest_dependency_violations(
+    violations.extend(hmac_manifest_dependency_violations(
         package_name,
         dependency.name.as_str(),
         &dependency.req.to_string(),
     ));
 }
 
-fn blob_manifest_dependency_violations(
+fn hmac_manifest_dependency_violations(
     package_name: &str,
     dependency_name: &str,
     version: &str,
 ) -> Vec<String> {
-    const BLOB_SPIKE: &str = BLOB_DIAGNOSTIC_OWNERS[0];
-    if dependency_name == "rustix" {
-        return (package_name == BLOB_SPIKE && version != "=1.1.4")
-            .then(|| format!("{package_name} -> rustix must pin exactly 1.1.4"))
-            .into_iter()
-            .collect();
-    }
-    let expected = match dependency_name {
-        "chacha20poly1305" => Some("=0.10.1"),
-        "hmac" => Some("=0.12.1"),
-        _ => None,
-    };
-    let Some(expected) = expected else {
+    if dependency_name != "hmac" {
         return Vec::new();
-    };
-    let mut violations = Vec::new();
-    let permitted = if dependency_name == "hmac" {
-        HMAC_OWNERS.contains(&package_name)
-    } else {
-        package_name == BLOB_SPIKE
-    };
-    if !permitted {
-        let message = if dependency_name == "hmac" {
-            "cryptography ownership is restricted".to_owned()
-        } else {
-            format!("blob cryptography is exclusive to {BLOB_SPIKE}")
-        };
-        violations.push(format!("{package_name} -> {dependency_name} ({message})"));
     }
-    if version != expected {
+    let mut violations = Vec::new();
+    if !HMAC_OWNERS.contains(&package_name) {
         violations.push(format!(
-            "{package_name} -> {dependency_name} must pin exactly {}",
-            expected.trim_start_matches('=')
+            "{package_name} -> hmac (cryptography ownership is restricted)"
         ));
+    }
+    if version != "=0.12.1" {
+        violations.push(format!("{package_name} -> hmac must pin exactly 0.12.1"));
     }
     violations
 }
@@ -9847,10 +9766,7 @@ fn future_macos_store_dependency_violation(
         )
     );
     let store_crypto = package_name == "tersa-store-sqlcipher-macos"
-        && matches!(
-            dependency_name,
-            "rusqlite" | "libsqlite3-sys" | "chacha20poly1305" | "hmac"
-        );
+        && matches!(dependency_name, "rusqlite" | "libsqlite3-sys" | "hmac");
     if !protected_edge && !store_crypto {
         return None;
     }
@@ -9873,7 +9789,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "tersa-presentation",
             ]),
         ),
-        ("tersa-blob-spike", BTreeSet::new()),
         (
             "tersa-keychain-macos",
             BTreeSet::from([
@@ -9888,7 +9803,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             BTreeSet::from(["tersa-application", "tersa-domain", "tersa-keychain-macos"]),
         ),
         ("tersa-mime-spike", BTreeSet::new()),
-        ("tersa-sqlcipher-spike", BTreeSet::new()),
         (
             "tersa-store-sqlcipher-macos",
             BTreeSet::from(["tersa-application", "tersa-domain"]),
@@ -9921,7 +9835,6 @@ fn dependency_policy() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "tersa-oauth-sync-macos",
             ]),
         ),
-        ("tersa-search-spike", BTreeSet::new()),
         ("tersa-domain", BTreeSet::new()),
         ("tersa-application", BTreeSet::from(["tersa-domain"])),
         (
@@ -10044,16 +9957,18 @@ mod tests {
         REVIEWED_TOKEN_BROKER_SESSION_RESOURCE_BAG_DEINIT_PATH,
         REVIEWED_TOKEN_BROKER_WIRE_STATUSES, ResolvedDependencyIdentity,
         TOKEN_BROKER_ALLOWED_SOURCE_PATHS, TOKEN_BROKER_FFI_C_ABI_COUNT_MESSAGE,
-        apple_bridge_direct_dependency_set_violations, blob_dependency_graph_violations,
-        blob_manifest_dependency_violations, bridge_bootstrap_source_violations,
+        apple_bridge_direct_dependency_set_violations, bridge_bootstrap_source_violations,
         bridge_package_source_surface_violations, canonical_cli_source_anchor_violations,
         cli_direct_dependency_set_violations, cli_keychain_source_violations,
         collect_entitlement_paths, dependency_policy, expected_apple_c_abi_exports,
         expected_mailbox_sync_ffi_c_abi_exports, expected_token_broker_ffi_c_abi_exports,
         future_macos_store_dependency_violation, gmail_dependency_graph_violations,
         gmail_manifest_dependency_violations, gmail_resolved_feature_violations,
-        keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        macos_client_xpc_wiring_violations, mailbox_sync_ffi_direct_dependency_set_violations,
+        hmac_dependency_graph_violations, hmac_manifest_dependency_violations,
+        is_macos_architecture_target, keychain_direct_dependency_set_violations,
+        keychain_mutation_boundary_violations, macos_client_xpc_wiring_violations,
+        macos_only_resolved_package_presence_violations,
+        mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
@@ -10061,14 +9976,15 @@ mod tests {
         resolved_workspace_dependency_names, retrieval_tokio_denial_violations,
         rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
         rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
-        shipped_direct_dependency_names, signing_configuration_violations,
-        source_token_broker_entitlement_violations, sqlcipher_dependency_graph_violations,
-        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
-        strip_swift_non_code, swift_bootstrap_inventory_violations,
-        swift_bootstrap_source_inventory, swift_bootstrap_source_violations,
-        swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
-        swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
-        target_metadata_options, token_broker_bridge_header_c_abi_violations,
+        rustix_resolved_presence_and_shape_violations, shipped_direct_dependency_names,
+        signing_configuration_violations, source_token_broker_entitlement_violations,
+        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
+        strip_rust_non_code, strip_rust_test_modules, strip_swift_non_code,
+        swift_bootstrap_inventory_violations, swift_bootstrap_source_inventory,
+        swift_bootstrap_source_violations, swift_bridge_call_inventory,
+        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
+        swift_source_lexical_violations, target_metadata_options,
+        token_broker_bridge_header_c_abi_violations,
         token_broker_code_signing_requirement_violations,
         token_broker_ffi_source_surface_violations, token_broker_probe_entrypoint_is_canonical,
         token_broker_protocol_mirror_violations, token_broker_source_surface_violations,
@@ -10368,16 +10284,6 @@ targets:
     fn rustix_direct_ownership_features_and_targets_are_exact() {
         assert!(
             rustix_manifest_dependency_violations(
-                "tersa-blob-spike",
-                "=1.1.4",
-                false,
-                None,
-                &["fs".to_owned(), "std".to_owned()],
-            )
-            .is_empty()
-        );
-        assert!(
-            rustix_manifest_dependency_violations(
                 "tersa-keychain-macos",
                 "=1.1.4",
                 false,
@@ -10416,6 +10322,16 @@ targets:
                 &["fs".to_owned(), "std".to_owned()],
             ),
             vec!["tersa-apple-bridge -> rustix is outside the closed direct-owner set"]
+        );
+        assert_eq!(
+            rustix_manifest_dependency_violations(
+                "tersa-application",
+                "=1.1.4",
+                false,
+                None,
+                &["fs".to_owned(), "std".to_owned()],
+            ),
+            vec!["tersa-application -> rustix is outside the closed direct-owner set"]
         );
     }
 
@@ -17040,7 +16956,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             BTreeSet::from([
                 "tersa-application".to_owned(),
                 "tersa-platform".to_owned(),
-                "tersa-search-spike".to_owned(),
+                "tersa-mime-spike".to_owned(),
             ]),
         )]);
 
@@ -17128,7 +17044,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
 
     #[test]
     fn permits_store_crypto_dependencies_only_under_the_exact_macos_cfg() {
-        for dependency_name in ["rusqlite", "libsqlite3-sys", "chacha20poly1305", "hmac"] {
+        for dependency_name in ["rusqlite", "libsqlite3-sys", "hmac"] {
             let violation = future_macos_store_dependency_violation(
                 "tersa-store-sqlcipher-macos",
                 dependency_name,
@@ -17211,7 +17127,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
     }
 
     #[test]
-    fn rejects_unauthorized_sqlcipher_and_aead_manifest_dependencies() {
+    fn rejects_unauthorized_sqlcipher_and_hmac_manifest_dependencies() {
         assert_eq!(
             sqlcipher_manifest_dependency_violations(
                 "tersa-application",
@@ -17227,10 +17143,8 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ]
         );
         assert_eq!(
-            blob_manifest_dependency_violations("tersa-application", "chacha20poly1305", "=0.10.1",),
-            vec![
-                "tersa-application -> chacha20poly1305 (blob cryptography is exclusive to tersa-blob-spike)"
-            ]
+            hmac_manifest_dependency_violations("tersa-application", "hmac", "=0.12.1"),
+            vec!["tersa-application -> hmac (cryptography ownership is restricted)"]
         );
         for owner in ["tersa-keychain-macos", "tersa-cli-macos"] {
             assert_eq!(
@@ -17586,12 +17500,12 @@ final class BrokerSyncSecrets: @unchecked Sendable {
     }
 
     #[test]
-    fn rejects_unauthorized_transitive_sqlcipher_and_aead_graph_reachability() {
+    fn rejects_unauthorized_transitive_sqlcipher_and_hmac_graph_reachability() {
         let package_names = BTreeMap::from([
             ("application".to_owned(), "tersa-application".to_owned()),
             ("wrapper".to_owned(), "optional-crypto-wrapper".to_owned()),
             ("sqlite".to_owned(), "libsqlite3-sys".to_owned()),
-            ("aead".to_owned(), "chacha20poly1305".to_owned()),
+            ("hmac".to_owned(), "hmac".to_owned()),
         ]);
         let workspace_members = vec!["application".to_owned()];
         let dependencies = BTreeMap::from([
@@ -17601,7 +17515,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ),
             (
                 "wrapper".to_owned(),
-                BTreeSet::from(["sqlite".to_owned(), "aead".to_owned()]),
+                BTreeSet::from(["sqlite".to_owned(), "hmac".to_owned()]),
             ),
         ]);
         let sqlcipher_violations = sqlcipher_dependency_graph_violations(
@@ -17611,7 +17525,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             &BTreeSet::from(["sqlite".to_owned()]),
             "aarch64-apple-darwin",
         );
-        let blob_violations = blob_dependency_graph_violations(
+        let hmac_violations = hmac_dependency_graph_violations(
             &package_names,
             &workspace_members,
             &dependencies,
@@ -17625,9 +17539,9 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ]
         );
         assert_eq!(
-            blob_violations,
+            hmac_violations,
             vec![
-                "tersa-application reaches ChaCha20-Poly1305 outside tersa-blob-spike for aarch64-apple-darwin"
+                "tersa-application reaches HMAC outside the approved owners for aarch64-apple-darwin"
             ]
         );
     }
@@ -17655,7 +17569,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ("rusqlite".to_owned(), BTreeSet::from(["sqlite".to_owned()])),
         ]);
         assert!(
-            blob_dependency_graph_violations(
+            hmac_dependency_graph_violations(
                 &package_names,
                 &workspace_members,
                 &dependencies,
@@ -17680,7 +17594,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             BTreeSet::from(["hmac".to_owned(), "keychain".to_owned()]),
         );
         assert_eq!(
-            blob_dependency_graph_violations(
+            hmac_dependency_graph_violations(
                 &package_names,
                 &workspace_members,
                 &broadened,
@@ -17706,7 +17620,7 @@ final class BrokerSyncSecrets: @unchecked Sendable {
             ("hkdf".to_owned(), BTreeSet::from(["hmac".to_owned()])),
         ]);
         assert_eq!(
-            blob_dependency_graph_violations(
+            hmac_dependency_graph_violations(
                 &package_names,
                 &["bridge".to_owned()],
                 &dependencies,
@@ -17771,6 +17685,150 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 "tersa-store-sqlcipher-macos reaches libsqlite3-sys on non-macOS target aarch64-apple-ios",
             ]
         );
+    }
+
+    #[test]
+    fn macos_architecture_target_classification_is_exact() {
+        assert!(is_macos_architecture_target("aarch64-apple-darwin"));
+        assert!(!is_macos_architecture_target("aarch64-apple-ios"));
+        assert!(!is_macos_architecture_target("aarch64-apple-ios-sim"));
+    }
+
+    #[test]
+    fn macos_only_resolved_package_presence_is_target_aware() {
+        for package in ["rusqlite", "libsqlite3-sys", "rustix"] {
+            assert!(
+                macos_only_resolved_package_presence_violations(
+                    package,
+                    true,
+                    "aarch64-apple-darwin",
+                )
+                .is_empty(),
+                "{package} present on macOS must be clean"
+            );
+            assert_eq!(
+                macos_only_resolved_package_presence_violations(
+                    package,
+                    false,
+                    "aarch64-apple-darwin",
+                ),
+                vec![format!("resolved dependency graph is missing {package}")],
+                "{package} missing on macOS must fail closed"
+            );
+            for ios_target in ["aarch64-apple-ios", "aarch64-apple-ios-sim"] {
+                assert!(
+                    macos_only_resolved_package_presence_violations(package, false, ios_target)
+                        .is_empty(),
+                    "{package} absent on {ios_target} is the clean state"
+                );
+                assert_eq!(
+                    macos_only_resolved_package_presence_violations(package, true, ios_target),
+                    vec![format!(
+                        "resolved {package} must not appear for non-macOS target {ios_target}"
+                    )],
+                    "{package} present on {ios_target} must fail closed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rustix_resolved_graph_is_target_aware() {
+        let reviewed = [
+            "alloc".to_owned(),
+            "default".to_owned(),
+            "fs".to_owned(),
+            "process".to_owned(),
+            "std".to_owned(),
+        ];
+        assert!(
+            rustix_resolved_presence_and_shape_violations(
+                1,
+                Some("1.1.4"),
+                Some(&reviewed),
+                "aarch64-apple-darwin",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rustix_resolved_presence_and_shape_violations(0, None, None, "aarch64-apple-darwin",),
+            vec!["resolved rustix for aarch64-apple-darwin must be exactly one package at 1.1.4"]
+        );
+        assert_eq!(
+            rustix_resolved_presence_and_shape_violations(
+                1,
+                Some("1.1.4"),
+                None,
+                "aarch64-apple-darwin",
+            ),
+            vec!["resolved rustix node is missing for aarch64-apple-darwin"]
+        );
+        assert_eq!(
+            rustix_resolved_presence_and_shape_violations(
+                1,
+                Some("1.1.4"),
+                Some(&["alloc".to_owned(), "std".to_owned()]),
+                "aarch64-apple-darwin",
+            ),
+            vec![
+                "resolved rustix features for aarch64-apple-darwin changed from the reviewed lock graph"
+            ]
+        );
+        for ios_target in ["aarch64-apple-ios", "aarch64-apple-ios-sim"] {
+            assert!(
+                rustix_resolved_presence_and_shape_violations(0, None, None, ios_target).is_empty(),
+                "rustix absence on {ios_target} is the clean state"
+            );
+            assert_eq!(
+                rustix_resolved_presence_and_shape_violations(
+                    1,
+                    Some("1.1.4"),
+                    Some(&reviewed),
+                    ios_target,
+                ),
+                vec![format!(
+                    "resolved rustix must not appear for non-macOS target {ios_target}"
+                )],
+                "rustix presence on {ios_target} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_every_sqlcipher_owner_reachability_on_ios() {
+        // Every approved macOS SQLCipher owner — store, Keychain, CLI, oauth-sync
+        // composition, mailbox-sync FFI, and token-broker FFI — must fail closed if
+        // it reaches libsqlite3-sys on a non-macOS filter platform.
+        for owner in [
+            "tersa-store-sqlcipher-macos",
+            "tersa-keychain-macos",
+            "tersa-cli-macos",
+            "tersa-oauth-sync-macos",
+            "tersa-mailbox-sync-ffi-macos",
+            "tersa-token-broker-ffi-macos",
+        ] {
+            let package_names = BTreeMap::from([
+                ("owner".to_owned(), owner.to_owned()),
+                ("sqlite".to_owned(), "libsqlite3-sys".to_owned()),
+            ]);
+            let dependencies =
+                BTreeMap::from([("owner".to_owned(), BTreeSet::from(["sqlite".to_owned()]))]);
+            for ios_target in ["aarch64-apple-ios", "aarch64-apple-ios-sim"] {
+                assert_eq!(
+                    sqlcipher_dependency_graph_violations(
+                        &package_names,
+                        &["owner".to_owned()],
+                        &dependencies,
+                        &BTreeSet::from(["sqlite".to_owned()]),
+                        ios_target,
+                    ),
+                    vec![format!(
+                        "{owner} reaches libsqlite3-sys on non-macOS target {ios_target}"
+                    )],
+                    "{owner} on {ios_target}"
+                );
+            }
+        }
     }
 }
 
