@@ -620,8 +620,8 @@ class ChangeScopeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         jobs = dict(self._workflow_job_blocks(workflow))
         apple = jobs["apple_product"]
-        # Parallel step: stream long TersaMac test live; background only independent
-        # iOS build. Distinct DerivedData + deterministic dual-status propagation.
+        # Parallel step: macOS-first launch, live TersaMac stream, isolated iOS
+        # build. Distinct DerivedData + deterministic dual-status propagation.
         self.assertIn("Test macOS and build iOS simulator in parallel", apple)
         self.assertIn(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac",
@@ -638,27 +638,45 @@ class ChangeScopeTests(unittest.TestCase):
         self.assertIn("CODE_SIGNING_ALLOWED=NO", apple)
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* test")
         self.assertRegex(apple, r"TERSA_OAUTH_REDIRECT_SCHEME=.* build")
-        # Topology: iOS is the sole background PID; macOS streams in the foreground.
+        # Topology: macOS launches first (claims shared Rust resources), then iOS.
+        # Both are background PIDs with unconditional waits and dual failure exit.
+        self.assertIn("macos_pid=$!", apple)
         self.assertIn("ios_pid=$!", apple)
-        self.assertNotIn("macos_pid", apple)
+        self.assertIn('wait "$macos_pid" || macos_status=$?', apple)
         self.assertIn('wait "$ios_pid" || ios_status=$?', apple)
-        self.assertIn(') || macos_status=$?', apple)
         self.assertIn(') >"$log_dir/ios-build.log" 2>&1 &', apple)
-        self.assertNotIn("macos-test.log", apple)
         self.assertIn('cat "$log_dir/ios-build.log"', apple)
-        # iOS starts before the foreground macOS suite so they still overlap.
-        ios_bg = apple.index(') >"$log_dir/ios-build.log" 2>&1 &')
-        macos_fg = apple.index(
+        # Live TersaMac diagnostics: tee inside the pipefail subshell so wait on
+        # macos_pid propagates xcodebuild status (not bare tee success).
+        self.assertIn('2>&1 | tee "$log_dir/macos-test.log"', apple)
+        self.assertIn("set -euo pipefail", apple)
+        # Reject outer `) 2>&1 | tee ... &` where $! would be tee, not xcodebuild.
+        self.assertNotIn(") 2>&1 | tee", apple)
+        macos_xcode = apple.index(
             "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac"
         )
-        self.assertLess(ios_bg, macos_fg)
+        macos_tee = apple.index('2>&1 | tee "$log_dir/macos-test.log"')
+        macos_pid = apple.index("macos_pid=$!")
+        ios_xcode = apple.index(
+            "xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS"
+        )
+        ios_bg = apple.index(') >"$log_dir/ios-build.log" 2>&1 &')
+        ios_pid = apple.index("ios_pid=$!")
+        self.assertLess(macos_xcode, macos_tee)
+        self.assertLess(macos_tee, macos_pid)
+        self.assertLess(macos_pid, ios_xcode)
+        self.assertLess(ios_xcode, ios_bg)
+        self.assertLess(ios_bg, ios_pid)
+        # Isolated iOS log only (one redirect-background); macOS uses tee.
         self.assertEqual(apple.count(" 2>&1 &"), 1)
-        # Unconditional wait/log for iOS, then propagate both exit statuses.
+        # Unconditional waits for both, then iOS log, then deterministic exits.
+        wait_macos = apple.index('wait "$macos_pid" || macos_status=$?')
         wait_ios = apple.index('wait "$ios_pid" || ios_status=$?')
         cat_ios = apple.index('cat "$log_dir/ios-build.log"')
         fail_macos = apple.index('if [ "$macos_status" -ne 0 ]; then')
         fail_ios = apple.index('if [ "$ios_status" -ne 0 ]; then')
-        self.assertLess(macos_fg, wait_ios)
+        self.assertLess(ios_pid, wait_macos)
+        self.assertLess(wait_macos, wait_ios)
         self.assertLess(wait_ios, cat_ios)
         self.assertLess(cat_ios, fail_macos)
         self.assertLess(fail_macos, fail_ios)

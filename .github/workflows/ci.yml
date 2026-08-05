@@ -115,13 +115,29 @@ jobs:
       # macOS test (~79s) and iOS simulator build (~24s) are independent once the
       # project exists. Separate DerivedData paths avoid Xcode races; Rust archives
       # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
-      # Stream the longer TersaMac test live; isolate only the independent iOS build
-      # in a background log so timeout/cancel still leave foreground diagnostics.
+      # Launch TersaMac first so the critical path acquires shared Rust build
+      # resources (apple/build/rust + Cargo lock) before the shorter iOS path.
+      # Stream TersaMac live through tee inside a pipefail subshell (PID + wait
+      # propagate xcodebuild status); isolate only the independent iOS build log.
       - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/apple-product-logs"
           mkdir -p "$log_dir"
+
+          # Critical path first: claim shared Rust resources ahead of iOS.
+          # tee is inside the pipefail subshell so wait on macos_pid reflects
+          # xcodebuild failure, not tee success, while stdout stays live.
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
+              -configuration Debug -destination 'platform=macOS,arch=arm64' \
+              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test \
+              2>&1 | tee "$log_dir/macos-test.log"
+          ) &
+          macos_pid=$!
 
           (
             set -euo pipefail
@@ -136,17 +152,9 @@ jobs:
 
           macos_status=0
           ios_status=0
-          # Foreground streaming: live Actions log for the long TersaMac suite.
-          (
-            set -euo pipefail
-            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
-              -configuration Debug -destination 'platform=macOS,arch=arm64' \
-              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
-              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
-              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
-          ) || macos_status=$?
 
-          # Always wait for iOS even if macOS failed, then emit its isolated log.
+          # Always wait for both even if one failed, then emit the iOS log.
+          wait "$macos_pid" || macos_status=$?
           wait "$ios_pid" || ios_status=$?
 
           echo "----- iOS simulator build -----"
