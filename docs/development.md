@@ -40,23 +40,28 @@ supersede an older in-progress run through the per-PR concurrency group. Every
 ready pull request runs the lightweight classifier job (deterministic
 control-script tests, DCO validation, and change scope), then only the
 path-scoped active lanes that apply, and finally the required `CI gate`.
-Documentation, workflow, and exact self-tested CI-control changes stop at the
-classifier and gate, so their required run normally finishes in seconds.
+Documentation and non-executable GitHub templates (issue/PR templates and
+`CODEOWNERS`) stay lightweight and stop at the classifier and gate, so those
+required runs normally finish in seconds. Workflow YAML, `xtask/**`, and other
+executable CI-control inputs intentionally fail closed to full fanout so a
+control-plane change cannot skip the lanes it alters.
 
-The five path-scoped active lanes are:
+The four path-scoped build and policy lanes are:
 
 - Rust (Linux)
-- Rust (macOS)
 - Policy and supply chain
 - Apple product
-- Third-party notices
+- macOS quality
 
-Portable Rust or xtask changes add Linux Rust verification and supply-chain
-policy. macOS Rust verification is reserved for platform, adapter, Apple bridge,
-and macOS CLI paths. Apple product paths add the real macOS test and
-iOS-simulator build; that build also covers the Rust linked into the
-application. Root manifests, shared build inputs, and unknown paths still fail
-closed to the full active baseline.
+Portable shared-crate changes add Linux Rust verification and supply-chain
+policy. Host macOS Rust verification (`rust_macos`) is reserved for platform,
+adapter, Apple bridge, and macOS CLI paths and runs inside `macOS quality`.
+Notice regeneration (`notices`) also runs conditionally inside that same job
+whenever the selected scope requires it. Apple product paths add the real macOS
+test and iOS-simulator build; that build also covers the Rust linked into the
+application. Root manifests, shared build inputs, unknown paths, workflow YAML,
+`xtask/**`, and executable CI-control scripts still fail closed to the full
+active baseline.
 
 Merge-group runs fan out conservatively across every active product lane for the
 combined state. There is no `main` push workflow and no manual evidence-suite
@@ -69,13 +74,13 @@ execution has no billable minute charge. The policy above still minimizes queue
 time, redundant macOS capacity, and artifact growth.
 
 The classifier in `scripts/ci-change-scope.py` is fail closed: unknown or shared
-build paths fan out conservatively, while documentation, workflow, and exact
-self-tested control paths avoid build jobs. xtask-only changes run the portable
-Linux and policy baseline but avoid Apple product work. The classifier and its
-own tests are an exact control-path allowlist exercised inside the scope job;
-every other unknown `scripts/` path still fans out. Its table-driven tests must
-change with every new scope rule. A dedicated macOS lane owns the single
-target-specific notice regeneration whenever the selected scope requires it.
+build paths fan out conservatively. Documentation and non-executable GitHub
+templates avoid build jobs; workflow YAML, `xtask/**`, and the executable
+CI-control allowlist (scope/DCO/performance scripts and their tests) enable
+every active product scope. The classifier and its own tests are that exact
+control-path allowlist, exercised inside the scope job; every other unknown
+`scripts/` path still fans out. Its table-driven tests must change with every
+new scope rule.
 
 ## Dependency changes
 

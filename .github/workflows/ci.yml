@@ -17,6 +17,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # setup-rust-toolchain already exports CARGO_INCREMENTAL=0 and
+  # CARGO_PROFILE_DEV_DEBUG=0. Also strip test-profile debuginfo so cold
+  # `cargo test` / doctest link steps do not pay full debug overhead.
+  # Does not change which tests run or their assertions.
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   changes:
@@ -112,126 +117,282 @@ jobs:
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version | grep -Fx 'Version: 2.45.4'
       - name: Generate Apple project
         run: sh apple/scripts/generate-project.sh
-      - name: Test unsigned macOS debug application
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac
-          -configuration Debug -destination 'platform=macOS,arch=arm64'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
-      - name: Build unsigned iOS simulator debug application
-        run: >-
-          xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS
-          -configuration Debug -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
-          -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO
-          TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID"
-          TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
-      - name: Verify built Rust bridge symbols
-        run: |
-          nm -gU apple/build/DerivedData/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
-            | grep -F '_tersa_apple_bridge_version'
-          nm -gU apple/build/DerivedData/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
-            | grep -F '_tersa_apple_bridge_version'
-      - name: Verify macOS mailbox-sync FFI archive symbols
+      # macOS test (~79s) and iOS simulator build (~24s) are independent once the
+      # project exists. Separate DerivedData paths avoid Xcode races; Rust archives
+      # still land under apple/build/rust/{macosx,iphonesimulator}/ by platform.
+      # Both xcodebuild processes share apple/build/rust (immutable build script
+      # sets CARGO_TARGET_DIR), so Cargo target-dir lock ordering matters. Launch
+      # TersaMac first, then poll until both macOS Rust archives exist (mailbox-
+      # sync and token-broker) or macOS has exited before starting the shorter
+      # iOS path. Waiting for both archives — not merely the first lock grab —
+      # prevents iOS from interleaving between the two host Cargo builds.
+      # Bounded so a hung pre-cargo phase cannot stall forever.
+      # Both lanes buffer to separate logs (no live streaming of multi-MB Xcode
+      # output). Full logs flush only on trap/failure; the all-success path emits
+      # a concise summary plus extracted TersaMac test evidence so Actions does
+      # not upload multi-thousand-line success buffers. Index-store generation is
+      # disabled on ephemeral CI runners.
+      - name: Test macOS and build iOS simulator in parallel
         run: |
           set -euo pipefail
-          # ADR-0024 production cutover: the macOS app links ONLY this archive,
-          # which must now define exactly the 12-symbol broker-only contract
-          # (the legacy oauth-macos exports and the retired *_begin entry points
-          # are gone). Assert the closed export inventory in the archive so dead
-          # stripping cannot hide a missing entry point and no extra `_tersa_`
-          # text symbol can slip in.
-          archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
-          test -f "$archive"
-          symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
-          printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
-          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 12
-          for expected in \
-            _tersa_apple_bridge_version \
-            _tersa_macos_bootstrap_default_account \
-            _tersa_macos_mailbox_read_inbox \
-            _tersa_macos_mailbox_read_thread \
-            _tersa_macos_mailbox_search \
-            _tersa_mailbox_macos_broker_disconnect_finalize \
-            _tersa_mailbox_macos_broker_disconnect_prepare \
-            _tersa_mailbox_macos_broker_subject_get \
-            _tersa_mailbox_macos_broker_subject_store \
-            _tersa_mailbox_macos_broker_sync_begin \
-            _tersa_mailbox_macos_lifecycle_get \
-            _tersa_mailbox_macos_sync_poll
-          do
-            printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
-              echo "missing defined text symbol: $expected" >&2
-              exit 1
-            }
+          log_dir="${RUNNER_TEMP}/apple-product-logs"
+          macos_log="$log_dir/macos-test.log"
+          ios_log="$log_dir/ios-build.log"
+          mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          # Idempotent dump: safe if a log is missing; never masks caller status.
+          # Invoked only from traps and the non-zero child-status path.
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$macos_log" ]; then
+              echo "----- macOS test -----"
+              cat "$macos_log" || true
+            fi
+            if [ -f "$ios_log" ]; then
+              echo "----- iOS simulator build -----"
+              cat "$ios_log" || true
+            fi
+            return 0
+          }
+
+          # Flush before process termination; re-exit with the original status so
+          # the trap cannot mask child failures. INT/TERM clear EXIT first to
+          # avoid a second flush/exit from the EXIT handler.
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
+
+          # Critical path first: start macOS so it can claim shared Rust resources.
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \
+              -configuration Debug -destination 'platform=macOS,arch=arm64' \
+              -derivedDataPath apple/build/DerivedData-macos CODE_SIGNING_ALLOWED=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" test
+          ) >"$macos_log" 2>&1 &
+          macos_pid=$!
+
+          # Deterministic handoff: do not start iOS until macOS has finished both
+          # host Rust archive builds (shared CARGO_TARGET_DIR) or has exited.
+          # 600 * 0.2s = 120s budget; timeout still launches iOS (best-effort).
+          mailbox_archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+          token_archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
+          _cargo_claim_attempts=0
+          while [ "$_cargo_claim_attempts" -lt 600 ]; do
+            if { [ -f "$mailbox_archive" ] && [ -f "$token_archive" ]; } \
+              || ! kill -0 "$macos_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+            _cargo_claim_attempts=$((_cargo_claim_attempts + 1))
           done
-          # Negative checks: nothing from the retired oauth-macos FFI surface may
-          # remain in the archive, neither as a global symbol nor as an embedded
-          # string. A no-match is success; any match is a hard failure.
-          if nm -g "$archive" | grep -F '_tersa_oauth_macos_' > /dev/null; then
-            echo "archive must not contain any _tersa_oauth_macos_ global symbol:" >&2
-            nm -g "$archive" | grep -F '_tersa_oauth_macos_' >&2
-            exit 1
+
+          (
+            set -euo pipefail
+            xcodebuild -project apple/Tersa.xcodeproj -scheme TersaIOS \
+              -configuration Debug -sdk iphonesimulator \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath apple/build/DerivedData-ios CODE_SIGNING_ALLOWED=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO \
+              TERSA_OAUTH_CLIENT_ID="$TERSA_OAUTH_CLIENT_ID" \
+              TERSA_OAUTH_REDIRECT_SCHEME="$TERSA_OAUTH_REDIRECT_SCHEME" build
+          ) >"$ios_log" 2>&1 &
+          ios_pid=$!
+
+          macos_status=0
+          ios_status=0
+
+          # Always wait for both even if one failed; decide only after both land.
+          wait "$macos_pid" || macos_status=$?
+          wait "$ios_pid" || ios_status=$?
+
+          # Failure path: dump both full logs once for cross-lane context, then
+          # clear traps and exit with deterministic status priority (macOS first).
+          if [ "$macos_status" -ne 0 ] || [ "$ios_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$macos_status" -ne 0 ]; then
+              exit "$macos_status"
+            fi
+            exit "$ios_status"
           fi
-          for banned in \
-            _tersa_mailbox_macos_sync_begin \
-            _tersa_mailbox_macos_connect_begin \
-            _tersa_mailbox_macos_disconnect_begin
-          do
-            if nm -g "$archive" | grep -F "$banned" > /dev/null; then
-              echo "archive must not contain retired global symbol: $banned" >&2
-              exit 1
-            fi
-          done
-          for banned_string in oauth_token DataProtectionRefreshTokenStore; do
-            if strings "$archive" | grep -F "$banned_string" > /dev/null; then
-              echo "archive must not embed string: $banned_string" >&2
-              exit 1
-            fi
-          done
-      - name: Verify macOS token-broker FFI archive symbols
+
+          # Success path: no full-log upload; disarm traps, summarize, and emit
+          # concise TersaMac test-count evidence (non-fatal if format changes).
+          trap - EXIT INT TERM
+          echo "Apple product: macOS tests and iOS simulator build succeeded."
+          tersa_mac_summary=""
+          if [ -f "$macos_log" ]; then
+            tersa_mac_summary="$(
+              grep -E 'Executed [0-9]+ tests?, with [0-9]+ failures' "$macos_log" \
+                | tail -n 1
+            )" || true
+          fi
+          if [ -n "$tersa_mac_summary" ]; then
+            echo "TersaMac tests: $tersa_mac_summary"
+          else
+            echo "TersaMac tests: summary unavailable (log format changed)."
+          fi
+      # Four independent post-build probes (bridge dylibs, mailbox archive,
+      # token-broker archive, C link-and-run). Parallel children with buffered
+      # per-probe logs; every prior command and assertion is preserved. Full
+      # logs flush only on trap/failure; success is a concise summary.
+      - name: Verify built symbols, archives, and FFI probe
         run: |
           set -euo pipefail
-          # Source-level xtask guards pin this crate's own five exports; the
-          # linked static archive must still reject any sixth `_tersa_` text
-          # export pulled in transitively from dependencies.
-          archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
-          test -f "$archive"
-          symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
-          printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
-          test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 5
-          for expected in \
-            _tersa_token_broker_begin_authorization \
-            _tersa_token_broker_complete_authorization \
-            _tersa_token_broker_refresh_access_token \
-            _tersa_token_broker_revoke_provider_grant \
-            _tersa_token_broker_delete_stored_tokens
-          do
-            printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
-              echo "missing defined text symbol: $expected" >&2
+          log_dir="${RUNNER_TEMP}/apple-symbol-logs"
+          bridge_log="$log_dir/bridge-symbols.log"
+          mailbox_log="$log_dir/mailbox-archive.log"
+          token_log="$log_dir/token-broker-archive.log"
+          probe_log="$log_dir/ffi-probe.log"
+          mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$bridge_log" ]; then
+              echo "----- built Rust bridge symbols -----"
+              cat "$bridge_log" || true
+            fi
+            if [ -f "$mailbox_log" ]; then
+              echo "----- macOS mailbox-sync FFI archive -----"
+              cat "$mailbox_log" || true
+            fi
+            if [ -f "$token_log" ]; then
+              echo "----- macOS token-broker FFI archive -----"
+              cat "$token_log" || true
+            fi
+            if [ -f "$probe_log" ]; then
+              echo "----- mailbox-sync FFI C probe -----"
+              cat "$probe_log" || true
+            fi
+            return 0
+          }
+
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
+
+          (
+            set -euo pipefail
+            nm -gU apple/build/DerivedData-macos/Build/Products/Debug/Tersa.app/Contents/MacOS/Tersa.debug.dylib \
+              | grep -F '_tersa_apple_bridge_version'
+            nm -gU apple/build/DerivedData-ios/Build/Products/Debug-iphonesimulator/Tersa.app/Tersa.debug.dylib \
+              | grep -F '_tersa_apple_bridge_version'
+          ) >"$bridge_log" 2>&1 &
+          bridge_pid=$!
+
+          (
+            set -euo pipefail
+            # ADR-0024 production cutover: the macOS app links ONLY this archive,
+            # which must now define exactly the 12-symbol broker-only contract
+            # (the legacy oauth-macos exports and the retired *_begin entry points
+            # are gone). Assert the closed export inventory in the archive so dead
+            # stripping cannot hide a missing entry point and no extra `_tersa_`
+            # text symbol can slip in.
+            archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+            test -f "$archive"
+            symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
+            printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
+            test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 12
+            for expected in \
+              _tersa_apple_bridge_version \
+              _tersa_macos_bootstrap_default_account \
+              _tersa_macos_mailbox_read_inbox \
+              _tersa_macos_mailbox_read_thread \
+              _tersa_macos_mailbox_search \
+              _tersa_mailbox_macos_broker_disconnect_finalize \
+              _tersa_mailbox_macos_broker_disconnect_prepare \
+              _tersa_mailbox_macos_broker_subject_get \
+              _tersa_mailbox_macos_broker_subject_store \
+              _tersa_mailbox_macos_broker_sync_begin \
+              _tersa_mailbox_macos_lifecycle_get \
+              _tersa_mailbox_macos_sync_poll
+            do
+              printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
+                echo "missing defined text symbol: $expected" >&2
+                exit 1
+              }
+            done
+            # Negative checks: nothing from the retired oauth-macos FFI surface may
+            # remain in the archive, neither as a global symbol nor as an embedded
+            # string. A no-match is success; any match is a hard failure.
+            if nm -g "$archive" | grep -F '_tersa_oauth_macos_' > /dev/null; then
+              echo "archive must not contain any _tersa_oauth_macos_ global symbol:" >&2
+              nm -g "$archive" | grep -F '_tersa_oauth_macos_' >&2
               exit 1
-            }
-          done
-      - name: Link and execute the mailbox-sync FFI C probe
-        run: |
-          set -euo pipefail
-          # A real Swift call site now pulls these symbols into the linked app
-          # binary; this probe proves the mailbox-sync FFI archive LINKS as a
-          # single archive (its own symbols AND the re-exported bridge ones
-          # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
-          # return their expected status. NOTE: static C↔Rust linking resolves by
-          # symbol NAME only, so this does NOT verify argument/return ABI — a
-          # widened return or an added parameter is invisible here (and poll(0)
-          # short-circuits to -8 before reading any argument). ABI shape is
-          # pinned per-side (the canonical header + the Rust export inventory);
-          # this step is the single-archive link-and-run proof. The
-          # pointer-taking begins are exercised through the app itself; their
-          # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
-          # defined behavior, never a violable contract.
-          archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
-          test -f "$archive"
-          cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'
+            fi
+            for banned in \
+              _tersa_mailbox_macos_sync_begin \
+              _tersa_mailbox_macos_connect_begin \
+              _tersa_mailbox_macos_disconnect_begin
+            do
+              if nm -g "$archive" | grep -F "$banned" > /dev/null; then
+                echo "archive must not contain retired global symbol: $banned" >&2
+                exit 1
+              fi
+            done
+            for banned_string in oauth_token DataProtectionRefreshTokenStore; do
+              if strings "$archive" | grep -F "$banned_string" > /dev/null; then
+                echo "archive must not embed string: $banned_string" >&2
+                exit 1
+              fi
+            done
+          ) >"$mailbox_log" 2>&1 &
+          mailbox_pid=$!
+
+          (
+            set -euo pipefail
+            # Source-level xtask guards pin this crate's own five exports; the
+            # linked static archive must still reject any sixth `_tersa_` text
+            # export pulled in transitively from dependencies.
+            archive="apple/build/rust/macosx/Debug/libtersa_token_broker_ffi_macos.a"
+            test -f "$archive"
+            symbols="$(nm -g "$archive" | grep -E ' T _tersa_' | awk '{ print $NF }' | sort -u)"
+            printf 'defined _tersa_ text symbols in %s:\n%s\n' "$archive" "$symbols"
+            test "$(printf '%s\n' "$symbols" | grep -c .)" -eq 5
+            for expected in \
+              _tersa_token_broker_begin_authorization \
+              _tersa_token_broker_complete_authorization \
+              _tersa_token_broker_refresh_access_token \
+              _tersa_token_broker_revoke_provider_grant \
+              _tersa_token_broker_delete_stored_tokens
+            do
+              printf '%s\n' "$symbols" | grep -Fx "$expected" > /dev/null || {
+                echo "missing defined text symbol: $expected" >&2
+                exit 1
+              }
+            done
+          ) >"$token_log" 2>&1 &
+          token_pid=$!
+
+          (
+            set -euo pipefail
+            # A real Swift call site now pulls these symbols into the linked app
+            # binary; this probe proves the mailbox-sync FFI archive LINKS as a
+            # single archive (its own symbols AND the re-exported bridge ones
+            # resolve) and that a bridge and a mailbox-sync entry point EXECUTE and
+            # return their expected status. NOTE: static C↔Rust linking resolves by
+            # symbol NAME only, so this does NOT verify argument/return ABI — a
+            # widened return or an added parameter is invisible here (and poll(0)
+            # short-circuits to -8 before reading any argument). ABI shape is
+            # pinned per-side (the canonical header + the Rust export inventory);
+            # this step is the single-archive link-and-run proof. The
+            # pointer-taking begins are exercised through the app itself; their
+            # decls stay _Nonnull-free so the Rust null rejection (-7) remains a
+            # defined behavior, never a violable contract.
+            archive="apple/build/rust/macosx/Debug/libtersa_mailbox_sync_ffi_macos.a"
+            test -f "$archive"
+            cat > "$RUNNER_TEMP/ffi_probe.c" <<'C'
           #include <stdint.h>
           uint32_t tersa_apple_bridge_version(void);
           int32_t tersa_mailbox_macos_sync_poll(uint64_t session_id);
@@ -246,53 +407,49 @@ jobs:
               return 0;
           }
           C
-          cc "$RUNNER_TEMP/ffi_probe.c" "$archive" \
-            -framework Security -framework Foundation \
-            -o "$RUNNER_TEMP/ffi_probe"
-          "$RUNNER_TEMP/ffi_probe"
+            cc "$RUNNER_TEMP/ffi_probe.c" "$archive" \
+              -framework Security -framework Foundation \
+              -o "$RUNNER_TEMP/ffi_probe"
+            "$RUNNER_TEMP/ffi_probe"
+          ) >"$probe_log" 2>&1 &
+          probe_pid=$!
 
-  notices:
-    name: Third-party notices
-    needs: changes
-    if: ${{ needs.changes.outputs.notices == 'true' }}
-    runs-on: macos-15
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-      - name: Install notice generator
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          tool: cargo-about@0.9.1
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Check target-specific third-party notices
-        run: sh apple/scripts/generate-third-party-notices.sh --check
+          bridge_status=0
+          mailbox_status=0
+          token_status=0
+          probe_status=0
+
+          # Always reap every child; decide only after all land.
+          wait "$bridge_pid" || bridge_status=$?
+          wait "$mailbox_pid" || mailbox_status=$?
+          wait "$token_pid" || token_status=$?
+          wait "$probe_pid" || probe_status=$?
+
+          if [ "$bridge_status" -ne 0 ] || [ "$mailbox_status" -ne 0 ] \
+            || [ "$token_status" -ne 0 ] || [ "$probe_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$bridge_status" -ne 0 ]; then
+              exit "$bridge_status"
+            fi
+            if [ "$mailbox_status" -ne 0 ]; then
+              exit "$mailbox_status"
+            fi
+            if [ "$token_status" -ne 0 ]; then
+              exit "$token_status"
+            fi
+            exit "$probe_status"
+          fi
+
+          trap - EXIT INT TERM
+          echo "Apple product: built symbols, archives, and FFI probe succeeded."
 
   rust_linux:
     name: Rust (Linux)
     needs: changes
     if: ${{ needs.changes.outputs.rust_linux == 'true' }}
     runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-      - name: Run baseline verification
-        run: cargo run --locked --package xtask -- verify
-
-  rust_macos:
-    name: Rust (macOS)
-    needs: changes
-    if: ${{ needs.changes.outputs.rust_macos == 'true' }}
-    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -308,6 +465,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.policy == 'true' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -332,35 +490,256 @@ jobs:
       - name: Check spelling
         run: typos
 
+  # Single macOS quality job: checkout and toolchain once, then run the macOS
+  # Rust suite and/or third-party notices based on the distinct classifier
+  # outputs `rust_macos` and `notices`. Avoids a second full `verify` on macOS.
+  #
+  # Cold CI bypasses `cargo run -p xtask -- ci-macos` so the job does not spend
+  # ~14s compiling the dependency-heavy xtask binary. The shell sequence below
+  # is the exact `ci-macos` coverage (Clippy, tests, doctests, warning-denied
+  # rustdoc) with the same flags, run sequentially on the default Cargo target
+  # directory so artifacts are reused. Notices may overlap that sequence; both
+  # selected lanes run as background children with interruptible `wait` so
+  # EXIT/INT/TERM traps can flush buffered logs on timeout/cancellation. Full
+  # logs flush only on trap/failure; the all-success path emits a concise
+  # selected-lane summary plus extracted Cargo test-result evidence.
+  # `cargo xtask ci-macos` remains the developer entry point and must stay
+  # equivalent. Static tests pin that equivalence.
+  macos_quality:
+    name: macOS quality
+    needs: changes
+    if: ${{ needs.changes.outputs.rust_macos == 'true' || needs.changes.outputs.notices == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+      - name: Install notice generator
+        if: ${{ needs.changes.outputs.notices == 'true' }}
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
+      - name: Run macOS quality checks
+        env:
+          RUN_RUST: ${{ needs.changes.outputs.rust_macos }}
+          RUN_NOTICES: ${{ needs.changes.outputs.notices }}
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/macos-quality-logs"
+          rust_log="$log_dir/rust.log"
+          notices_log="$log_dir/notices.log"
+          mkdir -p "$log_dir"
+          _logs_flushed=0
+
+          # Idempotent dump: safe if a log is missing; never masks caller status.
+          # Invoked only from traps and the non-zero child-status path.
+          flush_logs() {
+            if [ "${_logs_flushed}" -ne 0 ]; then
+              return 0
+            fi
+            _logs_flushed=1
+            if [ -f "$rust_log" ]; then
+              echo "----- Rust suite -----"
+              cat "$rust_log" || true
+            fi
+            if [ -f "$notices_log" ]; then
+              echo "----- third-party notices -----"
+              cat "$notices_log" || true
+            fi
+            return 0
+          }
+
+          # Flush before process termination; re-exit with the original status so
+          # the trap cannot mask child failures. INT/TERM clear EXIT first to
+          # avoid a second flush/exit from the EXIT handler.
+          trap 'rc=$?; flush_logs || true; exit "$rc"' EXIT
+          trap 'flush_logs || true; trap - EXIT; exit 130' INT
+          trap 'flush_logs || true; trap - EXIT; exit 143' TERM
+
+          # Fail closed if this job was selected but neither lane is exactly
+          # true. An empty/false/unexpected selector must never report notices
+          # success after launching no child.
+          if [ "$RUN_RUST" != "true" ] && [ "$RUN_NOTICES" != "true" ]; then
+            echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true (RUN_RUST=${RUN_RUST:-}; RUN_NOTICES=${RUN_NOTICES:-}); refusing no-op success." >&2
+            trap - EXIT INT TERM
+            exit 1
+          fi
+
+          rust_pid=""
+          notices_pid=""
+          rust_status=0
+          notices_status=0
+
+          # Both selected lanes are background children so `wait` is interruptible
+          # and EXIT/INT/TERM can flush buffered logs on timeout/cancellation.
+          # Notices fetch/generation may overlap the sequential Rust suite.
+          # Clippy → tests → doctests → rustdoc share the default Cargo target
+          # directory (no per-lane target override) so artifacts are reused
+          # exactly as in `cargo xtask ci-macos`. Full dumps only on trap/failure.
+          if [ "$RUN_NOTICES" = "true" ]; then
+            (
+              set -euo pipefail
+              cargo fetch --locked
+              sh apple/scripts/generate-third-party-notices.sh --check
+            ) >"$notices_log" 2>&1 &
+            notices_pid=$!
+          fi
+
+          if [ "$RUN_RUST" = "true" ]; then
+            # Background sequential suite on the default target dir; buffer output.
+            (
+              set -euo pipefail
+              echo "Running Clippy check..."
+              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+              echo "Running tests check..."
+              cargo test --locked --workspace --all-targets --all-features
+              echo "Running documentation tests check..."
+              cargo test --locked --workspace --doc --all-features
+              echo "Running documentation check..."
+              export RUSTDOCFLAGS="--deny warnings"
+              cargo doc --locked --workspace --no-deps --all-features
+              echo "macOS CI verification passed."
+            ) >"$rust_log" 2>&1 &
+            rust_pid=$!
+          fi
+
+          # Always wait/reap both selected children even if one failed; decide
+          # only after both land. Interruptible wait lets traps flush on signal.
+          if [ -n "$rust_pid" ]; then
+            wait "$rust_pid" || rust_status=$?
+          fi
+          if [ -n "$notices_pid" ]; then
+            wait "$notices_pid" || notices_status=$?
+          fi
+
+          # Failure path: dump every available full log once for cross-lane
+          # context, then clear traps and exit with deterministic priority
+          # (Rust before notices).
+          if [ "$rust_status" -ne 0 ] || [ "$notices_status" -ne 0 ]; then
+            flush_logs
+            trap - EXIT INT TERM
+            if [ "$rust_status" -ne 0 ]; then
+              exit "$rust_status"
+            fi
+            exit "$notices_status"
+          fi
+
+          # Success path: no full-log upload; disarm traps, summarize lanes, and
+          # emit phase-aggregate Cargo evidence (non-fatal if format changes).
+          trap - EXIT INT TERM
+          if [ "$RUN_RUST" = "true" ] && [ "$RUN_NOTICES" = "true" ]; then
+            echo "macOS quality: Rust suite and third-party notices succeeded."
+          elif [ "$RUN_RUST" = "true" ]; then
+            echo "macOS quality: Rust suite succeeded."
+          elif [ "$RUN_NOTICES" = "true" ]; then
+            echo "macOS quality: third-party notices succeeded."
+          else
+            # Unreachable when early selector validation holds; keep fail-closed.
+            echo "macOS quality: neither RUN_RUST nor RUN_NOTICES is exactly true; refusing no-op success." >&2
+            exit 1
+          fi
+          if [ "$RUN_RUST" = "true" ]; then
+            # Phase windows use the existing suite markers so normal tests and
+            # doc-tests cannot hide each other. Aggregate every crate's
+            # `test result: ok.` summary inside the window (count + sum of
+            # passed/failed) instead of keeping only the final line. Empty,
+            # missing, or unparsable phases print an explicit unavailable line
+            # and never fail success. Awk is macOS/BSD/POSIX-compatible (no
+            # GNU three-argument match).
+            tests_summary=""
+            doctests_summary=""
+            if [ -f "$rust_log" ]; then
+              tests_summary="$(
+                awk '
+                  $0 == "Running tests check..." { in_phase=1; next }
+                  $0 == "Running documentation tests check..." { in_phase=0 }
+                  in_phase && index($0, "test result: ok.") {
+                    line_passed = ""
+                    line_failed = ""
+                    for (i = 2; i <= NF; i++) {
+                      if ($i ~ /^passed/) line_passed = $(i-1)
+                      if ($i ~ /^failed/) line_failed = $(i-1)
+                    }
+                    if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+                      unparsable = 1
+                      next
+                    }
+                    summaries++
+                    passed += line_passed + 0
+                    failed += line_failed + 0
+                  }
+                  END {
+                    if (!unparsable && summaries > 0)
+                      print "summaries=" summaries " passed=" passed " failed=" failed
+                  }
+                ' "$rust_log"
+              )" || true
+              doctests_summary="$(
+                awk '
+                  $0 == "Running documentation tests check..." { in_phase=1; next }
+                  $0 == "Running documentation check..." { in_phase=0 }
+                  in_phase && index($0, "test result: ok.") {
+                    line_passed = ""
+                    line_failed = ""
+                    for (i = 2; i <= NF; i++) {
+                      if ($i ~ /^passed/) line_passed = $(i-1)
+                      if ($i ~ /^failed/) line_failed = $(i-1)
+                    }
+                    if (line_passed !~ /^[0-9]+$/ || line_failed !~ /^[0-9]+$/) {
+                      unparsable = 1
+                      next
+                    }
+                    summaries++
+                    passed += line_passed + 0
+                    failed += line_failed + 0
+                  }
+                  END {
+                    if (!unparsable && summaries > 0)
+                      print "summaries=" summaries " passed=" passed " failed=" failed
+                  }
+                ' "$rust_log"
+              )" || true
+            fi
+            if [ -n "$tests_summary" ]; then
+              echo "Cargo tests: $tests_summary"
+            else
+              echo "Cargo tests: summary unavailable (log format changed)."
+            fi
+            if [ -n "$doctests_summary" ]; then
+              echo "Cargo doc-tests: $doctests_summary"
+            else
+              echo "Cargo doc-tests: summary unavailable (log format changed)."
+            fi
+          fi
+
   ci_gate:
     name: CI gate
-    needs: [changes, apple_product, notices, rust_linux, rust_macos, policy]
+    needs: [changes, apple_product, rust_linux, policy, macos_quality]
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Require the selected validation lane
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           APPLE_PRODUCT_RESULT: ${{ needs.apple_product.result }}
-          NOTICES_RESULT: ${{ needs.notices.result }}
           RUST_LINUX_RESULT: ${{ needs.rust_linux.result }}
-          RUST_MACOS_RESULT: ${{ needs.rust_macos.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
+          MACOS_QUALITY_RESULT: ${{ needs.macos_quality.result }}
         run: |
           set -euo pipefail
           printf '%s\n' \
             "changes=$CHANGES_RESULT" \
             "apple_product=$APPLE_PRODUCT_RESULT" \
-            "notices=$NOTICES_RESULT" \
             "rust_linux=$RUST_LINUX_RESULT" \
-            "rust_macos=$RUST_MACOS_RESULT" \
-            "policy=$POLICY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+            "policy=$POLICY_RESULT" \
+            "macos_quality=$MACOS_QUALITY_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$CHANGES_RESULT" = success
           case "$APPLE_PRODUCT_RESULT" in
-            success|skipped) ;;
-            *) exit 1 ;;
-          esac
-          case "$NOTICES_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
@@ -368,11 +747,11 @@ jobs:
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          case "$RUST_MACOS_RESULT" in
+          case "$POLICY_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
-          case "$POLICY_RESULT" in
+          case "$MACOS_QUALITY_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac

@@ -92,6 +92,10 @@ fn run() -> TaskResult {
             reject_extra_arguments(arguments)?;
             verify()
         }
+        Some("ci-macos") => {
+            reject_extra_arguments(arguments)?;
+            ci_macos()
+        }
         Some("help") | None => {
             print_help();
             Ok(())
@@ -128,6 +132,7 @@ Usage:
   cargo xtask architecture       Check workspace dependency boundaries
   cargo xtask dco <base> <head>  Check DCO sign-offs in a commit range
   cargo xtask verify             Run the baseline Rust verification suite
+  cargo xtask ci-macos           Run the macOS CI Rust suite (no fmt/arch/check)
   cargo xtask help               Show this help"
     );
 }
@@ -184,6 +189,53 @@ fn verify() -> TaskResult {
     run_command("documentation", documentation)?;
 
     println!("Baseline verification passed.");
+    Ok(())
+}
+
+/// macOS CI Rust suite: Clippy, tests, doctests, and rustdoc only.
+///
+/// Architecture, formatting, and a separate `cargo check` stay on the Linux
+/// `verify` lane so macOS does not repeat that portable work.
+fn ci_macos() -> TaskResult {
+    run_command(
+        "Clippy",
+        cargo([
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "--deny",
+            "warnings",
+        ]),
+    )?;
+    run_command(
+        "tests",
+        cargo([
+            "test",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+        ]),
+    )?;
+    run_command(
+        "documentation tests",
+        cargo(["test", "--locked", "--workspace", "--doc", "--all-features"]),
+    )?;
+
+    let mut documentation = cargo([
+        "doc",
+        "--locked",
+        "--workspace",
+        "--no-deps",
+        "--all-features",
+    ]);
+    documentation.env("RUSTDOCFLAGS", "--deny warnings");
+    run_command("documentation", documentation)?;
+
+    println!("macOS CI verification passed.");
     Ok(())
 }
 
