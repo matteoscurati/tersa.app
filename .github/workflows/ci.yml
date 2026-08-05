@@ -23,6 +23,7 @@ jobs:
     name: Detect change scope
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       rust_linux: ${{ steps.scope.outputs.rust_linux }}
       rust_macos: ${{ steps.scope.outputs.rust_macos }}
@@ -61,8 +62,8 @@ jobs:
           case "$EVENT_NAME" in
             merge_group)
               # The merge queue conservatively checks every active product lane
-              # for the combined state.
-              python3 scripts/ci-change-scope.py >> "$GITHUB_OUTPUT"
+              # for the combined state. Explicit EOF avoids inherited stdin.
+              python3 scripts/ci-change-scope.py < /dev/null >> "$GITHUB_OUTPUT"
               ;;
             pull_request)
               # Diff from the merge base so a branch that is behind main reports

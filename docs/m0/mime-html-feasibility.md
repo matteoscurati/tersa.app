@@ -110,11 +110,11 @@ MIME parser fuzz evidence is local-only through `sh scripts/verify-mime-fuzz.sh`
 once the pinned nightly and fuzz driver are installed. That script pins the
 nightly toolchain and cargo-fuzz version, verifies seed count and checksums,
 detects lock mutation, builds the fuzz target, replays every seed, and performs
-the fixed finite fuzz run. It does not validate fuzz license, source, or
-advisory policy. After diagnostic CI retirement, that policy path is not
-automated and remains unchecked pending PR4 removal. The script does not
-modify application notices or the shipping dependency graph, and it is not
-merge-blocking CI.
+the fixed finite fuzz run. It does not validate fuzz formatting, Clippy/lint,
+license, source, or advisory policy. After diagnostic CI retirement, those
+checks are not automated and remain unchecked pending PR4 removal. The script
+does not modify application notices or the shipping dependency graph, and it
+is not merge-blocking CI.
 
 No token, message content, hostile fixture, URL, filesystem path, or raw WebKit
 log is an evidence artifact.

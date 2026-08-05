@@ -33,12 +33,15 @@ python3 scripts/verify-m0-gates.py
 python3 scripts/verify-m0-gates.py --self-test
 ```
 
-CI runs that cheap self-test in the lightweight change-scope job. The validator
-is not an active product lane; it stays only while the register is still in
-tree and retires with that register in the documentation PR. Adding a gate,
-changing a minimum evidence tier, or changing the attestation schema still
-requires a matching validator update and independent exact-head review; editing
-the JSON alone fails closed. For physical-device or signed-distribution
+CI runs `python3 scripts/verify-m0-gates.py --self-test` in the lightweight
+change-scope job. That mode performs full register validation plus negative
+mutation self-tests; the policy job does not own it. Contributors should run
+the same `--self-test` command locally before `cargo xtask verify`. The
+validator is not an active product lane; it stays only while the register is
+still in tree and retires with that register in the documentation PR. Adding a
+gate, changing a minimum evidence tier, or changing the attestation schema
+still requires a matching validator update and independent exact-head review;
+editing the JSON alone fails closed. For physical-device or signed-distribution
 evidence, follow the
 [physical-device and distribution protocol](m0/physical-device-and-distribution-protocol.md),
 including its commit-bound locator and review-retention rules.
@@ -288,6 +291,8 @@ rustup toolchain install nightly-2026-07-14 --profile minimal \
   --component clippy --component rust-src --component rustfmt
 cargo install cargo-fuzz --version 0.13.2 --locked
 sh scripts/verify-mime-fuzz.sh
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 cargo deny --locked --manifest-path fuzz/Cargo.toml \
   --config fuzz/deny.toml check
 cargo audit --file fuzz/Cargo.lock --deny warnings
@@ -404,8 +409,10 @@ The Rust bridge, both UI spikes, and the MIME diagnostic are root workspace
 members and are therefore covered by `cargo xtask verify` and the repository
 supply-chain checks. The standalone fuzz project is deliberately excluded.
 Local `sh scripts/verify-mime-fuzz.sh` covers only the finite fuzz path; its
-license, source, and advisory policies are not automated after diagnostic CI
-retirement and remain unchecked pending PR4 removal. Only the Apple
+formatting, Clippy/lint, license, source, and advisory policies are not
+automated after diagnostic CI retirement and remain unchecked pending PR4
+removal. Root workspace policy still rejects fuzz dependencies entering the
+workspace graph. Only the Apple
 application targets disable Xcode user-script sandboxing: Cargo and rustup must
 read the compiler sysroot outside `SRCROOT`, while locked build
 scripts write intermediates exclusively below the ignored `apple/build`

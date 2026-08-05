@@ -334,11 +334,13 @@ class ChangeScopeTests(unittest.TestCase):
         merge_group_end = workflow.index("            pull_request)\n", merge_group_start)
         merge_group_branch = workflow[merge_group_start:merge_group_end]
         self.assertIn(
-            'python3 scripts/ci-change-scope.py >> "$GITHUB_OUTPUT"',
+            'python3 scripts/ci-change-scope.py < /dev/null >> "$GITHUB_OUTPUT"',
             merge_group_branch,
         )
         self.assertNotIn("git diff", merge_group_branch)
         self.assertNotIn("|", merge_group_branch)
+        self.assertNotIn("--full", merge_group_branch)
+        self.assertNotIn("--baseline", merge_group_branch)
         for token in RETIRED_WORKFLOW_TOKENS:
             with self.subTest(token=token):
                 self.assertNotIn(token, workflow)
@@ -365,6 +367,7 @@ class ChangeScopeTests(unittest.TestCase):
         changes_start = workflow.index("  changes:\n")
         changes_end = workflow.index("\n  apple_product:\n", changes_start)
         changes_job = workflow[changes_start:changes_end]
+        self.assertIn("    timeout-minutes: 5\n", changes_job)
         self.assertIn("python3 scripts/check-dco.py", changes_job)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_ci_change_scope.py", changes_job)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py", changes_job)
