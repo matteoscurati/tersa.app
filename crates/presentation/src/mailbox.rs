@@ -107,47 +107,160 @@ const MAX_DISPLAY_BODY_CHARS: usize = 32_768;
 
 /// Derives bounded plain-text display content from a cached RFC 5322 message.
 ///
-/// This is a conservative, fail-closed extraction for offline reading: it strips
-/// headers, prefers a `text/plain` part when multipart is obvious, undoes soft
-/// quoted-printable breaks, and never attempts HTML sanitization or remote
-/// resource loading. Incomplete MIME stays truncated/plain rather than rendered.
+/// Conservative offline extraction only:
+/// - prefers the first `text/plain` MIME part and stops at the next boundary
+/// - fully decodes quoted-printable (`=XX` and soft line breaks)
+/// - never renders HTML, never loads remote resources
+///
+/// This is not a full MIME library: base64 parts, nested multiparts beyond the
+/// first plain part, and HTML-only messages fall back to best-effort text.
 #[must_use]
 pub fn display_text_from_rfc5322(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
-    let body = strip_rfc5322_headers(text.as_ref());
-    let body = prefer_text_plain_part(body);
-    let body = decode_quoted_printable_soft(body);
-    let body = body.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = body.trim();
+    let (part_headers, part_body) = extract_plain_part(text.as_ref());
+    let decoded = if part_is_quoted_printable(part_headers) || looks_quoted_printable(part_body) {
+        decode_quoted_printable(part_body)
+    } else {
+        part_body.to_owned()
+    };
+    let normalized = decoded.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return String::new();
     }
     trimmed.chars().take(MAX_DISPLAY_BODY_CHARS).collect()
 }
 
-fn strip_rfc5322_headers(message: &str) -> &str {
+fn strip_rfc5322_headers(message: &str) -> (&str, &str) {
     if let Some(index) = message.find("\r\n\r\n") {
-        return &message[index + 4..];
+        return (&message[..index], &message[index + 4..]);
     }
     if let Some(index) = message.find("\n\n") {
-        return &message[index + 2..];
+        return (&message[..index], &message[index + 2..]);
     }
-    message
+    ("", message)
 }
 
-fn prefer_text_plain_part(body: &str) -> &str {
-    let lowered = body.to_ascii_lowercase();
-    // Prefer the first text/plain body region after its part headers when present
-    // (multipart outer headers may already have been stripped).
+/// Returns `(part_headers, part_body)` for the preferred display part.
+fn extract_plain_part(message: &str) -> (&str, &str) {
+    let (top_headers, top_body) = strip_rfc5322_headers(message);
+    let lowered = message.to_ascii_lowercase();
+
+    // Multipart: take the first text/plain part and stop before the next boundary.
     if let Some(plain_at) = lowered.find("content-type: text/plain") {
-        let after = &body[plain_at..];
-        return strip_rfc5322_headers(after);
+        let after_type = &message[plain_at..];
+        let (part_headers, part_body) = strip_rfc5322_headers(after_type);
+        let boundary = mime_boundary(top_headers).or_else(|| mime_boundary(message));
+        let part_body = if let Some(boundary) = boundary {
+            // Boundary lines are `--boundary` or `--boundary--`.
+            let marker = format!("--{boundary}");
+            if let Some(end) = part_body.find(&marker) {
+                &part_body[..end]
+            } else {
+                part_body
+            }
+        } else {
+            // No boundary declared: still cut before an HTML sibling if present.
+            let part_lower = part_body.to_ascii_lowercase();
+            if let Some(html_at) = part_lower.find("content-type: text/html") {
+                &part_body[..html_at]
+            } else if let Some(dash) = part_body.find("\n------=") {
+                &part_body[..=dash]
+            } else if let Some(dash) = part_body.find("\r\n------=") {
+                &part_body[..=dash]
+            } else {
+                part_body
+            }
+        };
+        return (part_headers, part_body);
     }
-    body
+
+    // Single-part text/plain (or unknown): use the top-level body.
+    (top_headers, top_body)
 }
 
-fn decode_quoted_printable_soft(body: &str) -> String {
-    body.replace("=\r\n", "").replace("=\n", "")
+fn mime_boundary(headers_or_message: &str) -> Option<String> {
+    let lowered = headers_or_message.to_ascii_lowercase();
+    let key = "boundary=";
+    let idx = lowered.find(key)?;
+    let rest = headers_or_message[idx + key.len()..].trim_start();
+    let rest = rest
+        .strip_prefix('"')
+        .or_else(|| rest.strip_prefix('\''))
+        .unwrap_or(rest);
+    let end = rest
+        .find(|c: char| {
+            c == '"' || c == '\'' || c == ';' || c == '\r' || c == '\n' || c.is_whitespace()
+        })
+        .unwrap_or(rest.len());
+    let boundary = rest[..end].trim();
+    if boundary.is_empty() {
+        None
+    } else {
+        Some(boundary.to_owned())
+    }
+}
+
+fn part_is_quoted_printable(headers: &str) -> bool {
+    headers
+        .to_ascii_lowercase()
+        .contains("content-transfer-encoding: quoted-printable")
+}
+
+fn looks_quoted_printable(body: &str) -> bool {
+    // LinkedIn digests and many marketing mails ship soft breaks / =XX without
+    // always being easy to re-parse from part headers alone.
+    body.contains("=\r\n")
+        || body.contains("=\n")
+        || body.contains("=20")
+        || body.contains("=3D")
+        || body.contains("=C2=")
+        || body.contains("=F0=")
+}
+
+/// RFC 2045 quoted-printable decoder (soft breaks + `=HH` hex bytes).
+fn decode_quoted_printable(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if i + 1 < bytes.len() && (bytes[i + 1] == b'\n') {
+                i += 2;
+                continue;
+            }
+            if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                let hi = hex_nibble(bytes[i + 1]);
+                let lo = hex_nibble(bytes[i + 2]);
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+            // Lone '=' — keep as-is (malformed input).
+            out.push(b'=');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 /// Holds an owned inbox listing ready for a platform presentation adapter.
@@ -473,7 +586,33 @@ mod tests {
         let multipart = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: text/html\r\n\r\n<html>x</html>\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n--b--\r\n";
-        assert_eq!(display_text_from_rfc5322(multipart), "Plain body\n--b--");
+        assert_eq!(display_text_from_rfc5322(multipart), "Plain body");
+    }
+
+    #[test]
+    fn display_text_decodes_quoted_printable_and_stops_before_html() {
+        let raw = b"Content-Type: multipart/alternative; boundary=\"----=_Part_1\"\r\n\r\n\
+------=_Part_1\r\n\
+Content-Type: text/plain;charset=UTF-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+You appeared in 19 searches this week.=20\r\n\
+It's a Dutch company: =F0=9F=87=B3=F0=9F=87=B1\r\n\
+link?x=3D1\r\n\
+------=_Part_1\r\n\
+Content-Type: text/html;charset=UTF-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+<html xmlns=3D\"http://www.w3.org/1999/xhtml\">body</html>\r\n\
+------=_Part_1--\r\n";
+        let text = display_text_from_rfc5322(raw);
+        assert!(text.contains("You appeared in 19 searches this week."));
+        assert!(text.contains("It's a Dutch company:"));
+        assert!(text.contains("link?x=1"));
+        assert!(!text.contains("=20"));
+        assert!(!text.contains("=3D"));
+        assert!(!text.contains("<html"));
+        assert!(!text.contains("Content-Type: text/html"));
     }
 
     #[test]
