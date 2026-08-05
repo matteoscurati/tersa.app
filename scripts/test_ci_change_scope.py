@@ -738,26 +738,43 @@ class ChangeScopeTests(unittest.TestCase):
             "cargo doc --locked --workspace --no-deps --all-features",
             job,
         )
-        # Distinct cargo target dirs for concurrent Clippy vs tests.
-        self.assertIn(
-            'CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"',
-            job,
+        # Sequential Clippy → tests → doctests → rustdoc on the default target
+        # directory (shared artifacts; no dual cold compiles under contention).
+        clippy_at = job.index(
+            "cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings"
         )
-        self.assertIn(
-            'CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-test"',
-            job,
-        )
-        # Failure propagation: wait for every background lane, emit full logs, exit.
-        self.assertIn('wait "$clippy_pid" || clippy_status=$?', job)
-        self.assertIn('wait "$tests_pid" || tests_status=$?', job)
+        tests_at = job.index("cargo test --locked --workspace --all-targets --all-features")
+        doctests_at = job.index("cargo test --locked --workspace --doc --all-features")
+        rustdoc_at = job.index("cargo doc --locked --workspace --no-deps --all-features")
+        self.assertLess(clippy_at, tests_at)
+        self.assertLess(tests_at, doctests_at)
+        self.assertLess(doctests_at, rustdoc_at)
+        # No per-lane CARGO_TARGET_DIR overrides or dual-target concurrency.
+        self.assertNotIn("CARGO_TARGET_DIR", job)
+        self.assertNotIn("target-ci-macos-clippy", job)
+        self.assertNotIn("target-ci-macos-test", job)
+        self.assertNotIn("clippy_pid", job)
+        self.assertNotIn("tests_pid", job)
+        self.assertNotIn("clippy_status", job)
+        self.assertNotIn("tests_status", job)
+        self.assertNotIn("doc_status", job)
+        self.assertNotIn("clippy.log", job)
+        self.assertNotIn("tests.log", job)
+        # Notices is the sole background PID; wait even if Rust fails, emit logs,
+        # then deterministically propagate rust then notices failures.
+        self.assertIn("notices_pid=$!", job)
         self.assertIn('wait "$notices_pid" || notices_status=$?', job)
-        self.assertIn('cat "$log_dir/clippy.log"', job)
-        self.assertIn('cat "$log_dir/tests.log"', job)
+        self.assertIn(') >"$log_dir/rust.log" 2>&1 || rust_status=$?', job)
+        self.assertIn('cat "$log_dir/rust.log"', job)
         self.assertIn('cat "$log_dir/notices.log"', job)
-        self.assertIn('if [ "$clippy_status" -ne 0 ]; then', job)
-        self.assertIn('if [ "$tests_status" -ne 0 ]; then', job)
-        self.assertIn('if [ "$doc_status" -ne 0 ]; then', job)
+        self.assertIn('if [ "$rust_status" -ne 0 ]; then', job)
         self.assertIn('if [ "$notices_status" -ne 0 ]; then', job)
+        # Notices starts before the sequential Rust suite so fetch/generation can
+        # overlap; only one background `&` for the notices subshell.
+        notices_bg = job.index(") >\"$log_dir/notices.log\" 2>&1 &")
+        rust_seq = job.index("echo \"Running Clippy check...\"")
+        self.assertLess(notices_bg, rust_seq)
+        self.assertEqual(job.count(" 2>&1 &"), 1)
         self.assertIn('RUN_RUST: ${{ needs.changes.outputs.rust_macos }}', job)
         self.assertIn('RUN_NOTICES: ${{ needs.changes.outputs.notices }}', job)
         self.assertIn("if: ${{ needs.changes.outputs.notices == 'true' }}", job)

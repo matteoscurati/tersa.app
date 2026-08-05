@@ -7,13 +7,13 @@ job that shares checkout and the pinned Rust toolchain for the host Rust suite
 and third-party notice checks. It preserves functional, Rust, Apple,
 supply-chain, notice, and DCO coverage while reducing macOS fanout.
 
-Performance-oriented orchestration (inlined `ci-macos` cargo commands, limited
-intra-job concurrency with distinct output directories, parallel Apple
-macOS test / iOS simulator build) removes measured cold-start and serial
-overhead without dropping checks. It does **not** claim that the acceptance
-budget has been measured or passed. Budget pass/fail requires a representative
-exact-head pull-request run after this change lands. Until that run exists,
-treat the budgets below as targets only.
+Performance-oriented orchestration (inlined `ci-macos` cargo commands on one
+default Cargo target directory, notices overlapping that sequential Rust suite,
+parallel Apple macOS test / iOS simulator build) removes measured cold-start
+and serial overhead without dropping checks. It does **not** claim that the
+acceptance budget has been measured or passed. Budget pass/fail requires a
+representative exact-head pull-request run after this change lands. Until that
+run exists, treat the budgets below as targets only.
 
 ## Baseline (pre-consolidation)
 
@@ -40,8 +40,8 @@ Representative full-fanout pull request **#106**, GitHub Actions run
 | --- | --- | --- |
 | Change scope, DCO, classifier/unit contracts | `Detect change scope` | Always required; fail-closed draft/DCO semantics unchanged |
 | Architecture, format, check, Clippy, tests, doctests, rustdoc | `Rust (Linux)` via `cargo xtask verify` | Portable full baseline |
-| Clippy, tests, doctests, rustdoc (host) | `macOS quality` when `rust_macos` | Workflow runs the exact `ci-macos` cargo sequence directly (no cold xtask compile). Clippy and tests use distinct `CARGO_TARGET_DIR` values and may overlap; doctests stay with tests; warning-denied rustdoc follows. `cargo xtask ci-macos` remains the developer entry point with identical flags. No architecture, format, or separate `cargo check` |
-| Third-party notices (`cargo-about`) | `macOS quality` when `notices` | Install `cargo-about` when selected; fetch and `--check` may overlap the Rust suite when both classifier outputs are true |
+| Clippy, tests, doctests, rustdoc (host) | `macOS quality` when `rust_macos` | Workflow runs the exact `ci-macos` cargo sequence directly (no cold xtask compile): Clippy, tests, doctests, then warning-denied rustdoc, strictly sequential on the default Cargo target directory so artifacts are reused. `cargo xtask ci-macos` remains the developer entry point with identical flags. No architecture, format, or separate `cargo check` |
+| Third-party notices (`cargo-about`) | `macOS quality` when `notices` | Install `cargo-about` when selected; fetch and `--check` are the sole background task and may overlap the sequential Rust suite when both classifier outputs are true |
 | Product Apple build/test/symbols | `Apple product` | Complete TersaMac tests and TersaIOS simulator build may run concurrently with distinct DerivedData paths; symbol inventories and the FFI probe stay after both succeed |
 | Licenses, advisories, feature powerset, spelling | `Policy and supply chain` | Unchanged |
 | Aggregate required status | `CI gate` | Sole required aggregate; optional lanes may be `skipped` |

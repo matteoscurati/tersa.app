@@ -335,8 +335,10 @@ jobs:
   # Cold CI bypasses `cargo run -p xtask -- ci-macos` so the job does not spend
   # ~14s compiling the dependency-heavy xtask binary. The shell sequence below
   # is the exact `ci-macos` coverage (Clippy, tests, doctests, warning-denied
-  # rustdoc) with the same flags; `cargo xtask ci-macos` remains the developer
-  # entry point and must stay equivalent. Static tests pin that equivalence.
+  # rustdoc) with the same flags, run sequentially on the default Cargo target
+  # directory so artifacts are reused. Notices may overlap that sequence as the
+  # sole background task. `cargo xtask ci-macos` remains the developer entry
+  # point and must stay equivalent. Static tests pin that equivalence.
   macos_quality:
     name: macOS quality
     needs: changes
@@ -364,36 +366,14 @@ jobs:
           log_dir="${RUNNER_TEMP}/macos-quality-logs"
           mkdir -p "$log_dir"
 
-          clippy_pid=""
-          tests_pid=""
           notices_pid=""
-          clippy_status=0
-          tests_status=0
           notices_status=0
-          doc_status=0
+          rust_status=0
 
-          if [ "$RUN_RUST" = "true" ]; then
-            # Distinct target dirs so Clippy and tests never race on one tree.
-            # Coverage and flags match `cargo xtask ci-macos` exactly.
-            (
-              set -euo pipefail
-              export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"
-              echo "Running Clippy check..."
-              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
-            ) >"$log_dir/clippy.log" 2>&1 &
-            clippy_pid=$!
-
-            (
-              set -euo pipefail
-              export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-test"
-              echo "Running tests check..."
-              cargo test --locked --workspace --all-targets --all-features
-              echo "Running documentation tests check..."
-              cargo test --locked --workspace --doc --all-features
-            ) >"$log_dir/tests.log" 2>&1 &
-            tests_pid=$!
-          fi
-
+          # Notices is the only background task: fetch/generation may overlap the
+          # sequential Rust suite. Clippy → tests → doctests → rustdoc share the
+          # default Cargo target directory (no per-lane target override) so
+          # artifacts are reused exactly as in `cargo xtask ci-macos`.
           if [ "$RUN_NOTICES" = "true" ]; then
             (
               set -euo pipefail
@@ -403,45 +383,38 @@ jobs:
             notices_pid=$!
           fi
 
-          if [ -n "$clippy_pid" ]; then
-            wait "$clippy_pid" || clippy_status=$?
+          if [ "$RUN_RUST" = "true" ]; then
+            (
+              set -euo pipefail
+              echo "Running Clippy check..."
+              cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
+              echo "Running tests check..."
+              cargo test --locked --workspace --all-targets --all-features
+              echo "Running documentation tests check..."
+              cargo test --locked --workspace --doc --all-features
+              echo "Running documentation check..."
+              export RUSTDOCFLAGS="--deny warnings"
+              cargo doc --locked --workspace --no-deps --all-features
+              echo "macOS CI verification passed."
+            ) >"$log_dir/rust.log" 2>&1 || rust_status=$?
           fi
-          if [ -n "$tests_pid" ]; then
-            wait "$tests_pid" || tests_status=$?
-          fi
+
+          # Always wait for notices even if Rust failed, then emit complete logs.
           if [ -n "$notices_pid" ]; then
             wait "$notices_pid" || notices_status=$?
           fi
 
           if [ "$RUN_RUST" = "true" ]; then
-            echo "----- Clippy -----"
-            cat "$log_dir/clippy.log"
-            echo "----- tests and documentation tests -----"
-            cat "$log_dir/tests.log"
+            echo "----- Clippy, tests, documentation tests, and rustdoc -----"
+            cat "$log_dir/rust.log"
           fi
           if [ "$RUN_NOTICES" = "true" ]; then
             echo "----- third-party notices -----"
             cat "$log_dir/notices.log"
           fi
 
-          if [ "$RUN_RUST" = "true" ] && [ "$clippy_status" -eq 0 ] && [ "$tests_status" -eq 0 ]; then
-            echo "Running documentation check..."
-            export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-ci-macos-clippy"
-            export RUSTDOCFLAGS="--deny warnings"
-            cargo doc --locked --workspace --no-deps --all-features || doc_status=$?
-            if [ "$doc_status" -eq 0 ]; then
-              echo "macOS CI verification passed."
-            fi
-          fi
-
-          if [ "$clippy_status" -ne 0 ]; then
-            exit "$clippy_status"
-          fi
-          if [ "$tests_status" -ne 0 ]; then
-            exit "$tests_status"
-          fi
-          if [ "$doc_status" -ne 0 ]; then
-            exit "$doc_status"
+          if [ "$rust_status" -ne 0 ]; then
+            exit "$rust_status"
           fi
           if [ "$notices_status" -ne 0 ]; then
             exit "$notices_status"
