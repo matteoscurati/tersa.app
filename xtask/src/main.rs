@@ -5301,7 +5301,7 @@ fn project_generation_surface_violations(
             ));
         }
     }
-// The UI development evidence capture signs the embedded token broker
+    // The UI development evidence capture signs the embedded token broker
     // inside-out: the nested XPC is signed with its dedicated broker
     // entitlements and strictly verified before the outer application is
     // signed with the outer entitlement set. Pin the exact reviewed commands
@@ -15100,8 +15100,7 @@ targets:
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
         assert!(
-            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer)
-                .is_empty()
+            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer).is_empty()
         );
 
         assert!(
@@ -15115,14 +15114,9 @@ targets:
             "--entitlements \"$RESOLVED_ENTITLEMENTS\"",
         );
         assert!(
-            project_generation_surface_violations(
-                &wrapper,
-                &ci,
-                consumer,
-                &wrong_entitlements,
-            )
-            .iter()
-            .any(|violation| violation.contains("reviewed nested-signing command"))
+            project_generation_surface_violations(&wrapper, &ci, consumer, &wrong_entitlements,)
+                .iter()
+                .any(|violation| violation.contains("reviewed nested-signing command"))
         );
 
         let reordered = concat!(
@@ -15332,7 +15326,9 @@ targets:
         let ci = "sh apple/scripts/generate-project.sh\n";
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
-        assert!(project_generation_surface_violations(&wrapper, ci, consumer, ui_consumer).is_empty());
+        assert!(
+            project_generation_surface_violations(&wrapper, ci, consumer, ui_consumer).is_empty()
+        );
 
         let missing_no_env = wrapper.replace(" --no-env", "");
         assert!(
@@ -15345,15 +15341,25 @@ targets:
             " generate --spec apple/project.yml --project apple\n"
         );
         assert!(
-            project_generation_surface_violations(&wrapper, &(ci.to_owned() + direct), consumer, ui_consumer)
-                .iter()
-                .any(|violation| violation.contains("must not bypass"))
+            project_generation_surface_violations(
+                &wrapper,
+                &(ci.to_owned() + direct),
+                consumer,
+                ui_consumer
+            )
+            .iter()
+            .any(|violation| violation.contains("must not bypass"))
         );
         let root_form = "xcodegen --spec apple/project.yml --project apple\n";
         assert!(
-            project_generation_surface_violations(&wrapper, &format!("{ci}{root_form}"), consumer, ui_consumer)
-                .iter()
-                .any(|violation| violation.contains("must not bypass"))
+            project_generation_surface_violations(
+                &wrapper,
+                &format!("{ci}{root_form}"),
+                consumer,
+                ui_consumer
+            )
+            .iter()
+            .any(|violation| violation.contains("must not bypass"))
         );
     }
 
