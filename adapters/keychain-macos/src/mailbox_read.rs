@@ -13,14 +13,16 @@ use std::fmt;
 use std::task::{Context, Poll, Waker};
 
 use tersa_application::mailbox::{
-    BoxFuture, MailboxReader, MailboxStoreError, StoreLimit, ThreadId,
+    BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit, ThreadId,
 };
 use tersa_application::mailbox_metadata::{inbox_metadata, thread_metadata};
 use tersa_application::mailbox_search::{MailboxSearchQuery, search_metadata};
 use tersa_platform::secure_storage::AccountId;
-use tersa_presentation::mailbox::{InboxViewModel, SearchViewModel, ThreadViewModel};
+use tersa_presentation::mailbox::{
+    InboxViewModel, MessageRowViewModel, SearchViewModel, ThreadViewModel,
+};
 
-use crate::{ReadOnlyMailboxOpenError, open_default_read_only_mailbox};
+use crate::{ReadOnlyMailboxOpenError, open_default_mailbox_store, open_default_read_only_mailbox};
 
 // Rust guideline compliant 1.0.
 
@@ -144,6 +146,11 @@ fn read_default_inbox_with_dependencies<R: MailboxReader>(
 }
 
 /// Executes the thread read through an injected trusted opening capability.
+///
+/// After a successful metadata load, attaches cached body display text when
+/// present and best-effort marks the whole thread as locally read (sticky under
+/// later sync; server UNREAD is not cleared because the product is
+/// `gmail.readonly`-only).
 fn read_default_thread_with_dependencies<R: MailboxReader>(
     is_main_thread: bool,
     account_bytes: &[u8],
@@ -157,10 +164,33 @@ fn read_default_thread_with_dependencies<R: MailboxReader>(
     let document = poll_once(thread_metadata(&reader, &account, &thread, limit))
         .map_err(|_pending| MailboxReadStatus::Unavailable)?
         .map_err(store_failure_status)?;
-    let model = ThreadViewModel::from_document(&document, &thread)
-        .map_err(|_mismatched_command| MailboxReadStatus::Unavailable)?;
+
+    let mut rows = Vec::with_capacity(document.messages().len());
+    for message in document.messages() {
+        let body_bytes = match poll_once(reader.get_message(&account, message.message_id())) {
+            Ok(Ok(Some(complete))) => Some(complete.content().as_bytes().to_vec()),
+            _ => None,
+        };
+        let mut row = MessageRowViewModel::from_message_with_body(message, body_bytes.as_deref());
+        // Opening a thread marks its messages locally read for the UI response.
+        row.unread = false;
+        rows.push(row);
+    }
     drop(reader);
-    Ok(model)
+
+    // Best-effort durable local mark-as-read. Failure leaves rows already shown
+    // as read for this response; the next open retries the write.
+    if let Ok(store) = open_default_mailbox_store(&account) {
+        let _ignored = poll_once(store.mark_thread_read(&account, &thread));
+        drop(store);
+    }
+
+    Ok(ThreadViewModel::from_rows(
+        document.account_id().as_str().to_owned(),
+        thread.as_str().to_owned(),
+        document.limit().get(),
+        rows,
+    ))
 }
 
 /// Executes the metadata search through an injected trusted opening capability.
@@ -254,7 +284,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use tersa_application::mailbox::{HeaderText, MessageEnvelope, MessageId, UnixTimestampMillis};
+    use tersa_application::mailbox::{
+        HeaderText, Message, MessageEnvelope, MessageId, UnixTimestampMillis,
+    };
 
     use super::*;
 
@@ -286,6 +318,14 @@ mod tests {
                 .store(usize::from(limit.get()), Ordering::SeqCst);
             let result = self.threaded.clone();
             Box::pin(async move { result })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 
@@ -323,6 +363,14 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(pending())
         }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(pending())
+        }
     }
 
     struct DropReader {
@@ -351,6 +399,14 @@ mod tests {
             _limit: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async { Ok(None) })
         }
     }
 

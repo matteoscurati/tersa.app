@@ -36,12 +36,17 @@ impl MailboxMetadataCommand {
 }
 
 /// Contains only the fields approved for metadata output.
+///
+/// Includes the envelope preview (provider snippet). Complete message bodies
+/// stay out of this projection and are attached by presentation adapters when
+/// a cached body is available.
 #[derive(Clone, Eq, PartialEq)]
 pub struct MailboxMetadataMessage {
     message_id: MessageId,
     thread_id: ThreadId,
     from: HeaderText,
     subject: HeaderText,
+    preview: HeaderText,
     received_at: UnixTimestampMillis,
     unread: bool,
 }
@@ -53,6 +58,7 @@ impl MailboxMetadataMessage {
             thread_id: envelope.thread_id().clone(),
             from: envelope.from().clone(),
             subject: envelope.subject().clone(),
+            preview: envelope.preview().clone(),
             received_at: envelope.received_at(),
             unread: envelope.is_unread(),
         }
@@ -82,6 +88,12 @@ impl MailboxMetadataMessage {
         &self.subject
     }
 
+    /// Returns the provider preview/snippet header.
+    #[must_use]
+    pub fn preview(&self) -> &HeaderText {
+        &self.preview
+    }
+
     /// Returns the received timestamp.
     #[must_use]
     pub const fn received_at(&self) -> UnixTimestampMillis {
@@ -103,6 +115,7 @@ impl fmt::Debug for MailboxMetadataMessage {
             .field("thread_id", &self.thread_id)
             .field("from", &"[REDACTED]")
             .field("subject", &"[REDACTED]")
+            .field("preview", &"[REDACTED]")
             .field("received_at", &self.received_at)
             .field("unread", &self.unread)
             .finish()
@@ -233,6 +246,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
+    use crate::mailbox::Message;
+
     use super::*;
 
     struct FakeReader {
@@ -271,6 +286,14 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let result = self.thread.clone();
             Box::pin(async move { result })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 

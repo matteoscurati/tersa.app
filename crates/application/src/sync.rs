@@ -485,6 +485,20 @@ mod tests {
         put_calls: Mutex<u16>,
     }
     impl MailboxStore for TestStore {
+        fn mark_message_read<'a>(
+            &'a self,
+            _: &'a AccountId,
+            _: &'a MessageId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(ready(Ok(())))
+        }
+        fn mark_thread_read<'a>(
+            &'a self,
+            _: &'a AccountId,
+            _: &'a ThreadId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(ready(Ok(())))
+        }
         fn upsert_envelopes<'a>(
             &'a self,
             _: &'a AccountId,
@@ -559,6 +573,13 @@ mod tests {
             _: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             Box::pin(ready(Ok(Vec::new())))
+        }
+        fn get_message<'a>(
+            &'a self,
+            _: &'a AccountId,
+            _: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(ready(Ok(None)))
         }
     }
     fn account() -> AccountId {

@@ -240,6 +240,17 @@ mod macos {
                 .map_err(|_poison| MailboxStoreError::Storage)?;
             list_envelopes(&mut connection, thread, limit)
         }
+
+        fn load_complete_message(
+            &self,
+            id: &MessageId,
+        ) -> Result<Option<Message>, MailboxStoreError> {
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_poison| MailboxStoreError::Storage)?;
+            get_complete_message(&connection, id)
+        }
     }
 
     impl SqlCipherMailboxStore {
@@ -928,7 +939,7 @@ mod macos {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
                 let changed = transaction.execute(
-                    "UPDATE messages SET thread_id = ?2, sender = ?3, subject = ?4, preview = ?5, received_at = ?6, unread = ?7, content = ?8 WHERE message_id = ?1",
+                    "UPDATE messages SET thread_id = ?2, sender = ?3, subject = ?4, preview = ?5, received_at = ?6, unread = CASE WHEN unread = 0 THEN 0 ELSE ?7 END, content = ?8 WHERE message_id = ?1",
                     params![message.envelope().message_id().as_str(), message.envelope().thread_id().as_str(), message.envelope().from().as_str(), message.envelope().subject().as_str(), message.envelope().preview().as_str(), message.envelope().received_at().as_millis(), i64::from(message.envelope().is_unread()), message.content().as_bytes()],
                 ).map_err(store_error)?;
                 #[cfg(test)]
@@ -953,27 +964,74 @@ mod macos {
             self.with_connection(|connection| list_envelopes(connection, thread, limit))
         }
 
-        fn get_message(&self, id: &MessageId) -> Result<Option<Message>, MailboxStoreError> {
+        fn load_complete_message(
+            &self,
+            id: &MessageId,
+        ) -> Result<Option<Message>, MailboxStoreError> {
+            self.with_connection(|connection| get_complete_message(connection, id))
+        }
+
+        fn mark_one_message_read(&self, message_id: &MessageId) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
-                let max_content_len = i64::try_from(MessageContent::MAX_LEN)
-                    .map_err(|_error| MailboxStoreError::Corrupted)?;
-                let mut statement = connection.prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END, CASE WHEN content IS NULL THEN 0 WHEN typeof(content) = 'blob' AND length(content) <= ?2 THEN 1 ELSE -1 END, CASE WHEN typeof(content) = 'blob' AND length(content) <= ?2 THEN content END FROM messages WHERE message_id = ?1").map_err(store_error)?;
-                let mut rows = statement
-                    .query(params![id.as_str(), max_content_len])
+                connection
+                    .execute(
+                        "UPDATE messages SET unread = 0 WHERE message_id = ?1 AND unread = 1",
+                        params![message_id.as_str()],
+                    )
                     .map_err(store_error)?;
-                let Some(row) = rows.next().map_err(store_error)? else { return Ok(None); };
-                let envelope = envelope_from_row(row)?;
-                match row.get::<_, i64>(7).map_err(corrupted)? {
-                    0 => Ok(None),
-                    1 => {
-                        let content: Vec<u8> = row.get(8).map_err(corrupted)?;
-                        MessageContent::new(content)
-                            .map_err(|_error| MailboxStoreError::Corrupted)
-                            .map(|content| Some(Message::new(envelope, content)))
-                    }
-                    _ => Err(MailboxStoreError::Corrupted),
-                }
+                Ok(())
             })
+        }
+
+        fn mark_one_thread_read(&self, thread_id: &ThreadId) -> Result<(), MailboxStoreError> {
+            self.with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE messages SET unread = 0 WHERE thread_id = ?1 AND unread = 1",
+                        params![thread_id.as_str()],
+                    )
+                    .map_err(store_error)?;
+                Ok(())
+            })
+        }
+    }
+
+    fn get_complete_message(
+        connection: &Connection,
+        id: &MessageId,
+    ) -> Result<Option<Message>, MailboxStoreError> {
+        let max_content_len = i64::try_from(MessageContent::MAX_LEN)
+            .map_err(|_error| MailboxStoreError::Corrupted)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, \
+                 CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, \
+                 CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, \
+                 CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, \
+                 CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, \
+                 CASE WHEN typeof(received_at) = 'integer' THEN received_at END, \
+                 CASE WHEN typeof(unread) = 'integer' THEN unread END, \
+                 CASE WHEN content IS NULL THEN 0 WHEN typeof(content) = 'blob' AND length(content) <= ?2 THEN 1 ELSE -1 END, \
+                 CASE WHEN typeof(content) = 'blob' AND length(content) <= ?2 THEN content END \
+                 FROM messages WHERE message_id = ?1",
+            )
+            .map_err(store_error)?;
+        let mut rows = statement
+            .query(params![id.as_str(), max_content_len])
+            .map_err(store_error)?;
+        let Some(row) = rows.next().map_err(store_error)? else {
+            return Ok(None);
+        };
+        let envelope = envelope_from_row(row)?;
+        match row.get::<_, i64>(7).map_err(corrupted)? {
+            0 => Ok(None),
+            1 => {
+                let content: Vec<u8> = row.get(8).map_err(corrupted)?;
+                MessageContent::new(content)
+                    .map_err(|_error| MailboxStoreError::Corrupted)
+                    .map(|content| Some(Message::new(envelope, content)))
+            }
+            _ => Err(MailboxStoreError::Corrupted),
         }
     }
 
@@ -2113,6 +2171,26 @@ mod macos {
     }
 
     impl MailboxStore for SqlCipherMailboxStore {
+        fn mark_message_read<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.mark_one_message_read(message_id)
+            })
+        }
+        fn mark_thread_read<'a>(
+            &'a self,
+            account: &'a AccountId,
+            thread_id: &'a ThreadId,
+        ) -> BoxFuture<'a, Result<(), MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.mark_one_thread_read(thread_id)
+            })
+        }
         fn upsert_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -2163,7 +2241,7 @@ mod macos {
         ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
-                self.get_message(message_id)
+                self.load_complete_message(message_id)
             })
         }
     }
@@ -2277,6 +2355,17 @@ mod macos {
                 self.list(None, limit)
             })
         }
+
+        fn get_message<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.load_complete_message(message_id)
+            })
+        }
         fn thread_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -2299,6 +2388,17 @@ mod macos {
             Box::pin(async move {
                 self.checked_account(account)?;
                 self.list(None, limit)
+            })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.load_complete_message(message_id)
             })
         }
 
@@ -2408,8 +2508,10 @@ mod macos {
         content: Option<&[u8]>,
     ) -> Result<(), MailboxStoreError> {
         match content {
-            Some(content) => transaction.execute("INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(message_id) DO UPDATE SET thread_id = excluded.thread_id, sender = excluded.sender, subject = excluded.subject, preview = excluded.preview, received_at = excluded.received_at, unread = excluded.unread, content = excluded.content", params![envelope.message_id().as_str(), envelope.thread_id().as_str(), envelope.from().as_str(), envelope.subject().as_str(), envelope.preview().as_str(), envelope.received_at().as_millis(), i64::from(envelope.is_unread()), content]).map_err(store_error)?,
-            None => transaction.execute("INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) ON CONFLICT(message_id) DO UPDATE SET thread_id = excluded.thread_id, sender = excluded.sender, subject = excluded.subject, preview = excluded.preview, received_at = excluded.received_at, unread = excluded.unread", params![envelope.message_id().as_str(), envelope.thread_id().as_str(), envelope.from().as_str(), envelope.subject().as_str(), envelope.preview().as_str(), envelope.received_at().as_millis(), i64::from(envelope.is_unread())]).map_err(store_error)?,
+            // Sticky local read: once unread is 0, a later remote UNREAD snapshot
+            // must not reopen the message (gmail.readonly cannot clear server labels).
+            Some(content) => transaction.execute("INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(message_id) DO UPDATE SET thread_id = excluded.thread_id, sender = excluded.sender, subject = excluded.subject, preview = excluded.preview, received_at = excluded.received_at, unread = CASE WHEN messages.unread = 0 THEN 0 ELSE excluded.unread END, content = excluded.content", params![envelope.message_id().as_str(), envelope.thread_id().as_str(), envelope.from().as_str(), envelope.subject().as_str(), envelope.preview().as_str(), envelope.received_at().as_millis(), i64::from(envelope.is_unread()), content]).map_err(store_error)?,
+            None => transaction.execute("INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) ON CONFLICT(message_id) DO UPDATE SET thread_id = excluded.thread_id, sender = excluded.sender, subject = excluded.subject, preview = excluded.preview, received_at = excluded.received_at, unread = CASE WHEN messages.unread = 0 THEN 0 ELSE excluded.unread END", params![envelope.message_id().as_str(), envelope.thread_id().as_str(), envelope.from().as_str(), envelope.subject().as_str(), envelope.preview().as_str(), envelope.received_at().as_millis(), i64::from(envelope.is_unread())]).map_err(store_error)?,
         };
         Ok(())
     }

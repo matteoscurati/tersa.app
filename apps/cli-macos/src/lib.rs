@@ -322,8 +322,8 @@ mod tests {
     use std::future::{Pending, Ready, pending, ready};
     use std::io;
 
-    use tersa_application::mailbox::BoxFuture;
-    use tersa_domain::mailbox::{HeaderText, MessageEnvelope, MessageId, UnixTimestampMillis};
+    use tersa_application::mailbox::{BoxFuture, Message, MessageId};
+    use tersa_domain::mailbox::{HeaderText, MessageEnvelope, UnixTimestampMillis};
 
     use super::*;
 
@@ -369,6 +369,14 @@ mod tests {
             _limit: StoreLimit,
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             self.thread.future()
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 

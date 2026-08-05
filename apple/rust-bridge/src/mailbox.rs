@@ -251,6 +251,10 @@ fn push_limit(output: &mut String, limit: u16) {
 }
 
 /// Writes the message rows in document order with the stable field parity.
+///
+/// Includes `preview` and optional `body_text` / `body_html` so the macOS UI
+/// can render message content offline in plain or sandboxed HTML mode. The CLI
+/// keeps its own metadata-only encoder.
 fn push_rows(output: &mut String, rows: &[MessageRowViewModel]) {
     output.push_str(",\"messages\":[");
     for (index, row) in rows.iter().enumerate() {
@@ -265,6 +269,16 @@ fn push_rows(output: &mut String, rows: &[MessageRowViewModel]) {
         push_json_string(output, &row.from);
         output.push_str(",\"subject\":");
         push_json_string(output, &row.subject);
+        output.push_str(",\"preview\":");
+        push_json_string(output, &row.preview);
+        if let Some(body_text) = &row.body_text {
+            output.push_str(",\"body_text\":");
+            push_json_string(output, body_text);
+        }
+        if let Some(body_html) = &row.body_html {
+            output.push_str(",\"body_html\":");
+            push_json_string(output, body_html);
+        }
         output.push_str(",\"received_at_millis\":");
         // Writing to a String cannot fail.
         let _ = write!(output, "{}", row.received_at_millis);
@@ -306,8 +320,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tersa_application::mailbox::{
-        AccountId, BoxFuture, HeaderText, MailboxReader, MailboxStoreError, MessageEnvelope,
-        MessageId, StoreLimit, ThreadId, UnixTimestampMillis,
+        AccountId, BoxFuture, HeaderText, MailboxReader, MailboxStoreError, Message,
+        MessageEnvelope, MessageId, StoreLimit, ThreadId, UnixTimestampMillis,
     };
     use tersa_application::mailbox_metadata::{inbox_metadata, thread_metadata};
     use tersa_application::mailbox_search::{MailboxSearchQuery, search_metadata};
@@ -339,6 +353,14 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
             let result = Ok(self.envelopes.clone());
             Box::pin(async move { result })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 
@@ -407,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_golden_json_matches_the_cli_byte_for_byte() {
+    fn inbox_golden_json_includes_preview_for_ui() {
         let model = inbox_model(vec![
             envelope("newest", "thread-a", "from-newest", 20),
             envelope("older", "thread-b", "from-older", 10),
@@ -416,7 +438,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            "{\"schema_version\":1,\"command\":\"inbox\",\"account_id\":\"account-1\",\"limit\":50,\"messages\":[{\"message_id\":\"newest\",\"thread_id\":\"thread-a\",\"from\":\"from-newest\",\"subject\":\"subject-newest\",\"received_at_millis\":20,\"unread\":true},{\"message_id\":\"older\",\"thread_id\":\"thread-b\",\"from\":\"from-older\",\"subject\":\"subject-older\",\"received_at_millis\":10,\"unread\":true}]}"
+            "{\"schema_version\":1,\"command\":\"inbox\",\"account_id\":\"account-1\",\"limit\":50,\"messages\":[{\"message_id\":\"newest\",\"thread_id\":\"thread-a\",\"from\":\"from-newest\",\"subject\":\"subject-newest\",\"preview\":\"preview-secret-newest\",\"received_at_millis\":20,\"unread\":true},{\"message_id\":\"older\",\"thread_id\":\"thread-b\",\"from\":\"from-older\",\"subject\":\"subject-older\",\"preview\":\"preview-secret-older\",\"received_at_millis\":10,\"unread\":true}]}"
         );
     }
 
@@ -432,7 +454,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            "{\"schema_version\":1,\"command\":\"thread\",\"account_id\":\"account-1\",\"thread_id\":\"thread-a\",\"limit\":50,\"messages\":[{\"message_id\":\"message-1\",\"thread_id\":\"thread-a\",\"from\":\"from-message-1\",\"subject\":\"subject-message-1\",\"received_at_millis\":10,\"unread\":true}]}"
+            "{\"schema_version\":1,\"command\":\"thread\",\"account_id\":\"account-1\",\"thread_id\":\"thread-a\",\"limit\":50,\"messages\":[{\"message_id\":\"message-1\",\"thread_id\":\"thread-a\",\"from\":\"from-message-1\",\"subject\":\"subject-message-1\",\"preview\":\"preview-secret-message-1\",\"received_at_millis\":10,\"unread\":true}]}"
         );
     }
 
@@ -449,7 +471,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            "{\"schema_version\":1,\"command\":\"search\",\"account_id\":\"account-1\",\"query\":\"alice\",\"limit\":50,\"messages\":[{\"message_id\":\"hit\",\"thread_id\":\"thread-a\",\"from\":\"alice@example.test\",\"subject\":\"subject-hit\",\"received_at_millis\":20,\"unread\":true}]}"
+            "{\"schema_version\":1,\"command\":\"search\",\"account_id\":\"account-1\",\"query\":\"alice\",\"limit\":50,\"messages\":[{\"message_id\":\"hit\",\"thread_id\":\"thread-a\",\"from\":\"alice@example.test\",\"subject\":\"subject-hit\",\"preview\":\"preview-secret-hit\",\"received_at_millis\":20,\"unread\":true}]}"
         );
     }
 
@@ -474,6 +496,9 @@ mod tests {
             thread_id: "thread".to_owned(),
             from: "quote=\" slash=\\ snow=雪".to_owned(),
             subject: String::new(),
+            preview: String::new(),
+            body_text: None,
+            body_html: None,
             received_at_millis: 7,
             unread: false,
         };
@@ -491,7 +516,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                ",\"messages\":[{{\"message_id\":\"m{expected_controls}\",\"thread_id\":\"thread\",\"from\":\"quote=\\\" slash=\\\\ snow=雪\",\"subject\":\"\",\"received_at_millis\":7,\"unread\":false}}]}}"
+                ",\"messages\":[{{\"message_id\":\"m{expected_controls}\",\"thread_id\":\"thread\",\"from\":\"quote=\\\" slash=\\\\ snow=雪\",\"subject\":\"\",\"preview\":\"\",\"received_at_millis\":7,\"unread\":false}}]}}"
             )
         );
     }
