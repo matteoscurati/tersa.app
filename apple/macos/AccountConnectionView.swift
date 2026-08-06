@@ -11,6 +11,7 @@ import SwiftUI
 @MainActor
 struct AccountConnectionView: View {
     @ObservedObject var viewModel: AccountConnectionViewModel
+    @FocusState private var accountFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 20) {
@@ -39,6 +40,10 @@ struct AccountConnectionView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Account connection")
         .accessibilityValue(viewModel.state.accessibilityValue)
+        .onAppear(perform: focusPrimaryControl)
+        .onChange(of: viewModel.state) { _, _ in
+            focusPrimaryControl()
+        }
         .onChange(of: viewModel.disconnectNotice) { _, newNotice in
             announce(newNotice)
         }
@@ -56,6 +61,7 @@ struct AccountConnectionView: View {
             Text("Connect your account")
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("Enter a local account name, such as primary-gmail, to connect this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -70,12 +76,22 @@ struct AccountConnectionView: View {
                 .frame(maxWidth: 320)
                 .disabled(isConnecting)
                 .accessibilityLabel("Local account name")
+                .focused($accountFieldFocused)
                 .onSubmit(handleConnectTapped)
             Button("Connect", action: handleConnectTapped)
                 .keyboardShortcut(.defaultAction)
                 .disabled(isConnecting || viewModel.isConnectDisabled)
                 .accessibilityLabel("Connect account")
         }
+    }
+
+    /// Puts VoiceOver and keyboard focus on the primary editable control when
+    /// the form is ready, so the connection screen is not a dead-focus region.
+    private func focusPrimaryControl() {
+        guard viewModel.state == .notConnected || viewModel.state == .connecting else {
+            return
+        }
+        accountFieldFocused = true
     }
 
     private var authorizingContent: some View {
@@ -87,6 +103,7 @@ struct AccountConnectionView: View {
             Text("Finish sign-in in your browser")
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("Tersa opened a sign-in page in your browser. Tersa finishes connecting automatically once you've signed in.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -109,6 +126,7 @@ struct AccountConnectionView: View {
             Text("Disconnecting account")
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("Revoking Tersa's access and removing mail stored on this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -128,6 +146,7 @@ struct AccountConnectionView: View {
             Text(failure.title)
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text(failure.message)
                 .font(.callout)
                 .foregroundStyle(.secondary)

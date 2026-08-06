@@ -92,6 +92,7 @@ struct ComposerView: View {
             Text("New Message")
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             unavailableNotice
             composerForm
             HStack {
