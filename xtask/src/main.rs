@@ -410,7 +410,8 @@ mod preflight_router_tests {
     fn adapter_preflight_requires_package() {
         assert!(preflight_plan(PreflightClass::Adapter, None).is_err());
         assert_eq!(
-            preflight_plan(PreflightClass::Adapter, Some("tersa-gmail-rest-macos")).unwrap(),
+            preflight_plan(PreflightClass::Adapter, Some("tersa-gmail-rest-macos"))
+                .expect("adapter with package"),
             PreflightPlan::AdapterPackage("tersa-gmail-rest-macos".to_owned())
         );
     }
@@ -418,25 +419,25 @@ mod preflight_router_tests {
     #[test]
     fn domain_and_bridge_plans_are_stable() {
         assert_eq!(
-            preflight_plan(PreflightClass::Domain, None).unwrap(),
+            preflight_plan(PreflightClass::Domain, None).expect("domain"),
             PreflightPlan::Packages {
                 packages: vec!["tersa-domain"],
                 architecture: false,
             }
         );
         assert_eq!(
-            preflight_plan(PreflightClass::Bridge, None).unwrap(),
+            preflight_plan(PreflightClass::Bridge, None).expect("bridge"),
             PreflightPlan::Packages {
                 packages: vec!["tersa-apple-bridge", "tersa-mailbox-sync-ffi-macos"],
                 architecture: true,
             }
         );
         assert_eq!(
-            preflight_plan(PreflightClass::Policy, None).unwrap(),
+            preflight_plan(PreflightClass::Policy, None).expect("policy"),
             PreflightPlan::ArchitectureOnly
         );
         assert_eq!(
-            preflight_plan(PreflightClass::Swift, None).unwrap(),
+            preflight_plan(PreflightClass::Swift, None).expect("swift"),
             PreflightPlan::PrintSwiftGuidance
         );
     }
