@@ -116,15 +116,19 @@ struct InboxView: View {
             )
 
             Button(action: handleSearchTapped) {
-                Image(systemName: "magnifyingglass")
+                Label("Search", systemImage: "magnifyingglass")
+                    .labelStyle(.iconOnly)
             }
             .accessibilityLabel("Search")
+            .accessibilityHint("Opens mailbox search.")
             .help("Search")
 
             Button(action: handleComposeTapped) {
-                Image(systemName: "square.and.pencil")
+                Label("New message", systemImage: "square.and.pencil")
+                    .labelStyle(.iconOnly)
             }
             .accessibilityLabel("New message")
+            .accessibilityHint("Opens the read-only composer entry screen.")
             .help("New message")
 
             Spacer(minLength: 8)
@@ -134,14 +138,18 @@ struct InboxView: View {
             Menu {
                 Button("Disconnect Account…", action: handleDisconnectTapped)
             } label: {
-                Image(systemName: "ellipsis.circle")
+                Label("Account actions", systemImage: "ellipsis.circle")
+                    .labelStyle(.iconOnly)
             }
             .accessibilityLabel("Account actions")
+            .accessibilityHint("Account actions, including disconnect.")
             .help("Account actions")
         }
         .buttonStyle(.bordered)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Inbox actions")
     }
 
     private var freshnessBanner: some View {
@@ -243,6 +251,8 @@ struct InboxView: View {
                 .accessibilityHidden(true)
             Text("The inbox could not be loaded")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text(failure.message)
                 .font(.callout)
                 .foregroundStyle(.secondary)

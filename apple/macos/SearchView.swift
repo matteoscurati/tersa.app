@@ -13,8 +13,6 @@ import SwiftUI
 /// concatenation.
 @MainActor
 struct SearchView: View {
-    private static let maximumQueryByteCount = 256
-
     let accountIdentifier: Data
     let onClose: () -> Void
 
@@ -23,6 +21,7 @@ struct SearchView: View {
     @State private var queryText = ""
     @State private var searching = false
     @State private var validationMessage: String?
+    @State private var staleEditNoticeVisible = false
     @State private var didHandleInitialAppearance = false
     @FocusState private var searchFieldFocused: Bool
 
@@ -34,6 +33,9 @@ struct SearchView: View {
             if let validationMessage {
                 validationBanner(validationMessage)
             }
+            if staleEditNoticeVisible {
+                staleEditBanner
+            }
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -43,9 +45,6 @@ struct SearchView: View {
         }
         .onChange(of: searching) { _, isSearching in
             announceSearching(isSearching)
-        }
-        .onChange(of: validationMessage) { _, newMessage in
-            announceValidationMessage(newMessage)
         }
         .onChange(of: queryText) { _, _ in
             validationMessage = nil
@@ -58,10 +57,11 @@ struct SearchView: View {
             Text("Search")
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Spacer()
             Button("Close", action: onClose)
-            .keyboardShortcut(.cancelAction)
-            .accessibilityLabel("Close search")
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Close search")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -115,6 +115,8 @@ struct SearchView: View {
                 .accessibilityHidden(true)
             Text("Search your mailbox")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("Type a sender or subject, then press Return to search.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -133,6 +135,8 @@ struct SearchView: View {
                 .accessibilityHidden(true)
             Text("No results")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("No messages match this search.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -161,13 +165,15 @@ struct SearchView: View {
                 .accessibilityHidden(true)
             Text("The search could not be completed")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text(failure.message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Search current text", action: handleSearchSubmit)
+            Button("Try again", action: handleSearchReloadTapped)
                 .keyboardShortcut(.defaultAction)
-                .accessibilityLabel("Search current text")
+                .accessibilityLabel("Try again")
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -188,32 +194,56 @@ struct SearchView: View {
         .accessibilityLabel(message)
     }
 
-    /// Validates the field, then enqueues one bounded search. Empty, over-limit,
-    /// or control-character input clears stale results, sets an inline message,
-    /// and never reaches the ABI.
+    /// The deterministic status for a discarded stale result: the field was
+    /// edited mid-search, the dropped result stays suppressed, and the user is
+    /// told that Return searches again. Fixed copy — it never names the query.
+    private var staleEditBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(SearchCompletionGuard.staleEditStatus)
+                .font(.callout)
+                .multilineTextAlignment(.center)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(SearchCompletionGuard.staleEditStatus)
+    }
+
+    /// Validates the field, then enqueues one bounded search. A resubmit while
+    /// a search is in flight is rejected with one fixed announced status —
+    /// never silently. An empty or invalid field sets an inline banner and
+    /// posts one direct announcement per submit, and never reaches the ABI.
     private func handleSearchSubmit() {
-        // Serialize submits: the worker serves one request at a time, so a
-        // resubmit while a search is in flight is ignored to avoid displaying an
-        // earlier query's results under the current text.
-        guard !searching else {
+        switch SearchSubmitGuard.decision(searching: searching) {
+        case .rejectInFlight:
+            AccessibilityNotification.Announcement(SearchSubmitGuard.inProgressStatus).post()
             return
+        case .submitField:
+            break
         }
         validationMessage = nil
-        outcome = nil
-        let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            validationMessage = "Enter a sender or subject to search."
+        staleEditNoticeVisible = false
+        switch SearchFieldValidator.decision(forFieldText: queryText) {
+        case .emptyField:
+            validationMessage = SearchFieldValidator.emptyFieldMessage
+            AccessibilityNotification.Announcement(SearchFieldValidator.emptyFieldMessage).post()
             return
-        }
-        guard trimmed.utf8.count <= Self.maximumQueryByteCount else {
-            validationMessage = "Search text is limited to 256 bytes. Shorten it and try again."
+        case .invalid(let message):
+            validationMessage = message
+            AccessibilityNotification.Announcement(message).post()
             return
+        case .validatedQuery(let query):
+            runSearch(query)
         }
-        guard !trimmed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
-            validationMessage = "Search text cannot contain control characters."
-            return
-        }
-        runSearch(trimmed)
+    }
+
+    /// Try again uses the same current-field validation and submit path as
+    /// Return. The field is never rewritten to an earlier query.
+    private func handleSearchReloadTapped() {
+        handleSearchSubmit()
     }
 
     private func runSearch(_ query: String) {
@@ -223,12 +253,18 @@ struct SearchView: View {
             self.searching = false
             // Display the result only if the field still shows the query it was
             // for. If the user edited the field while the search was in flight,
-            // the earlier query's result would be mismatched, so drop it — the
-            // view returns to the idle prompt and the new query can be submitted.
-            guard query == self.queryText.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                return
+            // drop the mismatched result — but never silently.
+            switch SearchCompletionGuard.decision(
+                completedQuery: query,
+                currentFieldText: self.queryText
+            ) {
+            case .displayResult:
+                self.staleEditNoticeVisible = false
+                self.outcome = result
+            case .discardStale:
+                self.staleEditNoticeVisible = true
+                AccessibilityNotification.Announcement(SearchCompletionGuard.staleEditStatus).post()
             }
-            self.outcome = result
         }
     }
 
@@ -266,12 +302,5 @@ struct SearchView: View {
         case .failure(let failure):
             return failure.message
         }
-    }
-
-    private func announceValidationMessage(_ message: String?) {
-        guard let message else {
-            return
-        }
-        AccessibilityNotification.Announcement(message).post()
     }
 }

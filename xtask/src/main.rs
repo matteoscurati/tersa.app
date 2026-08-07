@@ -6544,8 +6544,9 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
     }
     // Exact ordered TersaMacTests sources: macos-tests, the shared read-only
     // Keychain isolation probe source, the pure client/model surface under
-    // macos/, and the single reviewed shared callback-buffer helper. No
-    // directory wildcard for macos-token-broker; only this path.
+    // macos/ (including composer focus-traversal and search-guard models),
+    // and the single reviewed shared callback-buffer helper. No directory
+    // wildcard for macos-token-broker; only this path.
     let valid_sources = matches!(
         body.get("sources"),
         Some(StrictYamlValue::Sequence(sources))
@@ -6555,6 +6556,9 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
                 StrictYamlValue::Mapping(deadline_source),
                 StrictYamlValue::Mapping(connection_state_source),
                 StrictYamlValue::Mapping(disconnect_intent_source),
+                StrictYamlValue::Mapping(composer_source),
+                StrictYamlValue::Mapping(mailbox_documents_source),
+                StrictYamlValue::Mapping(mailbox_read_state_source),
                 StrictYamlValue::Mapping(lifecycle_source),
                 StrictYamlValue::Mapping(broker_protocol_source),
                 StrictYamlValue::Mapping(broker_client_source),
@@ -6571,6 +6575,12 @@ fn tersa_mac_test_target_surface_violations(target: &ProjectTarget) -> Vec<Strin
                 && matches!(connection_state_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ConnectionState.swift")
                 && disconnect_intent_source.len() == 1
                 && matches!(disconnect_intent_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/DisconnectIntentStore.swift")
+                && composer_source.len() == 1
+                && matches!(composer_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/ComposerView.swift")
+                && mailbox_documents_source.len() == 1
+                && matches!(mailbox_documents_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxDocuments.swift")
+                && mailbox_read_state_source.len() == 1
+                && matches!(mailbox_read_state_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxReadState.swift")
                 && lifecycle_source.len() == 1
                 && matches!(lifecycle_source.get("path"), Some(StrictYamlValue::String(path)) if path == "macos/MailboxLifecyclePresentation.swift")
                 && broker_protocol_source.len() == 1
@@ -10360,6 +10370,9 @@ targets:
       - path: macos/ConnectionOperationDeadline.swift
       - path: macos/ConnectionState.swift
       - path: macos/DisconnectIntentStore.swift
+      - path: macos/ComposerView.swift
+      - path: macos/MailboxDocuments.swift
+      - path: macos/MailboxReadState.swift
       - path: macos/MailboxLifecyclePresentation.swift
       - path: macos/TokenBrokerProtocol.swift
       - path: macos/TokenBrokerClient.swift

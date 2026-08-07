@@ -17,6 +17,8 @@ struct InboxEmptyStateView: View {
                 .accessibilityHidden(true)
             Text("Inbox is empty")
                 .font(.title2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(.h1)
             Text("New messages will appear here when they arrive.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
