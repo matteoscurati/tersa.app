@@ -170,8 +170,99 @@ def read_paths(arguments: list[str]) -> list[str]:
     return arguments if arguments else sys.stdin.read().splitlines()
 
 
+def recommend_preflight_classes(paths: Iterable[str], scope: Scope) -> list[str]:
+    """Suggest agent playbook preflight class names for *paths*.
+
+    Presentation only: CI continues to use the boolean scope fields alone.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    for raw_path in paths:
+        path = normalise_path(raw_path)
+        if path is None:
+            add("policy")
+            continue
+        if path.startswith("xtask/") or path in CI_CONTROL_PATHS or path.startswith(
+            FULL_FANOUT_PREFIXES
+        ) or path in FULL_FANOUT_PATHS:
+            add("policy")
+            continue
+        if path.startswith("docs/") or path.endswith(".md"):
+            add("docs")
+            continue
+        if path.startswith("crates/domain/"):
+            add("domain")
+        elif path.startswith("crates/application/"):
+            add("application")
+        elif path.startswith("crates/presentation/"):
+            add("presentation")
+        elif path.startswith("apple/rust-bridge/"):
+            add("bridge")
+        elif path.startswith("apple/macos-token-broker/") or path.startswith(
+            "adapters/token-broker-"
+        ):
+            add("token-broker")
+        elif path.startswith("adapters/"):
+            add("adapter")
+        elif path.startswith("apple/macos/") or path.startswith("apple/macos-tests/"):
+            add("swift-ui")
+        elif path.startswith("apple/"):
+            add("swift-ui")
+        elif path.startswith("apps/cli-macos/"):
+            add("adapter")
+        elif path.startswith("crates/platform/"):
+            add("application")
+
+    if not ordered:
+        if any(getattr(scope, field.name) for field in fields(Scope)):
+            add("policy")
+        else:
+            add("docs")
+    return ordered
+
+
+def print_github_output(scope: Scope) -> None:
+    for field in fields(Scope):
+        print(f"{field.name}={'true' if getattr(scope, field.name) else 'false'}")
+
+
+def print_agent_report(scope: Scope, paths: list[str]) -> None:
+    """Human/agent-oriented view; classification matches CI for the same paths."""
+    enabled = [field.name for field in fields(Scope) if getattr(scope, field.name)]
+    preflights = recommend_preflight_classes(paths, scope)
+    # Docs-only changes leave every scope false; full verify is not required.
+    full_verify = any(getattr(scope, field.name) for field in fields(Scope))
+    print("mode=agent")
+    print("scopes:")
+    for field in fields(Scope):
+        print(f"  {field.name}={'true' if getattr(scope, field.name) else 'false'}")
+    print(f"enabled={','.join(enabled) if enabled else '(none)'}")
+    print(f"full_verify_recommended={'true' if full_verify else 'false'}")
+    print(f"product_apple_lane={'true' if scope.product_apple else 'false'}")
+    print("recommended_preflight:")
+    for name in preflights:
+        print(f"  - {name}")
+    if full_verify:
+        print("note=run cargo xtask verify before ready-for-review")
+    if scope.product_apple:
+        print("note=budget for macOS product and quality CI lanes")
+    if not full_verify:
+        print("note=docs-only or empty product scopes; CI classifier lane is enough")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Classify changed paths for fail-closed product CI.")
+    parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="Print a human/agent report (scopes + recommended preflight). Classification is identical to CI.",
+    )
     parser.add_argument(
         "paths",
         nargs="*",
@@ -179,9 +270,12 @@ def main() -> int:
         help="Changed repository-relative paths; when omitted, read newline-delimited paths from standard input.",
     )
     arguments = parser.parse_args()
-    scope = classify(read_paths(arguments.paths))
-    for field in fields(Scope):
-        print(f"{field.name}={'true' if getattr(scope, field.name) else 'false'}")
+    paths = read_paths(arguments.paths)
+    scope = classify(paths)
+    if arguments.agent:
+        print_agent_report(scope, paths)
+    else:
+        print_github_output(scope)
     return 0
 
 

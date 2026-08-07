@@ -68,8 +68,9 @@ git diff --name-only main...HEAD | python3 scripts/ci-change-scope.py --agent
 cargo xtask verify   # always for code PRs
 ```
 
-If the classifier reports `product_apple=true`, budget for the macOS product
-and quality lanes.
+`--agent` is presentation only: scope booleans match CI for the same path list.
+If it reports `product_apple_lane=true`, budget for the macOS product and
+quality lanes.
 
 ## ADR pointers by class
 
