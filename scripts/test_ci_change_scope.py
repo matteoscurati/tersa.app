@@ -1037,6 +1037,43 @@ class ChangeScopeTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_cli_agent_mode_matches_ci_scopes_and_suggests_preflight(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--agent"],
+            input="crates/application/src/mailbox_search.rs\napple/macos/InboxView.swift\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        stdout = result.stdout
+        self.assertIn("mode=agent", stdout)
+        self.assertIn("rust_linux=true", stdout)
+        self.assertIn("product_apple=true", stdout)
+        self.assertIn("full_verify_recommended=true", stdout)
+        self.assertIn("product_apple_lane=true", stdout)
+        self.assertIn("recommended_preflight:", stdout)
+        self.assertIn("- application", stdout)
+        self.assertIn("- swift-ui", stdout)
+        # Same classification as CI format for the same path list.
+        ci = MODULE.classify(
+            [
+                "crates/application/src/mailbox_search.rs",
+                "apple/macos/InboxView.swift",
+            ]
+        )
+        self.assertTrue(ci.rust_linux)
+        self.assertTrue(ci.product_apple)
+        self.assertEqual(
+            MODULE.recommend_preflight_classes(
+                [
+                    "crates/application/src/mailbox_search.rs",
+                    "apple/macos/InboxView.swift",
+                ],
+                ci,
+            ),
+            ["application", "swift-ui"],
+        )
+
     def test_cli_reads_stdin_and_emits_github_output_format(self) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT)],
