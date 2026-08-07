@@ -24,6 +24,12 @@ advisory checks, feature-powerset checks, DCO validation, and spelling checks.
 The xtask architecture check enforces active product dependency boundaries on
 every supported Apple target.
 
+Coding agents should classify work and run **scoped** loops from the
+[agent playbook](development/agent-playbook.md) during implementation. Full
+`cargo xtask verify` remains the merge-quality gate and is not required after
+every single-file edit. The playbook also links ADR entry points and the
+unsigned macOS UI test command for Swift-only changes.
+
 For physical-device or signed-distribution evidence, follow the
 [Apple physical-device and distribution protocol](release/apple-distribution.md),
 including its commit-bound locator and review-retention rules. macOS UI and
