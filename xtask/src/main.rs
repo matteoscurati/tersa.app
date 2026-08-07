@@ -96,6 +96,27 @@ fn run() -> TaskResult {
             reject_extra_arguments(arguments)?;
             ci_macos()
         }
+        Some("check-pkg") => {
+            let package = required_argument(&mut arguments, "package name")?;
+            reject_extra_arguments(arguments)?;
+            check_pkg(&package)
+        }
+        Some("test-pkg") => {
+            let package = required_argument(&mut arguments, "package name")?;
+            reject_extra_arguments(arguments)?;
+            test_pkg(&package)
+        }
+        Some("clippy-pkg") => {
+            let package = required_argument(&mut arguments, "package name")?;
+            reject_extra_arguments(arguments)?;
+            clippy_pkg(&package)
+        }
+        Some("preflight") => {
+            let class = required_argument(&mut arguments, "preflight class")?;
+            let package = optional_package_flag(&mut arguments)?;
+            reject_extra_arguments(arguments)?;
+            preflight(&class, package.as_deref())
+        }
         Some("help") | None => {
             print_help();
             Ok(())
@@ -129,12 +150,296 @@ fn print_help() {
 Repository automation for tersa.app
 
 Usage:
-  cargo xtask architecture       Check workspace dependency boundaries
-  cargo xtask dco <base> <head>  Check DCO sign-offs in a commit range
-  cargo xtask verify             Run the baseline Rust verification suite
-  cargo xtask ci-macos           Run the macOS CI Rust suite (no fmt/arch/check)
-  cargo xtask help               Show this help"
+  cargo xtask architecture              Check workspace dependency boundaries
+  cargo xtask dco <base> <head>         Check DCO sign-offs in a commit range
+  cargo xtask verify                    Run the baseline Rust verification suite
+  cargo xtask ci-macos                  Run the macOS CI Rust suite (no fmt/arch/check)
+  cargo xtask check-pkg <package>       cargo check -p <package> --all-targets (locked)
+  cargo xtask test-pkg <package>        cargo test  -p <package> --all-targets (locked)
+  cargo xtask clippy-pkg <package>      cargo clippy -p <package> --all-targets -D warnings
+  cargo xtask preflight <class> [--package <crate>]
+                                        Class-scoped min suite (see agent playbook)
+  cargo xtask help                      Show this help
+
+preflight classes: domain, application, presentation, adapter|adapter-rust,
+  bridge|bridge-ffi, token-broker, policy|policy-xtask, swift|swift-ui, docs|docs-only
+adapter requires --package <workspace-crate>. swift prints unsigned xcodebuild lines."
     );
+}
+
+fn cargo_args(arguments: &[&str]) -> Command {
+    let mut command = Command::new("cargo");
+    command.args(arguments);
+    command
+}
+
+fn optional_package_flag(
+    arguments: &mut impl Iterator<Item = String>,
+) -> TaskResult<Option<String>> {
+    let Some(first) = arguments.next() else {
+        return Ok(None);
+    };
+    if first == "--package" || first == "-p" {
+        return Ok(Some(required_argument(arguments, "package name")?));
+    }
+    if let Some(package) = first.strip_prefix("--package=") {
+        return Ok(Some(package.to_owned()));
+    }
+    Err(io::Error::other(format!(
+        "unexpected argument `{first}`; expected --package <crate> or no further arguments"
+    ))
+    .into())
+}
+
+fn workspace_package_names() -> TaskResult<BTreeSet<String>> {
+    let metadata = MetadataCommand::new()
+        .no_deps()
+        .other_options(vec!["--locked".to_owned()])
+        .exec()
+        .map_err(|error| io::Error::other(format!("cargo metadata failed: {error}")))?;
+    Ok(metadata
+        .workspace_packages()
+        .into_iter()
+        .map(|package| package.name.to_string())
+        .collect())
+}
+
+fn require_workspace_package(package: &str) -> TaskResult {
+    let names = workspace_package_names()?;
+    if names.contains(package) {
+        return Ok(());
+    }
+    let mut listed = names.into_iter().collect::<Vec<_>>();
+    listed.sort();
+    Err(io::Error::other(format!(
+        "unknown package `{package}`; workspace packages: {}",
+        listed.join(", ")
+    ))
+    .into())
+}
+
+fn check_pkg(package: &str) -> TaskResult {
+    require_workspace_package(package)?;
+    run_command(
+        &format!("check-pkg {package}"),
+        cargo_args(&["check", "--locked", "-p", package, "--all-targets"]),
+    )
+}
+
+fn test_pkg(package: &str) -> TaskResult {
+    require_workspace_package(package)?;
+    run_command(
+        &format!("test-pkg {package}"),
+        cargo_args(&["test", "--locked", "-p", package, "--all-targets"]),
+    )
+}
+
+fn clippy_pkg(package: &str) -> TaskResult {
+    require_workspace_package(package)?;
+    run_command(
+        &format!("clippy-pkg {package}"),
+        cargo_args(&[
+            "clippy",
+            "--locked",
+            "-p",
+            package,
+            "--all-targets",
+            "--",
+            "--deny",
+            "warnings",
+        ]),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightClass {
+    Domain,
+    Application,
+    Presentation,
+    Adapter,
+    Bridge,
+    TokenBroker,
+    Policy,
+    Swift,
+    Docs,
+}
+
+fn parse_preflight_class(raw: &str) -> Option<PreflightClass> {
+    match raw {
+        "domain" => Some(PreflightClass::Domain),
+        "application" => Some(PreflightClass::Application),
+        "presentation" => Some(PreflightClass::Presentation),
+        "adapter" | "adapter-rust" => Some(PreflightClass::Adapter),
+        "bridge" | "bridge-ffi" => Some(PreflightClass::Bridge),
+        "token-broker" => Some(PreflightClass::TokenBroker),
+        "policy" | "policy-xtask" => Some(PreflightClass::Policy),
+        "swift" | "swift-ui" => Some(PreflightClass::Swift),
+        "docs" | "docs-only" => Some(PreflightClass::Docs),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreflightPlan {
+    ArchitectureOnly,
+    DocsNoop,
+    PrintSwiftGuidance,
+    Packages {
+        packages: Vec<&'static str>,
+        architecture: bool,
+    },
+    AdapterPackage(String),
+}
+
+fn preflight_plan(class: PreflightClass, package: Option<&str>) -> Result<PreflightPlan, String> {
+    match class {
+        PreflightClass::Domain => Ok(PreflightPlan::Packages {
+            packages: vec!["tersa-domain"],
+            architecture: false,
+        }),
+        PreflightClass::Application => Ok(PreflightPlan::Packages {
+            packages: vec!["tersa-application"],
+            architecture: false,
+        }),
+        PreflightClass::Presentation => Ok(PreflightPlan::Packages {
+            packages: vec!["tersa-presentation"],
+            architecture: false,
+        }),
+        PreflightClass::Adapter => {
+            let package = package
+                .ok_or_else(|| "preflight adapter requires --package <workspace-crate>".to_owned())?
+                .to_owned();
+            Ok(PreflightPlan::AdapterPackage(package))
+        }
+        PreflightClass::Bridge => Ok(PreflightPlan::Packages {
+            packages: vec!["tersa-apple-bridge", "tersa-mailbox-sync-ffi-macos"],
+            architecture: true,
+        }),
+        PreflightClass::TokenBroker => Ok(PreflightPlan::Packages {
+            packages: vec!["tersa-token-broker-core", "tersa-token-broker-ffi-macos"],
+            architecture: true,
+        }),
+        PreflightClass::Policy => Ok(PreflightPlan::ArchitectureOnly),
+        PreflightClass::Swift => Ok(PreflightPlan::PrintSwiftGuidance),
+        PreflightClass::Docs => Ok(PreflightPlan::DocsNoop),
+    }
+}
+
+fn preflight(class_raw: &str, package: Option<&str>) -> TaskResult {
+    let class = parse_preflight_class(class_raw).ok_or_else(|| {
+        io::Error::other(format!(
+            "unknown preflight class `{class_raw}`; run `cargo xtask help`"
+        ))
+    })?;
+    let plan = preflight_plan(class, package).map_err(io::Error::other)?;
+    execute_preflight_plan(plan)
+}
+
+fn execute_preflight_plan(plan: PreflightPlan) -> TaskResult {
+    match plan {
+        PreflightPlan::ArchitectureOnly => {
+            println!(
+                "preflight policy: architecture only; run full verify before ready-for-review"
+            );
+            check_architecture()
+        }
+        PreflightPlan::DocsNoop => {
+            println!("preflight docs-only: no local cargo suite; CI classifier is enough");
+            Ok(())
+        }
+        PreflightPlan::PrintSwiftGuidance => {
+            println!(
+                "\
+preflight swift-ui: run unsigned macOS tests locally (xtask does not invoke Xcode):
+
+  sh apple/scripts/generate-project.sh   # only if project.yml / XcodeGen inputs changed
+  xcodebuild -project apple/Tersa.xcodeproj -scheme TersaMac \\
+    -configuration Debug -destination 'platform=macOS,arch=arm64' \\
+    -derivedDataPath apple/build/DerivedData CODE_SIGNING_ALLOWED=NO test
+
+Run cargo xtask architecture if project.yml, bridge headers, or inventories changed."
+            );
+            Ok(())
+        }
+        PreflightPlan::Packages {
+            packages,
+            architecture,
+        } => {
+            if architecture {
+                check_architecture()?;
+            }
+            for package in packages {
+                test_pkg(package)?;
+            }
+            Ok(())
+        }
+        PreflightPlan::AdapterPackage(package) => test_pkg(&package),
+    }
+}
+
+#[cfg(test)]
+mod preflight_router_tests {
+    use super::{PreflightClass, PreflightPlan, parse_preflight_class, preflight_plan};
+
+    #[test]
+    fn parses_playbook_class_aliases() {
+        assert_eq!(
+            parse_preflight_class("adapter-rust"),
+            Some(PreflightClass::Adapter)
+        );
+        assert_eq!(
+            parse_preflight_class("bridge-ffi"),
+            Some(PreflightClass::Bridge)
+        );
+        assert_eq!(
+            parse_preflight_class("swift-ui"),
+            Some(PreflightClass::Swift)
+        );
+        assert_eq!(
+            parse_preflight_class("policy-xtask"),
+            Some(PreflightClass::Policy)
+        );
+        assert_eq!(
+            parse_preflight_class("docs-only"),
+            Some(PreflightClass::Docs)
+        );
+        assert_eq!(parse_preflight_class("not-a-class"), None);
+    }
+
+    #[test]
+    fn adapter_preflight_requires_package() {
+        assert!(preflight_plan(PreflightClass::Adapter, None).is_err());
+        assert_eq!(
+            preflight_plan(PreflightClass::Adapter, Some("tersa-gmail-rest-macos")).unwrap(),
+            PreflightPlan::AdapterPackage("tersa-gmail-rest-macos".to_owned())
+        );
+    }
+
+    #[test]
+    fn domain_and_bridge_plans_are_stable() {
+        assert_eq!(
+            preflight_plan(PreflightClass::Domain, None).unwrap(),
+            PreflightPlan::Packages {
+                packages: vec!["tersa-domain"],
+                architecture: false,
+            }
+        );
+        assert_eq!(
+            preflight_plan(PreflightClass::Bridge, None).unwrap(),
+            PreflightPlan::Packages {
+                packages: vec!["tersa-apple-bridge", "tersa-mailbox-sync-ffi-macos"],
+                architecture: true,
+            }
+        );
+        assert_eq!(
+            preflight_plan(PreflightClass::Policy, None).unwrap(),
+            PreflightPlan::ArchitectureOnly
+        );
+        assert_eq!(
+            preflight_plan(PreflightClass::Swift, None).unwrap(),
+            PreflightPlan::PrintSwiftGuidance
+        );
+    }
 }
 
 fn verify() -> TaskResult {

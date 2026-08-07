@@ -84,7 +84,7 @@ and quality lanes.
 
 ## Scoped commands
 
-When `xtask` provides package lanes (see `cargo xtask help`):
+Package and class lanes (see `cargo xtask help`):
 
 ```sh
 cargo xtask check-pkg <package>
@@ -93,8 +93,9 @@ cargo xtask clippy-pkg <package>
 cargo xtask preflight <class> [--package <crate>]
 ```
 
-Until those commands exist in a tree, use the equivalent `cargo test -p …`
-commands from the change-class table. Full `cargo xtask verify` and
+`preflight` classes match the table above (`adapter` / `adapter-rust` require
+`--package`). `preflight swift-ui` prints the unsigned `xcodebuild` lines and
+does not invoke Xcode (Linux-safe). Full `cargo xtask verify` and
 `cargo xtask architecture` remain the merge gates.
 
 ### Unsigned macOS UI tests (`swift-ui`)

@@ -30,6 +30,20 @@ Coding agents should classify work and run **scoped** loops from the
 every single-file edit. The playbook also links ADR entry points and the
 unsigned macOS UI test command for Swift-only changes.
 
+Scoped package lanes (Linux-safe for Rust classes):
+
+```sh
+cargo xtask check-pkg tersa-domain
+cargo xtask test-pkg tersa-application
+cargo xtask clippy-pkg tersa-presentation
+cargo xtask preflight domain
+cargo xtask preflight adapter --package tersa-gmail-rest-macos
+cargo xtask preflight swift-ui    # prints unsigned xcodebuild lines; does not run Xcode
+```
+
+`preflight policy` runs architecture only; still run full `verify` before
+ready-for-review.
+
 For physical-device or signed-distribution evidence, follow the
 [Apple physical-device and distribution protocol](release/apple-distribution.md),
 including its commit-bound locator and review-retention rules. macOS UI and
