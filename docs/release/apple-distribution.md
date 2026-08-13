@@ -54,13 +54,18 @@ evidence only.
 
 1. Repeat foreground/background, active/inactive, rotation, memory-pressure,
    lock/unlock, and protected-data-unavailable transitions while the inbox,
-   composer, OAuth callback, and hostile-content renderer are active.
+   composer, and OAuth callback are active. Include the hostile-content
+   renderer only after an approved `SafeHtml` boundary exists.
 2. Confirm cancellation and recovery are bounded, no sensitive state appears in
    logs or the app switcher, and no protected store is opened while unavailable.
-3. Load the current synthetic hostile MIME corpus. JavaScript, navigation,
-   pop-ups, downloads, forms, remote requests, and persistent WebKit residue
-   must remain denied. The positive transport control must prove the harness
-   could observe a request before the protected run reports zero requests.
+3. Load the current synthetic hostile MIME corpus. While the temporary
+   plain-text-only policy is active, verify that only plain text/preview is
+   displayed, no HTML mode exists, the product has no WebKit UI surface, and a
+   positive transport control first proves that the harness can observe a
+   request; the protected product run must then report zero requests. After a
+   separately approved renderer exists, additionally prove that JavaScript,
+   navigation, pop-ups, downloads, forms, remote requests, and persistent
+   WebKit residue remain denied.
 4. Toggle airplane mode and change networks during OAuth and synchronization.
    The app must fail closed, preserve local intent, and avoid duplicate actions.
 

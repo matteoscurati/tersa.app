@@ -692,6 +692,16 @@ class ChangeScopeTests(unittest.TestCase):
                 {"rust_linux", "policy", "product_apple"},
             ),
             (
+                "product macOS Markdown remains a containment policy input",
+                ["apple/macos/NOTES.md"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
+                "shared isolation probe enables xtask policy and product",
+                ["apple/keychain-isolation-probe/KeychainIsolationProbe.swift"],
+                {"rust_linux", "policy", "product_apple"},
+            ),
+            (
                 "retired MIME entitlements use generic Apple entitlement routing",
                 ["apple/mime-macos/TersaMimeMac.entitlements"],
                 {"rust_linux", "policy", "product_apple"},

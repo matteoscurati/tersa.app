@@ -6,8 +6,9 @@ import Foundation
 
 /// One message row in the bridge wire shape.
 ///
-/// Includes provider `preview` and optional offline `bodyText` / `bodyHtml`
-/// when a complete cached message is available.
+/// Includes provider `preview` and optional offline `bodyText` when a complete
+/// cached message is available. Untrusted HTML is intentionally not decoded
+/// into the active UI model.
 struct MessageRow: Decodable, Identifiable, Equatable {
     let messageId: String
     let threadId: String
@@ -15,7 +16,6 @@ struct MessageRow: Decodable, Identifiable, Equatable {
     let subject: String
     let preview: String
     let bodyText: String?
-    let bodyHtml: String?
     let receivedAtMillis: Int64
     let unread: Bool
 
@@ -36,14 +36,6 @@ struct MessageRow: Decodable, Identifiable, Equatable {
         return preview
     }
 
-    var hasPlainBody: Bool {
-        !(bodyText ?? "").isEmpty || !preview.isEmpty
-    }
-
-    var hasHtmlBody: Bool {
-        !(bodyHtml ?? "").isEmpty
-    }
-
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id"
         case threadId = "thread_id"
@@ -51,7 +43,6 @@ struct MessageRow: Decodable, Identifiable, Equatable {
         case subject
         case preview
         case bodyText = "body_text"
-        case bodyHtml = "body_html"
         case receivedAtMillis = "received_at_millis"
         case unread
     }

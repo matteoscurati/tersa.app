@@ -995,6 +995,14 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &keychain_authority_sources,
     ));
     let macos_sources = tracked_source_documents(Path::new("."), "apple/macos")?;
+    let keychain_isolation_probe_sources =
+        tracked_source_documents(Path::new("."), "apple/keychain-isolation-probe")?;
+    let mut tersa_mac_sources = macos_sources.clone();
+    tersa_mac_sources.extend(keychain_isolation_probe_sources.iter().cloned());
+    violations.extend(macos_html_containment_violations(
+        &tersa_mac_sources,
+        &project,
+    ));
     violations.extend(macos_client_xpc_wiring_violations(&macos_sources));
     let broker_sources = tracked_source_documents(Path::new("."), "apple/macos-token-broker")?;
     violations.extend(token_broker_source_surface_violations(&broker_sources));
@@ -1002,8 +1010,6 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &macos_sources,
         &broker_sources,
     ));
-    let keychain_isolation_probe_sources =
-        tracked_source_documents(Path::new("."), "apple/keychain-isolation-probe")?;
     violations.extend(keychain_isolation_probe_source_surface_violations(
         &keychain_isolation_probe_sources,
     ));
@@ -3470,6 +3476,51 @@ fn swift_single_function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> 
         return None;
     };
     Some(body)
+}
+
+/// Keeps untrusted mail HTML or markup outside the active macOS UI until a
+/// separately approved `SafeHtml` boundary replaces this temporary deny policy.
+///
+/// This deliberately scans raw source, including strings and comments, rather
+/// than executable tokens only. Literal deny fragments raise the cost of a
+/// reflective or comment-hidden reintroduction and make ordinary exceptions an
+/// explicit policy change with their own security review; they are not a proof
+/// against deliberately obfuscated source.
+fn macos_html_containment_violations(sources: &[(PathBuf, String)], project: &str) -> Vec<String> {
+    const FORBIDDEN_SOURCE_FRAGMENTS: [&str; 13] = [
+        "WebKit",
+        "WebView",
+        "loadHTMLString",
+        "evaluateJavaScript",
+        "AttributedString",
+        "NSHTMLTextDocumentType",
+        "documentType",
+        "NSClassFromString",
+        "LocalizedStringKey",
+        ".init(",
+        "bodyHtml",
+        "body_html",
+        "HTML message body",
+    ];
+
+    let mut violations = Vec::new();
+    for (path, document) in sources {
+        for forbidden in FORBIDDEN_SOURCE_FRAGMENTS {
+            if document.contains(forbidden) {
+                violations.push(format!(
+                    "{} contains forbidden pre-SafeHtml macOS UI surface `{forbidden}`",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if project.contains("WebKit") {
+        violations.push(
+            "apple/project.yml must not link WebKit before the SafeHtml boundary is approved"
+                .to_owned(),
+        );
+    }
+    violations
 }
 
 fn swift_oauth_authorize_entry_violations(authorize: &str) -> Vec<String> {
@@ -10542,7 +10593,8 @@ mod tests {
         hmac_dependency_graph_violations, hmac_manifest_dependency_violations,
         hmac_resolved_version_violations, is_macos_architecture_target,
         keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
-        macos_client_xpc_wiring_violations, macos_only_resolved_package_presence_violations,
+        macos_client_xpc_wiring_violations, macos_html_containment_violations,
+        macos_only_resolved_package_presence_violations,
         mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
@@ -12808,6 +12860,45 @@ private enum TersaApplication {
                 "an uninstalled or ambiguous AppKit entrypoint must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn macos_html_containment_rejects_webkit_and_raw_html_ui_surfaces() {
+        let safe_sources = vec![(
+            PathBuf::from("apple/macos/ThreadView.swift"),
+            "import SwiftUI\nstruct ThreadView {}\n".to_owned(),
+        )];
+        assert!(macos_html_containment_violations(&safe_sources, "name: Tersa").is_empty());
+
+        for forbidden in [
+            "import WebKit",
+            "let view = WKWebView()",
+            "view.loadHTMLString(message, baseURL: nil)",
+            "NSAttributedString(data: data, options: [.documentType: .html])",
+            "AttributedString(markdown: attackerText)",
+            "NSClassFromString(\"WK\" + \"WebView\")",
+            "Text(LocalizedStringKey(row.displayBody))",
+            "Text(.init(row.displayBody))",
+            "Text(\n    .init(row.displayBody)\n)",
+            "Label(.init(row.subject), systemImage: \"envelope\")",
+            ".navigationTitle(.init(row.subject))",
+            "let bodyHtml: String?",
+            "case bodyHtml = \"body_html\"",
+        ] {
+            let hostile_sources = vec![(
+                PathBuf::from("apple/macos/ThreadView.swift"),
+                forbidden.to_owned(),
+            )];
+            assert!(
+                !macos_html_containment_violations(&hostile_sources, "name: Tersa").is_empty(),
+                "the pre-SafeHtml policy must reject `{forbidden}`"
+            );
+        }
+
+        assert_eq!(
+            macos_html_containment_violations(&safe_sources, "frameworks: [WebKit]"),
+            vec!["apple/project.yml must not link WebKit before the SafeHtml boundary is approved"]
+        );
     }
 
     #[test]

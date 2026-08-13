@@ -64,9 +64,11 @@ exists. Historical decision:
 
 ### MIME / HTML / fuzz
 
-Bounded synthetic host diagnostics only. No active parser, sanitizer,
-`SafeHtml`, restricted WKWebView, renderer, or fuzz harness remains. Hostile
-MIME/HTML handling remains a future product security requirement.
+Bounded synthetic host diagnostics only. The active product later gained
+lightweight MIME text extraction, but it is not an approved hostile-content
+parser or sanitizer. No `SafeHtml`, restricted renderer, content worker, or
+fuzz harness remains. The macOS UI is plain-text-only and hostile MIME/HTML
+handling remains a future product security requirement.
 
 ### macOS UI and performance evidence
 

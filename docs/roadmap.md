@@ -12,8 +12,14 @@ Google API compliance through diagnostic spikes. That program is retired.
 The [M0 historical summary](history/m0-summary.md) consolidates results and
 limits. Active product SQLCipher is the production macOS store. Active product
 search is the bounded mailbox search path. Hostile MIME/HTML handling remains a
-product security requirement with no active parser, sanitizer, `SafeHtml`,
-restricted WKWebView, renderer, or fuzz harness in the product graph.
+product security requirement. The current core stores bounded raw messages and
+the presentation layer performs lightweight MIME text extraction, but neither
+is the approved hostile-content boundary: there is no sanitizer, `SafeHtml`,
+restricted renderer, content worker, or fuzz harness in the product graph.
+The active macOS UI decodes only plain text and provider preview fields. Raw
+`body_html` may still be serialized across the Rust bridge, but Swift ignores
+it and `xtask` rejects WebKit and raw-HTML UI surfaces until the `SafeHtml`
+boundary receives a separate approval.
 
 The portable PKCE state machine and Apple callback transports are implemented
 with deterministic evidence. A development-signed macOS run also completed
@@ -28,6 +34,16 @@ verification remain unproven. Current product OAuth work follows
 M1 remains blocked because no production UI baseline has passed device-signed
 product evidence. Removed M0 gate IDs and statuses are historical only and are
 no longer an authoritative live register.
+
+## Immediate hostile-HTML containment
+
+The macOS product path is plain-text-only before any further feature work. It
+has no HTML mode, WebKit view, remote-content load, or raw-HTML field in the
+Swift UI model. The temporary architecture policy rejects WebKit linkage and
+WebKit/raw-HTML UI source until an approved `SafeHtml` design deliberately
+replaces that deny rule. This containment limits rendering exposure; it does
+not approve the current MIME extraction as a security boundary and does not
+close parser, content-worker, fuzzing, signed-runtime, or future-renderer gates.
 
 ## Phase 1 — macOS-first product path
 
@@ -79,12 +95,16 @@ Active acceptance and release evidence follow the
 [macOS performance harness](quality/macos-performance.md), and
 [Apple physical-device and distribution protocol](release/apple-distribution.md).
 
-The target slice connects one account, synchronizes a bounded recent mailbox,
-shows an encrypted cached inbox and thread, supports the planned bounded
-mailbox state flow, reopens offline, and exposes the same core through the
-read-only CLI. It retains the existing product boundaries: no required
-proprietary backend, encrypted local persistence, shared Rust core, open source,
-and Gmail through the official API.
+The current source slice connects one fixed `default` account through the
+embedded token-broker XPC service, synchronizes a bounded recent snapshot,
+shows an encrypted cached inbox and plain-text thread, searches cached metadata,
+reopens offline, and exposes the same core through the read-only CLI. The main
+macOS archive no longer links the legacy in-process token path. Production team
+provisioning for the disjoint account/token groups, Developer ID signing,
+notarization, exact-head process-isolation evidence, and the aggregate Phase 1
+acceptance remain open. The slice retains the existing product boundaries: no
+required proprietary backend, encrypted local persistence, shared Rust core,
+open source, and Gmail through the official API.
 
 A macOS baseline never satisfies the mobile-inclusive production UI baseline.
 The current cache budgets remain constraints, not passes. The real Google

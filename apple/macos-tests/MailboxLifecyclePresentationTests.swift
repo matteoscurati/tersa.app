@@ -255,3 +255,33 @@ final class MailboxLifecyclePresentationTests: XCTestCase {
         XCTAssertEqual(presentation.notice, .offline)
     }
 }
+
+final class MailboxDocumentsTests: XCTestCase {
+    func testThreadDecoderIgnoresHtmlAndUsesPlainText() {
+        let payload = Data(
+            #"{"schema_version":1,"command":"thread","account_id":"default","thread_id":"thread-1","limit":1,"messages":[{"message_id":"message-1","thread_id":"thread-1","from":"Sender","subject":"Subject","preview":"Preview fallback","body_text":"Plain body","body_html":"<img src=\"https://tracking.example/pixel\">","received_at_millis":0,"unread":false}]}"#.utf8
+        )
+
+        let outcome = MailboxDocumentDecoder.decodeThread(payload)
+        guard case .content(let rows) = outcome else {
+            return XCTFail("Expected decoded thread content")
+        }
+
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].displayBody, "Plain body")
+    }
+
+    func testMissingBodyTextUsesProviderPreview() {
+        let payload = Data(
+            #"{"schema_version":1,"command":"thread","account_id":"default","thread_id":"thread-1","limit":1,"messages":[{"message_id":"message-1","thread_id":"thread-1","from":"Sender","subject":"Subject","preview":"Preview fallback","body_text":null,"body_html":"<p>Untrusted HTML</p>","received_at_millis":0,"unread":false}]}"#.utf8
+        )
+
+        let outcome = MailboxDocumentDecoder.decodeThread(payload)
+        guard case .content(let rows) = outcome else {
+            return XCTFail("Expected decoded thread content")
+        }
+
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].displayBody, "Preview fallback")
+    }
+}
