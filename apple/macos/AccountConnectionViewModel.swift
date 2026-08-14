@@ -49,14 +49,15 @@ final class AccountConnectionViewModel: ObservableObject {
     private static let authorizationTimeout: TimeInterval = 5 * 60
     private static let disconnectTimeout: TimeInterval = 45
     private static let lastAccountIdentifierKey = "TersaLastAccountIdentifier"
-    /// A finished browser authorization may arrive while Chrome is still the
-    /// foreground app. `WhenUnlockedThisDeviceOnly` Data Protection Keychain
-    /// operations can then fail with `errSecInteractionNotAllowed`; retain the
-    /// one activation handoff until AppKit confirms Tersa is active, and only
-    /// then let the Rust connect worker claim and persist the grant.
-    private var activationPending = false
-    private var activationObserver: NSObjectProtocol?
-    private var activationTimeout: Timer?
+    /// A finished browser authorization may arrive while the browser is still
+    /// foreground. Retain a one-shot activation handoff so Tersa requests focus
+    /// before it adopts the grant, but do not make credential adoption depend on
+    /// AppKit reporting `isActive`. The installation root is available after the
+    /// first unlock and the broker refresh-token item while the device is
+    /// unlocked; neither policy depends on which application is foreground.
+    /// macOS may decline or delay an activation request even though the callback
+    /// was valid, and that presentation outcome must never delete a fresh grant.
+    private var activationPending = BrokerGrantActivationHandoff()
     private var didRestorePersistedLifecycle = false
     private var launchLifecycleRestoreFence = MailboxLifecycleRestoreFence()
     /// The single token-broker client this view model currently owns, or nil.
@@ -1015,103 +1016,62 @@ final class AccountConnectionViewModel: ObservableObject {
         state = .authorizing
     }
 
-    private func clearApplicationActivation() {
-        activationPending = false
-        if let activationObserver {
-            NotificationCenter.default.removeObserver(activationObserver)
-        }
-        activationObserver = nil
-        activationTimeout?.invalidate()
-        activationTimeout = nil
-    }
-
-    /// After browser consent, Tersa must be foreground-active before
-    /// `storeBrokerSubject` opens the root/store Keychain/SQLCipher state —
-    /// a `WhenUnlockedThisDeviceOnly` Keychain operation can fail with
-    /// `errSecInteractionNotAllowed` while the browser is still the foreground
-    /// app. Registering the activation observer before `activate()` closes the
-    /// synchronous-notice race, and the post-activate `isActive` check closes
-    /// the opposite race; both sequence on the shared
-    /// activationPending/observer/timer state. Every failure path here cleans
-    /// up through `cleanupFreshBrokerGrant`.
+    /// After browser consent, request foreground activation before adopting the
+    /// fresh grant. The next main-queue turn completes the handoff even if AppKit
+    /// has not reported `isActive`: the protected store uses unlocked-device
+    /// Keychain policies, so focus is UX state rather than a security precondition.
+    /// A generation-bound callback and the operation deadline fence stale work.
     private func connectBrokerGrantAfterApplicationActivation(
         accountIdentifier: Data,
         brokerToken: TokenBrokerAccessToken,
         token: ConnectionOperationToken
     ) {
-        guard operationDeadline.accepts(token), !activationPending else {
+        guard operationDeadline.accepts(token) else {
             cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
             return
         }
-        activationPending = true
 
-        if NSApp.isActive {
-            finishBrokerGrantApplicationActivation(
-                accountIdentifier: accountIdentifier,
-                brokerToken: brokerToken,
-                token: token
-            )
-            return
-        }
-
-        activationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: NSApp,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.finishBrokerGrantApplicationActivation(
+        let started = activationPending.beginApplicationActivation(
+            isApplicationActive: { NSApp.isActive },
+            requestActivation: {
+                NSApp.activate()
+            },
+            scheduleNextMainQueueTurn: { completion in
+                DispatchQueue.main.async {
+                    completion()
+                }
+            },
+            adopt: { [self] in
+                finishBrokerGrantApplicationActivation(
                     accountIdentifier: accountIdentifier,
                     brokerToken: brokerToken,
                     token: token
                 )
             }
-        }
-        activationTimeout = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.activationPending else {
-                    return
-                }
-                self.clearApplicationActivation()
-                // The cleanup must run even when the operation went stale
-                // waiting for activation: the broker grant still exists and
-                // must not be orphaned by a deadline that lapsed first.
-                self.cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
-            }
-        }
-        NSApp.activate()
-        if NSApp.isActive {
-            finishBrokerGrantApplicationActivation(
-                accountIdentifier: accountIdentifier,
-                brokerToken: brokerToken,
-                token: token
-            )
+        )
+        guard started else {
+            cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            return
         }
     }
 
-    /// Delivers the freshly-consented broker grant exactly once after AppKit
-    /// confirms Tersa is foreground-active: persist the account's routing
-    /// subject, then feed the access token into the broker sync. Clearing
-    /// observer/timer state before the worker begins makes a duplicate
-    /// activation notification harmless. A subject may remain locally if the
-    /// operation goes stale just after a successful persist; the cleanup
-    /// still deletes the broker-stored tokens, and the next
-    /// stored-credential refresh safely routes the missing token to
-    /// re-consent.
+    /// Delivers the freshly-consented broker grant exactly once after Tersa has
+    /// requested activation: persist the account's routing subject, then feed
+    /// the access token into the broker sync. A generation-bound one-shot
+    /// callback makes stale activation work harmless. A subject may remain
+    /// locally if the operation goes stale just after a
+    /// successful persist; the cleanup still deletes the broker-stored tokens,
+    /// and the next stored-credential refresh safely routes the missing token
+    /// to re-consent.
     private func finishBrokerGrantApplicationActivation(
         accountIdentifier: Data,
         brokerToken: TokenBrokerAccessToken,
         token: ConnectionOperationToken
     ) {
-        guard activationPending else {
-            return
-        }
         guard operationDeadline.accepts(token) else {
-            clearApplicationActivation()
             cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
             return
         }
-        clearApplicationActivation()
         guard state == .connecting else {
             cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
             return

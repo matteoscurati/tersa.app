@@ -2,6 +2,72 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import Foundation
+
+/// Coordinates the one-shot handoff from browser consent to broker-grant
+/// adoption. Foreground activation is a UX request, not a credential-access
+/// prerequisite, so an inactive app adopts on the next main-queue turn whether
+/// or not AppKit grants the presentation request. Generations fence stale
+/// callbacks from a later handoff.
+@MainActor
+final class BrokerGrantActivationHandoff {
+    private enum State {
+        case idle
+        case pending(UInt64)
+        case claimed(UInt64)
+    }
+
+    private var state = State.idle
+    private var nextGeneration: UInt64 = 0
+
+    var isPending: Bool {
+        if case .pending = state {
+            return true
+        }
+        return false
+    }
+
+    /// Starts the exact production activation orchestration against injected
+    /// AppKit-shaped operations. A foreground app adopts synchronously; an
+    /// inactive app requests presentation and adopts on the next main-queue
+    /// turn. A second handoff is rejected until the first action returns.
+    func beginApplicationActivation(
+        isApplicationActive: () -> Bool,
+        requestActivation: () -> Void,
+        scheduleNextMainQueueTurn: (@escaping @MainActor () -> Void) -> Void,
+        adopt: @escaping @MainActor () -> Void
+    ) -> Bool {
+        guard case .idle = state else {
+            return false
+        }
+        nextGeneration &+= 1
+        let generation = nextGeneration
+        state = .pending(generation)
+        if isApplicationActive() {
+            runIfPending(generation: generation, action: adopt)
+            return true
+        }
+        requestActivation()
+        scheduleNextMainQueueTurn { [weak self] in
+            self?.runIfPending(generation: generation, action: adopt)
+        }
+        return true
+    }
+
+    private func runIfPending(generation: UInt64, action: @MainActor () -> Void) {
+        guard case .pending(let pendingGeneration) = state,
+              pendingGeneration == generation
+        else {
+            return
+        }
+        state = .claimed(generation)
+        defer {
+            state = .idle
+        }
+        action()
+    }
+}
+
 /// Closed product-bootstrap status integers shared with the Rust bridge.
 enum ProductBootstrapStatus: Int32 {
     case ready = 0
