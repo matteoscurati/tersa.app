@@ -38,7 +38,10 @@ and blob diagnostic executables were likewise removed by ADR-0025 housekeeping
 graph by `deny.toml`. The M0 MIME/hostile-HTML diagnostic executable and
 isolated fuzz project were removed by ADR-0025 housekeeping (PR4); `ammonia`
 and `mail-parser` are banned from the active workspace graph by `deny.toml`.
-No active MIME renderer or parser package remains. The production store
+No dedicated MIME parser or renderer package remains. The presentation crate's
+lightweight text extraction is not an approved hostile-content parser, and the
+macOS UI is plain-text-only under the temporary WebKit/raw-HTML deny policy.
+The production store
 `tersa-store-sqlcipher-macos` is the direct SQLCipher owner; authorized
 composition crates may reach `rusqlite`/`libsqlite3-sys` only through the
 reviewed owner set enforced by `xtask`. `hmac` 0.12.1 is pinned exactly and may

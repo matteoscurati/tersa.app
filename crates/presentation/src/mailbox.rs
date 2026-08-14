@@ -47,7 +47,10 @@ pub struct MessageRowViewModel {
     pub preview: String,
     /// Optional plain-text body for display when a cached complete message is present.
     pub body_text: Option<String>,
-    /// Optional HTML body for sandboxed offline display when a `text/html` part exists.
+    /// Optional unsanitized HTML extracted from a `text/html` part.
+    ///
+    /// The current UI does not decode or render this field. Any future renderer
+    /// requires a separately approved `SafeHtml` boundary.
     pub body_html: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub received_at_millis: i64,
@@ -128,11 +131,12 @@ pub fn display_text_from_rfc5322(raw: &[u8]) -> String {
     decode_mime_text_part(text.as_ref(), "content-type: text/plain", true)
 }
 
-/// Derives bounded HTML display content from a cached RFC 5322 message.
+/// Derives bounded unsanitized HTML from a cached RFC 5322 message.
 ///
-/// Extracts the first `text/html` MIME part (quoted-printable decoded). The UI
-/// must render this only in a sandboxed web view with JavaScript and remote
-/// navigation disabled. This function does not sanitize HTML tags.
+/// Extracts the first `text/html` MIME part (quoted-printable decoded). The
+/// current UI must not decode or render this output. This function does not
+/// sanitize HTML tags; any future renderer requires a separately approved
+/// `SafeHtml` boundary.
 #[must_use]
 pub fn display_html_from_rfc5322(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);

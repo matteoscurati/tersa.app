@@ -16,7 +16,7 @@ production-security claim.
 | Gmail messages, headers, addresses, labels, drafts, and local intent | Authenticated transport; encrypted local persistence; account isolation; bounded retention |
 | Root and derived encryption keys | CSPRNG generation; device-only Data Protection Keychain storage; domain-separated derivation; no export or diagnostics |
 | SQLCipher databases, WAL/journals, blobs, thumbnails, and search indexes | Application encryption at rest; controlled temporary storage; integrity checks; crypto-erasure |
-| MIME, HTML, inline resources, and attachments | Required future product controls: bounded parsing; typed sanitized output; deny-by-default rendering; no automatic remote fetch. No active MIME renderer or parser is present in the product graph |
+| MIME, HTML, inline resources, and attachments | Immediate plain-text-only UI containment; future bounded parsing, typed sanitized output, isolated content worker, deny-by-default rendering, and no automatic remote fetch. Current lightweight MIME extraction is not the approved security boundary |
 | Exports, clipboard data, and notifications | Explicit user declassification; minimum disclosure; no claim of encryption after export |
 | Logs, crash reports, and CI evidence | Aggregate and redacted; no content, queries, secrets, paths, or stable user identifiers |
 | Release artifacts and dependency graph | Reproducible inputs where practical; signed distribution; notarization; SBOM and advisory review |
@@ -29,16 +29,22 @@ production-security claim.
 2. The Apple operating system, Keychain, protected-data state, WebKit, and
    signing services are platform boundaries, not components controlled by the
    project.
-3. The shared Rust core owns domain invariants. Platform adapters own only
+3. The token-broker XPC is the sole refresh-token authority in the macOS source
+   architecture. The main app owns the loopback listener and receives a
+   short-lived access token for bounded sync. Production team provisioning and
+   signed wrong-group denial evidence remain open.
+4. The shared Rust core owns domain invariants. Platform adapters own only
    unavoidable OS capabilities and may not leak Apple or UI types inward.
-4. Each account database and blob namespace is an isolation boundary. The
+5. Each account database and blob namespace is an isolation boundary. The
    interim macOS CLI composition may receive only the envelope-only
    `MailboxReader`; UI, future CLI mutations, and future MCP access must go
    through authorized application use cases rather than widening direct store
    authority.
-5. Planned MIME parsers, render surfaces, attachment decoders, exports, logs,
-   and diagnostic evidence cross from hostile or sensitive data into narrower
-   representations. No active MIME parser or render surface is present yet.
+6. The current presentation layer performs lightweight MIME text extraction,
+   and the bridge may serialize raw HTML. The Swift UI ignores raw HTML and has
+   no WebKit surface. A future parser, `SafeHtml`, render surface, attachment
+   decoder, export, log, or evidence flow crosses into a narrower
+   representation and requires its own approval.
 
 ## Attacker capabilities
 
@@ -58,9 +64,9 @@ passcode, Google credentials, signing identity, or an authorized local process.
 
 | Threat | Required controls | Residual risk or open gate |
 |---|---|---|
-| OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, system authentication session on iOS, refresh token in device-only Keychain | Real Google exchange, Keychain persistence, revocation, and physical-device flow remain open |
+| OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, token-broker XPC, refresh token in a broker-only device Keychain group, bounded access-token lifetime in main-app memory | Source cutover and real Google exchange/refresh/revoke are implemented; production group provisioning, signed process isolation, physical-device lifecycle, and Google verification remain open |
 | Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, macOS Data Protection Keychain root key with device-only accessibility, fixed App Group profile layout, locked product bootstrap, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; signed cross-target Keychain interoperability remains PR 33b evidence after the deterministic PR 33a.5 source slice, while pathname SQLite and mutable final names retain the documented same-user race residuals |
-| Malicious MIME/HTML and tracking pixels | Required future product controls: size/depth/part limits, attachment exclusion, typed sanitized output, deny-by-default render surface with JavaScript/network/navigation denial, remote images blocked. Historical M0 host diagnostic retired in PR4; no active renderer claims | Parser/WebKit zero-days, production implementation, and physical-device containment remain open |
+| Malicious MIME/HTML and tracking pixels | Current UI decodes only plain text/preview and contains no WebKit or HTML toggle; `xtask` denies WebKit/raw-HTML UI surfaces. Future controls require size/depth/part limits, typed sanitized output, isolated parsing, deny-by-default rendering, and blocked remote images | Raw HTML is still stored/extracted and serialized across the bridge before Swift ignores it; the current extraction is not a hardened parser. Parser/worker implementation, future renderer zero-days, and signed containment evidence remain open |
 | Malicious attachment or decompression bomb | On-demand fetch, byte/ratio/time/memory limits, no macro execution, sandboxed short-lived worker when needed | Complex production parsers and sandbox evidence are not implemented |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, stable RFC Message-ID, server reconciliation after ambiguous timeout | Production sync/outbox is not implemented |
 | Cross-account or cross-surface access | `(account_id, gmail_id)` identity, per-account storage/key namespace, application authorization boundary, future single-writer host on macOS | Production repositories and IPC authorization remain open |
@@ -86,7 +92,7 @@ may move into a production path.
 
 ## Review triggers
 
-Revisit this model when a production UI is selected, a real Google token is
-stored, a new plaintext or persistence surface is added, network egress changes,
-a production parser/renderer is adopted, CLI/MCP/AI/OpenPGP becomes reachable,
-Apple entitlements change, or the optional relay is designed.
+Revisit this model when a new plaintext or persistence surface is added,
+network egress changes, the temporary HTML deny policy is relaxed, a production
+parser/renderer or content worker is adopted, CLI/MCP/AI/OpenPGP becomes
+reachable, Apple entitlements change, or the optional relay is designed.

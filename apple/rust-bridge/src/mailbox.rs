@@ -252,9 +252,10 @@ fn push_limit(output: &mut String, limit: u16) {
 
 /// Writes the message rows in document order with the stable field parity.
 ///
-/// Includes `preview` and optional `body_text` / `body_html` so the macOS UI
-/// can render message content offline in plain or sandboxed HTML mode. The CLI
-/// keeps its own metadata-only encoder.
+/// Includes `preview` and optional `body_text` / `body_html` for stable wire
+/// compatibility. The current macOS UI decodes only `body_text` and ignores
+/// unsanitized `body_html`; any future renderer requires an approved `SafeHtml`
+/// boundary. The CLI keeps its own metadata-only encoder.
 fn push_rows(output: &mut String, rows: &[MessageRowViewModel]) {
     output.push_str(",\"messages\":[");
     for (index, row) in rows.iter().enumerate() {

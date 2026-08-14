@@ -104,6 +104,13 @@ def classify(paths: Iterable[str]) -> Scope:
             # selected or enforced; fail closed to every active product scope.
             enable_all(scope)
             continue
+        if path.startswith("apple/macos/") or path.startswith(
+            "apple/keychain-isolation-probe/"
+        ):
+            # Every tracked document under these prefixes is an input to the
+            # pre-SafeHtml containment scan, irrespective of extension.
+            scope.enable("rust_linux", "policy", "product_apple")
+            continue
         if path.startswith(DOCS_ONLY_PREFIXES) or path.endswith(".md"):
             continue
         if path in GITHUB_LIGHTWEIGHT_PATHS or path.startswith(GITHUB_LIGHTWEIGHT_PREFIXES):
@@ -122,14 +129,14 @@ def classify(paths: Iterable[str]) -> Scope:
         # Security-critical Apple packaging inputs can drift the fail-closed
         # policy checked by `cargo xtask verify`, so they also enable the
         # portable Rust and policy lanes. `apple/macos/**` hosts the product
-        # client XPC-wiring guards; the token broker, XcodeGen project, and
-        # entitlements are the other exact-scoped inputs.
+        # client XPC-wiring guards; the shared isolation probe is also compiled
+        # into TersaMac; the token broker, XcodeGen project, and entitlements
+        # are the other exact-scoped inputs.
         is_component_entitlement = path.startswith("apple/") and path.endswith(
             ".entitlements"
         )
         if (
             path.startswith("apple/macos-token-broker/")
-            or path.startswith("apple/macos/")
             or path == "apple/project.yml"
             or is_component_entitlement
         ):

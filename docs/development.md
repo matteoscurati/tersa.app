@@ -212,9 +212,12 @@ The M0 diagnostic program is retired. A short
 [historical summary](history/m0-summary.md) consolidates what the spikes
 learned. Active product SQLCipher remains the production store adapter. Product
 mailbox search remains the bounded application/store search path. No production
-blob implementation, Tantivy replacement, MIME renderer, `SafeHtml`
-implementation, restricted WKWebView, parser, or fuzz harness is claimed by that
-retirement. Hostile-content handling remains a product security requirement.
+blob implementation, Tantivy replacement, approved MIME security parser,
+`SafeHtml` implementation, restricted renderer, content worker, or fuzz harness
+is claimed by that retirement. The active presentation layer has lightweight
+MIME text extraction, while the macOS UI is plain-text-only and the temporary
+`xtask` policy denies WebKit/raw-HTML UI surfaces. Hostile-content handling
+remains a product security requirement.
 
 Preserved architectural decisions include
 [ADR 0011](architecture/adr-0011-sqlcipher-schema-and-migration-ownership.md),
