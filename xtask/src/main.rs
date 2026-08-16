@@ -3531,13 +3531,26 @@ fn swift_oauth_coordinator_ownership_violations(
         })
         .sum::<usize>();
     let coordinator_calls = swift_sources
+        .clone()
         .map(|(_, source)| {
             swift_member_call_count(&strip_swift_non_code(source), "beginApplicationActivation")
         })
         .sum::<usize>();
-    if coordinator_references != 2 || coordinator_constructions != 1 || coordinator_calls != 1 {
+    let coordinator_method_references = swift_sources
+        .map(|(_, source)| {
+            swift_member_reference_count(
+                &strip_swift_non_code(source),
+                "beginApplicationActivation",
+            )
+        })
+        .sum::<usize>();
+    if coordinator_references != 2
+        || coordinator_constructions != 1
+        || coordinator_calls != 1
+        || coordinator_method_references != 1
+    {
         violations.push(
-            "the macOS source inventory must contain only the BrokerGrantActivationHandoff declaration, canonical construction, and canonical begin call"
+            "the macOS source inventory must contain only the BrokerGrantActivationHandoff declaration, canonical construction, and canonical begin method reference and call"
                 .to_owned(),
         );
     }
@@ -13537,6 +13550,13 @@ func connectWithBrokerGrant(
                 view_model.replace(
                     "func authorizeAndConnect(accountIdentifier: Data) {",
                     "func unused() { let handoff = activationPending; handoff.beginApplicationActivation() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
+                ),
+            ),
+            (
+                "additional bound coordinator begin method",
+                view_model.replace(
+                    "func authorizeAndConnect(accountIdentifier: Data) {",
+                    "func unused() { let beginAgain = activationPending.beginApplicationActivation; _ = beginAgain }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
                 ),
             ),
         ];
