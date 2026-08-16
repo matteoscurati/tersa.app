@@ -3423,9 +3423,10 @@ fn swift_bootstrap_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<St
 
 /// Keeps the browser-to-Keychain activation handoff one-shot. Foreground
 /// activation is a UX request rather than a Keychain access precondition: the
-/// reviewed coordinator must install its observer and cleanup before requesting
-/// activation, then allow the notification or next-main-turn fallback to claim
-/// the grant exactly once.
+/// reviewed coordinator claims an already-active handoff synchronously, or
+/// requests activation and claims it on the next main-queue turn. Both routes
+/// share one generation-bound state transition and never install a destructive
+/// observer or timeout.
 fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
     let path = Path::new(ACCOUNT_CONNECTION_VIEW_MODEL_PATH);
     let Some((_path, document)) = sources.iter().find(|(candidate, _)| candidate == path) else {
@@ -3466,6 +3467,7 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     violations.extend(swift_oauth_activation_handoff_violations(activation));
     if uses_coordinator {
         violations.extend(swift_oauth_coordinated_view_model_violations(activation));
+        violations.extend(swift_oauth_coordinator_ownership_violations(sources, &code));
     }
     if uses_coordinator {
         let coordinator_path = Path::new(CONNECTION_STATE_PATH);
@@ -3500,8 +3502,75 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     violations
 }
 
+fn swift_oauth_coordinator_ownership_violations(
+    sources: &[(PathBuf, String)],
+    view_model: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if compact_swift_code(view_model)
+        .matches("privateletactivationPending=BrokerGrantActivationHandoff()")
+        .count()
+        != 1
+    {
+        violations.push(
+            "AccountConnectionViewModel must own exactly one immutable BrokerGrantActivationHandoff property"
+                .to_owned(),
+        );
+    }
+    let swift_sources = sources.iter().filter(|(path, _)| {
+        path.extension().and_then(|extension| extension.to_str()) == Some("swift")
+    });
+    let coordinator_references = swift_sources
+        .clone()
+        .map(|(_, source)| {
+            identifier_occurrence_count(
+                &strip_swift_non_code(source),
+                "BrokerGrantActivationHandoff",
+            )
+        })
+        .sum::<usize>();
+    let coordinator_constructions = swift_sources
+        .map(|(_, source)| {
+            swift_call_count(
+                &strip_swift_non_code(source),
+                "BrokerGrantActivationHandoff",
+            )
+        })
+        .sum::<usize>();
+    if coordinator_references != 2 || coordinator_constructions != 1 {
+        violations.push(
+            "the macOS source inventory must contain only the BrokerGrantActivationHandoff declaration and its canonical construction"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
 fn swift_single_function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
     let bodies = swift_function_bodies(code, name);
+    let [body] = bodies.as_slice() else {
+        return None;
+    };
+    Some(body)
+}
+
+fn swift_single_class_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let bodies = code
+        .match_indices("class")
+        .filter(|(start, _)| is_identifier_at(code, *start, "class"))
+        .filter_map(|(start, _)| {
+            let name_start = skip_ascii_whitespace(code, start + "class".len());
+            let name_length = code[name_start..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            (name_length > 0 && &code[name_start..name_start + name_length] == name).then(|| {
+                let opening =
+                    name_start + name_length + code[name_start + name_length..].find('{')?;
+                balanced_brace_body(code, opening)
+            })?
+        })
+        .collect::<Vec<_>>();
     let [body] = bodies.as_slice() else {
         return None;
     };
@@ -3665,58 +3734,50 @@ fn swift_oauth_coordinated_view_model_violations(activation: &str) -> Vec<String
 }
 
 fn swift_oauth_activation_coordinator_violations(code: &str) -> Vec<String> {
-    let mut violations = Vec::new();
     let compact = compact_swift_code(code);
-    for required in [
-        "privateenumState{caseidlecasepending(UInt64)caseclaimed(UInt64)}",
-        "privatevarstate=State.idle",
-        "privatevarnextGeneration:UInt64=0",
-        "varisPending:Bool{ifcase.pending=state{returntrue}returnfalse}",
-    ] {
-        if compact.matches(required).count() != 1 {
-            violations.push(format!(
-                "BrokerGrantActivationHandoff must contain exactly one reviewed `{required}` state declaration"
-            ));
-        }
-    }
-    let Some(begin) = swift_single_function_body(code, "beginApplicationActivation") else {
+    if compact
+        .matches("@MainActorfinalclassBrokerGrantActivationHandoff{")
+        .count()
+        != 1
+    {
         return vec![
-            "BrokerGrantActivationHandoff must contain exactly one beginApplicationActivation function"
+            "ConnectionState must contain exactly one @MainActor final BrokerGrantActivationHandoff class"
+                .to_owned(),
+        ];
+    }
+    let Some(coordinator) = swift_single_class_body(code, "BrokerGrantActivationHandoff") else {
+        return vec![
+            "ConnectionState must contain exactly one BrokerGrantActivationHandoff class"
                 .to_owned(),
         ];
     };
-    let expected_begin = concat!(
-        "{guardcase.idle=stateelse{returnfalse}",
+    let expected = concat!(
+        "{privateenumState{caseidlecasepending(UInt64)caseclaimed(UInt64)}",
+        "privatevarstate=State.idleprivatevarnextGeneration:UInt64=0",
+        "varisPending:Bool{ifcase.pending=state{returntrue}returnfalse}",
+        "funcbeginApplicationActivation(",
+        "isApplicationActive:()->Bool,requestActivation:()->Void,",
+        "scheduleNextMainQueueTurn:(@escaping@MainActor()->Void)->Void,",
+        "adopt:@escaping@MainActor()->Void)->Bool{",
+        "guardcase.idle=stateelse{returnfalse}",
         "nextGeneration&+=1letgeneration=nextGeneration",
         "state=.pending(generation)",
         "ifisApplicationActive(){runIfPending(",
         "generation:generation,action:adopt)returntrue}",
         "requestActivation()scheduleNextMainQueueTurn{[weakself]in",
         "self?.runIfPending(generation:generation,action:adopt)}returntrue}",
+        "privatefuncrunIfPending(generation:UInt64,action:@MainActor()->Void){",
+        "guardcase.pending(letpendingGeneration)=state,",
+        "pendingGeneration==generationelse{return}",
+        "state=.claimed(generation)defer{state=.idle}action()}}",
     );
-    if compact_swift_code(begin) != expected_begin {
-        violations.push(
-            "the OAuth coordinator must match the exact reviewed generation-bound activation body"
+    if compact_swift_code(coordinator) != expected {
+        return vec![
+            "BrokerGrantActivationHandoff must match the exact reviewed main-actor, generation-bound class"
                 .to_owned(),
-        );
+        ];
     }
-
-    let Some(claim) = swift_single_function_body(code, "runIfPending") else {
-        violations.push(
-            "BrokerGrantActivationHandoff must contain exactly one runIfPending function"
-                .to_owned(),
-        );
-        return violations;
-    };
-    if compact_swift_code(claim)
-        != "{guardcase.pending(letpendingGeneration)=state,pendingGeneration==generationelse{return}state=.claimed(generation)defer{state=.idle}action()}"
-    {
-        violations.push(
-            "the OAuth coordinator claim must match its pending generation, transition to claimed, and defer its idle reset before running the action"
-                .to_owned(),
-        );
-    }
-    violations
+    Vec::new()
 }
 
 fn swift_oauth_finish_persist_violations(finish: &str, uses_coordinator: bool) -> Vec<String> {
@@ -13228,6 +13289,10 @@ func connectWithBrokerGrant(
             "the coordinated OAuth handoff must pass: {:?}",
             swift_oauth_foreground_handoff_violations(&valid_sources)
         );
+        assert!(
+            !swift_oauth_foreground_handoff_violations(&[valid_sources[0].clone()]).is_empty(),
+            "a coordinated OAuth handoff without its coordinator source must fail closed"
+        );
     }
 
     #[test]
@@ -13317,6 +13382,50 @@ func connectWithBrokerGrant(
                     coordinator_drift,
                 ),
             ];
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "{label} coordinator drift must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn swift_oauth_coordinator_rejects_isolation_and_surface_drift() {
+        let view_model = valid_coordinated_oauth_handoff_view_model();
+        let coordinator = valid_oauth_activation_coordinator();
+        let drifts = [
+            ("missing main-actor isolation", coordinator.replace("@MainActor\n", "")),
+            (
+                "non-final coordinator",
+                coordinator.replace(
+                    "final class BrokerGrantActivationHandoff",
+                    "class BrokerGrantActivationHandoff",
+                ),
+            ),
+            (
+                "unisolated scheduled callback",
+                coordinator.replace(
+                    "scheduleNextMainQueueTurn: (@escaping @MainActor () -> Void) -> Void",
+                    "scheduleNextMainQueueTurn: (@escaping () -> Void) -> Void",
+                ),
+            ),
+            (
+                "unisolated adoption callback",
+                coordinator.replace(
+                    "adopt: @escaping @MainActor () -> Void",
+                    "adopt: @escaping () -> Void",
+                ),
+            ),
+            (
+                "extra reset method",
+                coordinator.replace(
+                    "    private func runIfPending(generation: UInt64, action: @MainActor () -> Void) {",
+                    "    func reset() { state = .idle }\n\n    private func runIfPending(generation: UInt64, action: @MainActor () -> Void) {",
+                ),
+            ),
+        ];
+        for (label, coordinator_drift) in drifts {
+            let sources = coordinated_oauth_sources(view_model, &coordinator_drift);
             assert!(
                 !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
                 "{label} coordinator drift must fail closed"
@@ -13421,8 +13530,66 @@ func connectWithBrokerGrant(
         }
     }
 
+    #[test]
+    fn swift_oauth_coordinated_view_model_rejects_ownership_drift() {
+        let view_model = valid_coordinated_oauth_handoff_view_model();
+        let coordinator = valid_oauth_activation_coordinator();
+        let drifts = [
+            (
+                "mutable coordinator property",
+                view_model.replace(
+                    "private let activationPending = BrokerGrantActivationHandoff()",
+                    "private var activationPending = BrokerGrantActivationHandoff()",
+                ),
+            ),
+            (
+                "computed coordinator property",
+                view_model.replace(
+                    "private let activationPending = BrokerGrantActivationHandoff()",
+                    "private var activationPending: BrokerGrantActivationHandoff { BrokerGrantActivationHandoff() }",
+                ),
+            ),
+            (
+                "aliased coordinator property type",
+                view_model.replace(
+                    "private let activationPending = BrokerGrantActivationHandoff()",
+                    "private let activationPending = OtherActivationHandoff()",
+                ),
+            ),
+            (
+                "additional coordinator construction",
+                view_model.replace(
+                    "func authorizeAndConnect(accountIdentifier: Data) {",
+                    "func unused() { _ = BrokerGrantActivationHandoff() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
+                ),
+            ),
+        ];
+        for (label, view_model_drift) in drifts {
+            let sources = coordinated_oauth_sources(&view_model_drift, coordinator);
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    fn coordinated_oauth_sources(view_model: &str, coordinator: &str) -> Vec<(PathBuf, String)> {
+        vec![
+            (
+                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                view_model.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/ConnectionState.swift"),
+                coordinator.to_owned(),
+            ),
+        ]
+    }
+
     fn valid_coordinated_oauth_handoff_view_model() -> &'static str {
         r"
+private let activationPending = BrokerGrantActivationHandoff()
+
 func authorizeAndConnect(accountIdentifier: Data) {
     connectBrokerGrantAfterApplicationActivation(
         accountIdentifier: accountIdentifier,
@@ -13498,6 +13665,7 @@ func connectWithBrokerGrant(
 
     fn valid_oauth_activation_coordinator() -> &'static str {
         r"
+@MainActor
 final class BrokerGrantActivationHandoff {
     private enum State {
         case idle
@@ -13514,8 +13682,8 @@ final class BrokerGrantActivationHandoff {
     func beginApplicationActivation(
         isApplicationActive: () -> Bool,
         requestActivation: () -> Void,
-        scheduleNextMainQueueTurn: (() -> Void) -> Void,
-        adopt: () -> Void
+        scheduleNextMainQueueTurn: (@escaping @MainActor () -> Void) -> Void,
+        adopt: @escaping @MainActor () -> Void
     ) -> Bool {
         guard case .idle = state else { return false }
         nextGeneration &+= 1
@@ -13532,7 +13700,7 @@ final class BrokerGrantActivationHandoff {
         return true
     }
 
-    private func runIfPending(generation: UInt64, action: () -> Void) {
+    private func runIfPending(generation: UInt64, action: @MainActor () -> Void) {
         guard case .pending(let pendingGeneration) = state,
               pendingGeneration == generation
         else { return }
