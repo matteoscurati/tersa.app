@@ -57,7 +57,7 @@ final class AccountConnectionViewModel: ObservableObject {
     /// unlocked; neither policy depends on which application is foreground.
     /// macOS may decline or delay an activation request even though the callback
     /// was valid, and that presentation outcome must never delete a fresh grant.
-    private var activationPending = BrokerGrantActivationHandoff()
+    private let activationPending = BrokerGrantActivationHandoff()
     private var didRestorePersistedLifecycle = false
     private var launchLifecycleRestoreFence = MailboxLifecycleRestoreFence()
     /// The single token-broker client this view model currently owns, or nil.
@@ -1056,9 +1056,9 @@ final class AccountConnectionViewModel: ObservableObject {
     }
 
     /// Delivers the freshly-consented broker grant exactly once after Tersa has
-    /// requested activation: persist the account's routing subject, then feed
-    /// the access token into the broker sync. A generation-bound one-shot
-    /// callback makes stale activation work harmless. A subject may remain
+    /// completed the activation handoff: persist the account's routing subject,
+    /// then feed the access token into the broker sync. A generation-bound
+    /// one-shot callback makes stale activation work harmless. A subject may remain
     /// locally if the operation goes stale just after a
     /// successful persist; the cleanup still deletes the broker-stored tokens,
     /// and the next stored-credential refresh safely routes the missing token
