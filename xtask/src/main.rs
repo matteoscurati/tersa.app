@@ -3491,8 +3491,8 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     };
     violations.extend(swift_oauth_finish_persist_violations(finish));
 
-    violations.extend(swift_oauth_sole_finish_caller_violations(&code));
-    violations.extend(swift_oauth_sole_connect_caller_violations(&code));
+    violations.extend(swift_oauth_sole_finish_caller_violations(sources));
+    violations.extend(swift_oauth_sole_connect_caller_violations(sources));
     violations
 }
 
@@ -3791,26 +3791,83 @@ fn swift_oauth_finish_persist_violations(finish: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn swift_oauth_sole_connect_caller_violations(code: &str) -> Vec<String> {
-    let connect_callers = swift_function_names_with(code, "connectWithBrokerGrant(");
-    if connect_callers != ["finishBrokerGrantApplicationActivation".to_owned()] {
+fn swift_oauth_sole_connect_caller_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let connect_owners = swift_oauth_executable_reference_owners(sources, "connectWithBrokerGrant");
+    let connect_occurrences =
+        swift_oauth_identifier_occurrence_count(sources, "connectWithBrokerGrant");
+    if connect_occurrences != 2
+        || connect_owners
+            != [format!(
+                "{ACCOUNT_CONNECTION_VIEW_MODEL_PATH}::func finishBrokerGrantApplicationActivation"
+            )]
+    {
         return vec![
-            "finishBrokerGrantApplicationActivation must be the sole caller of connectWithBrokerGrant"
+            "the compiled Swift inventory must contain only the connectWithBrokerGrant declaration and its canonical finishBrokerGrantApplicationActivation reference"
                 .to_owned(),
         ];
     }
     Vec::new()
 }
 
-fn swift_oauth_sole_finish_caller_violations(code: &str) -> Vec<String> {
-    let finish_callers = swift_function_names_with(code, "finishBrokerGrantApplicationActivation(");
-    if finish_callers != ["connectBrokerGrantAfterApplicationActivation".to_owned()] {
+fn swift_oauth_sole_finish_caller_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let finish_owners =
+        swift_oauth_executable_reference_owners(sources, "finishBrokerGrantApplicationActivation");
+    let finish_occurrences =
+        swift_oauth_identifier_occurrence_count(sources, "finishBrokerGrantApplicationActivation");
+    if finish_occurrences != 2
+        || finish_owners
+            != [format!(
+                "{ACCOUNT_CONNECTION_VIEW_MODEL_PATH}::func connectBrokerGrantAfterApplicationActivation"
+            )]
+    {
         return vec![
-            "connectBrokerGrantAfterApplicationActivation must be the sole caller of finishBrokerGrantApplicationActivation"
+            "the compiled Swift inventory must contain only the finishBrokerGrantApplicationActivation declaration and its canonical activation-handoff reference"
                 .to_owned(),
         ];
     }
     Vec::new()
+}
+
+fn swift_oauth_executable_reference_owners(
+    sources: &[(PathBuf, String)],
+    identifier: &str,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    for (path, document) in sources {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("swift") {
+            continue;
+        }
+        let code = strip_swift_non_code(document);
+        for (name, body) in swift_function_declarations(&code) {
+            for _ in 0..identifier_occurrence_count(body, identifier) {
+                owners.push(format!("{}::func {name}", path.display()));
+            }
+        }
+        for (name, bodies) in swift_named_property_bodies(&code) {
+            for body in bodies {
+                for _ in 0..identifier_occurrence_count(body, identifier) {
+                    owners.push(format!("{}::property {name}", path.display()));
+                }
+            }
+        }
+    }
+    owners.sort();
+    owners
+}
+
+fn swift_oauth_identifier_occurrence_count(
+    sources: &[(PathBuf, String)],
+    identifier: &str,
+) -> usize {
+    sources
+        .iter()
+        .filter(|(path, _)| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("swift")
+        })
+        .map(|(_, document)| {
+            identifier_occurrence_count(&strip_swift_non_code(document), identifier)
+        })
+        .sum()
 }
 
 fn swift_bootstrap_source_inventory(
@@ -13512,23 +13569,63 @@ func connectWithBrokerGrant(
     }
 
     #[test]
-    fn swift_oauth_coordinated_view_model_rejects_direct_finish_caller() {
-        let view_model = valid_coordinated_oauth_handoff_view_model().replace(
-            "func authorizeAndConnect(accountIdentifier: Data) {",
-            concat!(
-                "func retryAdoption() {\n",
-                "    finishBrokerGrantApplicationActivation(\n",
-                "        accountIdentifier: accountIdentifier, brokerToken: brokerToken, token: token\n",
-                "    )\n",
-                "}\n",
-                "func authorizeAndConnect(accountIdentifier: Data) {",
+    fn swift_oauth_coordinated_view_model_rejects_extra_finish_and_connect_references() {
+        let valid = valid_coordinated_oauth_handoff_view_model();
+        let insertion_point = "func authorizeAndConnect(accountIdentifier: Data) {";
+        let drifts = [
+            (
+                "direct finish caller",
+                concat!(
+                    "func retryAdoption() {\n",
+                    "    finishBrokerGrantApplicationActivation(\n",
+                    "        accountIdentifier: accountIdentifier, brokerToken: brokerToken, token: token\n",
+                    "    )\n",
+                    "}\n",
+                ),
             ),
-        );
-        let sources = coordinated_oauth_sources(&view_model, valid_oauth_activation_coordinator());
-        assert!(
-            !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
-            "a direct finish caller outside the coordinator adoption closure must fail closed"
-        );
+            (
+                "whitespace-separated finish caller",
+                "func retryAdoption() { finishBrokerGrantApplicationActivation () }\n",
+            ),
+            (
+                "bound finish method",
+                "func retryAdoption() { let finish = finishBrokerGrantApplicationActivation; _ = finish }\n",
+            ),
+            (
+                "finish reference in property body",
+                "private var retryAdoption: Void { finishBrokerGrantApplicationActivation () }\n",
+            ),
+            (
+                "finish reference in deinitializer",
+                "deinit { _ = finishBrokerGrantApplicationActivation }\n",
+            ),
+            (
+                "whitespace-separated connect caller",
+                "func bypassPersistence() { connectWithBrokerGrant () }\n",
+            ),
+            (
+                "bound connect method",
+                "func bypassPersistence() { let connect = connectWithBrokerGrant; _ = connect }\n",
+            ),
+            (
+                "connect reference in property body",
+                "private var bypassPersistence: Void { connectWithBrokerGrant () }\n",
+            ),
+            (
+                "connect reference in deinitializer",
+                "deinit { _ = connectWithBrokerGrant }\n",
+            ),
+        ];
+        for (label, inserted) in drifts {
+            let view_model =
+                valid.replace(insertion_point, &format!("{inserted}{insertion_point}"));
+            let sources =
+                coordinated_oauth_sources(&view_model, valid_oauth_activation_coordinator());
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "{label} outside the canonical handoff must fail closed"
+            );
+        }
     }
 
     #[test]
