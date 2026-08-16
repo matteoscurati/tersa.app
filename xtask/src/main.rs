@@ -3421,11 +3421,11 @@ fn swift_bootstrap_inventory_violations(sources: &[(PathBuf, String)]) -> Vec<St
     violations
 }
 
-/// Keeps the browser-to-Keychain handoff foreground-gated. A successful OAuth
-/// callback commonly arrives while the browser is still active; starting the
-/// connect worker there can make the `WhenUnlockedThisDeviceOnly` token store
-/// fail with `errSecInteractionNotAllowed` on macOS. This structural check makes
-/// the reviewed activation boundary part of the Apple product surface.
+/// Keeps the browser-to-Keychain activation handoff one-shot. Foreground
+/// activation is a UX request rather than a Keychain access precondition: the
+/// reviewed coordinator must install its observer and cleanup before requesting
+/// activation, then allow the notification or next-main-turn fallback to claim
+/// the grant exactly once.
 fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
     let path = Path::new(ACCOUNT_CONNECTION_VIEW_MODEL_PATH);
     let Some((_path, document)) = sources.iter().find(|(candidate, _)| candidate == path) else {
@@ -3454,7 +3454,34 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
         );
         return violations;
     };
+    let coordinator_call_count = activation
+        .matches("activationPending.beginApplicationActivation(")
+        .count();
+    let uses_coordinator = coordinator_call_count != 0;
+    if coordinator_call_count > 1 {
+        violations.push(
+            "the OAuth activation handoff must contain exactly one coordinator call".to_owned(),
+        );
+    }
     violations.extend(swift_oauth_activation_handoff_violations(activation));
+    if uses_coordinator {
+        violations.extend(swift_oauth_coordinated_view_model_violations(activation));
+    }
+    if uses_coordinator {
+        let coordinator_path = Path::new(CONNECTION_STATE_PATH);
+        match sources
+            .iter()
+            .find(|(candidate, _)| candidate == coordinator_path)
+        {
+            Some((_path, document)) => violations.extend(
+                swift_oauth_activation_coordinator_violations(&strip_swift_non_code(document)),
+            ),
+            None => violations.push(format!(
+                "the OAuth activation coordinator source `{}` must be tracked",
+                coordinator_path.display()
+            )),
+        }
+    }
 
     let Some(finish) = swift_single_function_body(&code, "finishBrokerGrantApplicationActivation")
     else {
@@ -3464,7 +3491,10 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
         );
         return violations;
     };
-    violations.extend(swift_oauth_finish_persist_violations(finish));
+    violations.extend(swift_oauth_finish_persist_violations(
+        finish,
+        uses_coordinator,
+    ));
 
     violations.extend(swift_oauth_sole_connect_caller_violations(&code));
     violations
@@ -3544,13 +3574,24 @@ fn swift_oauth_authorize_entry_violations(authorize: &str) -> Vec<String> {
 
 fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
     let mut violations = Vec::new();
-    for required in [
-        "NSApplication.didBecomeActiveNotification",
-        "NSApp.activate()",
-        "Timer.scheduledTimer",
-        "cleanupFreshBrokerGrant(",
-        "finishBrokerGrantApplicationActivation(",
-    ] {
+    let uses_coordinator = activation.contains("activationPending.beginApplicationActivation(");
+    let required = if uses_coordinator {
+        vec![
+            "NSApp.activate()",
+            "DispatchQueue.main.async",
+            "cleanupFreshBrokerGrant(",
+            "finishBrokerGrantApplicationActivation(",
+        ]
+    } else {
+        vec![
+            "NSApplication.didBecomeActiveNotification",
+            "NSApp.activate()",
+            "Timer.scheduledTimer",
+            "cleanupFreshBrokerGrant(",
+            "finishBrokerGrantApplicationActivation(",
+        ]
+    };
+    for required in required {
         if !activation.contains(required) {
             violations.push(format!(
                 "the OAuth activation handoff must contain `{required}`"
@@ -3566,31 +3607,152 @@ fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
                 .to_owned(),
         );
     }
-    let observer_position = activation.find("activationObserver =");
-    let activate_position = activation.find("NSApp.activate()");
-    if !matches!(
-        (observer_position, activate_position),
-        (Some(observer), Some(activate)) if observer < activate
-    ) {
+    if uses_coordinator {
+        for forbidden in [
+            "NSApplication.didBecomeActiveNotification",
+            "Timer.scheduledTimer",
+            "clearApplicationActivation(",
+        ] {
+            if activation.contains(forbidden) {
+                violations.push(format!(
+                    "the coordinated OAuth activation handoff must not retain `{forbidden}`"
+                ));
+            }
+        }
+    } else {
+        let observer_position = activation.find("activationObserver =");
+        let activate_position = activation.find("NSApp.activate()");
+        if !matches!(
+            (observer_position, activate_position),
+            (Some(observer), Some(activate)) if observer < activate
+        ) {
+            violations.push(
+                "the OAuth activation observer must be installed before NSApp.activate()"
+                    .to_owned(),
+            );
+        }
+    }
+    violations
+}
+
+fn compact_swift_code(code: &str) -> String {
+    code.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn swift_oauth_coordinated_view_model_violations(activation: &str) -> Vec<String> {
+    let compact = compact_swift_code(activation);
+    let expected = concat!(
+        "{guardoperationDeadline.accepts(token)else{",
+        "cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
+        "letstarted=activationPending.beginApplicationActivation(",
+        "isApplicationActive:{NSApp.isActive},",
+        "requestActivation:{NSApp.activate()},",
+        "scheduleNextMainQueueTurn:{completioninDispatchQueue.main.async{completion()}},",
+        "adopt:{[self]infinishBrokerGrantApplicationActivation(",
+        "accountIdentifier:accountIdentifier,brokerToken:brokerToken,token:token)})",
+        "guardstartedelse{cleanupFreshBrokerGrant(",
+        "subject:brokerToken.subject,token:token)return}}",
+    );
+    if compact != expected {
+        return vec![
+            "the coordinated OAuth activation handoff must match the exact reviewed outer-body orchestration"
+                .to_owned(),
+        ];
+    }
+    Vec::new()
+}
+
+fn swift_oauth_activation_coordinator_violations(code: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let compact = compact_swift_code(code);
+    for required in [
+        "privateenumState{caseidlecasepending(UInt64)caseclaimed(UInt64)}",
+        "privatevarstate=State.idle",
+        "privatevarnextGeneration:UInt64=0",
+        "varisPending:Bool{ifcase.pending=state{returntrue}returnfalse}",
+    ] {
+        if compact.matches(required).count() != 1 {
+            violations.push(format!(
+                "BrokerGrantActivationHandoff must contain exactly one reviewed `{required}` state declaration"
+            ));
+        }
+    }
+    let Some(begin) = swift_single_function_body(code, "beginApplicationActivation") else {
+        return vec![
+            "BrokerGrantActivationHandoff must contain exactly one beginApplicationActivation function"
+                .to_owned(),
+        ];
+    };
+    let expected_begin = concat!(
+        "{guardcase.idle=stateelse{returnfalse}",
+        "nextGeneration&+=1letgeneration=nextGeneration",
+        "state=.pending(generation)",
+        "ifisApplicationActive(){runIfPending(",
+        "generation:generation,action:adopt)returntrue}",
+        "requestActivation()scheduleNextMainQueueTurn{[weakself]in",
+        "self?.runIfPending(generation:generation,action:adopt)}returntrue}",
+    );
+    if compact_swift_code(begin) != expected_begin {
         violations.push(
-            "the OAuth activation observer must be installed before NSApp.activate()".to_owned(),
+            "the OAuth coordinator must match the exact reviewed generation-bound activation body"
+                .to_owned(),
+        );
+    }
+
+    let Some(claim) = swift_single_function_body(code, "runIfPending") else {
+        violations.push(
+            "BrokerGrantActivationHandoff must contain exactly one runIfPending function"
+                .to_owned(),
+        );
+        return violations;
+    };
+    if compact_swift_code(claim)
+        != "{guardcase.pending(letpendingGeneration)=state,pendingGeneration==generationelse{return}state=.claimed(generation)defer{state=.idle}action()}"
+    {
+        violations.push(
+            "the OAuth coordinator claim must match its pending generation, transition to claimed, and defer its idle reset before running the action"
+                .to_owned(),
         );
     }
     violations
 }
 
-fn swift_oauth_finish_persist_violations(finish: &str) -> Vec<String> {
+fn swift_oauth_finish_persist_violations(finish: &str, uses_coordinator: bool) -> Vec<String> {
     let clear_position = finish.find("clearApplicationActivation()");
     let store_position = finish.find("syncWorker.storeBrokerSubject(");
     let connect_position = finish.find("connectWithBrokerGrant(");
-    if !finish.contains("guard activationPending")
-        || !matches!(
-            (clear_position, store_position, connect_position),
-            (Some(clear), Some(store), Some(connect)) if clear < store && store < connect
-        )
-    {
+    let compact = compact_swift_code(finish);
+    let valid = if uses_coordinator {
+        let expected = concat!(
+            "{guardoperationDeadline.accepts(token)else{",
+            "cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
+            "guardstate==.connectingelse{cleanupFreshBrokerGrant(",
+            "subject:brokerToken.subject,token:token)return}",
+            "syncWorker.storeBrokerSubject(accountIdentifier:accountIdentifier,",
+            "subject:brokerToken.subject){[weakself]persistedin",
+            "guardletselfelse{return}",
+            "guardself.operationDeadline.accepts(token),persistedelse{",
+            "self.cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
+            "self.connectWithBrokerGrant(accountIdentifier:accountIdentifier,",
+            "brokerToken:brokerToken,token:token)}}",
+        );
+        compact == expected
+    } else {
+        compact.contains("guardactivationPendingelse{return}")
+            && matches!(
+                (clear_position, store_position, connect_position),
+                (Some(clear), Some(store), Some(connect)) if clear < store && store < connect
+            )
+    };
+    if !valid {
         return vec![
-            "the activation completion must clear its one-shot state before persisting the broker subject and connect only from the subject-store completion"
+            if uses_coordinator {
+                "the coordinated activation completion must fence deadline and connection state, persist the broker subject before connecting, and contain no legacy activation state"
+            } else {
+                "the activation completion must clear its one-shot state before persisting the broker subject and connect only from the subject-store completion"
+            }
                 .to_owned(),
         ];
     }
@@ -4031,6 +4193,7 @@ fn identifier_occurrence_count(document: &str, identifier: &str) -> usize {
 /// The single reviewed macOS view-model that may drive the product bootstrap
 /// owner from a user-intent action (ADR 0021 slice 2c).
 const ACCOUNT_CONNECTION_VIEW_MODEL_PATH: &str = "apple/macos/AccountConnectionViewModel.swift";
+const CONNECTION_STATE_PATH: &str = "apple/macos/ConnectionState.swift";
 /// The reviewed `AppKit` owner method that forwards to the bootstrap worker.
 const PRODUCT_BOOTSTRAP_OWNER: &str = "establishOwnedAccountProfile";
 
@@ -13044,6 +13207,341 @@ func connectWithBrokerGrant(
             "the reviewed foreground handoff must pass: {:?}",
             swift_oauth_foreground_handoff_violations(&sources)
         );
+    }
+
+    #[test]
+    fn swift_oauth_handoff_accepts_and_pins_activation_coordinator() {
+        let view_model = valid_coordinated_oauth_handoff_view_model();
+        let coordinator = valid_oauth_activation_coordinator();
+        let valid_sources = vec![
+            (
+                PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                view_model.to_owned(),
+            ),
+            (
+                PathBuf::from("apple/macos/ConnectionState.swift"),
+                coordinator.to_owned(),
+            ),
+        ];
+        assert!(
+            swift_oauth_foreground_handoff_violations(&valid_sources).is_empty(),
+            "the coordinated OAuth handoff must pass: {:?}",
+            swift_oauth_foreground_handoff_violations(&valid_sources)
+        );
+    }
+
+    #[test]
+    fn swift_oauth_coordinator_rejects_state_and_order_drift() {
+        let view_model = valid_coordinated_oauth_handoff_view_model();
+        let coordinator = valid_oauth_activation_coordinator();
+        let coordinator_drifts = [
+            (
+                "activation before pending state",
+                coordinator.replace(
+                    "        state = .pending(generation)\n        if isApplicationActive()",
+                    "        requestActivation()\n        state = .pending(generation)\n        if isApplicationActive()",
+                ),
+            ),
+            (
+                "fallback before activation",
+                coordinator.replace(
+                    "        requestActivation()\n        scheduleNextMainQueueTurn {",
+                    "        scheduleNextMainQueueTurn {",
+                ),
+            ),
+            (
+                "bypass shared claim",
+                coordinator.replace(
+                    "self?.runIfPending(generation: generation, action: adopt)",
+                    "adopt()",
+                ),
+            ),
+            (
+                "additive direct adoption",
+                coordinator.replace(
+                    "        requestActivation()",
+                    "        adopt()\n        requestActivation()",
+                ),
+            ),
+            (
+                "wrong initial state",
+                coordinator.replace(
+                    "private var state = State.idle",
+                    "private var state = State.pending(0)",
+                ),
+            ),
+            (
+                "broken begin guard",
+                coordinator.replace("guard case .idle = state", "guard case .pending = state"),
+            ),
+            (
+                "missing generation increment",
+                coordinator.replace("        nextGeneration &+= 1\n", ""),
+            ),
+            (
+                "wrong pending generation",
+                coordinator.replace("state = .pending(generation)", "state = .pending(0)"),
+            ),
+            (
+                "stale callback bypass",
+                coordinator.replace("pendingGeneration == generation", "pendingGeneration != generation"),
+            ),
+            (
+                "wrong claimed generation",
+                coordinator.replace("state = .claimed(generation)", "state = .claimed(0)"),
+            ),
+            (
+                "missing deferred reset",
+                coordinator.replace("        defer { state = .idle }\n", ""),
+            ),
+            (
+                "wrong deferred reset",
+                coordinator.replace("defer { state = .idle }", "defer { state = .pending(0) }"),
+            ),
+            (
+                "isPending always true",
+                coordinator.replace(
+                    "if case .pending = state { return true }",
+                    "if case .idle = state { return true }",
+                ),
+            ),
+        ];
+        for (label, coordinator_drift) in coordinator_drifts {
+            let sources = vec![
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    view_model.to_owned(),
+                ),
+                (
+                    PathBuf::from("apple/macos/ConnectionState.swift"),
+                    coordinator_drift,
+                ),
+            ];
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "{label} coordinator drift must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn swift_oauth_coordinated_view_model_rejects_miswiring() {
+        let view_model = valid_coordinated_oauth_handoff_view_model();
+        let coordinator = valid_oauth_activation_coordinator();
+        for (label, activation_drift) in [
+            (
+                "duplicate coordinator call",
+                view_model.replace(
+                    "    let started = activationPending.beginApplicationActivation(",
+                    "    activationPending.beginApplicationActivation()\n    let started = activationPending.beginApplicationActivation(",
+                ),
+            ),
+            (
+                "dead coordinator call",
+                view_model.replace(
+                    "    let started = activationPending.beginApplicationActivation(",
+                    "    if false {\n    let started = activationPending.beginApplicationActivation(",
+                ),
+            ),
+            (
+                "coordinator call hidden in closure",
+                view_model.replace(
+                    "    let started = activationPending.beginApplicationActivation(",
+                    "    let deferred = {\n    let started = activationPending.beginApplicationActivation(",
+                ),
+            ),
+            (
+                "miswired activation closure",
+                view_model.replace(
+                    "requestActivation: { NSApp.activate() }",
+                    "requestActivation: { completion() }",
+                ),
+            ),
+            (
+                "miswired adoption closure",
+                view_model.replace(
+                    "finishBrokerGrantApplicationActivation(",
+                    "cleanupFreshBrokerGrant(",
+                ),
+            ),
+            (
+                "weak adoption owner",
+                view_model.replace(
+                    "adopt: { [self] in",
+                    "adopt: { [weak self] in",
+                ),
+            ),
+            (
+                "legacy destructive timer",
+                view_model.replace(
+                    "        requestActivation: { NSApp.activate() },",
+                    "        requestActivation: { NSApp.activate() },\n        scheduleCleanup: { Timer.scheduledTimer() },",
+                ),
+            ),
+            (
+                "missing finish deadline fence",
+                view_model.replace(
+                    "    guard operationDeadline.accepts(token) else {",
+                    "    guard true else {",
+                ),
+            ),
+            (
+                "missing finish state fence",
+                view_model.replace("    guard state == .connecting else {", "    guard true else {"),
+            ),
+            (
+                "store before finish fences",
+                view_model.replace(
+                    "    guard operationDeadline.accepts(token) else {",
+                    "    syncWorker.storeBrokerSubject(accountIdentifier: accountIdentifier, subject: brokerToken.subject) { _ in }\n    guard operationDeadline.accepts(token) else {",
+                ),
+            ),
+            (
+                "connect before finish fences",
+                view_model.replace(
+                    "    guard operationDeadline.accepts(token) else {",
+                    "    connectWithBrokerGrant(accountIdentifier: accountIdentifier, brokerToken: brokerToken, token: token)\n    guard operationDeadline.accepts(token) else {",
+                ),
+            ),
+        ] {
+            let sources = vec![
+                (
+                    PathBuf::from("apple/macos/AccountConnectionViewModel.swift"),
+                    activation_drift,
+                ),
+                (
+                    PathBuf::from("apple/macos/ConnectionState.swift"),
+                    coordinator.to_owned(),
+                ),
+            ];
+            assert!(
+                !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    fn valid_coordinated_oauth_handoff_view_model() -> &'static str {
+        r"
+func authorizeAndConnect(accountIdentifier: Data) {
+    connectBrokerGrantAfterApplicationActivation(
+        accountIdentifier: accountIdentifier,
+        brokerToken: brokerToken,
+        token: token
+    )
+}
+func connectBrokerGrantAfterApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    guard operationDeadline.accepts(token) else {
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+        return
+    }
+    let started = activationPending.beginApplicationActivation(
+        isApplicationActive: { NSApp.isActive },
+        requestActivation: { NSApp.activate() },
+        scheduleNextMainQueueTurn: { completion in
+            DispatchQueue.main.async { completion() }
+        },
+        adopt: { [self] in
+            finishBrokerGrantApplicationActivation(
+                accountIdentifier: accountIdentifier,
+                brokerToken: brokerToken,
+                token: token
+            )
+        }
+    )
+    guard started else {
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+        return
+    }
+}
+func finishBrokerGrantApplicationActivation(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {
+    guard operationDeadline.accepts(token) else {
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+        return
+    }
+    guard state == .connecting else {
+        cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+        return
+    }
+    syncWorker.storeBrokerSubject(
+        accountIdentifier: accountIdentifier,
+        subject: brokerToken.subject
+    ) { [weak self] persisted in
+        guard let self else { return }
+        guard self.operationDeadline.accepts(token), persisted else {
+            self.cleanupFreshBrokerGrant(subject: brokerToken.subject, token: token)
+            return
+        }
+        self.connectWithBrokerGrant(
+            accountIdentifier: accountIdentifier,
+            brokerToken: brokerToken,
+            token: token
+        )
+    }
+}
+func cleanupFreshBrokerGrant(subject: String, token: ConnectionOperationToken) {}
+func connectWithBrokerGrant(
+    accountIdentifier: Data,
+    brokerToken: TokenBrokerAccessToken,
+    token: ConnectionOperationToken
+) {}
+"
+    }
+
+    fn valid_oauth_activation_coordinator() -> &'static str {
+        r"
+final class BrokerGrantActivationHandoff {
+    private enum State {
+        case idle
+        case pending(UInt64)
+        case claimed(UInt64)
+    }
+    private var state = State.idle
+    private var nextGeneration: UInt64 = 0
+    var isPending: Bool {
+        if case .pending = state { return true }
+        return false
+    }
+
+    func beginApplicationActivation(
+        isApplicationActive: () -> Bool,
+        requestActivation: () -> Void,
+        scheduleNextMainQueueTurn: (() -> Void) -> Void,
+        adopt: () -> Void
+    ) -> Bool {
+        guard case .idle = state else { return false }
+        nextGeneration &+= 1
+        let generation = nextGeneration
+        state = .pending(generation)
+        if isApplicationActive() {
+            runIfPending(generation: generation, action: adopt)
+            return true
+        }
+        requestActivation()
+        scheduleNextMainQueueTurn { [weak self] in
+            self?.runIfPending(generation: generation, action: adopt)
+        }
+        return true
+    }
+
+    private func runIfPending(generation: UInt64, action: () -> Void) {
+        guard case .pending(let pendingGeneration) = state,
+              pendingGeneration == generation
+        else { return }
+        state = .claimed(generation)
+        defer { state = .idle }
+        action()
+    }
+}
+"
     }
 
     #[test]
