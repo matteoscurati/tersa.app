@@ -3458,31 +3458,26 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     let coordinator_call_count = activation
         .matches("activationPending.beginApplicationActivation(")
         .count();
-    let uses_coordinator = coordinator_call_count != 0;
-    if coordinator_call_count > 1 {
+    if coordinator_call_count != 1 {
         violations.push(
             "the OAuth activation handoff must contain exactly one coordinator call".to_owned(),
         );
     }
     violations.extend(swift_oauth_activation_handoff_violations(activation));
-    if uses_coordinator {
-        violations.extend(swift_oauth_coordinated_view_model_violations(activation));
-        violations.extend(swift_oauth_coordinator_ownership_violations(sources, &code));
-    }
-    if uses_coordinator {
-        let coordinator_path = Path::new(CONNECTION_STATE_PATH);
-        match sources
-            .iter()
-            .find(|(candidate, _)| candidate == coordinator_path)
-        {
-            Some((_path, document)) => violations.extend(
-                swift_oauth_activation_coordinator_violations(&strip_swift_non_code(document)),
-            ),
-            None => violations.push(format!(
-                "the OAuth activation coordinator source `{}` must be tracked",
-                coordinator_path.display()
-            )),
-        }
+    violations.extend(swift_oauth_coordinated_view_model_violations(activation));
+    violations.extend(swift_oauth_coordinator_ownership_violations(sources, &code));
+    let coordinator_path = Path::new(CONNECTION_STATE_PATH);
+    match sources
+        .iter()
+        .find(|(candidate, _)| candidate == coordinator_path)
+    {
+        Some((_path, document)) => violations.extend(
+            swift_oauth_activation_coordinator_violations(&strip_swift_non_code(document)),
+        ),
+        None => violations.push(format!(
+            "the OAuth activation coordinator source `{}` must be tracked",
+            coordinator_path.display()
+        )),
     }
 
     let Some(finish) = swift_single_function_body(&code, "finishBrokerGrantApplicationActivation")
@@ -3493,10 +3488,7 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
         );
         return violations;
     };
-    violations.extend(swift_oauth_finish_persist_violations(
-        finish,
-        uses_coordinator,
-    ));
+    violations.extend(swift_oauth_finish_persist_violations(finish));
 
     violations.extend(swift_oauth_sole_connect_caller_violations(&code));
     violations
@@ -3530,6 +3522,7 @@ fn swift_oauth_coordinator_ownership_violations(
         })
         .sum::<usize>();
     let coordinator_constructions = swift_sources
+        .clone()
         .map(|(_, source)| {
             swift_call_count(
                 &strip_swift_non_code(source),
@@ -3537,9 +3530,16 @@ fn swift_oauth_coordinator_ownership_violations(
             )
         })
         .sum::<usize>();
-    if coordinator_references != 2 || coordinator_constructions != 1 {
+    let coordinator_calls = swift_sources
+        .map(|(_, source)| {
+            strip_swift_non_code(source)
+                .matches("activationPending.beginApplicationActivation(")
+                .count()
+        })
+        .sum::<usize>();
+    if coordinator_references != 2 || coordinator_constructions != 1 || coordinator_calls != 1 {
         violations.push(
-            "the macOS source inventory must contain only the BrokerGrantActivationHandoff declaration and its canonical construction"
+            "the macOS source inventory must contain only the BrokerGrantActivationHandoff declaration, canonical construction, and canonical begin call"
                 .to_owned(),
         );
     }
@@ -3643,24 +3643,12 @@ fn swift_oauth_authorize_entry_violations(authorize: &str) -> Vec<String> {
 
 fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
     let mut violations = Vec::new();
-    let uses_coordinator = activation.contains("activationPending.beginApplicationActivation(");
-    let required = if uses_coordinator {
-        vec![
-            "NSApp.activate()",
-            "DispatchQueue.main.async",
-            "cleanupFreshBrokerGrant(",
-            "finishBrokerGrantApplicationActivation(",
-        ]
-    } else {
-        vec![
-            "NSApplication.didBecomeActiveNotification",
-            "NSApp.activate()",
-            "Timer.scheduledTimer",
-            "cleanupFreshBrokerGrant(",
-            "finishBrokerGrantApplicationActivation(",
-        ]
-    };
-    for required in required {
+    for required in [
+        "NSApp.activate()",
+        "DispatchQueue.main.async",
+        "cleanupFreshBrokerGrant(",
+        "finishBrokerGrantApplicationActivation(",
+    ] {
         if !activation.contains(required) {
             violations.push(format!(
                 "the OAuth activation handoff must contain `{required}`"
@@ -3676,29 +3664,15 @@ fn swift_oauth_activation_handoff_violations(activation: &str) -> Vec<String> {
                 .to_owned(),
         );
     }
-    if uses_coordinator {
-        for forbidden in [
-            "NSApplication.didBecomeActiveNotification",
-            "Timer.scheduledTimer",
-            "clearApplicationActivation(",
-        ] {
-            if activation.contains(forbidden) {
-                violations.push(format!(
-                    "the coordinated OAuth activation handoff must not retain `{forbidden}`"
-                ));
-            }
-        }
-    } else {
-        let observer_position = activation.find("activationObserver =");
-        let activate_position = activation.find("NSApp.activate()");
-        if !matches!(
-            (observer_position, activate_position),
-            (Some(observer), Some(activate)) if observer < activate
-        ) {
-            violations.push(
-                "the OAuth activation observer must be installed before NSApp.activate()"
-                    .to_owned(),
-            );
+    for forbidden in [
+        "NSApplication.didBecomeActiveNotification",
+        "Timer.scheduledTimer",
+        "clearApplicationActivation(",
+    ] {
+        if activation.contains(forbidden) {
+            violations.push(format!(
+                "the coordinated OAuth activation handoff must not retain `{forbidden}`"
+            ));
         }
     }
     violations
@@ -3780,40 +3754,24 @@ fn swift_oauth_activation_coordinator_violations(code: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn swift_oauth_finish_persist_violations(finish: &str, uses_coordinator: bool) -> Vec<String> {
-    let clear_position = finish.find("clearApplicationActivation()");
-    let store_position = finish.find("syncWorker.storeBrokerSubject(");
-    let connect_position = finish.find("connectWithBrokerGrant(");
+fn swift_oauth_finish_persist_violations(finish: &str) -> Vec<String> {
     let compact = compact_swift_code(finish);
-    let valid = if uses_coordinator {
-        let expected = concat!(
-            "{guardoperationDeadline.accepts(token)else{",
-            "cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
-            "guardstate==.connectingelse{cleanupFreshBrokerGrant(",
-            "subject:brokerToken.subject,token:token)return}",
-            "syncWorker.storeBrokerSubject(accountIdentifier:accountIdentifier,",
-            "subject:brokerToken.subject){[weakself]persistedin",
-            "guardletselfelse{return}",
-            "guardself.operationDeadline.accepts(token),persistedelse{",
-            "self.cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
-            "self.connectWithBrokerGrant(accountIdentifier:accountIdentifier,",
-            "brokerToken:brokerToken,token:token)}}",
-        );
-        compact == expected
-    } else {
-        compact.contains("guardactivationPendingelse{return}")
-            && matches!(
-                (clear_position, store_position, connect_position),
-                (Some(clear), Some(store), Some(connect)) if clear < store && store < connect
-            )
-    };
-    if !valid {
+    let expected = concat!(
+        "{guardoperationDeadline.accepts(token)else{",
+        "cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
+        "guardstate==.connectingelse{cleanupFreshBrokerGrant(",
+        "subject:brokerToken.subject,token:token)return}",
+        "syncWorker.storeBrokerSubject(accountIdentifier:accountIdentifier,",
+        "subject:brokerToken.subject){[weakself]persistedin",
+        "guardletselfelse{return}",
+        "guardself.operationDeadline.accepts(token),persistedelse{",
+        "self.cleanupFreshBrokerGrant(subject:brokerToken.subject,token:token)return}",
+        "self.connectWithBrokerGrant(accountIdentifier:accountIdentifier,",
+        "brokerToken:brokerToken,token:token)}}",
+    );
+    if compact != expected {
         return vec![
-            if uses_coordinator {
-                "the coordinated activation completion must fence deadline and connection state, persist the broker subject before connecting, and contain no legacy activation state"
-            } else {
-                "the activation completion must clear its one-shot state before persisting the broker subject and connect only from the subject-store completion"
-            }
+            "the coordinated activation completion must fence deadline and connection state, persist the broker subject before connecting, and contain no legacy activation state"
                 .to_owned(),
         ];
     }
@@ -13168,7 +13126,7 @@ private enum TersaApplication {
     }
 
     #[test]
-    fn swift_oauth_foreground_handoff_accepts_one_shot_activation() {
+    fn swift_oauth_foreground_handoff_rejects_legacy_observer_timeout_activation() {
         let view_model = r"
 func authorizeAndConnect(accountIdentifier: Data) {
     let started = session.start { [weak self] outcome in
@@ -13264,9 +13222,8 @@ func connectWithBrokerGrant(
         )];
 
         assert!(
-            swift_oauth_foreground_handoff_violations(&sources).is_empty(),
-            "the reviewed foreground handoff must pass: {:?}",
-            swift_oauth_foreground_handoff_violations(&sources)
+            !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+            "the legacy observer and destructive timeout handoff must fail closed"
         );
     }
 
@@ -13561,6 +13518,13 @@ func connectWithBrokerGrant(
                 view_model.replace(
                     "func authorizeAndConnect(accountIdentifier: Data) {",
                     "func unused() { _ = BrokerGrantActivationHandoff() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
+                ),
+            ),
+            (
+                "additional coordinator begin caller",
+                view_model.replace(
+                    "func authorizeAndConnect(accountIdentifier: Data) {",
+                    "func unused() { activationPending.beginApplicationActivation() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
                 ),
             ),
         ];
