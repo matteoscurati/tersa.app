@@ -1140,8 +1140,17 @@ fn bootstrap_source_surface_violations(repository_root: &Path) -> io::Result<Vec
         violations.extend(swift_bootstrap_inventory_violations(&macos_sources));
     }
     violations.extend(swift_ffi_symbol_inventory_violations(&macos_sources));
-    violations.extend(swift_oauth_foreground_handoff_violations(&macos_sources));
+    violations.extend(swift_oauth_product_source_violations(repository_root)?);
     Ok(violations)
+}
+
+fn swift_oauth_product_source_violations(repository_root: &Path) -> io::Result<Vec<String>> {
+    let mut sources = tracked_source_documents(repository_root, "apple/macos")?;
+    sources.extend(tracked_source_documents(
+        repository_root,
+        "apple/keychain-isolation-probe",
+    )?);
+    Ok(swift_oauth_foreground_handoff_violations(&sources))
 }
 
 /// The token-broker FFI is a dedicated static library with its own five-symbol
@@ -3455,14 +3464,6 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
         );
         return violations;
     };
-    let coordinator_call_count = activation
-        .matches("activationPending.beginApplicationActivation(")
-        .count();
-    if coordinator_call_count != 1 {
-        violations.push(
-            "the OAuth activation handoff must contain exactly one coordinator call".to_owned(),
-        );
-    }
     violations.extend(swift_oauth_activation_handoff_violations(activation));
     violations.extend(swift_oauth_coordinated_view_model_violations(activation));
     violations.extend(swift_oauth_coordinator_ownership_violations(sources, &code));
@@ -3490,6 +3491,7 @@ fn swift_oauth_foreground_handoff_violations(sources: &[(PathBuf, String)]) -> V
     };
     violations.extend(swift_oauth_finish_persist_violations(finish));
 
+    violations.extend(swift_oauth_sole_finish_caller_violations(&code));
     violations.extend(swift_oauth_sole_connect_caller_violations(&code));
     violations
 }
@@ -3794,6 +3796,17 @@ fn swift_oauth_sole_connect_caller_violations(code: &str) -> Vec<String> {
     if connect_callers != ["finishBrokerGrantApplicationActivation".to_owned()] {
         return vec![
             "finishBrokerGrantApplicationActivation must be the sole caller of connectWithBrokerGrant"
+                .to_owned(),
+        ];
+    }
+    Vec::new()
+}
+
+fn swift_oauth_sole_finish_caller_violations(code: &str) -> Vec<String> {
+    let finish_callers = swift_function_names_with(code, "finishBrokerGrantApplicationActivation(");
+    if finish_callers != ["connectBrokerGrantAfterApplicationActivation".to_owned()] {
+        return vec![
+            "connectBrokerGrantAfterApplicationActivation must be the sole caller of finishBrokerGrantApplicationActivation"
                 .to_owned(),
         ];
     }
@@ -13496,6 +13509,26 @@ func connectWithBrokerGrant(
                 "{label} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn swift_oauth_coordinated_view_model_rejects_direct_finish_caller() {
+        let view_model = valid_coordinated_oauth_handoff_view_model().replace(
+            "func authorizeAndConnect(accountIdentifier: Data) {",
+            concat!(
+                "func retryAdoption() {\n",
+                "    finishBrokerGrantApplicationActivation(\n",
+                "        accountIdentifier: accountIdentifier, brokerToken: brokerToken, token: token\n",
+                "    )\n",
+                "}\n",
+                "func authorizeAndConnect(accountIdentifier: Data) {",
+            ),
+        );
+        let sources = coordinated_oauth_sources(&view_model, valid_oauth_activation_coordinator());
+        assert!(
+            !swift_oauth_foreground_handoff_violations(&sources).is_empty(),
+            "a direct finish caller outside the coordinator adoption closure must fail closed"
+        );
     }
 
     #[test]
