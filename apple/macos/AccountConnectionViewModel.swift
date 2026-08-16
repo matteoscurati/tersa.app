@@ -1055,10 +1055,10 @@ final class AccountConnectionViewModel: ObservableObject {
         }
     }
 
-    /// Delivers the freshly-consented broker grant exactly once after Tersa has
-    /// completed the activation handoff: persist the account's routing subject,
-    /// then feed the access token into the broker sync. A generation-bound
-    /// one-shot callback makes stale activation work harmless. A subject may remain
+    /// Persists the freshly-consented grant after the activation handoff, then
+    /// feeds its access token into broker sync. The sole legal caller is the
+    /// coordinator's generation-bound `adopt` closure, which provides exactly-once
+    /// delivery and makes stale activation work harmless. A subject may remain
     /// locally if the operation goes stale just after a
     /// successful persist; the cleanup still deletes the broker-stored tokens,
     /// and the next stored-credential refresh safely routes the missing token

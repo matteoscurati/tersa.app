@@ -60,6 +60,14 @@ final class BrokerGrantActivationHandoffTests: XCTestCase {
         XCTAssertTrue(handoff.isPending)
         XCTAssertEqual(first.adoptionCount, 0)
         XCTAssertEqual(second.adoptionCount, 0)
+
+        let firstCallback = first.nextTurnCallbacks.first
+        XCTAssertNotNil(firstCallback)
+        firstCallback?()
+
+        XCTAssertEqual(first.adoptionCount, 1)
+        XCTAssertEqual(second.adoptionCount, 0)
+        XCTAssertFalse(handoff.isPending)
     }
 
     @MainActor
