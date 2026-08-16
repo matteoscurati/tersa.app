@@ -3532,9 +3532,7 @@ fn swift_oauth_coordinator_ownership_violations(
         .sum::<usize>();
     let coordinator_calls = swift_sources
         .map(|(_, source)| {
-            strip_swift_non_code(source)
-                .matches("activationPending.beginApplicationActivation(")
-                .count()
+            swift_member_call_count(&strip_swift_non_code(source), "beginApplicationActivation")
         })
         .sum::<usize>();
     if coordinator_references != 2 || coordinator_constructions != 1 || coordinator_calls != 1 {
@@ -13525,6 +13523,20 @@ func connectWithBrokerGrant(
                 view_model.replace(
                     "func authorizeAndConnect(accountIdentifier: Data) {",
                     "func unused() { activationPending.beginApplicationActivation() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
+                ),
+            ),
+            (
+                "additional multiline coordinator begin caller",
+                view_model.replace(
+                    "func authorizeAndConnect(accountIdentifier: Data) {",
+                    "func unused() { activationPending\n    .beginApplicationActivation() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
+                ),
+            ),
+            (
+                "additional aliased coordinator begin caller",
+                view_model.replace(
+                    "func authorizeAndConnect(accountIdentifier: Data) {",
+                    "func unused() { let handoff = activationPending; handoff.beginApplicationActivation() }\nfunc authorizeAndConnect(accountIdentifier: Data) {",
                 ),
             ),
         ];
