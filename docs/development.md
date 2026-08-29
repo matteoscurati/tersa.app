@@ -63,6 +63,13 @@ That runner requires a clean worktree, exactly one Apple Development identity,
 and a matching Mac Development profile. It cannot satisfy
 `P1-MACOS-001`/`002`/`003`.
 
+The separate [macOS live OAuth development evidence](quality/macos-live-oauth-dev-evidence.md)
+record is model-reviewed and non-gate. It captures redacted Apple Development
+OAuth lifecycle observations without closing ADR-0024 Item 5: formal
+human-reviewed, retained signed-runtime evidence remains required. ADR-0024
+Item 6 and issue #51 remain open pending the exact Developer ID signed and
+notarized candidate.
+
 ### CI execution modes
 
 Open implementation pull requests as drafts. Draft creation and synchronization

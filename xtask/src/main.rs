@@ -1023,6 +1023,9 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
     let ci = fs::read_to_string(".github/workflows/ci.yml")?;
     let development = fs::read_to_string("docs/development.md")?;
     let ui_evidence = fs::read_to_string("apple/scripts/capture-macos-ui-dev-evidence.sh")?;
+    let live_oauth_evidence =
+        fs::read_to_string("apple/scripts/capture-macos-live-oauth-dev-evidence.sh")?;
+    let application_oauth = fs::read_to_string("crates/application/src/oauth.rs")?;
     violations.extend(project_generation_surface_violations(
         &project_generation_wrapper,
         &ci,
@@ -1030,6 +1033,11 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &ui_evidence,
     ));
     violations.extend(macos_ui_evidence_transcript_violations(&ui_evidence));
+    violations.extend(macos_live_oauth_development_evidence_violations(
+        &live_oauth_evidence,
+        &application_oauth,
+        &ci,
+    ));
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
     violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
     Ok(())
@@ -5855,6 +5863,191 @@ fn tracked_apple_signing_inventory(
         }
     }
     Ok(inventory)
+}
+
+fn requested_scope_from_application_source(application_source: &str) -> Option<String> {
+    const PREFIX: &str = "pub const REQUESTED_SCOPE: &str = \"";
+    application_source.lines().find_map(|line| {
+        let scope = line.strip_prefix(PREFIX)?.strip_suffix("\";")?;
+        (!scope.is_empty()
+            && scope.split(' ').count() == 2
+            && scope.split(' ').all(|token| !token.is_empty()))
+        .then(|| scope.to_owned())
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fail-closed live-evidence source guard keeps its ordered controls together"
+)]
+fn macos_live_oauth_development_evidence_violations(
+    evidence: &str,
+    application_source: &str,
+    ci: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let Some(requested_scope) = requested_scope_from_application_source(application_source) else {
+        return vec![
+            "crates/application/src/oauth.rs must expose one exact two-token REQUESTED_SCOPE for live OAuth evidence"
+                .to_owned(),
+        ];
+    };
+    if evidence.contains(&requested_scope)
+        || !evidence.contains("def requested_scope(application_source: str) -> str:")
+        || !evidence.contains("validate_oauth_lifecycle(data[\"oauth_lifecycle\"], scope)")
+    {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must derive REQUESTED_SCOPE from crates/application/src/oauth.rs at validation and capture time"
+                .to_owned(),
+        );
+    }
+
+    if evidence.matches("local.xcconfig").count() != 1
+        || !evidence.contains("fixed(data[\"source\"], \"apple/local.xcconfig-values-redacted\")")
+    {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must retain only the fixed redacted local build-provenance label"
+                .to_owned(),
+        );
+    }
+    let commands = shell_executable_logical_commands(evidence);
+    if commands.iter().any(|command| {
+        matches!(
+            command.first().map(|token| shell_command_name(token)),
+            Some("curl" | "osascript" | "security" | "defaults")
+        ) || command.iter().any(|token| token.contains("local.xcconfig"))
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must not expose a network, browser-automation, Keychain-discovery, defaults, or local-build-configuration command"
+                .to_owned(),
+        );
+    }
+    if evidence.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("open(") || line.starts_with("with open(") || line.contains("= open(")
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must not add a direct absolute or variable Python open outside its reviewed descriptor helpers"
+                .to_owned(),
+        );
+    }
+    if evidence.contains("install -m")
+        || evidence.contains("[ ! -e \"$OUTPUT_ABSOLUTE\" ]")
+        || !evidence.contains("flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL")
+        || !evidence.contains("os.fchmod(descriptor, 0o600)")
+    {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must create final output once with exclusive 0600 creation"
+                .to_owned(),
+        );
+    }
+
+    let sequence = [
+        "MANUAL_OBSERVATION_ABSOLUTE=\"$(absolute_path \"$1\")\"",
+        "cd \"$ROOT\"",
+        "run_contract_python snapshot \"$MANUAL_OBSERVATION_ABSOLUTE\" \"$MANUAL_SNAPSHOT\"",
+        "  capture_toolchain\n\n  MAIN_BINARY=",
+        "codesign --verify --deep --strict \"$APP\"",
+        "codesign --verify --deep --strict \"$XPC\"",
+        "run_contract_python digest-lines \"$APP\" \\\n    >\"$SCRATCH/pre-probe-digests.stdout\"",
+        "\"$MAIN_BINARY\" --tersa-keychain-isolation-probe-v1",
+        "[ \"$MAIN_PROBE_STATUS\" -eq 0 ]",
+        "[ ! -s \"$SCRATCH/main-probe.stderr\" ]",
+        "cmp -s \"$SCRATCH/main-probe.expected\" \"$SCRATCH/main-probe.stdout\"",
+        "MAIN_APP_PROBE_OUTCOME='pass'",
+        "\"$BROKER_BINARY\" --tersa-keychain-isolation-probe-v1",
+        "[ \"$BROKER_PROBE_STATUS\" -eq 0 ]",
+        "[ ! -s \"$SCRATCH/broker-probe.stderr\" ]",
+        "cmp -s \"$SCRATCH/broker-probe.expected\" \"$SCRATCH/broker-probe.stdout\"",
+        "TOKEN_BROKER_PROBE_OUTCOME='pass'",
+        "run_contract_python digest-lines \"$APP\" \\\n    >\"$SCRATCH/post-probe-digests.stdout\"",
+        "cmp -s \"$SCRATCH/pre-probe-digests.stdout\" \"$SCRATCH/post-probe-digests.stdout\"",
+        "ARTIFACT_ATTRIBUTION='live-artifact'",
+        "PROBES_RERUN_ON_LIVE_ARTIFACT=true",
+        "PROBES_OBSERVED_ON='live-artifact'",
+        "run_contract_python recompute \"$RECOMPUTED\"",
+        "run_contract_python render \"$MANUAL_SNAPSHOT\" \"$RECOMPUTED\" \"$OUTPUT_ABSOLUTE\"",
+    ];
+    let indices = sequence
+        .iter()
+        .map(|anchor| {
+            let matches = evidence
+                .match_indices(anchor)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then(|| matches[0])
+        })
+        .collect::<Option<Vec<_>>>();
+    if indices.as_ref().is_none()
+        || indices
+            .as_ref()
+            .is_some_and(|indices| indices.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must snapshot manual input, recompute metadata, verify signatures, digest, run exact probes, attest live-artifact observations, and only then render"
+                .to_owned(),
+        );
+    }
+    let render_start = evidence.find("def render(");
+    let render_end = evidence.find("\ndef absolute_path(");
+    if let Some(render) = match (render_start, render_end) {
+        (Some(render_start), Some(render_end)) if render_start < render_end => {
+            evidence.get(render_start..render_end)
+        }
+        _ => None,
+    } {
+        if !render.contains("\"artifact\": recomputed[\"artifact\"]")
+            || !render.contains("\"wrong_group_probes\": recomputed[\"wrong_group_probes\"]")
+            || [
+                "\"attribution\": \"live-artifact\"",
+                "\"observed_on\": \"live-artifact\"",
+                "\"signing_tier\": \"Apple Development\"",
+                "\"outcome\": \"pass\"",
+            ]
+            .iter()
+            .any(|forbidden| render.contains(forbidden))
+        {
+            violations.push(
+                "apple/scripts/capture-macos-live-oauth-dev-evidence.sh renderer must consume shell-recomputed artifact and probe observations without constant success claims"
+                    .to_owned(),
+            );
+        }
+    } else {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must retain ordered reviewed renderer bounds"
+                .to_owned(),
+        );
+    }
+    if !evidence.contains("elif mode == \"digest-json\":")
+        || !evidence.contains("def digest_json(bundle: str) -> bytes:")
+        || !evidence.contains("run_contract_python digest-json \"$BUNDLE_ABSOLUTE\"")
+    {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must expose the read-only digest mode through its canonical bundle digest function"
+                .to_owned(),
+        );
+    }
+    if !evidence.contains(
+        "\"$PROBES_RERUN_ON_LIVE_ARTIFACT\" \"$PROBES_OBSERVED_ON\" \\\n    \"$MAIN_APP_PROBE_OUTCOME\" \"$MAIN_APP_PROBE_RESULT\"",
+    ) || !evidence.contains(
+        "\"$TOKEN_BROKER_PROBE_OUTCOME\" \"$TOKEN_BROKER_PROBE_RESULT\" \\\n    >\"$SCRATCH/recompute.stdout\"",
+    ) {
+        violations.push(
+            "apple/scripts/capture-macos-live-oauth-dev-evidence.sh must pass the shell-observed probe results into the recomputed artifact record"
+                .to_owned(),
+        );
+    }
+    let ci_command = concat!(
+        "sh apple/scripts/capture-macos-live-oauth-dev-evidence.sh --validate\n",
+        "          docs/quality/evidence/98fdfa455d02c8278b024dead93f34df1df04895/macos-live-oauth-development.json",
+    );
+    if !ci.contains(ci_command) {
+        violations.push(
+            ".github/workflows/ci.yml must validate the committed macOS live OAuth development evidence"
+                .to_owned(),
+        );
+    }
+    violations
 }
 
 fn project_generation_wrapper() -> String {
@@ -11742,24 +11935,25 @@ mod tests {
         hmac_resolved_version_violations, is_macos_architecture_target,
         keychain_direct_dependency_set_violations, keychain_mutation_boundary_violations,
         macos_client_xpc_wiring_violations, macos_html_containment_violations,
+        macos_live_oauth_development_evidence_violations,
         macos_only_resolved_package_presence_violations,
         mailbox_sync_ffi_direct_dependency_set_violations,
         mailbox_sync_ffi_source_surface_violations, non_owner_entitlement_violations,
         oauth_sync_direct_dependency_set_violations, parse_identity, parse_plist_string_array,
         parse_project_targets, project_generation_surface_violations, project_generation_wrapper,
-        protected_keychain_dependency_rename_violations, reserved_future_policy_violations,
-        resolved_workspace_dependency_names, retrieval_tokio_denial_violations,
-        rusqlite_resolved_feature_violations, rust_authority_source_surface_violations,
-        rust_exported_c_abi_violations, rustix_manifest_dependency_violations,
-        rustix_resolved_presence_and_shape_violations, shipped_direct_dependency_names,
-        signing_configuration_violations, source_token_broker_entitlement_violations,
-        sqlcipher_dependency_graph_violations, sqlcipher_manifest_dependency_violations,
-        strip_rust_non_code, strip_rust_test_modules, strip_swift_non_code,
-        swift_bootstrap_inventory_violations, swift_bootstrap_source_inventory,
-        swift_bootstrap_source_violations, swift_bridge_call_inventory,
-        swift_ffi_symbol_inventory_violations, swift_oauth_foreground_handoff_violations,
-        swift_source_lexical_violations, target_metadata_options,
-        token_broker_bridge_header_c_abi_violations,
+        protected_keychain_dependency_rename_violations, requested_scope_from_application_source,
+        reserved_future_policy_violations, resolved_workspace_dependency_names,
+        retrieval_tokio_denial_violations, rusqlite_resolved_feature_violations,
+        rust_authority_source_surface_violations, rust_exported_c_abi_violations,
+        rustix_manifest_dependency_violations, rustix_resolved_presence_and_shape_violations,
+        shipped_direct_dependency_names, signing_configuration_violations,
+        source_token_broker_entitlement_violations, sqlcipher_dependency_graph_violations,
+        sqlcipher_manifest_dependency_violations, strip_rust_non_code, strip_rust_test_modules,
+        strip_swift_non_code, swift_bootstrap_inventory_violations,
+        swift_bootstrap_source_inventory, swift_bootstrap_source_violations,
+        swift_bridge_call_inventory, swift_ffi_symbol_inventory_violations,
+        swift_oauth_foreground_handoff_violations, swift_source_lexical_violations,
+        target_metadata_options, token_broker_bridge_header_c_abi_violations,
         token_broker_code_signing_requirement_violations,
         token_broker_ffi_source_surface_violations, token_broker_probe_entrypoint_is_canonical,
         token_broker_protocol_mirror_violations, token_broker_source_surface_violations,
@@ -20935,6 +21129,137 @@ final class BrokerSyncSecrets: @unchecked Sendable {
                 );
             }
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live-evidence mutation matrix must keep every ordered control in one test"
+    )]
+    fn macos_live_oauth_development_evidence_source_guards_fail_closed() {
+        let reviewed = include_str!("../../apple/scripts/capture-macos-live-oauth-dev-evidence.sh");
+        let application = include_str!("../../crates/application/src/oauth.rs");
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        let baseline = macos_live_oauth_development_evidence_violations(reviewed, application, ci);
+        assert!(baseline.is_empty(), "{baseline:?}");
+
+        let render_anchor =
+            "run_contract_python render \"$MANUAL_SNAPSHOT\" \"$RECOMPUTED\" \"$OUTPUT_ABSOLUTE\"";
+        let moved_renderer = reviewed
+            .replacen(render_anchor, "", 1)
+            .replace(
+                "  run_contract_python snapshot \"$MANUAL_OBSERVATION_ABSOLUTE\" \"$MANUAL_SNAPSHOT\"",
+                &format!("  {render_anchor}\n  run_contract_python snapshot \"$MANUAL_OBSERVATION_ABSOLUTE\" \"$MANUAL_SNAPSHOT\""),
+            );
+        let constant_renderer = reviewed.replacen(
+            "\"wrong_group_probes\": recomputed[\"wrong_group_probes\"],",
+            "\"wrong_group_probes\": {\"main_app\": {\"outcome\": \"pass\"}},",
+            1,
+        );
+        let reversed_renderer_bounds = reviewed.replacen(
+            "def render(",
+            "def absolute_path(path: str) -> str:\n    return path\n\ndef render(",
+            1,
+        );
+        for (label, mutation) in [
+            (
+                "missing application signature verification",
+                reviewed.replacen("codesign --verify --deep --strict \"$APP\"", "# removed", 1),
+            ),
+            (
+                "missing pre-probe digest",
+                reviewed.replacen(
+                    "$SCRATCH/pre-probe-digests.stdout",
+                    "$SCRATCH/removed.stdout",
+                    1,
+                ),
+            ),
+            (
+                "main probe nonzero accepted",
+                reviewed.replacen(
+                    "[ \"$MAIN_PROBE_STATUS\" -eq 0 ]",
+                    "[ \"$MAIN_PROBE_STATUS\" -eq 1 ]",
+                    1,
+                ),
+            ),
+            (
+                "broker stderr is not required empty",
+                reviewed.replacen("[ ! -s \"$SCRATCH/broker-probe.stderr\" ]", ":", 1),
+            ),
+            (
+                "main probe byte comparison removed",
+                reviewed.replacen(
+                    "cmp -s \"$SCRATCH/main-probe.expected\" \"$SCRATCH/main-probe.stdout\"",
+                    "cmp \"$SCRATCH/main-probe.expected\" \"$SCRATCH/main-probe.stdout\"",
+                    1,
+                ),
+            ),
+            ("renderer moved before evidence", moved_renderer),
+            ("renderer emits constant success", constant_renderer),
+            ("renderer bounds are reversed", reversed_renderer_bounds),
+            (
+                "exclusive output creation removed",
+                reviewed.replacen(
+                    "flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL",
+                    "flags = os.O_WRONLY | os.O_CREAT",
+                    1,
+                ),
+            ),
+            (
+                "digest mode removed",
+                reviewed.replacen(
+                    "elif mode == \"digest-json\":",
+                    "elif mode == \"removed\":",
+                    1,
+                ),
+            ),
+            (
+                "direct Python open added",
+                format!("{reviewed}\nopen('/private/unreviewed')\n"),
+            ),
+            (
+                "Keychain discovery command added",
+                format!("{reviewed}\nsecurity find-identity -v\n"),
+            ),
+        ] {
+            let violations =
+                macos_live_oauth_development_evidence_violations(&mutation, application, ci);
+            assert!(
+                !violations.is_empty(),
+                "{label} must fail closed: {violations:?}"
+            );
+        }
+        let changed_ci = ci.replacen(
+            "sh apple/scripts/capture-macos-live-oauth-dev-evidence.sh --validate",
+            "sh apple/scripts/capture-macos-live-oauth-dev-evidence.sh --canonicalize",
+            1,
+        );
+        assert!(
+            !macos_live_oauth_development_evidence_violations(reviewed, application, &changed_ci)
+                .is_empty(),
+            "the committed-manifest CI validation must fail closed"
+        );
+    }
+
+    #[test]
+    fn live_oauth_requested_scope_parser_tracks_the_product_source() {
+        let source = include_str!("../../crates/application/src/oauth.rs");
+        let original = requested_scope_from_application_source(source);
+        assert_eq!(
+            original.as_deref(),
+            Some("openid https://www.googleapis.com/auth/gmail.readonly")
+        );
+        let changed = source.replacen(
+            "pub const REQUESTED_SCOPE: &str = \"openid https://www.googleapis.com/auth/gmail.readonly\";",
+            "pub const REQUESTED_SCOPE: &str = \"openid https://example.invalid/scope\";",
+            1,
+        );
+        assert_eq!(
+            requested_scope_from_application_source(&changed).as_deref(),
+            Some("openid https://example.invalid/scope")
+        );
+        let missing = source.replacen("pub const REQUESTED_SCOPE", "pub const RETIRED_SCOPE", 1);
+        assert!(requested_scope_from_application_source(&missing).is_none());
     }
 }
 
