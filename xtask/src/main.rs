@@ -1029,6 +1029,7 @@ fn check_macos_keychain_signing_configuration(violations: &mut Vec<String>) -> T
         &development,
         &ui_evidence,
     ));
+    violations.extend(macos_ui_evidence_transcript_violations(&ui_evidence));
     violations.extend(tracked_project_generation_violations(Path::new("."))?);
     violations.extend(bootstrap_source_surface_violations(Path::new("."))?);
     Ok(())
@@ -5957,6 +5958,112 @@ fn project_generation_surface_violations(
     violations
 }
 
+fn macos_ui_evidence_transcript_violations(ui_evidence: &str) -> Vec<String> {
+    const CHECKLIST_LINES: &[&str] = &[
+        "  1. NOT RUN — PENDING MANUAL: VoiceOver:",
+        "  2. NOT RUN — PENDING MANUAL: VoiceOver checks:",
+        "  3. NOT RUN — PENDING MANUAL: Full Keyboard Access:",
+        "  4. RECORDED ABOVE: App Sandbox:",
+    ];
+
+    let commands = shell_executable_logical_commands(ui_evidence);
+    let mut violations = Vec::new();
+    let command_indices = REVIEWED_MACOS_UI_EXECUTABLE_TRANSCRIPT_COMMANDS
+        .iter()
+        .map(|expected| unique_shell_command_index(&commands, expected))
+        .collect::<Option<Vec<_>>>();
+    if command_indices.is_none() {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must retain each reviewed executable transcript and main-app entitlement control exactly once"
+                .to_owned(),
+        );
+    } else if command_indices
+        .as_ref()
+        .is_some_and(|indices| indices.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must preserve the reviewed executable transcript control order"
+                .to_owned(),
+        );
+    }
+    if commands.iter().any(|command| {
+        macos_ui_executable_transcript_command_is_relevant(command)
+            && !REVIEWED_MACOS_UI_EXECUTABLE_TRANSCRIPT_COMMANDS
+                .iter()
+                .any(|expected| shell_command_matches(command, expected))
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must not add an unpinned executable transcript control"
+                .to_owned(),
+        );
+    }
+    if commands.iter().any(|command| {
+        command.first().is_some_and(|token| token == "plutil")
+            && command.get(1).is_some_and(|token| token == "-lint")
+            && !REVIEWED_MACOS_UI_EXECUTABLE_TRANSCRIPT_COMMANDS
+                .iter()
+                .any(|expected| shell_command_matches(command, expected))
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must route every variable-path plutil lint failure through fixed redaction"
+                .to_owned(),
+        );
+    }
+    if CHECKLIST_LINES
+        .iter()
+        .any(|line| ui_evidence.matches(line).count() != 1)
+    {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must retain the reviewed manual-only checklist transcript"
+                .to_owned(),
+        );
+    }
+    let checklist_placement = (
+        unique_shell_command_index(&commands, REVIEWED_SANDBOX_DENIAL_SUMMARY),
+        unique_shell_command_index(&commands, REVIEWED_SANDBOX_POSITIVE_SUMMARY),
+        unique_shell_command_index(&commands, REVIEWED_CHECKLIST_EMITTER),
+    );
+    if !matches!(
+        checklist_placement,
+        (Some(denial), Some(positive), Some(emitter)) if denial < positive && positive < emitter
+    ) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must emit the canonical manual checklist after recorded sandbox summaries"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn macos_ui_executable_transcript_command_is_relevant(command: &[String]) -> bool {
+    command.iter().any(|token| {
+        token == "date"
+            || token == "sw_vers"
+            || (token == "xcodebuild" && command.iter().any(|value| value == "-version"))
+            || token.contains("$RUN_TIMESTAMP_UTC_FILE")
+            || token.contains("$MACOS_PRODUCT_VERSION_FILE")
+            || token.contains("$MACOS_BUILD_VERSION_FILE")
+            || token.contains("$XCODE_VERSION_STDOUT")
+            || token.contains("$XCODE_VERSION_STDERR")
+            || token.contains("$XCODE_VERSION_FILE")
+            || token.contains("$XCODE_BUILD_VERSION_FILE")
+            || token.contains("$APP_SANDBOX_ENTITLEMENT")
+            || token.contains("$APP_NETWORK_CLIENT_ENTITLEMENT")
+            || token.contains("$APP_NETWORK_SERVER_ENTITLEMENT")
+            || token.starts_with("XPC_ENTITLEMENTS_OUT=$(plutil -p")
+            || token.starts_with("ENTITLEMENTS_OUT=$(plutil -p")
+            || token.starts_with("APP_GROUP=$(plutil -extract")
+            || token.starts_with("KEYCHAIN_GROUP=$(plutil -extract")
+            || (token == "plutil" && command.get(1).is_some_and(|value| value == "-replace"))
+            || token.contains("application-group-index-1")
+            || token.contains("keychain-group-index-1")
+            || token.contains("installed_app_regular_file_bytes=")
+            || token.contains("sandbox_container_prelaunch=")
+            || token.contains("sandbox_container_postlaunch=")
+            || token.contains("sandbox_positive_control=unsandboxed")
+    })
+}
+
 fn swift_has_underscored_attribute(document: &str) -> bool {
     document.match_indices('@').any(|(at, _)| {
         let mut identifier = skip_ascii_whitespace(document, at + 1);
@@ -6285,6 +6392,7 @@ fn macos_ui_token_group_evidence_violations(ui_evidence: &str) -> Vec<String> {
 
     let commands = shell_executable_logical_commands(ui_evidence);
     let mut violations = macos_ui_token_group_command_pin_violations(&commands);
+    violations.extend(macos_ui_build_capture_redaction_violations(&commands));
     let reviewed_compiled_check = reviewed_compiled_token_group_check();
 
     let reviewed_setup = reviewed_token_group_setup();
@@ -6362,6 +6470,9 @@ fn macos_ui_token_group_evidence_violations(ui_evidence: &str) -> Vec<String> {
                 .to_owned(),
         );
     }
+    violations.extend(macos_ui_keychain_isolation_probe_evidence_violations(
+        &commands,
+    ));
     violations
 }
 
@@ -6378,19 +6489,115 @@ fn reviewed_compiled_token_group_check() -> [&'static str; 8] {
     ]
 }
 
-fn reviewed_token_group_setup() -> [&'static str; 6] {
+fn reviewed_token_group_setup() -> [&'static str; 8] {
     [
         "set",
         "--",
         "$@",
+        "TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com",
+        "TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.development-evidence",
         "CODE_SIGNING_ALLOWED=NO",
         "TERSA_MACOS_APP_GROUP=$TEAM_ID.app.tersa.shared",
         "TERSA_MACOS_TOKEN_GROUP=$TEAM_ID.app.tersa.token",
     ]
 }
 
-fn reviewed_token_group_build() -> [&'static str; 4] {
-    ["xcodebuild", "$@", "build", ">/dev/null"]
+fn reviewed_token_group_build() -> [&'static str; 8] {
+    [
+        "xcodebuild",
+        "$@",
+        "build",
+        ">$XCODEBUILD_STDOUT",
+        "2>$XCODEBUILD_STDERR",
+        "||",
+        "fail",
+        "tracked Release Xcode build failed",
+    ]
+}
+
+fn reviewed_project_generation_capture() -> [&'static str; 7] {
+    [
+        "sh",
+        "apple/scripts/generate-project.sh",
+        ">$PROJECT_GENERATION_STDOUT",
+        "2>$PROJECT_GENERATION_STDERR",
+        "||",
+        "fail",
+        "tracked Release project generation failed",
+    ]
+}
+
+fn macos_ui_build_capture_redaction_violations(commands: &[Vec<String>]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let reviewed_project_generation = reviewed_project_generation_capture();
+    let reviewed_build = reviewed_token_group_build();
+    let reviewed_setup = reviewed_token_group_setup();
+    let reviewed_commands: [&[&str]; 9] = [
+        &[
+            "[",
+            "!",
+            "-e",
+            "$ROOT/apple/local.xcconfig",
+            "]",
+            "||",
+            "fail",
+            "commit-bound capture refuses apple/local.xcconfig",
+        ],
+        &["PROJECT_GENERATION_STDOUT=$SCRATCH/project-generation.stdout"],
+        &["PROJECT_GENERATION_STDERR=$SCRATCH/project-generation.stderr"],
+        &["XCODEBUILD_STDOUT=$SCRATCH/xcodebuild-release.stdout"],
+        &["XCODEBUILD_STDERR=$SCRATCH/xcodebuild-release.stderr"],
+        &reviewed_project_generation,
+        &reviewed_setup,
+        &reviewed_build,
+        &[
+            "printf",
+            "build_settings_source=tracked-script-fixed-placeholders\\n",
+        ],
+    ];
+    if reviewed_commands.iter().any(|expected| {
+        commands
+            .iter()
+            .filter(|command| shell_command_matches(command, expected))
+            .count()
+            != 1
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must capture project-generation and Xcode build stdout/stderr only in private scratch files with fixed failures"
+                .to_owned(),
+        );
+    }
+    if commands.iter().any(|command| {
+        build_capture_command_is_relevant(command)
+            && !reviewed_commands
+                .iter()
+                .any(|expected| shell_command_matches(command, expected))
+    }) {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must not print or reroute captured project-generation or Xcode build output"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn build_capture_command_is_relevant(command: &[String]) -> bool {
+    command.iter().any(|token| {
+        token == "apple/scripts/generate-project.sh"
+            || (token == "xcodebuild" && command.iter().any(|value| value == "build"))
+            || token.contains("PROJECT_GENERATION_STDOUT")
+            || token.contains("PROJECT_GENERATION_STDERR")
+            || token.contains("XCODEBUILD_STDOUT")
+            || token.contains("XCODEBUILD_STDERR")
+            || token.contains("project-generation.stdout")
+            || token.contains("project-generation.stderr")
+            || token.contains("xcodebuild-release.stdout")
+            || token.contains("xcodebuild-release.stderr")
+            || token.contains("local.xcconfig")
+            || token.contains("TERSA_OAUTH_CLIENT_ID")
+            || token.contains("TERSA_OAUTH_REDIRECT_SCHEME")
+            || token.contains("build_settings_source=")
+    })
 }
 
 fn macos_ui_token_group_command_pin_violations(commands: &[Vec<String>]) -> Vec<String> {
@@ -6407,26 +6614,704 @@ fn macos_ui_token_group_command_pin_violations(commands: &[Vec<String>]) -> Vec<
         );
     }
     let reviewed_check = reviewed_compiled_token_group_check();
-    let compiled_checks = commands
+    let reviewed_probe_execution = REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION;
+    let broker_executable_uses = commands
         .iter()
         .filter(|command| {
             command.iter().any(|token| {
-                token == "$XPC/Contents/MacOS/TersaMacTokenBroker" || token == reviewed_check[7]
+                token.contains("$XPC/Contents/MacOS/TersaMacTokenBroker")
+                    || token == reviewed_check[7]
             })
         })
         .collect::<Vec<_>>();
-    if compiled_checks.len() != 1
-        || compiled_checks[0]
+    if broker_executable_uses.len() != 2
+        || !broker_executable_uses
             .iter()
-            .map(String::as_str)
-            .ne(reviewed_check)
+            .any(|command| shell_command_matches(command, &reviewed_check))
+        || !broker_executable_uses
+            .iter()
+            .any(|command| shell_command_matches(command, reviewed_probe_execution))
     {
         violations.push(
-            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one executable reviewed compiled token-broker token-group check"
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly the executable reviewed compiled token-broker token-group check and exact signed token-broker probe execution, with no unpinned executable use"
                 .to_owned(),
         );
     }
     violations
+}
+
+fn shell_command_matches(command: &[String], expected: &[&str]) -> bool {
+    command
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+}
+
+const REVIEWED_MACOS_UI_EXECUTABLE_TRANSCRIPT_COMMANDS: &[&[&str]] = &[
+    &[
+        "date",
+        "-u",
+        "+%Y-%m-%dT%H:%M:%SZ",
+        ">$RUN_TIMESTAMP_UTC_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "UTC run timestamp discovery failed",
+    ],
+    &[
+        "sw_vers",
+        "-productVersion",
+        ">$MACOS_PRODUCT_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS product version discovery failed",
+    ],
+    &[
+        "sw_vers",
+        "-buildVersion",
+        ">$MACOS_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS build version discovery failed",
+    ],
+    &[
+        "xcodebuild",
+        "-version",
+        ">$XCODE_VERSION_STDOUT",
+        "2>$XCODE_VERSION_STDERR",
+        "||",
+        "fail",
+        "Xcode version inspection failed",
+    ],
+    &[
+        "[",
+        "!",
+        "-s",
+        "$XCODE_VERSION_STDERR",
+        "]",
+        "||",
+        "fail",
+        "Xcode version inspection wrote stderr",
+    ],
+    &[
+        "sed",
+        "-n",
+        "1s/^Xcode //p",
+        "$XCODE_VERSION_STDOUT",
+        ">$XCODE_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode version parsing failed",
+    ],
+    &[
+        "sed",
+        "-n",
+        "2s/^Build version //p",
+        "$XCODE_VERSION_STDOUT",
+        ">$XCODE_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode build version parsing failed",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qEx",
+        "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        "$RUN_TIMESTAMP_UTC_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "UTC run timestamp is invalid",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qEx",
+        "[0-9]+(\\.[0-9]+){0,2}",
+        "$MACOS_PRODUCT_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS product version is invalid",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qEx",
+        "[0-9][0-9A-Z._-]*",
+        "$MACOS_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS build version is invalid",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qEx",
+        "[0-9]+(\\.[0-9]+){0,2}",
+        "$XCODE_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode version is invalid",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qEx",
+        "[0-9][0-9A-Z._-]*",
+        "$XCODE_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode build version is invalid",
+    ],
+    &["printf", "run_timestamp_utc="],
+    &[
+        "cat",
+        "$RUN_TIMESTAMP_UTC_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "UTC run timestamp output failed",
+    ],
+    &["printf", "macos_product_version="],
+    &[
+        "cat",
+        "$MACOS_PRODUCT_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS product version output failed",
+    ],
+    &["printf", "macos_build_version="],
+    &[
+        "cat",
+        "$MACOS_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "macOS build version output failed",
+    ],
+    &["printf", "xcode_version="],
+    &[
+        "cat",
+        "$XCODE_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode version output failed",
+    ],
+    &["printf", "xcode_build_version="],
+    &[
+        "cat",
+        "$XCODE_BUILD_VERSION_FILE",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "Xcode build version output failed",
+    ],
+    &[
+        "plutil",
+        "-lint",
+        "$RESOLVED_ENTITLEMENTS",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "the resolved application entitlements are invalid",
+    ],
+    &[
+        "plutil",
+        "-lint",
+        "$BROKER_RESOLVED_ENTITLEMENTS",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "the resolved token-broker entitlements are invalid",
+    ],
+    &[
+        "plutil",
+        "-lint",
+        "$XPC_EMBEDDED_ENTITLEMENTS",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "nested signing: the embedded XPC entitlements are invalid",
+    ],
+    &[
+        "XPC_ENTITLEMENTS_OUT=$(plutil -p $XPC_EMBEDDED_ENTITLEMENTS 2>/dev/null)",
+        "||",
+        "fail",
+        "nested signing: the embedded XPC entitlements could not be rendered",
+    ],
+    &[
+        "plutil",
+        "-lint",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "the embedded application entitlements are invalid",
+    ],
+    &[
+        "ENTITLEMENTS_OUT=$(plutil -p $EMBEDDED_ENTITLEMENTS 2>/dev/null)",
+        "||",
+        "fail",
+        "the application entitlements could not be rendered",
+    ],
+    &[
+        "plutil",
+        "-extract",
+        "com\\.apple\\.security\\.app-sandbox",
+        "raw",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">$APP_SANDBOX_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application app-sandbox entitlement is unavailable",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qx",
+        "true",
+        "$APP_SANDBOX_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application app-sandbox entitlement is not boolean true",
+    ],
+    &[
+        "plutil",
+        "-extract",
+        "com\\.apple\\.security\\.network\\.client",
+        "raw",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">$APP_NETWORK_CLIENT_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application network.client entitlement is unavailable",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qx",
+        "true",
+        "$APP_NETWORK_CLIENT_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application network.client entitlement is not boolean true",
+    ],
+    &[
+        "plutil",
+        "-extract",
+        "com\\.apple\\.security\\.network\\.server",
+        "raw",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">$APP_NETWORK_SERVER_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application network.server entitlement is unavailable",
+    ],
+    &[
+        "LC_ALL=C",
+        "grep",
+        "-qx",
+        "true",
+        "$APP_NETWORK_SERVER_ENTITLEMENT",
+        "2>/dev/null",
+        "||",
+        "fail",
+        "the embedded application network.server entitlement is not boolean true",
+    ],
+    &[
+        "printf",
+        "%s\\n",
+        "$ENTITLEMENTS_OUT",
+        "|",
+        "grep",
+        "-qE",
+        "^  \"com.apple.security.application-groups\" => \\[$",
+        "||",
+        "fail",
+        "the embedded application groups entitlement is not an array",
+    ],
+    &[
+        "plutil",
+        "-extract",
+        "com\\.apple\\.security\\.application-groups.1",
+        "raw",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">$SCRATCH/application-group-index-1",
+        "2>/dev/null",
+        "&&",
+        "fail",
+        "the embedded application declares more than its single application group",
+    ],
+    &[
+        "printf",
+        "%s\\n",
+        "$ENTITLEMENTS_OUT",
+        "|",
+        "grep",
+        "-qE",
+        "^  \"keychain-access-groups\" => \\[$",
+        "||",
+        "fail",
+        "the embedded Keychain groups entitlement is not an array",
+    ],
+    &[
+        "APP_GROUP=$(plutil -extract 'com.apple.security.application-groups.0' raw $EMBEDDED_ENTITLEMENTS 2>/dev/null)",
+        "||",
+        "fail",
+        "the embedded application group is unavailable",
+    ],
+    &[
+        "KEYCHAIN_GROUP=$(plutil -extract keychain-access-groups.0 raw $EMBEDDED_ENTITLEMENTS 2>/dev/null)",
+        "||",
+        "fail",
+        "the embedded Keychain group is unavailable",
+    ],
+    &[
+        "plutil",
+        "-extract",
+        "keychain-access-groups.1",
+        "raw",
+        "$EMBEDDED_ENTITLEMENTS",
+        ">$SCRATCH/keychain-group-index-1",
+        "2>/dev/null",
+        "&&",
+        "fail",
+        "the embedded application declares more than its single dedicated Keychain group",
+    ],
+    &[
+        "printf",
+        "installed_app_regular_file_bytes=%s\\n",
+        "$APP_BYTES",
+    ],
+    &["printf", "sandbox_container_prelaunch=present\\n"],
+    &["printf", "sandbox_container_prelaunch=absent\\n"],
+    &["printf", "launch=ok\\n"],
+    &[
+        "printf",
+        "sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\\n",
+    ],
+    &[
+        "plutil",
+        "-replace",
+        "CFBundleExecutable",
+        "-string",
+        "tersa-sandbox-write-canary",
+        "$SANDBOX_CANARY_APP/Contents/Info.plist",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "sandbox write canary executable metadata update failed",
+    ],
+    &[
+        "plutil",
+        "-replace",
+        "CFBundleName",
+        "-string",
+        "Tersa Sandbox Canary",
+        "$SANDBOX_CANARY_APP/Contents/Info.plist",
+        ">/dev/null",
+        "2>",
+        "&",
+        "1",
+        "||",
+        "fail",
+        "sandbox write canary display-name metadata update failed",
+    ],
+    &[
+        "printf",
+        "sandbox_positive_control=unsandboxed outside-container create succeeded\\n",
+    ],
+];
+
+const REVIEWED_SANDBOX_DENIAL_SUMMARY: &[&str] = &[
+    "printf",
+    "sandbox_denial=outside-container create denied\\n",
+];
+const REVIEWED_SANDBOX_POSITIVE_SUMMARY: &[&str] = &[
+    "printf",
+    "sandbox_positive_control=unsandboxed outside-container create succeeded\\n",
+];
+const REVIEWED_CHECKLIST_EMITTER: &[&str] = &["cat", "<<CHECKLIST"];
+
+const REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION: &[&str] = &[
+    "$XPC/Contents/MacOS/TersaMacTokenBroker",
+    "--tersa-keychain-isolation-probe-v1",
+    ">$TOKEN_BROKER_PROBE_STDOUT",
+    "2>$TOKEN_BROKER_PROBE_STDERR",
+];
+
+const MACOS_UI_MAIN_APP_PROBE_JSON: &str =
+    r#"{"schema_version":1,"principal":"main-app","result":"missing-entitlement"}"#;
+const MACOS_UI_TOKEN_BROKER_PROBE_JSON: &str =
+    r#"{"schema_version":1,"principal":"token-broker","result":"missing-entitlement"}"#;
+
+const REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS: &[&[&str]] = &[
+    &["MAIN_APP_PROBE_STDOUT=$SCRATCH/main-app-keychain-isolation-probe.stdout"],
+    &["MAIN_APP_PROBE_STDERR=$SCRATCH/main-app-keychain-isolation-probe.stderr"],
+    &["MAIN_APP_PROBE_EXPECTED=$SCRATCH/main-app-keychain-isolation-probe.expected"],
+    &["TOKEN_BROKER_PROBE_STDOUT=$SCRATCH/token-broker-keychain-isolation-probe.stdout"],
+    &["TOKEN_BROKER_PROBE_STDERR=$SCRATCH/token-broker-keychain-isolation-probe.stderr"],
+    &["TOKEN_BROKER_PROBE_EXPECTED=$SCRATCH/token-broker-keychain-isolation-probe.expected"],
+    &[
+        "printf",
+        "%s\\n",
+        MACOS_UI_MAIN_APP_PROBE_JSON,
+        ">$MAIN_APP_PROBE_EXPECTED",
+    ],
+    &["set", "+e"],
+    &[
+        "$APP/Contents/MacOS/Tersa",
+        "--tersa-keychain-isolation-probe-v1",
+        ">$MAIN_APP_PROBE_STDOUT",
+        "2>$MAIN_APP_PROBE_STDERR",
+    ],
+    &["MAIN_APP_PROBE_STATUS=$?"],
+    &["set", "-e"],
+    &[
+        "[",
+        "$MAIN_APP_PROBE_STATUS",
+        "-eq",
+        "0",
+        "]",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe did not exit 0",
+    ],
+    &[
+        "[",
+        "!",
+        "-s",
+        "$MAIN_APP_PROBE_STDERR",
+        "]",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe wrote stderr",
+    ],
+    &[
+        "cmp",
+        "-s",
+        "$MAIN_APP_PROBE_EXPECTED",
+        "$MAIN_APP_PROBE_STDOUT",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe output did not match the reviewed JSON",
+    ],
+    &[
+        "printf",
+        "main_app_keychain_wrong_group_probe=missing-entitlement\\n",
+    ],
+    &[
+        "printf",
+        "%s\\n",
+        MACOS_UI_TOKEN_BROKER_PROBE_JSON,
+        ">$TOKEN_BROKER_PROBE_EXPECTED",
+    ],
+    &["set", "+e"],
+    REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION,
+    &["TOKEN_BROKER_PROBE_STATUS=$?"],
+    &["set", "-e"],
+    &[
+        "[",
+        "$TOKEN_BROKER_PROBE_STATUS",
+        "-eq",
+        "0",
+        "]",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe did not exit 0",
+    ],
+    &[
+        "[",
+        "!",
+        "-s",
+        "$TOKEN_BROKER_PROBE_STDERR",
+        "]",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe wrote stderr",
+    ],
+    &[
+        "cmp",
+        "-s",
+        "$TOKEN_BROKER_PROBE_EXPECTED",
+        "$TOKEN_BROKER_PROBE_STDOUT",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe output did not match the reviewed JSON",
+    ],
+    &[
+        "printf",
+        "token_broker_keychain_wrong_group_probe=missing-entitlement\\n",
+    ],
+];
+
+const REVIEWED_OUTER_APP_SIGN_COMMAND: &[&str] = &[
+    "codesign",
+    "-s",
+    "$IDENTITY_HASH",
+    "--entitlements",
+    "$RESOLVED_ENTITLEMENTS",
+    "--force",
+    "--options",
+    "runtime",
+    "--timestamp=none",
+    "$APP",
+    ">/dev/null",
+    "2>",
+    "&",
+    "1",
+    "||",
+    "fail",
+    "outer signing: the application could not be Apple Development signed",
+];
+const REVIEWED_OUTER_APP_VERIFY_COMMAND: &[&str] = &[
+    "codesign",
+    "--verify",
+    "--deep",
+    "--strict",
+    "$APP",
+    ">/dev/null",
+    "2>",
+    "&",
+    "1",
+    "||",
+    "fail",
+    "outer signing: strict code-signature verification failed for the whole application",
+];
+const REVIEWED_OUTER_KEYCHAIN_ENTITLEMENT_SUMMARY: &[&str] = &[
+    "printf",
+    "keychain_group=[TEAM_REDACTED].app.tersa.shared\\n",
+];
+const REVIEWED_NORMAL_LAUNCH_SUMMARY: &[&str] = &["printf", "launch=ok\\n"];
+const REVIEWED_SANDBOX_CONTAINER_SUMMARY: &[&str] = &[
+    "printf",
+    "sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\\n",
+];
+const REVIEWED_KEYCHAIN_PROBE_SECTION: &[&str] = &["section", "Keychain isolation negative probes"];
+const REVIEWED_APP_SANDBOX_DENIAL_SECTION: &[&str] = &["section", "App Sandbox denial"];
+
+fn macos_ui_keychain_isolation_probe_evidence_violations(commands: &[Vec<String>]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let sequence_starts = commands
+        .windows(REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            window
+                .iter()
+                .zip(REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.iter())
+                .all(|(command, expected)| shell_command_matches(command, expected))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let probe_start = (sequence_starts.len() == 1).then(|| sequence_starts[0]);
+    if probe_start.is_none() {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one canonical signed Keychain isolation probe sequence"
+                .to_owned(),
+        );
+    }
+
+    if let Some(probe_start) = probe_start {
+        let probe_end = probe_start + REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.len();
+        let ordering = (
+            unique_shell_command_index(commands, REVIEWED_OUTER_APP_SIGN_COMMAND),
+            unique_shell_command_index(commands, REVIEWED_OUTER_APP_VERIFY_COMMAND),
+            unique_shell_command_index(commands, REVIEWED_OUTER_KEYCHAIN_ENTITLEMENT_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_NORMAL_LAUNCH_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_SANDBOX_CONTAINER_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_KEYCHAIN_PROBE_SECTION),
+            unique_shell_command_index(commands, REVIEWED_APP_SANDBOX_DENIAL_SECTION),
+        );
+        if !matches!(
+            ordering,
+            (
+                Some(sign),
+                Some(verify),
+                Some(entitlements),
+                Some(launch),
+                Some(container),
+                Some(section),
+                Some(sandbox_denial),
+            ) if sign < verify
+                && verify < entitlements
+                && entitlements < launch
+                && launch < container
+                && container < section
+                && section < probe_start
+                && probe_end <= sandbox_denial
+        ) {
+            violations.push(
+                "apple/scripts/capture-macos-ui-dev-evidence.sh must run the canonical Keychain isolation probes only after outer signing, entitlement verification, and normal launch/container verification, before App Sandbox denial"
+                    .to_owned(),
+            );
+        }
+
+        if commands.iter().enumerate().any(|(index, command)| {
+            keychain_isolation_probe_command_is_relevant(command)
+                && !(probe_start..probe_end).contains(&index)
+        }) {
+            violations.push(
+                "apple/scripts/capture-macos-ui-dev-evidence.sh must not expose unpinned Keychain isolation probe capture output"
+                    .to_owned(),
+            );
+        }
+    }
+
+    violations
+}
+
+fn unique_shell_command_index(commands: &[Vec<String>], expected: &[&str]) -> Option<usize> {
+    let mut matches = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| shell_command_matches(command, expected).then_some(index));
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn keychain_isolation_probe_command_is_relevant(command: &[String]) -> bool {
+    command.iter().any(|token| {
+        token.contains("MAIN_APP_PROBE_")
+            || token.contains("TOKEN_BROKER_PROBE_")
+            || token.contains("main-app-keychain-isolation-probe")
+            || token.contains("token-broker-keychain-isolation-probe")
+            || token == "--tersa-keychain-isolation-probe-v1"
+            || token == MACOS_UI_MAIN_APP_PROBE_JSON
+            || token == MACOS_UI_TOKEN_BROKER_PROBE_JSON
+            || token.contains("main_app_keychain_wrong_group_probe=")
+            || token.contains("token_broker_keychain_wrong_group_probe=")
+    })
 }
 
 fn shell_executable_logical_commands(document: &str) -> Vec<Vec<String>> {
@@ -16277,11 +17162,25 @@ targets:
 
     fn macos_ui_evidence_signing_fixture() -> &'static str {
         concat!(
-            "sh apple/scripts/generate-project.sh\n",
-            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "PROJECT_GENERATION_STDOUT=\"$SCRATCH/project-generation.stdout\"\n",
+            "PROJECT_GENERATION_STDERR=\"$SCRATCH/project-generation.stderr\"\n",
+            "XCODEBUILD_STDOUT=\"$SCRATCH/xcodebuild-release.stdout\"\n",
+            "XCODEBUILD_STDERR=\"$SCRATCH/xcodebuild-release.stderr\"\n",
+            "[ ! -e \"$ROOT/apple/local.xcconfig\" ] \\\n",
+            "  || fail 'commit-bound capture refuses apple/local.xcconfig'\n",
+            "sh apple/scripts/generate-project.sh \\\n",
+            "  >\"$PROJECT_GENERATION_STDOUT\" 2>\"$PROJECT_GENERATION_STDERR\" \\\n",
+            "  || fail 'tracked Release project generation failed'\n",
+            "set -- \"$@\" \\\n",
+            "  TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com \\\n",
+            "  TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.development-evidence \\\n",
+            "  CODE_SIGNING_ALLOWED=NO \\\n",
             "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
             "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
-            "xcodebuild \"$@\" build >/dev/null\n",
+            "xcodebuild \"$@\" build \\\n",
+            "  >\"$XCODEBUILD_STDOUT\" 2>\"$XCODEBUILD_STDERR\" \\\n",
+            "  || fail 'tracked Release Xcode build failed'\n",
+            "printf 'build_settings_source=tracked-script-fixed-placeholders\\n'\n",
             "printf 'embedded_xpc=exactly TersaMacTokenBroker.xpc at the reviewed location\\n'\n",
             "LC_ALL=C grep -aFq \"$TEAM_ID.app.tersa.token\" \"$XPC/Contents/MacOS/TersaMacTokenBroker\" \\\n",
             "  || fail 'the Rust token broker did not compile the team-prefixed token group'\n",
@@ -16291,7 +17190,49 @@ targets:
             "codesign --verify --deep --strict \"$XPC\" >/dev/null 2>&1\n",
             "codesign -s \"$IDENTITY_HASH\" ",
             "--entitlements \"$RESOLVED_ENTITLEMENTS\" \\\n",
-            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1\n",
+            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1 \\\n",
+            "  || fail 'outer signing: the application could not be Apple Development signed'\n",
+            "codesign --verify --deep --strict \"$APP\" >/dev/null 2>&1 \\\n",
+            "  || fail 'outer signing: strict code-signature verification failed for the whole application'\n",
+            "printf 'keychain_group=[TEAM_REDACTED].app.tersa.shared\\n'\n",
+            "printf 'launch=ok\\n'\n",
+            "printf 'sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\\n'\n",
+            "section 'Keychain isolation negative probes'\n",
+            "MAIN_APP_PROBE_STDOUT=\"$SCRATCH/main-app-keychain-isolation-probe.stdout\"\n",
+            "MAIN_APP_PROBE_STDERR=\"$SCRATCH/main-app-keychain-isolation-probe.stderr\"\n",
+            "MAIN_APP_PROBE_EXPECTED=\"$SCRATCH/main-app-keychain-isolation-probe.expected\"\n",
+            "TOKEN_BROKER_PROBE_STDOUT=\"$SCRATCH/token-broker-keychain-isolation-probe.stdout\"\n",
+            "TOKEN_BROKER_PROBE_STDERR=\"$SCRATCH/token-broker-keychain-isolation-probe.stderr\"\n",
+            "TOKEN_BROKER_PROBE_EXPECTED=\"$SCRATCH/token-broker-keychain-isolation-probe.expected\"\n",
+            "printf '%s\\n' '{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"missing-entitlement\"}' \\\n",
+            "  >\"$MAIN_APP_PROBE_EXPECTED\"\n",
+            "set +e\n",
+            "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 \\\n",
+            "  >\"$MAIN_APP_PROBE_STDOUT\" 2>\"$MAIN_APP_PROBE_STDERR\"\n",
+            "MAIN_APP_PROBE_STATUS=$?\n",
+            "set -e\n",
+            "[ \"$MAIN_APP_PROBE_STATUS\" -eq 0 ] \\\n",
+            "  || fail 'main-app Keychain isolation probe did not exit 0'\n",
+            "[ ! -s \"$MAIN_APP_PROBE_STDERR\" ] \\\n",
+            "  || fail 'main-app Keychain isolation probe wrote stderr'\n",
+            "cmp -s \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\" \\\n",
+            "  || fail 'main-app Keychain isolation probe output did not match the reviewed JSON'\n",
+            "printf 'main_app_keychain_wrong_group_probe=missing-entitlement\\n'\n",
+            "printf '%s\\n' '{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"missing-entitlement\"}' \\\n",
+            "  >\"$TOKEN_BROKER_PROBE_EXPECTED\"\n",
+            "set +e\n",
+            "\"$XPC/Contents/MacOS/TersaMacTokenBroker\" --tersa-keychain-isolation-probe-v1 \\\n",
+            "  >\"$TOKEN_BROKER_PROBE_STDOUT\" 2>\"$TOKEN_BROKER_PROBE_STDERR\"\n",
+            "TOKEN_BROKER_PROBE_STATUS=$?\n",
+            "set -e\n",
+            "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 0 ] \\\n",
+            "  || fail 'token-broker Keychain isolation probe did not exit 0'\n",
+            "[ ! -s \"$TOKEN_BROKER_PROBE_STDERR\" ] \\\n",
+            "  || fail 'token-broker Keychain isolation probe wrote stderr'\n",
+            "cmp -s \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\" \\\n",
+            "  || fail 'token-broker Keychain isolation probe output did not match the reviewed JSON'\n",
+            "printf 'token_broker_keychain_wrong_group_probe=missing-entitlement\\n'\n",
+            "section 'App Sandbox denial'\n",
         )
     }
 
@@ -16301,9 +17242,9 @@ targets:
         let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
-        assert!(
-            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer).is_empty()
-        );
+        let fixture_violations =
+            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer);
+        assert!(fixture_violations.is_empty(), "{fixture_violations:?}");
 
         assert!(
             project_generation_surface_violations(&wrapper, &ci, consumer, consumer)
@@ -16400,7 +17341,10 @@ targets:
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
         let reviewed_setup = concat!(
-            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "set -- \"$@\" \\\n",
+            "  TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com \\\n",
+            "  TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.development-evidence \\\n",
+            "  CODE_SIGNING_ALLOWED=NO \\\n",
             "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
             "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
         );
@@ -16408,22 +17352,27 @@ targets:
             "LC_ALL=C grep -aFq \"$TEAM_ID.app.tersa.token\" \"$XPC/Contents/MacOS/TersaMacTokenBroker\" \\\n",
             "  || fail 'the Rust token broker did not compile the team-prefixed token group'\n",
         );
-        let setup_after_build = ui_consumer.replace(reviewed_setup, "").replace(
-            "xcodebuild \"$@\" build >/dev/null\n",
-            &format!("xcodebuild \"$@\" build >/dev/null\n{reviewed_setup}"),
+        let reviewed_build = concat!(
+            "xcodebuild \"$@\" build \\\n",
+            "  >\"$XCODEBUILD_STDOUT\" 2>\"$XCODEBUILD_STDERR\" \\\n",
+            "  || fail 'tracked Release Xcode build failed'\n",
         );
+        let setup_after_build = ui_consumer
+            .replace(reviewed_setup, "")
+            .replace(reviewed_build, &format!("{reviewed_build}{reviewed_setup}"));
         let compiled_check_after_codesign = ui_consumer.replace(reviewed_compiled_check, "");
         let compiled_check_after_codesign =
             format!("{compiled_check_after_codesign}{reviewed_compiled_check}");
         let duplicate_wrong_assignment =
             format!("{ui_consumer}TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.shared\"\n");
-        let setup_without_propagated_arguments = ui_consumer.replace(
-            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO ",
-            "set -- CODE_SIGNING_ALLOWED=NO ",
-        );
+        let setup_without_propagated_arguments = ui_consumer.replace("set -- \"$@\" ", "set -- ");
         let build_without_propagated_arguments = ui_consumer.replace(
-            "xcodebuild \"$@\" build >/dev/null",
-            "xcodebuild build >/dev/null",
+            reviewed_build,
+            concat!(
+                "xcodebuild build \\\n",
+                "  >\"$XCODEBUILD_STDOUT\" 2>\"$XCODEBUILD_STDERR\" \\\n",
+                "  || fail 'tracked Release Xcode build failed'\n",
+            ),
         );
         let inert_heredoc = ui_consumer
             .replace(reviewed_setup, "")
@@ -16473,13 +17422,376 @@ targets:
     }
 
     #[test]
+    fn macos_ui_evidence_build_capture_redaction_guards_fail_closed() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        let baseline = project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer);
+        assert!(baseline.is_empty(), "{baseline:?}");
+
+        for (label, mutation) in [
+            (
+                "untracked local build settings are accepted",
+                ui_consumer.replace(
+                    "[ ! -e \"$ROOT/apple/local.xcconfig\" ] \\\n  || fail 'commit-bound capture refuses apple/local.xcconfig'\n",
+                    ":\n",
+                ),
+            ),
+            (
+                "caller OAuth client ID is accepted",
+                ui_consumer.replace(
+                    "TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com",
+                    "TERSA_OAUTH_CLIENT_ID=${TERSA_OAUTH_CLIENT_ID:-caller.apps.googleusercontent.com}",
+                ),
+            ),
+            (
+                "project-generation stderr is redirected to evidence stdout",
+                ui_consumer.replace("2>\"$PROJECT_GENERATION_STDERR\"", "2>&1"),
+            ),
+            (
+                "Xcode build stderr is redirected to evidence stdout",
+                ui_consumer.replace("2>\"$XCODEBUILD_STDERR\"", "2>&1"),
+            ),
+            (
+                "project-generation stderr is printed",
+                format!("{ui_consumer}cat \"$PROJECT_GENERATION_STDERR\"\n"),
+            ),
+            (
+                "Xcode build stdout is printed",
+                format!("{ui_consumer}cat \"$XCODEBUILD_STDOUT\"\n"),
+            ),
+            (
+                "Xcode build failure is not fixed",
+                ui_consumer.replace("|| fail 'tracked Release Xcode build failed'", "|| exit 1"),
+            ),
+            (
+                "build settings provenance is omitted",
+                ui_consumer.replace(
+                    "printf 'build_settings_source=tracked-script-fixed-placeholders\\n'\n",
+                    "",
+                ),
+            ),
+        ] {
+            let violations =
+                project_generation_surface_violations(&wrapper, &ci, consumer, &mutation);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains("project-generation")
+                        && violation.contains("build")),
+                "{label} must fail closed: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven mutation coverage keeps executable and heredoc transcript controls together"
+    )]
+    fn macos_ui_evidence_transcript_controls_fail_closed() {
+        let reviewed = include_str!("../../apple/scripts/capture-macos-ui-dev-evidence.sh");
+        let baseline = super::macos_ui_evidence_transcript_violations(reviewed);
+        assert!(baseline.is_empty(), "{baseline:?}");
+        for (label, anchor) in [
+            ("macOS metadata", "sw_vers -productVersion"),
+            ("Xcode metadata", "xcodebuild -version"),
+            (
+                "XPC entitlement render redaction",
+                "nested signing: the embedded XPC entitlements could not be rendered",
+            ),
+            (
+                "application entitlement render redaction",
+                "the application entitlements could not be rendered",
+            ),
+            (
+                "app-sandbox boolean validation",
+                "the embedded application app-sandbox entitlement is not boolean true",
+            ),
+            (
+                "network.client boolean validation",
+                "the embedded application network.client entitlement is not boolean true",
+            ),
+            (
+                "network.server boolean validation",
+                "the embedded application network.server entitlement is not boolean true",
+            ),
+            (
+                "application-groups array validation",
+                "the embedded application groups entitlement is not an array",
+            ),
+            (
+                "application-groups cardinality validation",
+                "the embedded application declares more than its single application group",
+            ),
+            (
+                "application-group extraction redaction",
+                "the embedded application group is unavailable",
+            ),
+            (
+                "main-app Keychain-array validation",
+                "the embedded Keychain groups entitlement is not an array",
+            ),
+            (
+                "main-app Keychain-cardinality validation",
+                "the embedded application declares more than its single dedicated Keychain group",
+            ),
+            (
+                "Keychain-group extraction redaction",
+                "the embedded Keychain group is unavailable",
+            ),
+            (
+                "canary executable metadata redaction",
+                "sandbox write canary executable metadata update failed",
+            ),
+            (
+                "canary display-name metadata redaction",
+                "sandbox write canary display-name metadata update failed",
+            ),
+            (
+                "regular-file size field",
+                "installed_app_regular_file_bytes",
+            ),
+            (
+                "sandbox positive-control summary",
+                "sandbox_positive_control=unsandboxed outside-container create succeeded",
+            ),
+            (
+                "manual VoiceOver status",
+                "1. NOT RUN — PENDING MANUAL: VoiceOver:",
+            ),
+            ("recorded sandbox status", "4. RECORDED ABOVE: App Sandbox:"),
+        ] {
+            let drifted = reviewed.replacen(anchor, "DRIFTED", 1);
+            assert!(
+                !super::macos_ui_evidence_transcript_violations(&drifted).is_empty(),
+                "{label} must fail closed"
+            );
+        }
+
+        let size_command = "printf 'installed_app_regular_file_bytes=%s\\n' \"$APP_BYTES\"\n";
+        for (label, mutation) in [
+            (
+                "commented executable control",
+                reviewed.replacen(size_command, &format!("# {size_command}"), 1),
+            ),
+            (
+                "heredoc executable control",
+                reviewed.replacen(
+                    size_command,
+                    &format!(
+                        "cat <<'INERT_EXECUTABLE_CONTROL'\n{size_command}INERT_EXECUTABLE_CONTROL\n"
+                    ),
+                    1,
+                ),
+            ),
+        ] {
+            assert!(
+                !super::macos_ui_evidence_transcript_violations(&mutation).is_empty(),
+                "{label} must not satisfy executable transcript controls"
+            );
+        }
+
+        let checklist_emitter = "cat <<'CHECKLIST'\n";
+        for (label, mutation) in [
+            (
+                "colon checklist emitter",
+                reviewed.replacen(checklist_emitter, ": <<'CHECKLIST'\n", 1),
+            ),
+            (
+                "commented checklist emitter reinsertion",
+                reviewed.replacen(checklist_emitter, "# cat <<'CHECKLIST'\n", 1),
+            ),
+            (
+                "inert heredoc checklist emitter copy",
+                reviewed.replacen(
+                    checklist_emitter,
+                    "cat <<'INERT_CHECKLIST'\ncat <<'CHECKLIST'\nINERT_CHECKLIST\n",
+                    1,
+                ),
+            ),
+        ] {
+            assert!(
+                !super::macos_ui_evidence_transcript_violations(&mutation).is_empty(),
+                "{label} must not satisfy checklist emission"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_ui_evidence_variable_path_plutil_redaction_fails_closed() {
+        let reviewed = include_str!("../../apple/scripts/capture-macos-ui-dev-evidence.sh");
+        for (label, mutation) in [
+            (
+                "XPC entitlement render stderr",
+                reviewed.replace(
+                    "XPC_ENTITLEMENTS_OUT=\"$(plutil -p \"$XPC_EMBEDDED_ENTITLEMENTS\" 2>/dev/null)\"",
+                    "XPC_ENTITLEMENTS_OUT=\"$(plutil -p \"$XPC_EMBEDDED_ENTITLEMENTS\")\"",
+                ),
+            ),
+            (
+                "application group extract stderr",
+                reviewed.replace(
+                    "APP_GROUP=\"$(plutil -extract 'com\\.apple\\.security\\.application-groups.0' raw \"$EMBEDDED_ENTITLEMENTS\" 2>/dev/null)\"",
+                    "APP_GROUP=\"$(plutil -extract 'com\\.apple\\.security\\.application-groups.0' raw \"$EMBEDDED_ENTITLEMENTS\")\"",
+                ),
+            ),
+            (
+                "canary metadata stderr",
+                reviewed.replace(
+                    "\"$SANDBOX_CANARY_APP/Contents/Info.plist\" >/dev/null 2>&1 \\\n  || fail 'sandbox write canary executable metadata update failed'",
+                    "\"$SANDBOX_CANARY_APP/Contents/Info.plist\" >/dev/null \\\n  || fail 'sandbox write canary executable metadata update failed'",
+                ),
+            ),
+        ] {
+            assert!(
+                !super::macos_ui_evidence_transcript_violations(&mutation).is_empty(),
+                "{label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven mutation coverage keeps the canonical evidence sequence in one test"
+    )]
+    fn macos_ui_evidence_keychain_isolation_probe_guards_fail_closed() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        let baseline = project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer);
+        assert!(baseline.is_empty(), "{baseline:?}");
+
+        let broker_alias = format!(
+            "TOKEN_BROKER_PROBE_BINARY=\"$XPC/Contents/MacOS/TersaMacTokenBroker\"\n{}",
+            ui_consumer.replace(
+                "\"$XPC/Contents/MacOS/TersaMacTokenBroker\" --tersa-keychain-isolation-probe-v1 \\\n",
+                "\"$TOKEN_BROKER_PROBE_BINARY\" --tersa-keychain-isolation-probe-v1 \\\n",
+            )
+        );
+        let probes_before_container = ui_consumer
+            .replace(
+                "printf 'sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\\n'\nsection 'Keychain isolation negative probes'\n",
+                "section 'Keychain isolation negative probes'\n",
+            )
+            .replace(
+                "section 'App Sandbox denial'\n",
+                "printf 'sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\\n'\nsection 'App Sandbox denial'\n",
+            );
+        let app_sandbox_denial_before_probes = ui_consumer.replacen(
+            "section 'Keychain isolation negative probes'\n",
+            "section 'App Sandbox denial'\nsection 'Keychain isolation negative probes'\n",
+            1,
+        );
+
+        for (label, mutation) in [
+            (
+                "main-app probe carries an extra argument",
+                ui_consumer.replace(
+                    "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 \\\n",
+                    "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 extra \\\n",
+                ),
+            ),
+            ("token-broker probe uses an alias", broker_alias),
+            (
+                "main-app probe accepts a nonzero status",
+                ui_consumer.replace(
+                    "[ \"$MAIN_APP_PROBE_STATUS\" -eq 0 ]",
+                    "[ \"$MAIN_APP_PROBE_STATUS\" -eq 1 ]",
+                ),
+            ),
+            (
+                "token-broker probe accepts a nonzero status",
+                ui_consumer.replace(
+                    "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 0 ]",
+                    "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 1 ]",
+                ),
+            ),
+            (
+                "main-app stderr is not required to be empty",
+                ui_consumer.replace("[ ! -s \"$MAIN_APP_PROBE_STDERR\" ]", ":"),
+            ),
+            (
+                "token-broker stderr is not required to be empty",
+                ui_consumer.replace("[ ! -s \"$TOKEN_BROKER_PROBE_STDERR\" ]", ":"),
+            ),
+            (
+                "main-app stdout is not byte-compared",
+                ui_consumer.replace(
+                    "cmp -s \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\"",
+                    "cmp \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\"",
+                ),
+            ),
+            (
+                "token-broker stdout is not byte-compared",
+                ui_consumer.replace(
+                    "cmp -s \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\"",
+                    "cmp \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\"",
+                ),
+            ),
+            (
+                "main-app expected JSON drifts",
+                ui_consumer.replace(
+                    "{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"missing-entitlement\"}",
+                    "{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"unexpected-status\"}",
+                ),
+            ),
+            (
+                "token-broker expected JSON drifts",
+                ui_consumer.replace(
+                    "{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"missing-entitlement\"}",
+                    "{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"unexpected-status\"}",
+                ),
+            ),
+            (
+                "main-app redacted summary drifts",
+                ui_consumer.replace(
+                    "main_app_keychain_wrong_group_probe=missing-entitlement",
+                    "main_app_keychain_wrong_group_probe=unexpected-status",
+                ),
+            ),
+            (
+                "token-broker redacted summary drifts",
+                ui_consumer.replace(
+                    "token_broker_keychain_wrong_group_probe=missing-entitlement",
+                    "token_broker_keychain_wrong_group_probe=unexpected-status",
+                ),
+            ),
+            (
+                "captured main-app stdout is printed",
+                format!("{ui_consumer}cat \"$MAIN_APP_PROBE_STDOUT\"\n"),
+            ),
+            ("probes run before the container check", probes_before_container),
+            (
+                "App Sandbox denial precedes the probes",
+                app_sandbox_denial_before_probes,
+            ),
+        ] {
+            let violations = project_generation_surface_violations(&wrapper, &ci, consumer, &mutation);
+            assert!(
+                violations.iter().any(|violation| {
+                    violation.contains("Keychain isolation probe")
+                        || violation.contains("token-broker probe")
+                }),
+                "{label} must fail closed: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_ui_evidence_heredoc_setup_anchors_are_inert() {
         let wrapper = project_generation_wrapper();
         let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
         let reviewed_setup = concat!(
-            "set -- \"$@\" CODE_SIGNING_ALLOWED=NO \\\n",
+            "set -- \"$@\" \\\n",
+            "  TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com \\\n",
+            "  TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.development-evidence \\\n",
+            "  CODE_SIGNING_ALLOWED=NO \\\n",
             "  TERSA_MACOS_APP_GROUP=\"$TEAM_ID.app.tersa.shared\" \\\n",
             "  TERSA_MACOS_TOKEN_GROUP=\"$TEAM_ID.app.tersa.token\"\n",
         );
