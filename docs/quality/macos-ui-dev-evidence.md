@@ -27,11 +27,13 @@ traversal remains queued independently of this record.
 ## Redaction
 
 Record only: reviewed entitlement keys, aggregate observations, the sandbox
-container path relative to the home directory, sizes, fixed-vocabulary outcomes,
-and the signing tier as **Apple Development** (authority and team redacted).
-Never record an Apple ID, team identifier, certificate name, machine name or
-UUID, absolute local path, account identifier, credential, token, or mail
-content.
+container path relative to the home directory, installed app regular-file bytes,
+fixed-vocabulary outcomes, the UTC run timestamp, macOS product/build versions,
+Xcode version/build version, and the signing tier as **Apple Development**
+(authority and team redacted).
+Never record an Apple ID, team identifier, certificate name, machine name,
+hardware identifier, UUID, absolute local path, account identifier, credential,
+token, or mail content.
 
 ## Capture procedure
 
@@ -48,25 +50,41 @@ sh apple/scripts/capture-macos-ui-dev-evidence.sh
 
 The script:
 
-1. Exports only tracked source for `HEAD` via `git archive`
-2. Builds Release/arm64 `TersaMac` with team-prefixed App Group and token
+1. Records only redacted reproducibility metadata: UTC timestamp, macOS
+   product/build versions, and Xcode version/build version; it does not record
+   a machine identifier
+2. Exports only tracked source for `HEAD` via `git archive`
+3. Builds Release/arm64 `TersaMac` with team-prefixed App Group and token
    Keychain group compile-time values
-3. Inventories and nested-signs the embedded `TersaMacTokenBroker.xpc` before
+4. Captures project-generation and Xcode build stdout/stderr only in the private
+   scratch directory; their failure reports use fixed text and never print
+   captured diagnostics
+5. Refuses `apple/local.xcconfig` and caller OAuth overrides, then builds only
+   with tracked-script fixed evidence placeholders and records that provenance
+6. Inventories and nested-signs the embedded `TersaMacTokenBroker.xpc` before
    signing the outer application (inside-out)
-4. Verifies Hardened Runtime, the exact five reviewed outer entitlements, launch,
-   and App Sandbox container materialization
-5. Runs the exact signed main-app and embedded token-broker probe entrypoints
+7. Verifies Hardened Runtime, the exact five reviewed outer entitlements, launch,
+   and App Sandbox container presence; it records prelaunch `absent` or
+   `present` without claiming a pre-existing container was created
+8. Runs the exact signed main-app and embedded token-broker probe entrypoints
    after the normal launch/container check and before the sandbox canary, each
    only with `--tersa-keychain-isolation-probe-v1`; it requires exit `0`, empty
    stderr, and the corresponding one-line byte-exact redacted JSON result
-6. Proves outside-container create denial with a same-signature canary and an
+9. Proves outside-container create denial with a same-signature canary and an
    unsandboxed positive control
-7. Prints the interactive VoiceOver / Full Keyboard Access checklist for the
+10. Prints the interactive VoiceOver / Full Keyboard Access checklist for the
    owner walk
 
 Automated output is redacted by design: the probe captures stay in private
-scratch files and only fixed summary outcomes are printed. Interactive walk
-results are recorded in the table below by the evidence producer.
+scratch files and only fixed summary outcomes are printed. The checklist output
+is pending only: any future manual result requires a new, distinct exact-head
+current-capture record and table, never an update to the historical table below.
+
+The size field is `installed_app_regular_file_bytes`. The capture records
+`sandbox_container_prelaunch=absent|present` before launch and requires the
+postlaunch container to be present; a pre-existing container is not a creation
+claim. Its canary success summary is
+`sandbox_positive_control=unsandboxed outside-container create succeeded`.
 
 ## Historical, superseded capture status
 
@@ -84,7 +102,7 @@ probe result, normal token operations, nor signed release closure.
 | Main-app and token-broker wrong-group probes | HISTORICAL NOT RUN — this superseded capture predates the live signed probes required by the current procedure |
 | Product launch and App Sandbox container | HISTORICAL PASS — app remained running; `~/Library/Containers/app.tersa.mac` present |
 | Sandbox denial and observation-path control | HISTORICAL PASS — sandboxed canary denied outside-container create; unsandboxed control succeeded |
-| Installed application regular-file bytes | HISTORICAL PASS — 15,086,960 (~14.4 MiB), under the 16 MiB product budget |
+| Installed app regular-file bytes | HISTORICAL PASS — 15,086,960 (~14.4 MiB), under the 16 MiB product budget |
 | VoiceOver-only five-screen walk | HISTORICAL PENDING — owner physical walk; no spoken-output claim |
 | Full Keyboard Access-only five-screen walk | HISTORICAL PENDING — owner physical walk; no keyboard-navigation claim |
 
@@ -109,14 +127,16 @@ That capture predated nested token-broker signing inventory.
 
 Record with no pointer or visual fallback:
 
-1. **VoiceOver:** connection, inbox, thread, search, and composer roles, names,
-   values, actions, logical order, focus continuity, and announcements.
-2. **VoiceOver edges:** composer unavailable-send announcement; body editor
-   Tab/Escape behavior; edited-mid-search result suppression stays silent.
-3. **Full Keyboard Access:** the same five-screen traversal with visible focus
-   and no trap, using keyboard controls only.
-4. **App Sandbox:** the automated bundled canary above must remain denied while
-   its unsandboxed positive control succeeds.
+1. **NOT RUN — PENDING MANUAL:** VoiceOver connection, inbox, thread, search,
+   and composer roles, names, values, actions, logical order, focus continuity,
+   and announcements.
+2. **NOT RUN — PENDING MANUAL:** VoiceOver edges: composer unavailable-send
+   announcement; body editor Tab/Escape behavior; edited-mid-search result
+   suppression stays silent.
+3. **NOT RUN — PENDING MANUAL:** Full Keyboard Access traversal of the same
+   five screens with visible focus and no trap, using keyboard controls only.
+4. **RECORDED ABOVE:** the automated App Sandbox canary was denied and its
+   unsandboxed positive control succeeded.
 
 This Apple Development result is non-gate. Developer ID, notarization, retained
 artifact binding, and independent distribution review remain mandatory for

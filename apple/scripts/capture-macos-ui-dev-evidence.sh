@@ -26,6 +26,24 @@ SANDBOX_CANARY_APP="$SCRATCH/Tersa Sandbox Canary.app"
 SANDBOX_CANARY="$SANDBOX_CANARY_APP/Contents/MacOS/tersa-sandbox-write-canary"
 UNSANDBOXED_CANARY="$SCRATCH/tersa-sandbox-write-canary-unsandboxed"
 CANARY_DESTINATION="$BUILD_DIR/outside-sandbox-write-canary"
+TEAM_PROBE_BUILD_STDOUT="$SCRATCH/team-probe-build.stdout"
+TEAM_PROBE_BUILD_STDERR="$SCRATCH/team-probe-build.stderr"
+PROJECT_GENERATION_STDOUT="$SCRATCH/project-generation.stdout"
+PROJECT_GENERATION_STDERR="$SCRATCH/project-generation.stderr"
+XCODEBUILD_STDOUT="$SCRATCH/xcodebuild-release.stdout"
+XCODEBUILD_STDERR="$SCRATCH/xcodebuild-release.stderr"
+RUN_TIMESTAMP_UTC_FILE="$SCRATCH/run-timestamp-utc"
+MACOS_PRODUCT_VERSION_FILE="$SCRATCH/macos-product-version"
+MACOS_BUILD_VERSION_FILE="$SCRATCH/macos-build-version"
+XCODE_VERSION_STDOUT="$SCRATCH/xcode-version.stdout"
+XCODE_VERSION_STDERR="$SCRATCH/xcode-version.stderr"
+XCODE_VERSION_FILE="$SCRATCH/xcode-version"
+XCODE_BUILD_VERSION_FILE="$SCRATCH/xcode-build-version"
+APP_SANDBOX_ENTITLEMENT="$SCRATCH/app-sandbox-entitlement"
+APP_NETWORK_CLIENT_ENTITLEMENT="$SCRATCH/app-network-client-entitlement"
+APP_NETWORK_SERVER_ENTITLEMENT="$SCRATCH/app-network-server-entitlement"
+SANDBOX_CANARY_BUILD_STDOUT="$SCRATCH/sandbox-canary-build.stdout"
+SANDBOX_CANARY_BUILD_STDERR="$SCRATCH/sandbox-canary-build.stderr"
 APP_PID=''
 
 cleanup() {
@@ -53,6 +71,8 @@ TRANSLATED="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
 [ "$TRANSLATED" = 0 ] || fail 'capture requires a non-Rosetta process'
 [ -z "$(git status --porcelain --untracked-files=all)" ] \
   || fail 'commit-bound capture requires a clean worktree'
+[ ! -e "$ROOT/apple/local.xcconfig" ] \
+  || fail 'commit-bound capture refuses apple/local.xcconfig'
 COMMIT="$(git rev-parse HEAD)"
 
 IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null \
@@ -70,9 +90,12 @@ IDENTITY_HASH="$(printf '%s\n' "$IDENTITIES" | awk 'NF { print $1 }')"
 cat >"$TEAM_PROBE_SOURCE" <<'TEAM_PROBE_C'
 int main(void) { return 0; }
 TEAM_PROBE_C
-cc "$TEAM_PROBE_SOURCE" -o "$TEAM_PROBE"
+cc "$TEAM_PROBE_SOURCE" -o "$TEAM_PROBE" \
+  >"$TEAM_PROBE_BUILD_STDOUT" 2>"$TEAM_PROBE_BUILD_STDERR" \
+  || fail 'team identifier probe compilation failed'
 codesign -s "$IDENTITY_HASH" --force --options runtime --timestamp=none \
-  "$TEAM_PROBE" >/dev/null 2>&1
+  "$TEAM_PROBE" >/dev/null 2>&1 \
+  || fail 'team identifier probe signing failed'
 TEAM_ID="$(codesign -dv --verbose=4 "$TEAM_PROBE" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
 printf '%s\n' "$TEAM_ID" | grep -qE '^[A-Z0-9]{10}$' \
   || fail 'the effective Apple Development team identifier is unavailable'
@@ -83,26 +106,60 @@ tar -xf "$SCRATCH/source.tar" -C "$SOURCE"
 cd "$SOURCE"
 
 section 'Toolchain and source binding'
-xcodebuild -version | head -1
+date -u '+%Y-%m-%dT%H:%M:%SZ' >"$RUN_TIMESTAMP_UTC_FILE" 2>/dev/null \
+  || fail 'UTC run timestamp discovery failed'
+sw_vers -productVersion >"$MACOS_PRODUCT_VERSION_FILE" 2>/dev/null \
+  || fail 'macOS product version discovery failed'
+sw_vers -buildVersion >"$MACOS_BUILD_VERSION_FILE" 2>/dev/null \
+  || fail 'macOS build version discovery failed'
+xcodebuild -version >"$XCODE_VERSION_STDOUT" 2>"$XCODE_VERSION_STDERR" \
+  || fail 'Xcode version inspection failed'
+[ ! -s "$XCODE_VERSION_STDERR" ] \
+  || fail 'Xcode version inspection wrote stderr'
+sed -n '1s/^Xcode //p' "$XCODE_VERSION_STDOUT" >"$XCODE_VERSION_FILE" 2>/dev/null \
+  || fail 'Xcode version parsing failed'
+sed -n '2s/^Build version //p' "$XCODE_VERSION_STDOUT" >"$XCODE_BUILD_VERSION_FILE" 2>/dev/null \
+  || fail 'Xcode build version parsing failed'
+LC_ALL=C grep -qEx '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$RUN_TIMESTAMP_UTC_FILE" 2>/dev/null \
+  || fail 'UTC run timestamp is invalid'
+LC_ALL=C grep -qEx '[0-9]+(\.[0-9]+){0,2}' "$MACOS_PRODUCT_VERSION_FILE" 2>/dev/null \
+  || fail 'macOS product version is invalid'
+LC_ALL=C grep -qEx '[0-9][0-9A-Z._-]*' "$MACOS_BUILD_VERSION_FILE" 2>/dev/null \
+  || fail 'macOS build version is invalid'
+LC_ALL=C grep -qEx '[0-9]+(\.[0-9]+){0,2}' "$XCODE_VERSION_FILE" 2>/dev/null \
+  || fail 'Xcode version is invalid'
+LC_ALL=C grep -qEx '[0-9][0-9A-Z._-]*' "$XCODE_BUILD_VERSION_FILE" 2>/dev/null \
+  || fail 'Xcode build version is invalid'
+printf 'run_timestamp_utc='
+cat "$RUN_TIMESTAMP_UTC_FILE" 2>/dev/null || fail 'UTC run timestamp output failed'
+printf 'macos_product_version='
+cat "$MACOS_PRODUCT_VERSION_FILE" 2>/dev/null || fail 'macOS product version output failed'
+printf 'macos_build_version='
+cat "$MACOS_BUILD_VERSION_FILE" 2>/dev/null || fail 'macOS build version output failed'
+printf 'xcode_version='
+cat "$XCODE_VERSION_FILE" 2>/dev/null || fail 'Xcode version output failed'
+printf 'xcode_build_version='
+cat "$XCODE_BUILD_VERSION_FILE" 2>/dev/null || fail 'Xcode build version output failed'
 printf 'source_commit=%s\n' "$COMMIT"
 printf 'architecture=arm64-native\n'
 printf 'signing_tier=Apple Development (identity and team redacted)\n'
 
 section 'Build tracked Release source'
-sh apple/scripts/generate-project.sh >/dev/null
+sh apple/scripts/generate-project.sh \
+  >"$PROJECT_GENERATION_STDOUT" 2>"$PROJECT_GENERATION_STDERR" \
+  || fail 'tracked Release project generation failed'
 set -- -project apple/Tersa.xcodeproj -scheme TersaMac -configuration Release \
   -destination 'platform=macOS,arch=arm64' -derivedDataPath "$DERIVED"
-if [ -f "$ROOT/apple/local.xcconfig" ]; then
-  set -- "$@" -xcconfig "$ROOT/apple/local.xcconfig"
-else
-  set -- "$@" \
-    TERSA_OAUTH_CLIENT_ID="${TERSA_OAUTH_CLIENT_ID:-public-development-evidence.apps.googleusercontent.com}" \
-    TERSA_OAUTH_REDIRECT_SCHEME="${TERSA_OAUTH_REDIRECT_SCHEME:-app.tersa.oauth.development-evidence}"
-fi
-set -- "$@" CODE_SIGNING_ALLOWED=NO \
+set -- "$@" \
+  TERSA_OAUTH_CLIENT_ID=public-development-evidence.apps.googleusercontent.com \
+  TERSA_OAUTH_REDIRECT_SCHEME=app.tersa.oauth.development-evidence \
+  CODE_SIGNING_ALLOWED=NO \
   TERSA_MACOS_APP_GROUP="$TEAM_ID.app.tersa.shared" \
   TERSA_MACOS_TOKEN_GROUP="$TEAM_ID.app.tersa.token"
-xcodebuild "$@" build >/dev/null
+xcodebuild "$@" build \
+  >"$XCODEBUILD_STDOUT" 2>"$XCODEBUILD_STDERR" \
+  || fail 'tracked Release Xcode build failed'
+printf 'build_settings_source=tracked-script-fixed-placeholders\n'
 printf 'unsigned_build=ok\n'
 LC_ALL=C grep -aFq "$TEAM_ID.app.tersa.shared" "$APP/Contents/MacOS/Tersa" \
   || fail 'the Rust binary did not compile the team-prefixed App Group'
@@ -189,13 +246,15 @@ chmod 600 "$XPC/Contents/embedded.provisionprofile"
 
 sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
   "$SOURCE/apple/macos/TersaMac.entitlements" >"$RESOLVED_ENTITLEMENTS"
-plutil -lint "$RESOLVED_ENTITLEMENTS" >/dev/null
+plutil -lint "$RESOLVED_ENTITLEMENTS" >/dev/null 2>&1 \
+  || fail 'the resolved application entitlements are invalid'
 # The broker keeps its dedicated three-key entitlement set resolved from the
 # committed file into scratch; the outer five-key set is never reused on it.
 sed "s/\${TeamIdentifierPrefix}/${TEAM_ID}./g" \
   "$SOURCE/apple/macos-token-broker/TersaMacTokenBroker.entitlements" \
   >"$BROKER_RESOLVED_ENTITLEMENTS"
-plutil -lint "$BROKER_RESOLVED_ENTITLEMENTS" >/dev/null
+plutil -lint "$BROKER_RESOLVED_ENTITLEMENTS" >/dev/null 2>&1 \
+  || fail 'the resolved token-broker entitlements are invalid'
 UNRESOLVED_TEAM_PLACEHOLDER="\${TeamIdentifierPrefix}"
 if LC_ALL=C grep -qF "$UNRESOLVED_TEAM_PLACEHOLDER" "$BROKER_RESOLVED_ENTITLEMENTS"; then
   fail 'nested signing: the resolved token-broker entitlements still contain the team placeholder'
@@ -220,8 +279,9 @@ printf '%s\n' "$XPC_SIGNATURE" | grep -qE '^CodeDirectory .*flags=.*runtime' \
 
 codesign -d --entitlements :- --xml "$XPC" >"$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null \
   || fail 'nested signing: the embedded XPC entitlements could not be read'
-plutil -lint "$XPC_EMBEDDED_ENTITLEMENTS" >/dev/null
-XPC_ENTITLEMENTS_OUT="$(plutil -p "$XPC_EMBEDDED_ENTITLEMENTS")" \
+plutil -lint "$XPC_EMBEDDED_ENTITLEMENTS" >/dev/null 2>&1 \
+  || fail 'nested signing: the embedded XPC entitlements are invalid'
+XPC_ENTITLEMENTS_OUT="$(plutil -p "$XPC_EMBEDDED_ENTITLEMENTS" 2>/dev/null)" \
   || fail 'nested signing: the embedded XPC entitlements could not be rendered'
 XPC_TOP_LEVEL_KEYS="$(printf '%s\n' "$XPC_ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>' || true)"
 [ "$XPC_TOP_LEVEL_KEYS" -eq 3 ] \
@@ -275,8 +335,9 @@ printf 'embedded_profile=present current Mac Development (identifier redacted)\n
 
 codesign -d --entitlements :- --xml "$APP" >"$EMBEDDED_ENTITLEMENTS" 2>/dev/null \
   || fail 'the application entitlements could not be read'
-plutil -lint "$EMBEDDED_ENTITLEMENTS" >/dev/null
-ENTITLEMENTS_OUT="$(plutil -p "$EMBEDDED_ENTITLEMENTS")" \
+plutil -lint "$EMBEDDED_ENTITLEMENTS" >/dev/null 2>&1 \
+  || fail 'the embedded application entitlements are invalid'
+ENTITLEMENTS_OUT="$(plutil -p "$EMBEDDED_ENTITLEMENTS" 2>/dev/null)" \
   || fail 'the application entitlements could not be rendered'
 TOP_LEVEL_KEYS="$(printf '%s\n' "$ENTITLEMENTS_OUT" | grep -cE '^  "[^"]+" =>' || true)"
 [ "$TOP_LEVEL_KEYS" -eq 5 ] \
@@ -288,10 +349,37 @@ for key in \
   printf '%s\n' "$ENTITLEMENTS_OUT" | grep -qE "^  \"$key\" =>" \
     || fail "reviewed entitlement missing: $key"
 done
-APP_GROUP="$(plutil -extract 'com\.apple\.security\.application-groups.0' raw "$EMBEDDED_ENTITLEMENTS")" \
+plutil -extract 'com\.apple\.security\.app-sandbox' raw "$EMBEDDED_ENTITLEMENTS" \
+  >"$APP_SANDBOX_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application app-sandbox entitlement is unavailable'
+LC_ALL=C grep -qx 'true' "$APP_SANDBOX_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application app-sandbox entitlement is not boolean true'
+plutil -extract 'com\.apple\.security\.network\.client' raw "$EMBEDDED_ENTITLEMENTS" \
+  >"$APP_NETWORK_CLIENT_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application network.client entitlement is unavailable'
+LC_ALL=C grep -qx 'true' "$APP_NETWORK_CLIENT_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application network.client entitlement is not boolean true'
+plutil -extract 'com\.apple\.security\.network\.server' raw "$EMBEDDED_ENTITLEMENTS" \
+  >"$APP_NETWORK_SERVER_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application network.server entitlement is unavailable'
+LC_ALL=C grep -qx 'true' "$APP_NETWORK_SERVER_ENTITLEMENT" 2>/dev/null \
+  || fail 'the embedded application network.server entitlement is not boolean true'
+printf '%s\n' "$ENTITLEMENTS_OUT" \
+  | grep -qE '^  "com.apple.security.application-groups" => \[$' \
+  || fail 'the embedded application groups entitlement is not an array'
+plutil -extract 'com\.apple\.security\.application-groups.1' raw "$EMBEDDED_ENTITLEMENTS" \
+  >"$SCRATCH/application-group-index-1" 2>/dev/null \
+  && fail 'the embedded application declares more than its single application group'
+printf '%s\n' "$ENTITLEMENTS_OUT" \
+  | grep -qE '^  "keychain-access-groups" => \[$' \
+  || fail 'the embedded Keychain groups entitlement is not an array'
+APP_GROUP="$(plutil -extract 'com\.apple\.security\.application-groups.0' raw "$EMBEDDED_ENTITLEMENTS" 2>/dev/null)" \
   || fail 'the embedded application group is unavailable'
-KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$EMBEDDED_ENTITLEMENTS")" \
+KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw "$EMBEDDED_ENTITLEMENTS" 2>/dev/null)" \
   || fail 'the embedded Keychain group is unavailable'
+plutil -extract keychain-access-groups.1 raw "$EMBEDDED_ENTITLEMENTS" \
+  >"$SCRATCH/keychain-group-index-1" 2>/dev/null \
+  && fail 'the embedded application declares more than its single dedicated Keychain group'
 [ "$APP_GROUP" = "$TEAM_ID.app.tersa.shared" ] \
   || fail 'the embedded application group is not team-prefixed app.tersa.shared'
 [ "$KEYCHAIN_GROUP" = "$TEAM_ID.app.tersa.shared" ] \
@@ -302,9 +390,14 @@ printf 'keychain_group=[TEAM_REDACTED].app.tersa.shared\n'
 
 APP_BYTES="$(find "$APP" -type f -exec stat -f%z {} + | awk '{ total += $1 } END { print total }')"
 [ -n "$APP_BYTES" ] || fail 'application size discovery failed'
-printf 'installed_app_bytes=%s\n' "$APP_BYTES"
+printf 'installed_app_regular_file_bytes=%s\n' "$APP_BYTES"
 
 section 'Launch'
+if [ -d "$HOME/Library/Containers/app.tersa.mac" ]; then
+  printf 'sandbox_container_prelaunch=present\n'
+else
+  printf 'sandbox_container_prelaunch=absent\n'
+fi
 PRE_LAUNCH_PIDS="$SCRATCH/pre-launch-pids"
 pgrep -f "$APP/Contents/MacOS/Tersa" 2>/dev/null | sort -n >"$PRE_LAUNCH_PIDS" || :
 open -n "$APP" >/dev/null 2>&1 || fail 'LaunchServices rejected the signed application'
@@ -326,7 +419,7 @@ kill -0 "$APP_PID" 2>/dev/null || fail 'the signed application exited during lau
 printf 'launch=ok\n'
 [ -d "$HOME/Library/Containers/app.tersa.mac" ] \
   || fail 'the App Sandbox container is unavailable'
-printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\n'
+printf 'sandbox_container_postlaunch=~/Library/Containers/app.tersa.mac present\n'
 
 section 'Keychain isolation negative probes'
 # Run only the reviewed, opt-in probe entrypoints from the exact binaries that
@@ -386,18 +479,23 @@ int main(int argc, char **argv) {
     return close(descriptor) == 0 ? 0 : 76;
 }
 CANARY
-cc "$SCRATCH/sandbox-write-canary.c" -o "$UNSANDBOXED_CANARY"
+cc "$SCRATCH/sandbox-write-canary.c" -o "$UNSANDBOXED_CANARY" \
+  >"$SANDBOX_CANARY_BUILD_STDOUT" 2>"$SANDBOX_CANARY_BUILD_STDERR" \
+  || fail 'sandbox write canary compilation failed'
 mkdir -p "$SANDBOX_CANARY_APP/Contents/MacOS"
 cp "$UNSANDBOXED_CANARY" "$SANDBOX_CANARY"
 cp "$APP/Contents/Info.plist" "$SANDBOX_CANARY_APP/Contents/Info.plist"
 plutil -replace CFBundleExecutable -string tersa-sandbox-write-canary \
-  "$SANDBOX_CANARY_APP/Contents/Info.plist"
+  "$SANDBOX_CANARY_APP/Contents/Info.plist" >/dev/null 2>&1 \
+  || fail 'sandbox write canary executable metadata update failed'
 plutil -replace CFBundleName -string 'Tersa Sandbox Canary' \
-  "$SANDBOX_CANARY_APP/Contents/Info.plist"
+  "$SANDBOX_CANARY_APP/Contents/Info.plist" >/dev/null 2>&1 \
+  || fail 'sandbox write canary display-name metadata update failed'
 cp "$PROFILE_MATCH" "$SANDBOX_CANARY_APP/Contents/embedded.provisionprofile"
 chmod 600 "$SANDBOX_CANARY_APP/Contents/embedded.provisionprofile"
 codesign -s "$IDENTITY_HASH" --entitlements "$RESOLVED_ENTITLEMENTS" \
-  --force --options runtime --timestamp=none "$SANDBOX_CANARY_APP" >/dev/null 2>&1
+  --force --options runtime --timestamp=none "$SANDBOX_CANARY_APP" >/dev/null 2>&1 \
+  || fail 'sandbox write canary could not be Apple Development signed'
 codesign --verify --deep --strict "$SANDBOX_CANARY_APP" >/dev/null 2>&1 \
   || fail 'sandbox write canary signature verification failed'
 
@@ -416,19 +514,22 @@ set -e
   || fail 'the unsandboxed positive control did not create its destination'
 rm -f -- "$CANARY_DESTINATION"
 printf 'sandbox_denial=outside-container create denied\n'
-printf 'sandbox_positive_control=outside-container create succeeded\n'
+printf 'sandbox_positive_control=unsandboxed outside-container create succeeded\n'
 
 section 'Interactive development-only walk'
 cat <<'CHECKLIST'
 Record with no pointer fallback:
-  1. VoiceOver: connection, inbox, thread, search, and composer roles/names/
-     values/actions, logical order, focus continuity, and announcements.
-  2. VoiceOver checks: composer unavailable-send announcement; Body editor
-     Tab/Escape behavior; edited-mid-search result suppression stays silent.
-  3. Full Keyboard Access: complete the same five-screen traversal with visible
-     focus and no trap, using keyboard controls only.
-  4. App Sandbox: the automated bundled canary above must be denied while its
-     unsandboxed positive control succeeds.
+  1. NOT RUN — PENDING MANUAL: VoiceOver: connection, inbox, thread, search,
+     and composer roles/names/values/actions, logical order, focus continuity,
+     and announcements.
+  2. NOT RUN — PENDING MANUAL: VoiceOver checks: composer unavailable-send
+     announcement; Body editor Tab/Escape behavior; edited-mid-search result
+     suppression stays silent.
+  3. NOT RUN — PENDING MANUAL: Full Keyboard Access: complete the same
+     five-screen traversal with visible focus and no trap, using keyboard
+     controls only.
+  4. RECORDED ABOVE: App Sandbox: the automated bundled canary was denied while
+     the unsandboxed positive control succeeded.
 
 This Apple Development result is non-gate. Developer ID, notarization, retained
 artifact binding, and independent distribution review remain mandatory.
