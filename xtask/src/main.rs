@@ -6362,6 +6362,9 @@ fn macos_ui_token_group_evidence_violations(ui_evidence: &str) -> Vec<String> {
                 .to_owned(),
         );
     }
+    violations.extend(macos_ui_keychain_isolation_probe_evidence_violations(
+        &commands,
+    ));
     violations
 }
 
@@ -6407,26 +6410,287 @@ fn macos_ui_token_group_command_pin_violations(commands: &[Vec<String>]) -> Vec<
         );
     }
     let reviewed_check = reviewed_compiled_token_group_check();
-    let compiled_checks = commands
+    let reviewed_probe_execution = REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION;
+    let broker_executable_uses = commands
         .iter()
         .filter(|command| {
             command.iter().any(|token| {
-                token == "$XPC/Contents/MacOS/TersaMacTokenBroker" || token == reviewed_check[7]
+                token.contains("$XPC/Contents/MacOS/TersaMacTokenBroker")
+                    || token == reviewed_check[7]
             })
         })
         .collect::<Vec<_>>();
-    if compiled_checks.len() != 1
-        || compiled_checks[0]
+    if broker_executable_uses.len() != 2
+        || !broker_executable_uses
             .iter()
-            .map(String::as_str)
-            .ne(reviewed_check)
+            .any(|command| shell_command_matches(command, &reviewed_check))
+        || !broker_executable_uses
+            .iter()
+            .any(|command| shell_command_matches(command, reviewed_probe_execution))
     {
         violations.push(
-            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one executable reviewed compiled token-broker token-group check"
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly the executable reviewed compiled token-broker token-group check and exact signed token-broker probe execution, with no unpinned executable use"
                 .to_owned(),
         );
     }
     violations
+}
+
+fn shell_command_matches(command: &[String], expected: &[&str]) -> bool {
+    command
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+}
+
+const REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION: &[&str] = &[
+    "$XPC/Contents/MacOS/TersaMacTokenBroker",
+    "--tersa-keychain-isolation-probe-v1",
+    ">$TOKEN_BROKER_PROBE_STDOUT",
+    "2>$TOKEN_BROKER_PROBE_STDERR",
+];
+
+const MACOS_UI_MAIN_APP_PROBE_JSON: &str =
+    r#"{"schema_version":1,"principal":"main-app","result":"missing-entitlement"}"#;
+const MACOS_UI_TOKEN_BROKER_PROBE_JSON: &str =
+    r#"{"schema_version":1,"principal":"token-broker","result":"missing-entitlement"}"#;
+
+const REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS: &[&[&str]] = &[
+    &["MAIN_APP_PROBE_STDOUT=$SCRATCH/main-app-keychain-isolation-probe.stdout"],
+    &["MAIN_APP_PROBE_STDERR=$SCRATCH/main-app-keychain-isolation-probe.stderr"],
+    &["MAIN_APP_PROBE_EXPECTED=$SCRATCH/main-app-keychain-isolation-probe.expected"],
+    &["TOKEN_BROKER_PROBE_STDOUT=$SCRATCH/token-broker-keychain-isolation-probe.stdout"],
+    &["TOKEN_BROKER_PROBE_STDERR=$SCRATCH/token-broker-keychain-isolation-probe.stderr"],
+    &["TOKEN_BROKER_PROBE_EXPECTED=$SCRATCH/token-broker-keychain-isolation-probe.expected"],
+    &[
+        "printf",
+        "%s\\n",
+        MACOS_UI_MAIN_APP_PROBE_JSON,
+        ">$MAIN_APP_PROBE_EXPECTED",
+    ],
+    &["set", "+e"],
+    &[
+        "$APP/Contents/MacOS/Tersa",
+        "--tersa-keychain-isolation-probe-v1",
+        ">$MAIN_APP_PROBE_STDOUT",
+        "2>$MAIN_APP_PROBE_STDERR",
+    ],
+    &["MAIN_APP_PROBE_STATUS=$?"],
+    &["set", "-e"],
+    &[
+        "[",
+        "$MAIN_APP_PROBE_STATUS",
+        "-eq",
+        "0",
+        "]",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe did not exit 0",
+    ],
+    &[
+        "[",
+        "!",
+        "-s",
+        "$MAIN_APP_PROBE_STDERR",
+        "]",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe wrote stderr",
+    ],
+    &[
+        "cmp",
+        "-s",
+        "$MAIN_APP_PROBE_EXPECTED",
+        "$MAIN_APP_PROBE_STDOUT",
+        "||",
+        "fail",
+        "main-app Keychain isolation probe output did not match the reviewed JSON",
+    ],
+    &[
+        "printf",
+        "main_app_keychain_wrong_group_probe=missing-entitlement\\n",
+    ],
+    &[
+        "printf",
+        "%s\\n",
+        MACOS_UI_TOKEN_BROKER_PROBE_JSON,
+        ">$TOKEN_BROKER_PROBE_EXPECTED",
+    ],
+    &["set", "+e"],
+    REVIEWED_TOKEN_BROKER_KEYCHAIN_ISOLATION_PROBE_EXECUTION,
+    &["TOKEN_BROKER_PROBE_STATUS=$?"],
+    &["set", "-e"],
+    &[
+        "[",
+        "$TOKEN_BROKER_PROBE_STATUS",
+        "-eq",
+        "0",
+        "]",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe did not exit 0",
+    ],
+    &[
+        "[",
+        "!",
+        "-s",
+        "$TOKEN_BROKER_PROBE_STDERR",
+        "]",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe wrote stderr",
+    ],
+    &[
+        "cmp",
+        "-s",
+        "$TOKEN_BROKER_PROBE_EXPECTED",
+        "$TOKEN_BROKER_PROBE_STDOUT",
+        "||",
+        "fail",
+        "token-broker Keychain isolation probe output did not match the reviewed JSON",
+    ],
+    &[
+        "printf",
+        "token_broker_keychain_wrong_group_probe=missing-entitlement\\n",
+    ],
+];
+
+const REVIEWED_OUTER_APP_SIGN_COMMAND: &[&str] = &[
+    "codesign",
+    "-s",
+    "$IDENTITY_HASH",
+    "--entitlements",
+    "$RESOLVED_ENTITLEMENTS",
+    "--force",
+    "--options",
+    "runtime",
+    "--timestamp=none",
+    "$APP",
+    ">/dev/null",
+    "2>",
+    "&",
+    "1",
+    "||",
+    "fail",
+    "outer signing: the application could not be Apple Development signed",
+];
+const REVIEWED_OUTER_APP_VERIFY_COMMAND: &[&str] = &[
+    "codesign",
+    "--verify",
+    "--deep",
+    "--strict",
+    "$APP",
+    ">/dev/null",
+    "2>",
+    "&",
+    "1",
+    "||",
+    "fail",
+    "outer signing: strict code-signature verification failed for the whole application",
+];
+const REVIEWED_OUTER_KEYCHAIN_ENTITLEMENT_SUMMARY: &[&str] = &[
+    "printf",
+    "keychain_group=[TEAM_REDACTED].app.tersa.shared\\n",
+];
+const REVIEWED_NORMAL_LAUNCH_SUMMARY: &[&str] = &["printf", "launch=ok\\n"];
+const REVIEWED_SANDBOX_CONTAINER_SUMMARY: &[&str] = &[
+    "printf",
+    "sandbox_container=~/Library/Containers/app.tersa.mac present\\n",
+];
+const REVIEWED_KEYCHAIN_PROBE_SECTION: &[&str] = &["section", "Keychain isolation negative probes"];
+const REVIEWED_APP_SANDBOX_DENIAL_SECTION: &[&str] = &["section", "App Sandbox denial"];
+
+fn macos_ui_keychain_isolation_probe_evidence_violations(commands: &[Vec<String>]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let sequence_starts = commands
+        .windows(REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            window
+                .iter()
+                .zip(REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.iter())
+                .all(|(command, expected)| shell_command_matches(command, expected))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let probe_start = (sequence_starts.len() == 1).then(|| sequence_starts[0]);
+    if probe_start.is_none() {
+        violations.push(
+            "apple/scripts/capture-macos-ui-dev-evidence.sh must contain exactly one canonical signed Keychain isolation probe sequence"
+                .to_owned(),
+        );
+    }
+
+    if let Some(probe_start) = probe_start {
+        let probe_end = probe_start + REVIEWED_MACOS_UI_KEYCHAIN_PROBE_COMMANDS.len();
+        let ordering = (
+            unique_shell_command_index(commands, REVIEWED_OUTER_APP_SIGN_COMMAND),
+            unique_shell_command_index(commands, REVIEWED_OUTER_APP_VERIFY_COMMAND),
+            unique_shell_command_index(commands, REVIEWED_OUTER_KEYCHAIN_ENTITLEMENT_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_NORMAL_LAUNCH_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_SANDBOX_CONTAINER_SUMMARY),
+            unique_shell_command_index(commands, REVIEWED_KEYCHAIN_PROBE_SECTION),
+            unique_shell_command_index(commands, REVIEWED_APP_SANDBOX_DENIAL_SECTION),
+        );
+        if !matches!(
+            ordering,
+            (
+                Some(sign),
+                Some(verify),
+                Some(entitlements),
+                Some(launch),
+                Some(container),
+                Some(section),
+                Some(sandbox_denial),
+            ) if sign < verify
+                && verify < entitlements
+                && entitlements < launch
+                && launch < container
+                && container < section
+                && section < probe_start
+                && probe_end <= sandbox_denial
+        ) {
+            violations.push(
+                "apple/scripts/capture-macos-ui-dev-evidence.sh must run the canonical Keychain isolation probes only after outer signing, entitlement verification, and normal launch/container verification, before App Sandbox denial"
+                    .to_owned(),
+            );
+        }
+
+        if commands.iter().enumerate().any(|(index, command)| {
+            keychain_isolation_probe_command_is_relevant(command)
+                && !(probe_start..probe_end).contains(&index)
+        }) {
+            violations.push(
+                "apple/scripts/capture-macos-ui-dev-evidence.sh must not expose unpinned Keychain isolation probe capture output"
+                    .to_owned(),
+            );
+        }
+    }
+
+    violations
+}
+
+fn unique_shell_command_index(commands: &[Vec<String>], expected: &[&str]) -> Option<usize> {
+    let mut matches = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| shell_command_matches(command, expected).then_some(index));
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn keychain_isolation_probe_command_is_relevant(command: &[String]) -> bool {
+    command.iter().any(|token| {
+        token.contains("MAIN_APP_PROBE_")
+            || token.contains("TOKEN_BROKER_PROBE_")
+            || token.contains("main-app-keychain-isolation-probe")
+            || token.contains("token-broker-keychain-isolation-probe")
+            || token == "--tersa-keychain-isolation-probe-v1"
+            || token == MACOS_UI_MAIN_APP_PROBE_JSON
+            || token == MACOS_UI_TOKEN_BROKER_PROBE_JSON
+            || token.contains("main_app_keychain_wrong_group_probe=")
+            || token.contains("token_broker_keychain_wrong_group_probe=")
+    })
 }
 
 fn shell_executable_logical_commands(document: &str) -> Vec<Vec<String>> {
@@ -16291,7 +16555,49 @@ targets:
             "codesign --verify --deep --strict \"$XPC\" >/dev/null 2>&1\n",
             "codesign -s \"$IDENTITY_HASH\" ",
             "--entitlements \"$RESOLVED_ENTITLEMENTS\" \\\n",
-            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1\n",
+            "  --force --options runtime --timestamp=none \"$APP\" >/dev/null 2>&1 \\\n",
+            "  || fail 'outer signing: the application could not be Apple Development signed'\n",
+            "codesign --verify --deep --strict \"$APP\" >/dev/null 2>&1 \\\n",
+            "  || fail 'outer signing: strict code-signature verification failed for the whole application'\n",
+            "printf 'keychain_group=[TEAM_REDACTED].app.tersa.shared\\n'\n",
+            "printf 'launch=ok\\n'\n",
+            "printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\\n'\n",
+            "section 'Keychain isolation negative probes'\n",
+            "MAIN_APP_PROBE_STDOUT=\"$SCRATCH/main-app-keychain-isolation-probe.stdout\"\n",
+            "MAIN_APP_PROBE_STDERR=\"$SCRATCH/main-app-keychain-isolation-probe.stderr\"\n",
+            "MAIN_APP_PROBE_EXPECTED=\"$SCRATCH/main-app-keychain-isolation-probe.expected\"\n",
+            "TOKEN_BROKER_PROBE_STDOUT=\"$SCRATCH/token-broker-keychain-isolation-probe.stdout\"\n",
+            "TOKEN_BROKER_PROBE_STDERR=\"$SCRATCH/token-broker-keychain-isolation-probe.stderr\"\n",
+            "TOKEN_BROKER_PROBE_EXPECTED=\"$SCRATCH/token-broker-keychain-isolation-probe.expected\"\n",
+            "printf '%s\\n' '{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"missing-entitlement\"}' \\\n",
+            "  >\"$MAIN_APP_PROBE_EXPECTED\"\n",
+            "set +e\n",
+            "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 \\\n",
+            "  >\"$MAIN_APP_PROBE_STDOUT\" 2>\"$MAIN_APP_PROBE_STDERR\"\n",
+            "MAIN_APP_PROBE_STATUS=$?\n",
+            "set -e\n",
+            "[ \"$MAIN_APP_PROBE_STATUS\" -eq 0 ] \\\n",
+            "  || fail 'main-app Keychain isolation probe did not exit 0'\n",
+            "[ ! -s \"$MAIN_APP_PROBE_STDERR\" ] \\\n",
+            "  || fail 'main-app Keychain isolation probe wrote stderr'\n",
+            "cmp -s \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\" \\\n",
+            "  || fail 'main-app Keychain isolation probe output did not match the reviewed JSON'\n",
+            "printf 'main_app_keychain_wrong_group_probe=missing-entitlement\\n'\n",
+            "printf '%s\\n' '{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"missing-entitlement\"}' \\\n",
+            "  >\"$TOKEN_BROKER_PROBE_EXPECTED\"\n",
+            "set +e\n",
+            "\"$XPC/Contents/MacOS/TersaMacTokenBroker\" --tersa-keychain-isolation-probe-v1 \\\n",
+            "  >\"$TOKEN_BROKER_PROBE_STDOUT\" 2>\"$TOKEN_BROKER_PROBE_STDERR\"\n",
+            "TOKEN_BROKER_PROBE_STATUS=$?\n",
+            "set -e\n",
+            "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 0 ] \\\n",
+            "  || fail 'token-broker Keychain isolation probe did not exit 0'\n",
+            "[ ! -s \"$TOKEN_BROKER_PROBE_STDERR\" ] \\\n",
+            "  || fail 'token-broker Keychain isolation probe wrote stderr'\n",
+            "cmp -s \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\" \\\n",
+            "  || fail 'token-broker Keychain isolation probe output did not match the reviewed JSON'\n",
+            "printf 'token_broker_keychain_wrong_group_probe=missing-entitlement\\n'\n",
+            "section 'App Sandbox denial'\n",
         )
     }
 
@@ -16301,9 +16607,9 @@ targets:
         let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
         let consumer = "sh apple/scripts/generate-project.sh\n";
         let ui_consumer = macos_ui_evidence_signing_fixture();
-        assert!(
-            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer).is_empty()
-        );
+        let fixture_violations =
+            project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer);
+        assert!(fixture_violations.is_empty(), "{fixture_violations:?}");
 
         assert!(
             project_generation_surface_violations(&wrapper, &ci, consumer, consumer)
@@ -16468,6 +16774,135 @@ targets:
                             )
                     }),
                 "{label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven mutation coverage keeps the canonical evidence sequence in one test"
+    )]
+    fn macos_ui_evidence_keychain_isolation_probe_guards_fail_closed() {
+        let wrapper = project_generation_wrapper();
+        let ci = "sh apple/scripts/generate-project.sh\n".repeat(3);
+        let consumer = "sh apple/scripts/generate-project.sh\n";
+        let ui_consumer = macos_ui_evidence_signing_fixture();
+        let baseline = project_generation_surface_violations(&wrapper, &ci, consumer, ui_consumer);
+        assert!(baseline.is_empty(), "{baseline:?}");
+
+        let broker_alias = format!(
+            "TOKEN_BROKER_PROBE_BINARY=\"$XPC/Contents/MacOS/TersaMacTokenBroker\"\n{}",
+            ui_consumer.replace(
+                "\"$XPC/Contents/MacOS/TersaMacTokenBroker\" --tersa-keychain-isolation-probe-v1 \\\n",
+                "\"$TOKEN_BROKER_PROBE_BINARY\" --tersa-keychain-isolation-probe-v1 \\\n",
+            )
+        );
+        let probes_before_container = ui_consumer
+            .replace(
+                "printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\\n'\nsection 'Keychain isolation negative probes'\n",
+                "section 'Keychain isolation negative probes'\n",
+            )
+            .replace(
+                "section 'App Sandbox denial'\n",
+                "printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\\n'\nsection 'App Sandbox denial'\n",
+            );
+        let app_sandbox_denial_before_probes = ui_consumer.replacen(
+            "section 'Keychain isolation negative probes'\n",
+            "section 'App Sandbox denial'\nsection 'Keychain isolation negative probes'\n",
+            1,
+        );
+
+        for (label, mutation) in [
+            (
+                "main-app probe carries an extra argument",
+                ui_consumer.replace(
+                    "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 \\\n",
+                    "\"$APP/Contents/MacOS/Tersa\" --tersa-keychain-isolation-probe-v1 extra \\\n",
+                ),
+            ),
+            ("token-broker probe uses an alias", broker_alias),
+            (
+                "main-app probe accepts a nonzero status",
+                ui_consumer.replace(
+                    "[ \"$MAIN_APP_PROBE_STATUS\" -eq 0 ]",
+                    "[ \"$MAIN_APP_PROBE_STATUS\" -eq 1 ]",
+                ),
+            ),
+            (
+                "token-broker probe accepts a nonzero status",
+                ui_consumer.replace(
+                    "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 0 ]",
+                    "[ \"$TOKEN_BROKER_PROBE_STATUS\" -eq 1 ]",
+                ),
+            ),
+            (
+                "main-app stderr is not required to be empty",
+                ui_consumer.replace("[ ! -s \"$MAIN_APP_PROBE_STDERR\" ]", ":"),
+            ),
+            (
+                "token-broker stderr is not required to be empty",
+                ui_consumer.replace("[ ! -s \"$TOKEN_BROKER_PROBE_STDERR\" ]", ":"),
+            ),
+            (
+                "main-app stdout is not byte-compared",
+                ui_consumer.replace(
+                    "cmp -s \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\"",
+                    "cmp \"$MAIN_APP_PROBE_EXPECTED\" \"$MAIN_APP_PROBE_STDOUT\"",
+                ),
+            ),
+            (
+                "token-broker stdout is not byte-compared",
+                ui_consumer.replace(
+                    "cmp -s \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\"",
+                    "cmp \"$TOKEN_BROKER_PROBE_EXPECTED\" \"$TOKEN_BROKER_PROBE_STDOUT\"",
+                ),
+            ),
+            (
+                "main-app expected JSON drifts",
+                ui_consumer.replace(
+                    "{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"missing-entitlement\"}",
+                    "{\"schema_version\":1,\"principal\":\"main-app\",\"result\":\"unexpected-status\"}",
+                ),
+            ),
+            (
+                "token-broker expected JSON drifts",
+                ui_consumer.replace(
+                    "{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"missing-entitlement\"}",
+                    "{\"schema_version\":1,\"principal\":\"token-broker\",\"result\":\"unexpected-status\"}",
+                ),
+            ),
+            (
+                "main-app redacted summary drifts",
+                ui_consumer.replace(
+                    "main_app_keychain_wrong_group_probe=missing-entitlement",
+                    "main_app_keychain_wrong_group_probe=unexpected-status",
+                ),
+            ),
+            (
+                "token-broker redacted summary drifts",
+                ui_consumer.replace(
+                    "token_broker_keychain_wrong_group_probe=missing-entitlement",
+                    "token_broker_keychain_wrong_group_probe=unexpected-status",
+                ),
+            ),
+            (
+                "captured main-app stdout is printed",
+                format!("{ui_consumer}cat \"$MAIN_APP_PROBE_STDOUT\"\n"),
+            ),
+            ("probes run before the container check", probes_before_container),
+            (
+                "App Sandbox denial precedes the probes",
+                app_sandbox_denial_before_probes,
+            ),
+        ] {
+            let violations = project_generation_surface_violations(&wrapper, &ci, consumer, &mutation);
+            assert!(
+                violations.iter().any(|violation| {
+                    violation.contains("Keychain isolation probe")
+                        || violation.contains("token-broker probe")
+                }),
+                "{label} must fail closed: {violations:?}"
             );
         }
     }

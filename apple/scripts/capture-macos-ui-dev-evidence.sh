@@ -328,6 +328,48 @@ printf 'launch=ok\n'
   || fail 'the App Sandbox container is unavailable'
 printf 'sandbox_container=~/Library/Containers/app.tersa.mac present\n'
 
+section 'Keychain isolation negative probes'
+# Run only the reviewed, opt-in probe entrypoints from the exact binaries that
+# were signed and normally launched above. Their fixed argument exits before
+# normal app or XPC behavior, so this capture performs no OAuth, browser, or
+# Keychain mutation.
+MAIN_APP_PROBE_STDOUT="$SCRATCH/main-app-keychain-isolation-probe.stdout"
+MAIN_APP_PROBE_STDERR="$SCRATCH/main-app-keychain-isolation-probe.stderr"
+MAIN_APP_PROBE_EXPECTED="$SCRATCH/main-app-keychain-isolation-probe.expected"
+TOKEN_BROKER_PROBE_STDOUT="$SCRATCH/token-broker-keychain-isolation-probe.stdout"
+TOKEN_BROKER_PROBE_STDERR="$SCRATCH/token-broker-keychain-isolation-probe.stderr"
+TOKEN_BROKER_PROBE_EXPECTED="$SCRATCH/token-broker-keychain-isolation-probe.expected"
+
+printf '%s\n' '{"schema_version":1,"principal":"main-app","result":"missing-entitlement"}' \
+  >"$MAIN_APP_PROBE_EXPECTED"
+set +e
+"$APP/Contents/MacOS/Tersa" --tersa-keychain-isolation-probe-v1 \
+  >"$MAIN_APP_PROBE_STDOUT" 2>"$MAIN_APP_PROBE_STDERR"
+MAIN_APP_PROBE_STATUS=$?
+set -e
+[ "$MAIN_APP_PROBE_STATUS" -eq 0 ] \
+  || fail 'main-app Keychain isolation probe did not exit 0'
+[ ! -s "$MAIN_APP_PROBE_STDERR" ] \
+  || fail 'main-app Keychain isolation probe wrote stderr'
+cmp -s "$MAIN_APP_PROBE_EXPECTED" "$MAIN_APP_PROBE_STDOUT" \
+  || fail 'main-app Keychain isolation probe output did not match the reviewed JSON'
+printf 'main_app_keychain_wrong_group_probe=missing-entitlement\n'
+
+printf '%s\n' '{"schema_version":1,"principal":"token-broker","result":"missing-entitlement"}' \
+  >"$TOKEN_BROKER_PROBE_EXPECTED"
+set +e
+"$XPC/Contents/MacOS/TersaMacTokenBroker" --tersa-keychain-isolation-probe-v1 \
+  >"$TOKEN_BROKER_PROBE_STDOUT" 2>"$TOKEN_BROKER_PROBE_STDERR"
+TOKEN_BROKER_PROBE_STATUS=$?
+set -e
+[ "$TOKEN_BROKER_PROBE_STATUS" -eq 0 ] \
+  || fail 'token-broker Keychain isolation probe did not exit 0'
+[ ! -s "$TOKEN_BROKER_PROBE_STDERR" ] \
+  || fail 'token-broker Keychain isolation probe wrote stderr'
+cmp -s "$TOKEN_BROKER_PROBE_EXPECTED" "$TOKEN_BROKER_PROBE_STDOUT" \
+  || fail 'token-broker Keychain isolation probe output did not match the reviewed JSON'
+printf 'token_broker_keychain_wrong_group_probe=missing-entitlement\n'
+
 section 'App Sandbox denial'
 cat >"$SCRATCH/sandbox-write-canary.c" <<'CANARY'
 #include <errno.h>
