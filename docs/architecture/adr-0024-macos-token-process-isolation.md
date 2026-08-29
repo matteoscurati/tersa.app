@@ -116,6 +116,13 @@ Issue #51 remains open until all of the following are complete:
    and `task_for_pid` from the main app to the broker fail under the exact
    release signing posture.
 
+The [macOS live OAuth development evidence](../quality/macos-live-oauth-dev-evidence.md)
+record is model-reviewed and explicitly non-gate. It records a bounded Apple
+Development local observation but does not close Item 5: Item 5 requires formal
+human-reviewed, retained signed-runtime evidence. Item 6 and issue #51 remain
+open until the exact Developer ID signed and notarized candidate satisfies their
+separate controls.
+
 Items 2 through 4 are implemented in source and fail-closed in CI as of the
 point-4 cutover (see *Current packaging status*). The fixed-purpose,
 read-only negative probes required by Item 5 are now implemented in source

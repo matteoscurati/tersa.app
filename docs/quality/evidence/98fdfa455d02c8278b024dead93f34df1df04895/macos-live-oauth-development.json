@@ -1,0 +1,112 @@
+{
+  "artifact": {
+    "attribution": "live-artifact",
+    "bundle_digest_algorithm": "sha256-lc-all-c-regular-file-manifest-v1",
+    "bundle_regular_file_manifest_sha256": "52916f779a2633cf5a1e4ea21cd78e852cb690a7fb55b2e4aff11b503163e1ae",
+    "main_binary_sha256": "2eacceb1f3ca07ca685f7e5ccada362d56354605be5e86682fb5da6a66307a43",
+    "reproducible_from_commit_alone": false,
+    "signing_tier": "Apple Development",
+    "token_broker_binary_sha256": "21038117225f610c4d54cb1151ea82bad80c05af47018fbc1f567505f4658047",
+    "toolchain": {
+      "macos_build_version": "25F80",
+      "macos_product_version": "26.5.1",
+      "xcode_build_version": "17F113",
+      "xcode_version": "26.6"
+    },
+    "verification": "locally-recomputed-from-live-artifact"
+  },
+  "candidate": {
+    "commit": "98fdfa455d02c8278b024dead93f34df1df04895",
+    "tree": "bc9060d62e64ad96363b6966ec8827ccb9f87939"
+  },
+  "evidence_kind": "macos-live-oauth-development",
+  "gate_status": "unchanged",
+  "nonclaims": [
+    "Testing refresh tokens may expire after 7 days.",
+    "No durability or post-expiry claim.",
+    "No cold stored refresh after process death.",
+    "No legacy pre-split app.tersa.mac.oauth-refresh-token.v1 absence claim.",
+    "No Developer ID, notarization, distribution, or accessibility claim.",
+    "This local manifest is non-gate and does not close issue #51."
+  ],
+  "operator_observations": {
+    "attestation": "operator-attested-not-locally-recomputable",
+    "build_input_provenance": {
+      "client_secret_used": true,
+      "configuration": "Release",
+      "scheme": "TersaMac",
+      "source": "apple/local.xcconfig-values-redacted"
+    },
+    "oauth_lifecycle": {
+      "authorization_request_scope": "openid https://www.googleapis.com/auth/gmail.readonly",
+      "callback_scopes": [
+        "openid",
+        "https://www.googleapis.com/auth/gmail.readonly"
+      ],
+      "consent": {
+        "gmail_readonly_granular_scope_selected": true,
+        "publishing_status": "testing",
+        "test_user": true,
+        "user_type": "external"
+      },
+      "disconnect": {
+        "local_purge": "pass",
+        "revoke": "pass",
+        "token_delete": "pass"
+      },
+      "exchange": "pass",
+      "initial_sync": {
+        "message_count": 50,
+        "outcome": "pass"
+      },
+      "linked_app_after_disconnect": false,
+      "local_database_after_disconnect": false,
+      "refresh_token_persistence": {
+        "outcome": "pass",
+        "temperature": "warm"
+      },
+      "relaunch_state": "not-connected",
+      "stored_credential_refresh": {
+        "outcome": "pass",
+        "temperature": "warm"
+      },
+      "stored_credential_refresh_after_relaunch": {
+        "observed": false,
+        "outcome": "not-run"
+      }
+    },
+    "production_archive_surface": {
+      "attested_not_proven": true,
+      "value": true
+    },
+    "token_path": {
+      "attested_not_proven": true,
+      "value": "embedded-xpc-broker"
+    }
+  },
+  "record_provenance": {
+    "emitted_by_capture_at_candidate": false,
+    "producer_validator": "later-tooling-canonicalization"
+  },
+  "redacted": true,
+  "related_fixed_placeholder_development_capture": {
+    "artifact_attribution": "fixed-placeholder-development-artifact",
+    "attestation": "historical-reference-not-live-artifact",
+    "capture_sha256": "25ec8ba33e11e11ac9572188dcf14ab908a66bd9de6c9142a6733cc72268e092",
+    "same_artifact_as_live_artifact": false,
+    "used_for_item5_colocation": false
+  },
+  "schema_version": 2,
+  "wrong_group_probes": {
+    "main_app": {
+      "outcome": "pass",
+      "result": "missing-entitlement"
+    },
+    "observed_on": "live-artifact",
+    "rerun_on_live_artifact": true,
+    "token_broker": {
+      "outcome": "pass",
+      "result": "missing-entitlement"
+    }
+  }
+}

@@ -46,6 +46,14 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py
       - name: Test macOS performance report contract
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_performance_report.py
+      - name: Test macOS live OAuth development evidence contract
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_macos_live_oauth_dev_evidence.py
+      - name: Check macOS live OAuth development evidence shell syntax
+        run: sh -n apple/scripts/capture-macos-live-oauth-dev-evidence.sh
+      - name: Validate committed macOS live OAuth development evidence
+        run: >-
+          sh apple/scripts/capture-macos-live-oauth-dev-evidence.sh --validate
+          docs/quality/evidence/98fdfa455d02c8278b024dead93f34df1df04895/macos-live-oauth-development.json
       - name: Check pull request DCO sign-offs
         if: github.event_name == 'pull_request'
         run: >-
