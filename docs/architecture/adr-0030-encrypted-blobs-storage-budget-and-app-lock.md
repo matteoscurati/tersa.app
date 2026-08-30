@@ -6,10 +6,8 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0030: encrypted blobs, storage budget, and app lock
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-29
-- Owner intent: Approved; implementation is blocked pending independent
-  architecture/security review and the prerequisite slices below.
 
 ## Context
 
