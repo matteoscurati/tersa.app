@@ -32,18 +32,21 @@ and derived keys to be evicted on lock.
 No blob, bundle, storage-budget, or app-lock implementation may start until
 these independently reviewed slices are accepted:
 
-1. **P30-dependency policy:** select and pin exact `chacha20poly1305` and
-   `argon2` versions, targets, features, and allowed owners. Retain the verified
-   workspace `rustix =1.1.4` API with its `fs` feature enabled for the additive
-   direct-owner set `{tersa-keychain-macos, tersa-store-sqlcipher-macos,
+1. **P30-dependency policy:** select and pin the exact `chacha20poly1305`
+   version, targets, features, and allowed owners. Argon2 is not part of this
+   ADR's blob-key or app-lock path; any Argon2id dependency remains owned by
+   ADR 0028's separate draft-bundle policy. Retain the verified workspace
+   `rustix =1.1.4` API with its `fs` feature enabled for the additive direct-owner
+   set `{tersa-keychain-macos, tersa-store-sqlcipher-macos,
    tersa-blob-aead-macos}`. The existing store owner is retained, never dropped.
    Amend `deny.toml`, dependency rules, and `xtask` owner fixtures accordingly.
    This ADR invents no new dependency version.
 2. **P30-architecture amendments:** explicitly amend/supersede the retired
    diagnostic constraints in ADR 0012, ADR 0019, and ADR 0025 only for the new
    production path; record the direct `rustix` 1.1.4 `fs` ownership amendment,
-   `renameat_with` no-replace policy, and exact fixtures in dependency/policy
-   documentation.
+   `renameat_with` no-replace policy, and the exact future fixture contract in
+   dependency/policy documentation. This docs-only slice changes no manifest,
+   `deny.toml`, or `xtask` source.
 3. **P30-composition:** approve the new inward edge from trusted
    `tersa-keychain-macos` composition to `tersa-blob-aead-macos`, its narrow
    `SecureBlobStore` capability, and the prohibition on raw-key bytes or public
@@ -74,31 +77,43 @@ The existing private Keychain/HKDF boundary gains the closed
 `blob/account-content/v1` derivation purpose. It derives a 32-byte per-account
 blob key without exposing root or derived bytes to callers. A blob receives a
 random 128-bit `BlobId`, a separate random 24-byte XChaCha20 nonce for every
-1 MiB plaintext chunk, and an encrypted/authenticated manifest. Each chunk's
-associated data binds format version, `AccountId`, `BlobId`, chunk index, and
-plaintext length. The manifest binds the same account/blob/version context,
+1 MiB plaintext chunk, and a further independent random 24-byte nonce for its
+encrypted/authenticated manifest. The adapter rejects every nonce collision
+within a blob before encryption or publication. Nonces are nonsecret and are
+stored beside their ciphertext in fixed versioned record headers. Each chunk's
+associated data begins with the literal `tersa.app/blob-chunk/v1` and binds
+format version, `AccountId`, `BlobId`, chunk index, and plaintext length. The
+manifest's associated data begins with the disjoint literal
+`tersa.app/blob-manifest/v1` and binds the same account/blob/version context,
 chunk count/order, total length, `BlobKind`, and storage class. A chunk or
-manifest from a different account, blob, index, or format must not decrypt.
+manifest from a different account, blob, index, record kind, or format must not
+decrypt.
 
-The adapter writes only ciphertext to a validated owner-only staging directory
-under the account's `blobs/` directory. It fsyncs chunks and manifest, then uses
-the verified Rustix 1.1.4 primitive
+The adapter writes only ciphertext plus nonsecret fixed framing and nonce
+metadata to a validated owner-only staging directory under the account's
+`blobs/` directory. It synchronizes every chunk and manifest file, then
+synchronizes the staging directory after all entries exist. Only then
+may it use the verified Rustix 1.1.4 primitive
 `rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)`, which maps on macOS to
 `renameatx_np` with `RENAME_EXCL`, to publish the complete staging directory,
-followed by parent fsync. An unavailable exclusive-rename primitive fails closed;
-it never falls back to overwrite/replace. Directories are `0700`; files are
-`0600`; all traversal is descriptor-relative and no-follow. It does not create
-plaintext files, replace an existing final blob, recursively clean unowned data,
-or claim power-loss atomicity beyond this staged publication protocol. A failed
-write cleans only files/directories proven created by that attempt and otherwise
-preserves redacted residue for recovery. This requires no libc or unsafe
-amendment.
+followed by synchronization of the account `blobs/` parent directory. Every
+file, staging-directory, rename, or parent-directory synchronization failure
+fails closed and never falls back to overwrite/replace. Directories are `0700`;
+files are `0600`; all traversal is descriptor-relative and no-follow. It does
+not create plaintext files, replace an existing final blob, recursively clean
+unowned data, or claim power-loss atomicity beyond this staged publication
+protocol. A failed write cleans only files/directories proven created by that
+attempt and otherwise preserves redacted residue for recovery. This requires no
+libc or unsafe amendment.
 
 P30-architecture amendments supersede ADR 0019's interim active-graph
 prohibition, ADR 0012's retired diagnostic-only status, and ADR 0025's retired
-program boundary only for this exact policy-approved production adapter. They
-also amend `deny.toml` and dependency/owner policy; no other ChaCha path is
-authorized and no historical diagnostic evidence becomes production evidence.
+program boundary only for this exact future policy-approved production adapter.
+The separate P30-dependency `policy-xtask` slice exclusively owns every
+`deny.toml`, manifest, and `xtask` owner-fixture change; the docs-only
+architecture-amendment slice records only the corresponding dependency/policy
+documentation. No other ChaCha path is authorized and no historical diagnostic
+evidence becomes production evidence.
 
 ### Budget and eviction
 
@@ -131,6 +146,57 @@ deletion is validated descriptor-relative unlink plus reference removal, not
 SSD secure erase; and diagnostics may record only aggregate sizes, versions,
 and redacted outcome classes, never paths, BlobIds, account IDs, content, or
 keys.
+
+### Blob commit and recovery state machine
+
+The application-layer `BlobCommitCoordinator` is the sole owner of the ordered
+operation across the SQLCipher store and blob adapter. The SQLCipher store is
+the durable transaction authority; the blob adapter receives only one
+account-bound prepared/published operation at a time and returns opaque status
+and authenticated manifest/accounting facts, never a path or key.
+
+Creation follows this exact order:
+
+1. After pessimistic budget preflight, one SQLCipher transaction inserts a
+   `PendingBlobCommit` containing the validated `AccountId`, `BlobId`,
+   `BlobKind`, storage class, and reserved upper-bound allocated bytes. It is not
+   a reachable `BlobRef` and cannot be opened, attached, or displayed.
+2. The blob adapter stages and publishes ciphertext using the file/directory
+   synchronization and no-replace order above. Only successful parent-directory
+   synchronization returns `PublishedBlob`, containing the same account/blob
+   identity, authenticated manifest summary, and measured allocated bytes.
+3. A second SQLCipher transaction verifies the pending/published identity and
+   size, atomically replaces the pending row with the reachable `BlobRef`, and
+   commits actual allocated-byte accounting. No reachable reference can commit
+   before durable filesystem publication.
+4. A pre-publication failure may cancel the pending row only after the adapter
+   proves that no final was published and completes or safely defers cleanup of
+   its proven stage. An ambiguous result retains the pending row and exposes no
+   `BlobRef` until recovery resolves it.
+
+Startup and explicit recovery perform a bounded descriptor-relative join of
+SQLCipher pending/reachable state and the account blob inventory:
+
+- A pending row plus a validated stage and no final cleans only an authenticated,
+  identity-bound stage before cancelling the pending row; any mismatch preserves
+  both and fails closed.
+- A pending row plus a final authenticates the manifest, requires exact
+  account/blob/kind/storage-class agreement, measures allocated bytes, and then
+  runs the same finalizing SQLCipher transaction. A mismatch remains pending and
+  unavailable without deletion.
+- An authenticated final with no pending or reachable row is never silently
+  adopted. Recoverable cache data may be removed only by a bounded validated
+  cleanup transaction. Non-evictable local intent is preserved, charged at its
+  measured allocated bytes through an `OrphanedProtectedBlob` recovery record,
+  and requires explicit recovery; it is never auto-deleted.
+- A reachable reference with a missing, invalid, or mismatched final becomes
+  `BlobUnavailable`. Protected intent and its reference remain durable and block
+  dependent send/export; no counter repair infers deletion. A recoverable-cache
+  reference may be removed only by the normal store transaction after the
+  missing-final state is confirmed.
+- An unbounded inventory, unauthenticated entry, accounting mismatch, or
+  ambiguous ownership makes that account's blob subsystem unavailable and
+  authorizes neither eviction nor cleanup.
 
 ### App-lock lifecycle
 
@@ -167,8 +233,10 @@ routed query after authentication and generation validation.
 
 ```text
 Account-scoped attachment/image bytes
+  -> SQLCipher PendingBlobCommit budget reservation (not reachable)
   -> SecureBlobStore staging ciphertext + authenticated manifest
-  -> BlobRef in encrypted SQLCipher state
+  -> file sync -> staging-directory sync -> NOREPLACE publish -> parent sync
+  -> SQLCipher atomic BlobRef + actual accounting finalize
   -> explicit open/save declassification only
 
 macOS sleep/timeout
@@ -179,9 +247,12 @@ macOS sleep/timeout
 
 - No blob, manifest, usage record, or key can be routed without a validated
   `AccountId`. Lock state carries no account identity and gates every account.
-- The SQLCipher store is the transactional authority for `BlobRef` reachability,
-  budget accounting, drafts/outbox protection, and eviction selection; the blob
-  adapter owns only ciphertext files and verified publication/removal.
+- The SQLCipher store is the durable transaction authority for pending/final
+  `BlobRef` reachability, budget accounting, protected-orphan recovery,
+  drafts/outbox protection, and eviction selection. The application
+  `BlobCommitCoordinator` alone orders cross-adapter transitions; the blob
+  adapter owns only ciphertext files, authenticated inventory facts, and verified
+  publication/removal.
 - A plaintext attachment exists only in bounded memory while explicitly opened,
   saved, composed, or parsed. The operation cannot silently export it.
 - Lock generation fences apply to Swift UI, bridge replies, XPC replies, and
@@ -195,10 +266,10 @@ macOS sleep/timeout
 | --- | --- |
 | `docs-only` | P30-architecture and P30-security amendments before implementation eligibility. |
 | `policy-xtask` | P30 dependency/owner fixtures for Rustix 1.1.4 `fs`, no-replace staging, ABI, and lock-generation guards only. |
-| `domain` | Add blob/reference/manifest/storage-class and app-lock policy values with redacted diagnostics. |
-| `application` | Add `SecureBlobStore`, `StorageBudgetStore`, eviction use case, and `AppLockCoordinator` state/fence contract. |
-| `adapter-rust — tersa-blob-aead-macos` | Implement chunk/manifest AEAD, no-replace staging, and ciphertext publication only. |
-| `adapter-rust — tersa-store-sqlcipher-macos` | Implement allocated-byte accounting, BlobRef reachability, eviction selection, and reference transactions only. |
+| `domain` | Add blob/reference/manifest/storage-class, pending/protected-orphan recovery, and app-lock policy values with redacted diagnostics. |
+| `application` | Add `SecureBlobStore`, `StorageBudgetStore`, eviction use case, the sole `BlobCommitCoordinator`, and `AppLockCoordinator` state/fence contract. |
+| `adapter-rust — tersa-blob-aead-macos` | Implement chunk/manifest AEAD, synchronized no-replace staging/publication, authenticated bounded inventory, and ciphertext removal only. |
+| `adapter-rust — tersa-store-sqlcipher-macos` | Implement pending/final BlobRef transactions, allocated-byte accounting, protected-orphan recovery records, eviction selection, and reference transactions only. |
 | `adapter-rust — tersa-keychain-macos` | Implement the private blob derivation/composition edge only. |
 | `token-broker` | Preserve token authority; expose only closed lock quiesce/recovery status. |
 | `bridge-ffi` | Add bounded BlobRef/budget/lock documents with atomic ABI fixture updates. |
@@ -211,12 +282,16 @@ fixtures. It carries no key, path, raw-byte, or store-handle capability.
 ## Failure handling
 
 Manifest/tag/nonce/order validation failure marks the blob unavailable and
-retains no decrypted output. Disk-full, quota, permission, or staging failure
-does not publish a final blob or update its reference/accounting transaction.
-An orphaned encrypted stage is never adopted blindly; recovery validates its
-identity and otherwise preserves it for explicit cleanup. A corrupted usage
-record or allocated-byte accounting divergence fails closed rather than evicting
-protected intent.
+retains no decrypted output. Disk-full, quota, permission, file/directory sync,
+exclusive-rename, parent-sync, or SQL finalization failure follows the commit
+state machine above and never exposes a reachable partial blob. An orphaned
+encrypted stage is never adopted blindly; recovery validates and identity-binds
+it before cleanup. A published-but-unreferenced final is reconciled only through
+its matching pending row, bounded recoverable-cache cleanup, or a preserved
+`OrphanedProtectedBlob` record. A missing final never makes protected intent look
+deleted. A corrupted usage record, allocated-byte accounting divergence, or
+unbounded/ambiguous inventory fails closed rather than evicting protected intent
+or repairing a counter by inference.
 
 Authentication cancellation/failure leaves the app locked. Worker cancellation
 on lock preserves durable sync/outbox intent but prevents stale result delivery.
@@ -227,13 +302,18 @@ falls back to partial rows.
 
 ## Test and evidence gates
 
-- Cryptographic tests cover wrong account/blob/key/nonce/index, manifest and
-  chunk tampering, truncation, reordered chunks, malformed staging entries, and
-  absence of plaintext sentinels from finals, stages, logs, and diagnostics.
-- Crash and fault-injection tests cover every publish/accounting boundary,
-  exclusive-rename failure, disk-full, concurrent writers, allocated-byte
-  divergence, quota eviction, protected-intent preservation, and post-crash
-  orphan handling.
+- Cryptographic tests cover wrong account/blob/key/nonce/index, chunk-versus-
+  manifest associated-data separation, chunk/manifest nonce collision rejection,
+  manifest and chunk tampering, truncation, reordered chunks, malformed staging
+  entries, and absence of plaintext sentinels from finals, stages, logs, and
+  diagnostics.
+- Crash and fault-injection tests stop after every chunk/manifest file sync,
+  staging-directory sync, no-replace rename, parent-directory sync,
+  pending-reservation transaction, and finalizing transaction. They cover every
+  pending/stage/final/reference recovery matrix row, published-but-unreferenced
+  cache and protected-intent outcomes, missing finals, exclusive-rename failure,
+  disk-full, concurrent writers, allocated-byte divergence, quota eviction,
+  protected-intent preservation, and bounded post-crash inventory handling.
 - Cross-account tests prove a `BlobRef` cannot be read, evicted, or attached
   through another account. Budget tests cover default, 1 GiB minimum, and LRU
   behavior without evicting drafts/outbox/pending actions.
