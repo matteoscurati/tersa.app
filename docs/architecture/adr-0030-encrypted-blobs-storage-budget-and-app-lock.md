@@ -177,13 +177,21 @@ Creation follows this exact order:
 Startup and explicit recovery perform a bounded descriptor-relative join of
 SQLCipher pending/reachable state and the account blob inventory:
 
+- A pending row with neither a stage nor a final is cancelled only after one
+  bounded descriptor-relative no-follow inventory proves both names absent under
+  the expected account/blob identity. Failure, an unbounded result, or ambiguity
+  retains the reservation and keeps it unavailable. This same transition handles
+  a crash after validated stage cleanup but before pending-row cancellation.
 - A pending row plus a validated stage and no final cleans only an authenticated,
-  identity-bound stage before cancelling the pending row; any mismatch preserves
-  both and fails closed.
+  identity-bound stage before running the same bounded double-absence proof and
+  cancelling the pending row; any mismatch preserves both and fails closed.
 - A pending row plus a final authenticates the manifest, requires exact
   account/blob/kind/storage-class agreement, measures allocated bytes, and then
-  runs the same finalizing SQLCipher transaction. A mismatch remains pending and
-  unavailable without deletion.
+  must successfully synchronize the account `blobs/` parent directory. Only
+  that successful recovery synchronization reconstructs the equivalent of
+  `PublishedBlob` and permits the finalizing SQLCipher transaction. A sync or
+  identity mismatch retains the pending row and final as unavailable without
+  deletion.
 - An authenticated final with no pending or reachable row is never silently
   adopted. Recoverable cache data may be removed only by a bounded validated
   cleanup transaction. Non-evictable local intent is preserved, charged at its
@@ -310,10 +318,12 @@ falls back to partial rows.
 - Crash and fault-injection tests stop after every chunk/manifest file sync,
   staging-directory sync, no-replace rename, parent-directory sync,
   pending-reservation transaction, and finalizing transaction. They cover every
-  pending/stage/final/reference recovery matrix row, published-but-unreferenced
-  cache and protected-intent outcomes, missing finals, exclusive-rename failure,
-  disk-full, concurrent writers, allocated-byte divergence, quota eviction,
-  protected-intent preservation, and bounded post-crash inventory handling.
+  pending/stage/final/reference recovery matrix row, including pending with neither
+  stage nor final, cleanup-before-pending-cancel crashes, recovery parent-sync
+  failure, published-but-unreferenced cache and protected-intent outcomes,
+  missing finals, exclusive-rename failure, disk-full, concurrent writers,
+  allocated-byte divergence, quota eviction, protected-intent preservation, and
+  bounded post-crash inventory handling.
 - Cross-account tests prove a `BlobRef` cannot be read, evicted, or attached
   through another account. Budget tests cover default, 1 GiB minimum, and LRU
   behavior without evicting drafts/outbox/pending actions.
