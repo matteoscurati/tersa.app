@@ -15,9 +15,9 @@ publish = false
 
 # Default features are empty: the refresh-token Keychain surface is opt-in.
 [features]
-# Exposes the per-account OAuth refresh-token Keychain module. The XPC token
-# broker (`tersa-token-broker-ffi-macos`) is the production owner of that
-# access and is the dependency that enables this feature.
+# Exposes the per-account OAuth refresh-token Keychain module. Its former
+# owner, the XPC token broker, was removed by ADR 0031; nothing enables this
+# feature, and T1 replaces this crate with the in-process token service.
 oauth-token = []
 
 [dependencies]
