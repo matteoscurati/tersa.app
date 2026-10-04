@@ -3,11 +3,13 @@ members = [
     "adapters/gmail-rest",
     "adapters/keychain-macos",
     "adapters/oauth-sync-macos",
+    "adapters/vault",
     "adapters/store-sqlcipher",
     "adapters/token-broker-core",
     "apps/cli-macos",
     "crates/application",
     "crates/domain",
+    "crates/keys",
     "crates/platform",
     "crates/presentation",
     "xtask",
@@ -23,8 +25,10 @@ repository = "https://github.com/matteoscurati/tersa.app"
 authors = ["tersa.app contributors"]
 
 [workspace.dependencies]
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "0.22.1"
 cargo_metadata = "0.23.1"
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 core-foundation = { version = "=0.10.1", default-features = false }
 getrandom = "0.3.4"
 hmac = "=0.12.1"
@@ -40,6 +44,7 @@ security-framework-sys = { version = "=2.17.0", default-features = false, featur
 subtle = "2.6.1"
 tersa-application = { path = "crates/application", version = "=0.0.0" }
 tersa-domain = { path = "crates/domain", version = "=0.0.0" }
+tersa-keys = { path = "crates/keys", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt", "net", "sync", "time"] }
 url = "2.5.8"

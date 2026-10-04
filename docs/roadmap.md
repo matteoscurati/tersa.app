@@ -11,7 +11,7 @@ accepted as temporary debt.
 | Milestone | Scope | Done when |
 |---|---|---|
 | T0 — Pivot | ADR 0031; Apple sources, FFI crates, and Apple CI removed; minimal `xtask`; docs rewritten | Workspace verifies on Linux and macOS without `apple/` |
-| T1 — Portable foundation | Adapters made portable and renamed; TLS and SQLCipher crypto from the OS on macOS and from one static vendored OpenSSL on Linux; `crates/keys`; `adapters/secrets` (keyring, optional passphrase, passphrase-only fallback); XDG paths; Rust loopback OAuth; in-process token service; BYO OAuth client config | `tersa account add` completes real Google consent on macOS, Linux desktop, and headless Linux |
+| T1 — Portable foundation | Adapters made portable and renamed; TLS and SQLCipher crypto from the OS on macOS and from one static vendored OpenSSL on Linux; `crates/keys`; `adapters/vault` (keyring, optional passphrase, passphrase-only fallback); XDG paths; Rust loopback OAuth; in-process token service; BYO OAuth client config | `tersa account add` completes real Google consent on macOS, Linux desktop, and headless Linux |
 | T2 — Read-only TUI | `ratatui` shell; paged inbox; thread view; sanitized text; HTML to text; search; offline reopen; background sync with status; first performance harness | Hostile fixtures render safely; budgets measured in the PR |
 | T3 — Multi-account | Encrypted registry; add, remove, reset; per-account sync workers; unified inbox | Two real accounts sync and display without cross-account leakage |
 | T4 — Triage | `history.list` incremental sync; archive, read state, labels, trash, undo with pending actions | Offline actions reconcile after reconnect |
