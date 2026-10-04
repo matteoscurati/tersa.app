@@ -4,6 +4,8 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -38,6 +40,21 @@ jobs:
           python3 scripts/check-dco.py
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
+      # The merge queue builds the commit that will land on main, including a
+      # squash message written in the GitHub UI, so check it again there.
+      - name: Check merge-queue DCO sign-offs
+        if: github.event_name == 'merge_group'
+        run: >-
+          python3 scripts/check-dco.py
+          "${{ github.event.merge_group.base_sha }}"
+          "${{ github.event.merge_group.head_sha }}"
+      # Last line of defense for anything that reaches main another way.
+      - name: Check pushed DCO sign-offs
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: >-
+          python3 scripts/check-dco.py
+          "${{ github.event.before }}"
+          "${{ github.event.after }}"
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -47,7 +64,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -62,7 +79,7 @@ jobs:
     name: Policy and supply chain
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
