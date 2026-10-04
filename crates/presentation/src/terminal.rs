@@ -12,8 +12,11 @@
 //!   OSC, DCS, and similar sequences), and DEL;
 //! - C1 controls (U+0080–U+009F), which some terminals treat as 8-bit
 //!   introducers such as CSI and OSC;
-//! - bidirectional embedding, override, and isolate controls
-//!   (U+202A–U+202E, U+2066–U+2069), used to reorder displayed text.
+//! - bidirectional embeddings, overrides, and isolates (U+202A–U+202E,
+//!   U+2066–U+2069) and marks (U+200E, U+200F, U+061C), used to reorder
+//!   displayed text;
+//! - zero-width and invisible formatting characters (U+200B–U+200D, U+2060,
+//!   U+FEFF) and the Tag block (U+E0000–U+E007F), used to hide content.
 
 use std::fmt;
 
@@ -64,7 +67,15 @@ impl fmt::Display for SafeText {
 const fn is_allowed(character: char) -> bool {
     !matches!(
         character,
-        '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{e0000}'..='\u{e007f}'
     )
 }
 
@@ -91,6 +102,12 @@ mod tests {
             SafeText::single_line("invoice\u{202e}fdp.exe\u{2066}x\u{2069}").as_str(),
             "invoicefdp.exex"
         );
+    }
+
+    #[test]
+    fn strips_bidi_marks_and_invisible_characters() {
+        let hostile = "a\u{200e}b\u{200f}c\u{61c}d\u{200b}e\u{200d}f\u{2060}g\u{feff}h\u{e0041}i";
+        assert_eq!(SafeText::single_line(hostile).as_str(), "abcdefghi");
     }
 
     #[test]
