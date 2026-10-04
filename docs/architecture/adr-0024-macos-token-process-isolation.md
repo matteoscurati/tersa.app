@@ -6,7 +6,7 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0024: macOS token/root isolation across signed processes
 
-- Status: Accepted
+- Status: Superseded by [ADR 0031](adr-0031-tui-only-pivot.md)
 - Date: 2026-08-02
 
 ## Context

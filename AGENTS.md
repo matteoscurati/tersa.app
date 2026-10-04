@@ -13,33 +13,31 @@
 ## Operating contract (change classes)
 
 Classify every implementation task as **one** change class. Own only that
-class’s paths. Run the **minimum** verify loop for the class; escalate to full
-`cargo xtask verify` and Apple product builds only at slice boundaries or when
-the playbook requires it.
+class’s paths. Run the **minimum** loop for the class; run full
+`cargo xtask verify` at slice boundaries and before review.
 
 | Class | Own (typical) | Min loop | Do not touch without explicit task |
 |-------|---------------|----------|-------------------------------------|
-| `domain` | `crates/domain/**` | package tests / `preflight domain` | adapters, `apple/**`, `xtask/**` |
-| `application` | `crates/application/**` | package tests / `preflight application` | Swift UI, FFI ABI |
-| `presentation` | `crates/presentation/**` | package tests / `preflight presentation` | store/keychain/gmail |
-| `adapter-rust` | one `adapters/<name>/**` | package tests for that crate | other adapters, broad UI |
-| `bridge-ffi` | `apple/rust-bridge/**` (+ related header/FFI) | architecture + targeted bridge tests | broad Swift UI rewrite |
-| `swift-ui` | `apple/macos/**`, tests | unsigned `TersaMac` `xcodebuild test` | Rust core, adapters, `xtask/**` |
-| `token-broker` | broker crates + `macos-token-broker` + client map | architecture + broker tests | mailbox-sync production FFI |
-| `policy-xtask` | `xtask/**` (and named policy files) | architecture, then full `verify` | product features in same PR |
-| `docs-only` | `docs/**`, markdown | none / classifier | code |
+| `domain` | `crates/domain/**` | `cargo xtask preflight domain` | adapters, apps, `xtask/**` |
+| `application` | `crates/application/**` | `cargo xtask preflight application` | adapters, apps |
+| `presentation` | `crates/presentation/**` | `cargo xtask preflight presentation` | store, secrets, Gmail adapters |
+| `adapter-rust` | one `adapters/<name>/**` | `cargo xtask preflight adapter --package <crate>` | other adapters, apps |
+| `tui` | `apps/**` | `cargo xtask preflight tui` | core crates, adapters, `xtask/**` |
+| `policy-xtask` | `xtask/**`, CI, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then full `verify` | product features in the same PR |
+| `docs-only` | `docs/**`, markdown | none (`typos` if installed) | code |
 
-Full map, anti-patterns, ADR pointers, and command examples:
+Full map, anti-patterns, and ADR pointers:
 [docs/development/agent-playbook.md](docs/development/agent-playbook.md).
 
 ### Hard rules
 
-- Prefer scoped loops; full `verify` is merge-quality, not per-edit.
+- Prefer scoped loops; full `verify` is merge quality, not per edit.
 - Do not edit `xtask/**` unless the task is policy/tooling.
-- Do not run full Apple product builds for pure Rust package work.
-- Do not inject production demo fixtures ([ADR-0021](docs/architecture/adr-0021-macos-ui-vertical-slice.md)).
-- Do not expand the exported C ABI without a dedicated bridge task.
-- Unknown path or multi-class need → stop and ask the lead (fail closed to full fanout).
+- Core crates stay free of I/O, OS crates, and `unsafe` (`cargo xtask architecture`).
+- Provider-derived text reaches the terminal only through the sanitized type
+  ([ADR 0031](docs/architecture/adr-0031-tui-only-pivot.md)).
+- Do not inject production demo fixtures.
+- Unknown path or multi-class need → stop and ask the lead.
 
 ### Required implementer return format
 

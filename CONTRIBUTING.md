@@ -38,7 +38,7 @@ treating the main build
 as complete:
 
 ```sh
-cargo xtask dco HEAD^ HEAD
+python3 scripts/check-dco.py HEAD^ HEAD
 ```
 
 If a transport error makes an otherwise certified published commit
@@ -94,9 +94,9 @@ staged as part of post-merge cleanup.
 ## Verification and review
 
 Run every check relevant to the change and record the commands and results in
-the pull request. Once the Rust workspace exists, the baseline includes format,
-Clippy, tests, dependency policy, security audit, feature checks, documentation,
-and Apple builds when applicable.
+the pull request. The baseline is `cargo xtask verify` (layering, format,
+Clippy, tests, documentation) plus dependency policy, security audit, feature
+checks, and spelling, which CI runs on Linux and macOS.
 
 The implementer cannot approve their own work. A pull request may merge only
 when required checks pass and an independent reviewer reports zero unresolved

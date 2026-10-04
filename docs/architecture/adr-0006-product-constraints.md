@@ -2,14 +2,17 @@
 
 ## Status
 
-Accepted. Durable product constraints A3, A4, A5, and A9 remain in force.
-The M0/Slint/Dioxus diagnostic gate program and toolkit-isolation machinery
-described historically below are retired by
-[ADR-0025](adr-0025-retire-m0-diagnostic-program.md). The former live gate
-register and validator were removed with PR5 documentation consolidation; see
-the [M0 historical summary](../history/m0-summary.md). Active acceptance work
-uses the [macOS acceptance protocol](../quality/macos-acceptance.md) and the
-[Apple physical-device and distribution protocol](../release/apple-distribution.md).
+Accepted. Amended by [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only
+pivot): **A3 and A4 remain in force; A5 and A9 are superseded**, because both
+are Apple-specific in their entirety (iOS/macOS cache budgets and an Apple
+UI-toolkit boundary). Cache and performance budgets for the terminal client
+live in ADR 0031. The M0/Slint/Dioxus diagnostic gate program is retired by
+[ADR-0025](adr-0025-retire-m0-diagnostic-program.md); see the
+[M0 historical summary](../history/m0-summary.md). The macOS acceptance and
+Apple distribution protocols this ADR once pointed to were removed at the
+`pre-tui-pivot` tag. The "Gate governance" and "Consequences" sections below,
+including the macOS Phase 1 carve-out and the M1 blocking rule, are historical
+and no longer govern work.
 
 ## Decisions
 
@@ -58,7 +61,7 @@ a named contributor other than the implementer, with relevant Apple platform,
 accessibility, security, or release-review competence, who records an explicit
 attestation. Review metadata has an expiry; missing, unknown, or unparsable
 fields fail closed. Current procedure is in the
-[Apple physical-device and distribution protocol](../release/apple-distribution.md).
+Apple physical-device and distribution protocol (removed at `pre-tui-pivot`).
 
 ## Consequences
 
