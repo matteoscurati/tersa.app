@@ -18,7 +18,7 @@ tersa-application = { workspace = true }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 
 rusqlite = { workspace = true, default-features = false, features = ["bundled-sqlcipher"] }
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 zeroize.workspace = true
 
 # macOS links SQLCipher against CommonCrypto; Linux builds a static OpenSSL so
