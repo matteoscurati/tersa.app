@@ -7,6 +7,7 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0017: Production macOS account store
 
 - Status: Accepted
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): `tersa-store-sqlcipher-macos` is now the portable `tersa-store-sqlcipher` (macOS and Linux); macOS-only target gates no longer apply
 - Date: 2026-07-16
 
 ## Context
