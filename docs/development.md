@@ -25,7 +25,7 @@ Scoped loops while iterating (see the
 
 ```sh
 cargo xtask preflight domain
-cargo xtask preflight adapter --package tersa-gmail-rest-macos
+cargo xtask preflight adapter --package tersa-gmail-rest
 cargo xtask preflight tui
 cargo xtask test-pkg tersa-application
 cargo xtask clippy-pkg tersa-presentation

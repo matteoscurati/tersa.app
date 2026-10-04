@@ -51,7 +51,7 @@ use tersa_application::sync::{SyncPolicy, SyncReport};
 #[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_application::token::{TokenClientConfig, TokenError, TokenTransport};
 #[cfg(any(feature = "legacy-token-lifecycle", test))]
-use tersa_gmail_rest_macos::GmailTokenTransport;
+use tersa_gmail_rest::GmailTokenTransport;
 #[cfg(any(feature = "legacy-token-lifecycle", test))]
 use tersa_keychain_macos::oauth_token::{DataProtectionRefreshTokenStore, RefreshTokenStore};
 use tersa_keychain_macos::{

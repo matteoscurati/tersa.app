@@ -7,7 +7,7 @@
 //!
 //! The mailbox adapter is deliberately limited to authenticated `GET` requests
 //! against Gmail's `users/me` resource. It owns one locally assigned account
-//! and a short-lived token on macOS. The token transport implements the
+//! and a short-lived token. The token transport implements the
 //! ADR-0023 `TokenTransport` port as form-encoded `POST` exchanges against the
 //! OAuth 2 token endpoint, plus a best-effort revoke call. It shares the
 //! hardened client policy with the `GET` path but no endpoint or state, and
@@ -18,7 +18,6 @@
 
 use std::fmt;
 use std::pin::Pin;
-#[cfg(any(target_os = "macos", test))]
 use std::time::Duration;
 
 use base64::Engine;
@@ -26,9 +25,7 @@ use serde::Deserialize;
 use tersa_application::mailbox::{
     BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
-#[cfg(any(target_os = "macos", test))]
 use tersa_application::oauth::GMAIL_READONLY_SCOPE;
-#[cfg(any(target_os = "macos", test))]
 use tersa_application::token::{
     ExchangeRequest, IdTokenClaims, RefreshRequest, TokenResponse, TokenTransport,
     TokenTransportError,
@@ -38,7 +35,6 @@ use tersa_domain::mailbox::{
     UnixTimestampMillis,
 };
 use url::Url;
-#[cfg(any(target_os = "macos", test))]
 use zeroize::{Zeroize, Zeroizing};
 
 const BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -48,23 +44,13 @@ const RAW_JSON_OVERHEAD: usize = 4 * 1024;
 const RAW_JSON_LIMIT: usize = RAW_ENCODED_LIMIT + RAW_JSON_OVERHEAD;
 const METADATA_FIELDS: &str = "id,threadId,internalDate,labelIds,snippet,payload(headers)";
 const RAW_FIELDS: &str = "id,threadId,raw";
-#[cfg(target_os = "macos")]
 const MAX_ACCESS_TOKEN_LEN: usize = 16 * 1024;
-#[cfg(target_os = "macos")]
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Bounds one token-endpoint request, so it is the largest term of the connect
-/// flow's claim→cancel-fence latency. That window is not bounded by the
-/// bridge's `CANCEL_TOMBSTONE_LIFETIME` (apple/rust-bridge): a claimed
-/// session's cancel tombstone is instead pinned by the bridge's in-flight
-/// lease until the connect worker calls `complete_session` — see the lease
-/// invariant documented on that constant.
-#[cfg(target_os = "macos")]
+/// flow's cancellation latency.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
-#[cfg(any(target_os = "macos", test))]
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-#[cfg(any(target_os = "macos", test))]
 const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
-#[cfg(any(target_os = "macos", test))]
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
 
 type TransportFuture<'a> =
@@ -83,7 +69,6 @@ impl fmt::Debug for GmailMailbox {
 }
 
 impl GmailMailbox {
-    #[cfg(target_os = "macos")]
     /// Creates a Gmail adapter with a short-lived access token for `account`.
     ///
     /// Replacing a rotated token requires replacing this adapter. The token is
@@ -213,7 +198,6 @@ trait Transport: Send + Sync {
 }
 
 struct Request {
-    #[cfg(any(target_os = "macos", test))]
     url: Url,
 }
 
@@ -232,13 +216,7 @@ impl Request {
         }
         url.query_pairs_mut()
             .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
-        #[cfg(any(target_os = "macos", test))]
-        return Ok(Self { url });
-        #[cfg(not(any(target_os = "macos", test)))]
-        {
-            drop(url);
-            Ok(Self {})
-        }
+        Ok(Self { url })
     }
 }
 
@@ -248,23 +226,18 @@ struct HttpResponse {
 }
 
 enum TransportError {
-    #[cfg(any(target_os = "macos", test))]
     Network,
-    #[cfg(any(target_os = "macos", test))]
     InvalidResponse,
 }
 
 impl TransportError {
     const fn into_mailbox_error(self) -> RemoteMailboxError {
         match self {
-            #[cfg(any(target_os = "macos", test))]
             Self::Network => RemoteMailboxError::Transport,
-            #[cfg(any(target_os = "macos", test))]
             Self::InvalidResponse => RemoteMailboxError::InvalidResponse,
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
     const fn into_token_error(self) -> TokenTransportError {
         match self {
             Self::Network => TokenTransportError::Transport,
@@ -273,13 +246,11 @@ impl TransportError {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 struct BoundedBody {
     bytes: Vec<u8>,
     limit: usize,
 }
 
-#[cfg(any(target_os = "macos", test))]
 const fn body_limit(status: u16, success_limit: usize) -> usize {
     if status >= 200 && status < 300 {
         success_limit
@@ -288,12 +259,10 @@ const fn body_limit(status: u16, success_limit: usize) -> usize {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 const fn reads_response_body(status: u16) -> bool {
     (status >= 200 && status < 300) || status == 403
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl BoundedBody {
     fn new(content_length: Option<usize>, limit: usize) -> Result<Self, TransportError> {
         if content_length.is_some_and(|length| length > limit) {
@@ -323,7 +292,6 @@ impl BoundedBody {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl Drop for BoundedBody {
     fn drop(&mut self) {
         // Wipe any residue left in the accumulator — e.g. a partially streamed
@@ -334,13 +302,11 @@ impl Drop for BoundedBody {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct ReqwestTransport {
     client: reqwest::Client,
     token: Zeroizing<String>,
 }
 
-#[cfg(target_os = "macos")]
 fn hardened_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .https_only(true)
@@ -353,7 +319,6 @@ fn hardened_client_builder() -> reqwest::ClientBuilder {
         .no_zstd()
 }
 
-#[cfg(target_os = "macos")]
 impl ReqwestTransport {
     fn new(token: Zeroizing<String>) -> Result<Self, RemoteMailboxError> {
         let client = hardened_client_builder()
@@ -363,7 +328,6 @@ impl ReqwestTransport {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Transport for ReqwestTransport {
     fn get(&self, request: Request, response_limit: usize) -> TransportFuture<'_> {
         Box::pin(async move {
@@ -400,7 +364,6 @@ impl Transport for ReqwestTransport {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn validate_access_token(token: &str) -> Result<(), RemoteMailboxError> {
     if token.is_empty() || token.len() > MAX_ACCESS_TOKEN_LEN || token.chars().any(char::is_control)
     {
@@ -625,7 +588,6 @@ fn error_reasons(bytes: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[cfg(any(target_os = "macos", test))]
 type PostFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;
 
@@ -640,22 +602,18 @@ type PostFuture<'a> =
 /// reqwest's own request and response buffers, and any intermediate buffer
 /// freed while a `Vec` or `String` grew during body assembly or form
 /// encoding — as on the bearer-token `GET` path.
-#[cfg(any(target_os = "macos", test))]
 pub struct GmailTokenTransport {
     transport: Box<dyn PostTransport>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl fmt::Debug for GmailTokenTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("GmailTokenTransport([REDACTED])")
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl GmailTokenTransport {
-    #[cfg(target_os = "macos")]
-    /// Creates a token transport with the hardened macOS client.
+    /// Creates a token transport with the hardened HTTP client.
     ///
     /// The transport is stateless beyond the client: each request carries its
     /// own client identity and secrets.
@@ -701,7 +659,6 @@ impl GmailTokenTransport {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl TokenTransport for GmailTokenTransport {
     fn exchange(
         &self,
@@ -755,17 +712,14 @@ impl TokenTransport for GmailTokenTransport {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 trait PostTransport: Send + Sync {
     fn post(&self, endpoint: &'static str, form: Zeroizing<String>) -> PostFuture<'_>;
 }
 
-#[cfg(target_os = "macos")]
 struct ReqwestPostTransport {
     client: reqwest::Client,
 }
 
-#[cfg(target_os = "macos")]
 impl ReqwestPostTransport {
     fn new() -> Result<Self, TokenTransportError> {
         let client = hardened_client_builder()
@@ -775,7 +729,6 @@ impl ReqwestPostTransport {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl PostTransport for ReqwestPostTransport {
     fn post(&self, endpoint: &'static str, form: Zeroizing<String>) -> PostFuture<'_> {
         Box::pin(async move {
@@ -811,7 +764,6 @@ impl PostTransport for ReqwestPostTransport {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn form_body(parameters: &[(&'static str, Zeroizing<String>)]) -> Zeroizing<String> {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     for (name, value) in parameters {
@@ -820,7 +772,6 @@ fn form_body(parameters: &[(&'static str, Zeroizing<String>)]) -> Zeroizing<Stri
     Zeroizing::new(serializer.finish())
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn deserialize_zeroizing<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -830,7 +781,6 @@ where
     Ok(Zeroizing::new(String::deserialize(deserializer)?))
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn deserialize_optional_zeroizing<'de, D>(
     deserializer: D,
 ) -> Result<Option<Zeroizing<String>>, D::Error>
@@ -840,7 +790,6 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.map(Zeroizing::new))
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportError> {
     #[derive(Deserialize)]
     #[expect(
@@ -893,7 +842,6 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
 /// front channel, cache, or IPC, where signature verification would be mandatory.
 /// It performs only a STRUCTURAL decode — the semantic `aud`/`iss`/`sub` checks
 /// live in the application layer, which holds the client identity as a typed value.
-#[cfg(any(target_os = "macos", test))]
 fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransportError> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -955,7 +903,6 @@ fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransport
 /// Decoding into caller-owned zeroizing storage wipes any partially decoded
 /// bytes on the error path too — `base64`'s own `decode` would drop its internal
 /// buffer unzeroized, potentially leaving account-identifying `sub` residue.
-#[cfg(any(target_os = "macos", test))]
 fn decode_b64url_segment(segment: &str) -> Result<Zeroizing<Vec<u8>>, TokenTransportError> {
     if segment.is_empty() {
         return Err(TokenTransportError::MalformedResponse);
@@ -968,7 +915,6 @@ fn decode_b64url_segment(segment: &str) -> Result<Zeroizing<Vec<u8>>, TokenTrans
     Ok(buffer)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn map_error_response(bytes: &[u8]) -> TokenTransportError {
     #[derive(Deserialize)]
     struct TokenErrorBody {
@@ -991,7 +937,6 @@ fn map_error_response(bytes: &[u8]) -> TokenTransportError {
 /// does not emit it for exchange or refresh, and if a provider ever did, the
 /// conservative `ProviderRejected` answer must not change. Every other
 /// well-formed revoke error matches the token-endpoint mapping.
-#[cfg(any(target_os = "macos", test))]
 fn map_revoke_error_response(bytes: &[u8]) -> TokenTransportError {
     #[derive(Deserialize)]
     struct RevokeErrorBody {
@@ -2170,7 +2115,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn validates_access_tokens_without_constructing_a_network_client() {
         use super::{MAX_ACCESS_TOKEN_LEN, validate_access_token};
