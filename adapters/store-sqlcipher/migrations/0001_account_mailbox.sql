@@ -1,9 +1,12 @@
 -- broker_subject is the encrypted account-identifying broker routing key:
 -- it is never logged or displayed, and it is not an OAuth credential.
+-- refresh_token is the account's OAuth refresh credential (ADR 0031). It is
+-- protected only by this database's encryption and is never logged.
 CREATE TABLE account_binding (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     account_id TEXT NOT NULL,
-    broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255))
+    broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)),
+    refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096))
 );
 
 CREATE TABLE messages (
