@@ -6,10 +6,8 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0028: drafts, outbox, and idempotent send
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-29
-- Owner intent: Approved; implementation is blocked pending independent
-  architecture/security review and the prerequisite slices below.
 
 ## Context
 
@@ -49,15 +47,22 @@ app-lock behavior, diagnostics, stable identifiers, and ambiguous-send recovery.
 ### Local-first drafts
 
 The domain layer adds `DraftId`, `OutboxItemId`, `GmailDraftId`,
-`RfcMessageId`, `DraftSyncState`, `ConflictCopy`, `PossibleDuplicateTombstone`,
-and the closed `OutboxState` set:
-`Queued`, `Preparing`, `Uploading`, `AwaitingReconciliation`, `Sent`,
+`RfcMessageId`, `MimeDigest`, `DraftCreateAttempt`, `DraftSyncState`,
+`ConflictCopy`, `PossibleDuplicateTombstone`, and the closed `OutboxState` set:
+`Queued`, `Preparing`, `DraftUploading`, `ReadyToSend`, `Sending`,
+`AwaitingDraftReconciliation`, `AwaitingSendReconciliation`, `Sent`,
 `RetryableFailure`, `PermanentFailure`, `Cancelled`, and
 `AbandonedAmbiguous`. `DraftId` and `OutboxItemId` are opaque local CSPRNG
 identifiers. `RfcMessageId` is generated exactly once when an item enters the
 outbox and is formatted as
 `<outbox-<OutboxItemId>@tersa.app>`; it is never regenerated during retry,
-restart, or reconciliation.
+restart, or reconciliation. `MimeDigest` is a redacted fixed-size digest of the
+complete transfer-encoded MIME bytes and never exposes content in debug or
+diagnostics. A `PreparedMimeRef` is an account-bound ADR-0030 `BlobRef` with
+non-evictable local-intent storage class. A `DraftCreateAttempt` is bound to one
+account/outbox item and persists the selected revision, prepared-MIME reference,
+stable message ID, MIME digest, encoded length, and closed phase `Prepared` or
+`Dispatched`; it contains no token and no plaintext MIME.
 
 `DraftStore` persists each account-scoped edit transactionally before the UI
 reports it saved. It stores the structured `RichComposeDocument`, recipients,
@@ -70,9 +75,10 @@ online and has `Modify` capability. A local dirty draft always wins over an
 unseen remote update: when its recorded remote revision differs from the
 current Gmail draft, the transport retains the local draft and creates a second
 local `ConflictCopy` from the remote content. It does not overwrite either
-version or silently upload a winner. `GmailDraftId` is replaceable but is the
-primary remote send/reconciliation handle; stable `DraftId` remains the local
-user route.
+version or silently upload a winner. Before a server ID exists, the durable
+`DraftCreateAttempt` is the sole remote-create route. Once adopted,
+`GmailDraftId` is replaceable but is the primary remote draft/send handle;
+stable `DraftId` remains the local user route.
 
 ### Rust-owned outbox and send transport
 
@@ -85,31 +91,57 @@ and submits intents only.
 Sending transitions are exact:
 
 1. `Queued` records the immutable `RfcMessageId` and selected draft revision.
-2. `Preparing` first creates or updates the Gmail draft and persists its
-   `GmailDraftId`, then reads encrypted draft/blob data, compiles the structured
-   document into plain text plus allowed HTML, and builds the complete MIME
-   source. A local-only queued draft never reaches `Uploading` without that
-   persisted primary handle.
-3. `Uploading` dispatches the Gmail request. Encoded MIME over 5 MiB uses
-   resumable upload; smaller messages may use simple upload. Every encoded MIME
-   source is capped at 20 MiB before dispatch.
-4. A confirmed provider result becomes `Sent` only after the resulting message
-   identity is persisted and History reconciliation observes it.
-5. A timeout, connection loss, crash after dispatch, or incomplete provider
-   response becomes `AwaitingReconciliation`, never an immediate retry.
-6. Reconciliation first resolves the persisted `GmailDraftId`, then uses the
-   stable RFC `Message-ID` only as a secondary correlation check in bounded
-   Gmail search/History. It marks `Sent` when one matching accepted message is
-   found; only a bounded, negative reconciliation moves the item to
-   `RetryableFailure`.
-7. User cancellation is allowed only before dispatch. Once a request may have
-   reached Gmail, cancellation waits for reconciliation. A permanently rejected
-   message becomes `PermanentFailure` with a redacted, closed reason.
-8. After an offline or provider-unavailable ambiguous outcome, the user may
-   explicitly acknowledge possible duplication. The coordinator then writes an
-   encrypted `PossibleDuplicateTombstone` and moves the item to terminal
-   `AbandonedAmbiguous`; it is never retried automatically or manually as the
-   same send.
+2. `Preparing` reads the encrypted selected revision and attachment `BlobRef`s,
+   compiles the structured document into plain text plus allowed HTML, and builds
+   the complete transfer-encoded MIME source deterministically. The 20 MiB cap is
+   checked before any provider request; an over-limit item remains an editable
+   local draft and creates no provider-side attempt. The bounded MIME bytes are
+   then committed through ADR 0030's `BlobCommitCoordinator` as a non-evictable
+   local-intent `PreparedMimeRef`; one account SQLCipher outbox transaction binds
+   that reference, its `MimeDigest`, encoded length, and selected revision before
+   the item can advance.
+3. `DraftUploading` reads and verifies those already persisted complete MIME
+   bytes by `PreparedMimeRef`. If a `GmailDraftId` exists, it updates only that
+   draft. For a local-only draft, the coordinator first persists a
+   `DraftCreateAttempt` in phase `Prepared`, then
+   atomically stamps it `Dispatched` immediately before invoking
+   `drafts.create`. Encoded MIME over 5 MiB uses resumable upload; smaller sources
+   may use simple upload. The provider receives no partial or unchecked MIME.
+4. A successful draft create/update persists the returned `GmailDraftId` and
+   remote revision, clears any pre-ID attempt, and moves to `ReadyToSend`. A
+   timeout, connection loss, crash after draft dispatch, or incomplete create
+   response moves to `AwaitingDraftReconciliation`; it never dispatches send or
+   a second create.
+5. Draft reconciliation with a persisted `GmailDraftId` fetches and validates
+   only that draft. A pre-ID create attempt instead performs a bounded
+   account-scoped drafts query for the exact stable RFC `Message-ID`, fetches the
+   candidates, and adopts a `GmailDraftId` only when exactly one draft carries
+   that exact message ID and matches the persisted attempt. Zero, multiple, or
+   invalid matches remain `AwaitingDraftReconciliation`; they never make the
+   same attempt retryable. The user may abandon the attempt with its encrypted
+   possible-duplicate tombstone, but no automatic or manual path issues a second
+   `drafts.create` for that outbox item.
+6. `ReadyToSend` is reachable only with a persisted `GmailDraftId` bound to the
+   immutable selected revision and prepared MIME digest. `Sending` dispatches
+   `drafts.send` by that ID; it never uploads a newly rebuilt MIME source.
+7. A confirmed or ambiguous send response persists every returned provider
+   identity when present and moves to `AwaitingSendReconciliation`, never
+   directly to `Sent` and never to an immediate retry.
+8. Send reconciliation resolves the persisted `GmailDraftId` first and uses the
+   stable RFC `Message-ID` only as secondary evidence in bounded Gmail
+   search/History. It marks `Sent` only when one matching accepted message is
+   found. A bounded negative result may move to `RetryableFailure` only when it
+   also proves the persisted Gmail draft remains unsent; otherwise the item
+   stays `AwaitingSendReconciliation`.
+9. User cancellation is allowed only before provider dispatch. Once a draft or
+   send request may have reached Gmail, cancellation waits for the corresponding
+   reconciliation. A permanently rejected message becomes `PermanentFailure`
+   with a redacted, closed reason.
+10. After an offline or provider-unavailable ambiguous outcome, the user may
+    explicitly acknowledge possible duplication. The coordinator then writes
+    an encrypted `PossibleDuplicateTombstone` and moves the item to terminal
+    `AbandonedAmbiguous`; it is never retried automatically or manually as the
+    same draft-create or send attempt.
 
 The MIME compiler creates `multipart/alternative` for plain text plus HTML,
 `multipart/related` when inline CID resources exist, and `multipart/mixed` when
@@ -133,8 +165,10 @@ revoke/delete and local account purge proceed.
 Native TextKit editor
   -> versioned compose document over the bridge
   -> DraftStore transaction in the account SQLCipher store
-  -> OutboxCoordinator + encrypted BlobRef reads
-  -> Gmail draft/send transport
+  -> deterministic complete MIME + 20 MiB check
+  -> ADR-0030 non-evictable PreparedMimeRef
+  -> durable pre-ID DraftCreateAttempt -> Gmail draft transport
+  -> persisted GmailDraftId -> Gmail send transport
   -> History/message-ID reconciliation
   -> closed state document back to Swift
 ```
@@ -144,15 +178,23 @@ Native TextKit editor
   them.
 - `OutboxStore` commits every transition atomically. A dropped future may leave
   an external outcome unknown but may not leave a partial local transition.
-- The persisted Gmail draft ID is the primary remote send handle. RFC
-  `Message-ID` is secondary correlation evidence and is never assumed to be a
-  provider idempotency key.
+- A pre-ID `DraftCreateAttempt` is the sole durable primary handle until exactly
+  one matching Gmail draft is adopted; after that, the persisted Gmail draft ID
+  is the primary remote send handle. RFC `Message-ID` is secondary correlation
+  evidence and is never assumed to be a provider idempotency key. No outbox item
+  may issue a second create while its pre-ID attempt is `Dispatched` or awaiting
+  reconciliation.
+- `PreparedMimeRef`, its digest, encoded length, selected revision, and every
+  attachment reference are account-bound non-evictable local intent. The bytes
+  sent to Gmail must verify against that persisted digest; they are never rebuilt
+  after dispatch from a newer draft revision.
 - The broker continues to provide only transient access tokens. Tokens, keys,
   raw MIME, recipients, subject, and message IDs never appear in diagnostics or
   bridge error text.
 - The 20 MiB limit measures the complete transfer-encoded MIME source, not
-  only attachment files. Over-limit items remain editable local drafts and are
-  never uploaded partially.
+  only attachment files, and is checked before `drafts.create`, `drafts.update`,
+  or send dispatch. Over-limit items remain editable local drafts and produce no
+  provider upload or partial remote draft.
 - Every draft/outbox C ABI addition must atomically update the exact expected
   export allowlist, export count, canonical header, Swift declarations, and
   positive/negative fixtures; no name-only allowance is valid.
@@ -163,10 +205,10 @@ Native TextKit editor
 | --- | --- |
 | `docs-only` | Define the importable bundle ADR and P28-security documentation before persistence/egress code. |
 | `policy-xtask` | Select bundle dependencies and add outbound, ABI, redaction, and no-direct-Swift-send guards only. |
-| `domain` | Add draft/outbox IDs, conflict/tombstone values, state machine, and redacted result types. |
-| `application` | Add draft/outbox ports and the sole transition/reconciliation coordinator. |
-| `adapter-rust — tersa-store-sqlcipher-macos` | Add account-scoped draft, outbox, tombstone, and atomic transition storage. |
-| `adapter-rust — tersa-gmail-rest-macos` | Add Gmail draft, send, search, and upload transport under `gmail.modify`. |
+| `domain` | Add draft/outbox IDs, MIME digest/prepared-reference and pre-ID attempt values, conflict/tombstone values, closed state machine, and redacted result types. |
+| `application` | Add draft/outbox ports and the sole prepare/draft-create/send/reconciliation transition coordinator. |
+| `adapter-rust — tersa-store-sqlcipher-macos` | Add account-scoped drafts, prepared-MIME references, pre-ID attempts, outbox/tombstone state, and atomic transition storage. |
+| `adapter-rust — tersa-gmail-rest-macos` | Add Gmail draft create/update, exact-Message-ID draft lookup, send, search, and upload transport under `gmail.modify`. |
 | `bridge-ffi` | Expose one bounded draft/outbox document and intent surface with atomic ABI fixtures. |
 | `swift-ui` | Replace the ephemeral composer with autosave, conflict, abandon, verified-export, and recovery UI. |
 | `token-broker` | Consume ADR 0027 capability/status only; add no credential operation. |
@@ -176,11 +218,12 @@ Native TextKit editor
 Blob/key/store failures leave the draft and outbox state durable and redacted;
 they never substitute an attachment with plaintext or silently drop it. A
 provider rejection classified as permanent does not destroy the draft. Ambiguous
-send results consume no automatic retry budget until reconciliation completes.
-If Gmail cannot be queried for reconciliation, the item remains
-`AwaitingReconciliation`; the user may not force a duplicate send from that
-state. They may only acknowledge `AbandonedAmbiguous`, which creates the
-possible-duplicate tombstone and permits account disconnect without a retry.
+draft-create/update or send results consume no automatic retry budget until their
+corresponding reconciliation completes. If Gmail cannot be queried, the item
+remains `AwaitingDraftReconciliation` or `AwaitingSendReconciliation` and the
+user may force neither a second create nor a send. They may only acknowledge
+`AbandonedAmbiguous`, which creates the possible-duplicate tombstone and permits
+account disconnect without reusing that outbox item's create or send attempt.
 
 Draft synchronization failures retain the local draft. A remote conflict makes
 two recoverable local copies, not an overwrite. An upload that exceeds the
@@ -191,15 +234,20 @@ obligations are explicitly resolved.
 ## Test and evidence gates
 
 - Domain/application tests cover every legal and illegal state transition,
-  `ConflictCopy`, primary draft-ID persistence, stable Message-ID generation,
-  tombstone creation, cancellation at every boundary, and no retry before
-  negative reconciliation.
-- Store crash-injection tests stop before/during/after each transition and
-  verify either the old or the complete new transaction state, never a partial
-  one.
+  `ConflictCopy`, stable Message-ID generation, `PreparedMimeRef` digest/length
+  binding, pre-ID `Prepared`/`Dispatched` persistence, no second create, separate
+  draft/send reconciliation, tombstone creation, cancellation at every boundary,
+  and no retry before negative send reconciliation.
+- Store/blob crash-injection tests stop before/during/after prepared-MIME
+  publication/binding, pre-ID attempt persistence and dispatch stamp, Gmail ID
+  adoption, ready-to-send transition, send dispatch, and tombstone commit. They
+  verify either the old or the complete new state, never a partial one, and never
+  evict prepared MIME local intent.
 - Adapter fakes cover Gmail draft replacement, conflict copy, simple/resumable
-  upload selection, encoded-size rejection, success with lost response, and
-  draft-ID-first/Message-ID-secondary reconciliation.
+  upload selection, encoded-size rejection before any request, successful and
+  ambiguous initial create, bounded exact-Message-ID draft adoption, zero/multiple
+  pre-ID matches remaining unresolved, no second create, send success with lost
+  response, and draft-ID-first/Message-ID-secondary send reconciliation.
 - Swift tests cover autosave, accessible conflict/send recovery, blocked
   disconnect, and no direct network send path.
 - A live Gmail send merge gate requires a separate owner authorization for one

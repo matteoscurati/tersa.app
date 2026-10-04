@@ -6,10 +6,8 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0029: SafeHtml, native rendering, and rich composition
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-29
-- Owner intent: Approved; implementation is blocked pending independent
-  architecture/security review and the prerequisite slices below.
 
 ## Context
 
@@ -60,10 +58,13 @@ code may start until these slices are independently reviewed:
 4. **P29-XPC/security:** amend `apple/project.yml` to declare/embed exactly
    `TersaContentWorker` and `TersaRemoteImageFetcher`, and amend `xtask`
    target/embed guards to validate those exact target/source/entitlement lists;
-   pin exact ABI/signing inventories; require every client connection to call
-   `NSXPCConnection.setCodeSigningRequirement` with the approved peer
-   requirement; forbid PID-based peer checks; and update the security data flow,
-   threat model, and signed hostile-content acceptance procedure.
+   pin exact ABI/signing inventories; require both peers to enable Hardened
+   Runtime and library validation and to exclude `get-task-allow`, debugger,
+   disabled-library-validation, and DYLD-environment exceptions; require every
+   client connection to call `NSXPCConnection.setCodeSigningRequirement` with
+   the approved peer requirement; forbid PID-based peer checks; and update the
+   security data flow, threat model, and signed hostile-content acceptance
+   procedure.
 5. **P29-fetch policy:** select and pin the isolated remote-image transport
    dependency/allowlist and its resolved-address SSRF test corpus before it can
    make a network request.
@@ -125,18 +126,23 @@ placeholders; revoking the rule restores the default block.
 
 `TersaRemoteImageFetcher` is a separate XPC peer with network authority only:
 it has no Keychain group, App Group, account-store, blob-store, or parser
-authority. It uses an ephemeral HTTPS-only transport with no cookies, referrer,
-persistent cache, proxy, or authentication. The main app and this peer use
-`NSXPCConnection.setCodeSigningRequirement` peer authentication; PID checks are
-forbidden. Before every initial connection and every redirect/hop it resolves the
-destination and rejects loopback, private, link-local, CGNAT, multicast, and
-unspecified addresses for every resolved address family; it rechecks the
-connected address rather than trusting only a hostname. It allows at most three
-redirects, 20 images, and 10 MiB aggregate image bytes per rendered message, and
-accepts only bounded image MIME data. Scripts, CSS URLs, forms, documents,
-downloads, and non-image MIME types are rejected. Accepted bytes return to the
-main process for encrypted `BlobRef` storage under ADR 0030; no WebKit, URL, or
-plaintext cache is used. The parser worker remains no-network.
+authority. It meets the same ADR-0024-equivalent release-blocking peer posture as
+`TersaContentWorker`: Hardened Runtime and library validation enabled;
+`get-task-allow`, debugger, disabled-library-validation, and DYLD-environment
+exceptions absent; and exact target/source/entitlement inventories checked
+before signing. It uses an ephemeral HTTPS-only transport with no cookies,
+referrer, persistent cache, proxy, or authentication. The main app and this peer
+use `NSXPCConnection.setCodeSigningRequirement` peer authentication; PID checks
+are forbidden. Before every initial connection and every redirect/hop it
+resolves the destination and rejects loopback, private, link-local, CGNAT,
+multicast, and unspecified addresses for every resolved address family; it
+rechecks the connected address rather than trusting only a hostname. It allows
+at most three redirects, 20 images, and 10 MiB aggregate image bytes per
+rendered message, and accepts only bounded image MIME data. Scripts, CSS URLs,
+forms, documents, downloads, and non-image MIME types are rejected.
+Accepted bytes return to the main process for encrypted `BlobRef` storage
+under ADR 0030; no WebKit, URL, or plaintext cache is used. The parser worker
+remains no-network.
 
 ### Native rich composition
 
@@ -203,25 +209,32 @@ DNS/address-policy or redirect failure leaves the image blocked. Permission
 records are per account and fail closed on corruption.
 
 The editor preserves the last valid structured draft on malformed paste or
-codec failure; it does not serialize a partial raw-HTML buffer. A stale worker
-reply, locked app, cancelled render request, or account switch is rejected by
-the caller's route/generation fence before it changes the view. A worker crash
-is a recoverable unavailable state, not a reason to run an in-process parser
-with wider privileges.
+codec failure; it does not serialize a partial raw-HTML buffer. A stale content-
+worker reply, locked app, cancelled render request, or account switch is rejected
+by the caller's route/generation fence before it changes the view. Every remote-
+image-fetcher completion must match the current exact `AccountId`, message/render
+route, generation, cancellation state, unlocked state, and still-effective
+remote-content permission for the exact parsed sender before image publication
+or encrypted `BlobRef` persistence. Account switch or permission revocation
+rejects the completion and persists neither bytes nor a blob route. A worker or
+fetcher crash is a recoverable unavailable state, not a reason to parse or fetch
+in-process with wider privileges.
 
 ## Test and evidence gates
 
 - Property and fuzz tests cover MIME framing, transfer encodings, nesting,
   node/byte/time limits, malformed HTML, link/image schemes, worker wire, and
   the in-process validating deserializer's rejection of every invalid model.
-- XPC/signing tests prove the content worker's no-network/no-Keychain/no-App
-  Group/no-store authority plus its hardened-runtime, library-validation, and
-  forbidden-debug-entitlement posture, exact code-signing requirement peer
-  authentication, and absence of PID-based checks.
+- XPC/signing tests prove both peers' hardened-runtime, library-validation,
+  forbidden-debug/DYLD-entitlement posture, exact code-signing requirement peer
+  authentication, and absence of PID-based checks. They separately prove the
+  content worker's no-network/no-Keychain/no-App Group/no-store authority and the
+  fetcher's network-only authority.
 - Remote-fetcher tests cover every resolved address on every redirect/hop,
   loopback/private/link-local/CGNAT/multicast denial, image-count and aggregate
-  byte caps, code-signing-requirement peer authentication, and no
-  parser/store/Keychain authority.
+  byte caps, and no parser/store/Keychain authority. Completion tests reject
+  mismatched account/route/generation, cancellation, lock, account switch, and
+  sender-permission revocation before image publication or `BlobRef` persistence.
 - Native renderer tests cover each closed tree node, no automatic request,
   VoiceOver, Full Keyboard Access, link confirmation, and no WebKit linkage.
 - Editor tests cover rich formatting, IME, paste, undo/redo, selection,
