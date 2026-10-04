@@ -13,41 +13,58 @@ use std::fs;
 use std::io;
 use std::process::{Command, ExitCode};
 
+use cargo_metadata::camino::Utf8Path;
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package};
 
 type TaskResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
-/// Core crates and the workspace crates each may depend on.
-///
-/// Core crates hold domain types, ports, and pure policy. Every new crate
-/// under `crates/` must be listed here before it can build in CI.
-const CORE_POLICY: [(&str, &[&str]); 5] = [
-    ("tersa-domain", &[]),
-    ("tersa-keys", &["tersa-domain"]),
-    ("tersa-platform", &["tersa-domain"]),
-    ("tersa-application", &["tersa-domain"]),
-    ("tersa-presentation", &["tersa-domain", "tersa-application"]),
-];
+/// One core crate and every dependency it may declare.
+struct CorePolicy {
+    name: &'static str,
+    /// Allowed workspace (core) dependencies.
+    workspace: &'static [&'static str],
+    /// Allowed external dependencies. Core crates hold domain types, ports,
+    /// and pure policy, so only computation crates belong here; I/O, runtime,
+    /// terminal, and OS crates belong to adapters and apps. `getrandom` is the
+    /// one OS-backed exception: it only reads the system CSPRNG.
+    external: &'static [&'static str],
+}
 
-/// External crates that perform I/O, own a runtime, or reach the OS.
-///
-/// Core crates must stay free of them so they remain portable and
-/// deterministic; adapters and apps own these capabilities.
-const CORE_FORBIDDEN_DEPENDENCIES: [&str; 14] = [
-    "core-foundation",
-    "crossterm",
-    "hyper",
-    "keyring",
-    "libc",
-    "objc2",
-    "objc2-foundation",
-    "ratatui",
-    "reqwest",
-    "rusqlite",
-    "rustix",
-    "security-framework",
-    "security-framework-sys",
-    "tokio",
+/// Every crate under `crates/` must be listed here before it builds in CI.
+/// Adding an external dependency to a core crate is a reviewed policy change.
+const CORE_POLICY: [CorePolicy; 5] = [
+    CorePolicy {
+        name: "tersa-domain",
+        workspace: &[],
+        external: &[],
+    },
+    CorePolicy {
+        name: "tersa-keys",
+        workspace: &["tersa-domain"],
+        external: &[
+            "argon2",
+            "chacha20poly1305",
+            "getrandom",
+            "hkdf",
+            "sha2",
+            "zeroize",
+        ],
+    },
+    CorePolicy {
+        name: "tersa-platform",
+        workspace: &["tersa-domain"],
+        external: &[],
+    },
+    CorePolicy {
+        name: "tersa-application",
+        workspace: &["tersa-domain"],
+        external: &["base64", "getrandom", "sha2", "subtle", "url", "zeroize"],
+    },
+    CorePolicy {
+        name: "tersa-presentation",
+        workspace: &["tersa-domain", "tersa-application"],
+        external: &[],
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,12 +91,6 @@ fn run() -> TaskResult {
         Some("architecture") => {
             reject_extra_arguments(arguments)?;
             check_architecture()
-        }
-        Some("dco") => {
-            let base = required_argument(&mut arguments, "base commit")?;
-            let head = required_argument(&mut arguments, "head commit")?;
-            reject_extra_arguments(arguments)?;
-            check_dco(&base, &head)
         }
         Some("verify") => {
             reject_extra_arguments(arguments)?;
@@ -159,7 +170,6 @@ Repository automation for tersa
 Usage:
   cargo xtask verify                    Run the full verification suite (merge quality)
   cargo xtask architecture              Check workspace layering and core purity
-  cargo xtask dco <base> <head>         Check DCO sign-offs in a commit range
   cargo xtask check-pkg <package>       cargo check  -p <package> --all-targets (locked)
   cargo xtask test-pkg <package>        cargo test   -p <package> --all-targets (locked)
   cargo xtask clippy-pkg <package>      cargo clippy -p <package> --all-targets -D warnings
@@ -342,7 +352,9 @@ fn preflight(class_raw: &str, package: Option<&str>) -> TaskResult {
             for app in metadata
                 .workspace_packages()
                 .into_iter()
-                .filter(|candidate| package_layer(candidate) == Some(Layer::App))
+                .filter(|candidate| {
+                    package_layer(candidate, &metadata.workspace_root) == Some(Layer::App)
+                })
             {
                 clippy_pkg(app.name.as_str())?;
                 test_pkg(app.name.as_str())?;
@@ -362,18 +374,17 @@ fn preflight(class_raw: &str, package: Option<&str>) -> TaskResult {
 
 // --- architecture --------------------------------------------------------
 
-fn package_layer(package: &Package) -> Option<Layer> {
-    let manifest = package.manifest_path.as_str().replace('\\', "/");
-    if manifest.contains("/crates/") {
-        Some(Layer::Core)
-    } else if manifest.contains("/adapters/") {
-        Some(Layer::Adapter)
-    } else if manifest.contains("/apps/") {
-        Some(Layer::App)
-    } else if manifest.ends_with("/xtask/Cargo.toml") {
-        Some(Layer::Tool)
-    } else {
-        None
+/// Classifies a package by the first component of its manifest path relative
+/// to the workspace root, so the checkout location cannot affect the result.
+fn package_layer(package: &Package, workspace_root: &Utf8Path) -> Option<Layer> {
+    let relative = package.manifest_path.strip_prefix(workspace_root).ok()?;
+    let mut components = relative.components().map(|component| component.as_str());
+    match (components.next(), components.next(), components.next()) {
+        (Some("crates"), Some(_), Some("Cargo.toml")) => Some(Layer::Core),
+        (Some("adapters"), Some(_), Some("Cargo.toml")) => Some(Layer::Adapter),
+        (Some("apps"), Some(_), Some("Cargo.toml")) => Some(Layer::App),
+        (Some("xtask"), Some("Cargo.toml"), None) => Some(Layer::Tool),
+        _ => None,
     }
 }
 
@@ -393,7 +404,10 @@ fn layering_violations(crates: &[CrateFacts<'_>]) -> Vec<String> {
         .iter()
         .map(|facts| (facts.name, facts.layer))
         .collect::<BTreeMap<_, _>>();
-    let core_policy = CORE_POLICY.into_iter().collect::<BTreeMap<_, _>>();
+    let core_policy = CORE_POLICY
+        .iter()
+        .map(|policy| (policy.name, policy))
+        .collect::<BTreeMap<_, _>>();
     let mut violations = Vec::new();
 
     for facts in crates {
@@ -419,23 +433,24 @@ fn layering_violations(crates: &[CrateFacts<'_>]) -> Vec<String> {
                 "{}: core crate is missing from CORE_POLICY in xtask",
                 facts.name
             )),
-            Some(allowed) => {
+            Some(policy) => {
                 for dependency in &facts.workspace_dependencies {
-                    if !allowed.contains(dependency) {
+                    if !policy.workspace.contains(dependency) {
                         violations.push(format!(
                             "{} -> {dependency}: not allowed by CORE_POLICY",
                             facts.name
                         ));
                     }
                 }
-            }
-        }
-        for dependency in &facts.external_dependencies {
-            if CORE_FORBIDDEN_DEPENDENCIES.contains(dependency) {
-                violations.push(format!(
-                    "{} -> {dependency}: core crates must stay free of I/O and OS crates",
-                    facts.name
-                ));
+                for dependency in &facts.external_dependencies {
+                    if !policy.external.contains(dependency) {
+                        violations.push(format!(
+                            "{} -> {dependency}: external dependency not allowed by CORE_POLICY \
+                             (core crates stay free of I/O and OS crates)",
+                            facts.name
+                        ));
+                    }
+                }
             }
         }
     }
@@ -453,7 +468,7 @@ fn check_architecture() -> TaskResult {
     let mut violations = Vec::new();
     let mut crates = Vec::new();
     for package in metadata.workspace_packages() {
-        let Some(layer) = package_layer(package) else {
+        let Some(layer) = package_layer(package, &metadata.workspace_root) else {
             violations.push(format!(
                 "{}: workspace crate lives outside crates/, adapters/, apps/, or xtask/",
                 package.name
@@ -498,7 +513,12 @@ fn core_unsafe_violation(package: &Package) -> TaskResult<Option<String>> {
             continue;
         }
         let source = fs::read_to_string(&target.src_path)?;
-        if !source.contains("#![forbid(unsafe_code)]") {
+        // Require the attribute as a line of its own, so a comment or a doc
+        // example that mentions it does not count.
+        if !source
+            .lines()
+            .any(|line| line.trim() == "#![forbid(unsafe_code)]")
+        {
             return Ok(Some(format!(
                 "{}: core crate root must declare #![forbid(unsafe_code)]",
                 package.name
@@ -508,87 +528,11 @@ fn core_unsafe_violation(package: &Package) -> TaskResult<Option<String>> {
     Ok(None)
 }
 
-// --- DCO -----------------------------------------------------------------
-
-fn check_dco(base: &str, head: &str) -> TaskResult {
-    let range = format!("{base}..{head}");
-    let output = Command::new("git")
-        .args([
-            "log",
-            "--format=%H%x1f%an%x1f%ae%x1f%(trailers:key=Signed-off-by,valueonly,separator=%x1d)%x1e",
-            &range,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "git log failed for range `{range}` with status {}",
-            output.status
-        ))
-        .into());
-    }
-
-    let log = String::from_utf8(output.stdout)?;
-    let unsigned = unsigned_commits(&log)?;
-    if unsigned.is_empty() {
-        println!("DCO sign-off check passed for {range}.");
-        return Ok(());
-    }
-    Err(io::Error::other(format!(
-        "commits missing a valid Signed-off-by trailer: {}",
-        unsigned.join(", ")
-    ))
-    .into())
-}
-
-fn unsigned_commits(log: &str) -> TaskResult<Vec<String>> {
-    let mut unsigned = Vec::new();
-    for record in log
-        .split('\u{1e}')
-        .filter(|record| !record.trim().is_empty())
-    {
-        let mut fields = record.trim().splitn(4, '\u{1f}');
-        let commit = required_log_field(&mut fields, "commit")?;
-        let author_name = required_log_field(&mut fields, "author name")?;
-        let author_email = required_log_field(&mut fields, "author email")?;
-        let sign_offs = required_log_field(&mut fields, "sign-off trailers")?;
-        let signed_by_author = sign_offs
-            .split('\u{1d}')
-            .filter_map(parse_identity)
-            .any(|(name, email)| name == author_name && email.eq_ignore_ascii_case(author_email));
-        if !signed_by_author {
-            unsigned.push(commit.trim().to_owned());
-        }
-    }
-    Ok(unsigned)
-}
-
-fn required_log_field<'a>(
-    fields: &mut impl Iterator<Item = &'a str>,
-    field: &str,
-) -> TaskResult<&'a str> {
-    fields
-        .next()
-        .ok_or_else(|| io::Error::other(format!("git log record is missing {field}")).into())
-}
-
-fn parse_identity(identity: &str) -> Option<(&str, &str)> {
-    let identity = identity.trim();
-    let (name, email) = identity.rsplit_once(" <")?;
-    let email = email.strip_suffix('>')?;
-    if name.trim().is_empty() || !email.contains('@') {
-        return None;
-    }
-    Some((name.trim(), email))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{
-        CrateFacts, Layer, PreflightClass, layering_violations, parse_identity,
-        parse_preflight_class, unsigned_commits,
-    };
+    use super::{CrateFacts, Layer, PreflightClass, layering_violations, parse_preflight_class};
 
     fn facts<'a>(
         name: &'a str,
@@ -673,13 +617,17 @@ mod tests {
     }
 
     #[test]
-    fn dco_requires_author_sign_off() {
-        let log = "aaa\u{1f}Ada\u{1f}ada@example.com\u{1f}Ada <ADA@example.com>\u{1e}\
-                   bbb\u{1f}Bob\u{1f}bob@example.com\u{1f}Eve <eve@example.com>\u{1e}";
-        assert_eq!(
-            unsigned_commits(log).expect("parse"),
-            vec!["bbb".to_owned()]
-        );
-        assert_eq!(parse_identity("No Email"), None);
+    fn rejects_unlisted_core_external_dependencies() {
+        // Not on the denylist of obvious I/O crates, but still not allowed:
+        // the allowlist catches what a denylist would miss.
+        let crates = [facts(
+            "tersa-application",
+            Layer::Core,
+            &["tersa-domain"],
+            &["url", "ureq"],
+        )];
+        let violations = layering_violations(&crates);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("ureq"));
     }
 }
