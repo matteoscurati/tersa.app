@@ -51,6 +51,8 @@ url = "2.5.8"
 zeroize = "1.9.0"
 
 [workspace.lints.rust]
+# Adapters that need FFI deny-and-expect it per call site with a reason.
+unsafe_code = "deny"
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
 redundant_imports = "warn"

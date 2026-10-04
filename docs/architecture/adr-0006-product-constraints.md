@@ -10,7 +10,9 @@ live in ADR 0031. The M0/Slint/Dioxus diagnostic gate program is retired by
 [ADR-0025](adr-0025-retire-m0-diagnostic-program.md); see the
 [M0 historical summary](../history/m0-summary.md). The macOS acceptance and
 Apple distribution protocols this ADR once pointed to were removed at the
-`pre-tui-pivot` tag.
+`pre-tui-pivot` tag. The "Gate governance" and "Consequences" sections below,
+including the macOS Phase 1 carve-out and the M1 blocking rule, are historical
+and no longer govern work.
 
 ## Decisions
 

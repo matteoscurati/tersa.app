@@ -66,10 +66,14 @@ def unsigned_commits(log: str) -> list[str]:
     return unsigned
 
 
-def git_log(base: str, head: str) -> str:
+def git_log(base: str, head: str, no_merges: bool = False) -> str:
     """Read author and sign-off metadata for ``base..head``."""
+    command = ["git", "log", f"--format={LOG_FORMAT}"]
+    if no_merges:
+        command.append("--no-merges")
+    command.append(f"{base}..{head}")
     result = subprocess.run(
-        ["git", "log", f"--format={LOG_FORMAT}", f"{base}..{head}"],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -84,10 +88,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check DCO sign-offs in a commit range.")
     parser.add_argument("base", help="Exclusive base commit")
     parser.add_argument("head", help="Inclusive head commit")
+    parser.add_argument(
+        "--no-merges",
+        action="store_true",
+        help="Skip merge commits, which GitHub creates without a sign-off",
+    )
     arguments = parser.parse_args()
 
     try:
-        unsigned = unsigned_commits(git_log(arguments.base, arguments.head))
+        unsigned = unsigned_commits(
+            git_log(arguments.base, arguments.head, arguments.no_merges)
+        )
     except (DcoError, UnicodeError) as error:
         print(f"DCO check failed closed: {error}", file=sys.stderr)
         return 1
