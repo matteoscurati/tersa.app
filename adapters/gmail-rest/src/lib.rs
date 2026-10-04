@@ -683,13 +683,9 @@ impl TokenTransport for GmailTokenTransport {
     /// desired end state; any other status, an unparsable error body, or a
     /// network failure resolves to a [`TokenTransportError`] without provider
     /// data.
-    /// The ADR-0023 disconnect composition treats revocation as best-effort and
-    /// still deletes the local token when this call fails. The connect flow's
-    /// cancel fences are NOT equivalent to disconnect: they store nothing (or
-    /// delete the just-stored token first), so a permanently-failed revoke on
-    /// that path leaves a live token at Google with no in-app remedy — the
-    /// fences therefore retry once (see `revoke_best_effort` in
-    /// `tersa-oauth-sync-macos`) before giving up.
+    /// Account removal treats revocation as best-effort and still deletes the
+    /// local token and data when this call fails, then tells the user how to
+    /// revoke access manually.
     fn revoke<'a>(
         &'a self,
         token: &'a Zeroizing<String>,
