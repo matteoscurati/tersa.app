@@ -38,7 +38,7 @@ treating the main build
 as complete:
 
 ```sh
-cargo xtask dco HEAD^ HEAD
+python3 scripts/check-dco.py HEAD^ HEAD
 ```
 
 If a transport error makes an otherwise certified published commit

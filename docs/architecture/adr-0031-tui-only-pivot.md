@@ -71,15 +71,36 @@ Same-user code that can read the keyring item, or capture the passphrase, can
 decrypt local data. Linux Secret Service has no per-application access
 control. These residuals replace the ADR 0024 process-isolation claim.
 
+### TLS and native crypto
+
+- macOS uses the system TLS (Security.framework through `native-tls`) and
+  CommonCrypto for SQLCipher.
+- Linux release binaries statically link one vendored OpenSSL, shared by
+  `reqwest` (`native-tls-vendored`) and SQLCipher
+  (`bundled-sqlcipher-vendored-openssl`), so they do not depend on the host's
+  libssl or libcrypto. rustls was considered and rejected because SQLCipher
+  needs OpenSSL on Linux anyway; one crypto library keeps the binary smaller.
+- Consequence: the vendored OpenSSL receives no operating-system security
+  updates. Every OpenSSL advisory that affects the linked version requires
+  bumping `openssl-src` and publishing new Linux binaries; `cargo audit` and
+  release checks must track it.
+
 ### Hostile content in a terminal
 
-- Every provider-derived string is sanitized before it reaches the terminal:
-  C0 controls except newline and tab, C1 controls, ESC, DEL, and bidirectional
-  override and isolate characters are removed or replaced. The TUI renders
-  only the sanitized type.
+- Every provider-derived string is sanitized before it reaches the terminal.
+  The removal set is: C0 controls except newline and tab (including ESC, which
+  starts ANSI, OSC, and DCS sequences), DEL, C1 controls (U+0080–U+009F);
+  bidirectional embeddings, overrides, and isolates (U+202A–U+202E,
+  U+2066–U+2069) and marks (U+200E, U+200F, U+061C); zero-width and invisible
+  formatting characters (U+200B–U+200D, U+2060, U+FEFF); and the Tag block
+  (U+E0000–U+E007F). The TUI renders only the sanitized type.
 - HTML bodies are converted to text in Rust with size and depth limits. No
   remote resource is ever fetched. Links become a numbered list and open only
-  on an explicit keypress after the URL is shown; tersa never emits OSC 8.
+  on an explicit keypress after the URL is shown.
+- Outbound, tersa never writes OSC 8 hyperlinks, OSC 52 clipboard writes, or
+  window-title sequences. A future "copy" action uses the OS clipboard command
+  (`pbcopy`, `wl-copy`, or `xclip`) through an argument vector, only on an
+  explicit keypress.
 - Attachments are saved with sanitized names and never opened automatically.
 - MIME parsing, HTML-to-text conversion, and the sanitizer get fuzz targets.
 
@@ -89,8 +110,11 @@ control. These residuals replace the ADR 0024 process-isolation claim.
   rustdoc, and a layering check) on Linux and macOS, plus `cargo deny`,
   `cargo audit`, feature powerset checks, and `typos`, are the merge checks.
 - The layering check enforces only durable rules: core crates under
-  `crates/` depend only on allowed core crates, forbid `unsafe`, and stay free
-  of I/O and OS crates; nothing depends on `apps/` or `xtask`.
+  `crates/` forbid `unsafe` and depend only on the core and external crates
+  allowlisted for each of them (computation crates only, plus `getrandom` for
+  the system CSPRNG); nothing depends on `apps/` or `xtask`.
+- DCO sign-offs are checked on pull requests, in the merge queue, and on
+  pushes to `main`.
 - ADRs are written only for decisions that change architecture, security
   boundaries, or the data model.
 
@@ -100,6 +124,8 @@ control. These residuals replace the ADR 0024 process-isolation claim.
 | --- | --- |
 | 0013 macOS-first phasing | Superseded. |
 | 0014 macOS production dependency boundaries | Superseded by the layering rules above and `cargo deny`. |
+| 0016 Gmail REST adapter | Amended: renamed `tersa-gmail-rest` and made portable (macOS and Linux). |
+| 0017 production macOS account store | Amended: renamed `tersa-store-sqlcipher` and made portable (macOS and Linux). |
 | 0019 macOS key provisioning and read-only CLI | Amended: HKDF framing retained; Keychain access groups, App Group layout, and CLI authority split superseded. |
 | 0020 macOS production UI toolkit | Superseded. |
 | 0021 macOS UI vertical slice | Superseded. |
@@ -134,8 +160,9 @@ ADR changes the budget.
 - `apple/`, the Apple bridge, the mailbox-sync and token-broker FFI crates,
   Apple CI lanes, macOS acceptance and distribution protocols, and their
   evidence are removed. They remain available at the `pre-tui-pivot` tag.
-- The `-macos` adapters stay in the workspace until T1 makes them portable
-  and renames them.
+- The Gmail and SQLCipher adapters are renamed and made portable in T1a;
+  `tersa-keychain-macos`, `tersa-oauth-sync-macos`, and `tersa-cli-macos`
+  remain macOS-only until T1d replaces them.
 - PR 33b, Apple signing campaigns, and the Phase 1 item 7 and item 8 gates are
   closed as not applicable.
 - On macOS, keyring access control is tied to the binary's code signature.

@@ -19,11 +19,15 @@ Nothing may depend on an app or on `xtask`.
 
 Core crates hold domain types, ports, and pure policy. They must:
 
-- declare `#![forbid(unsafe_code)]` at the crate root;
-- never depend on I/O, runtime, terminal, or OS crates (the list is
-  `CORE_FORBIDDEN_DEPENDENCIES` in `xtask/src/main.rs`);
-- be added to `CORE_POLICY` with their allowed core dependencies before they
-  build in CI.
+- declare `#![forbid(unsafe_code)]` on a line of its own at the crate root;
+- be listed in `CORE_POLICY` (`xtask/src/main.rs`) with an explicit allowlist
+  of both the core crates and the external crates they may depend on.
+
+The external allowlist admits only computation crates. I/O, runtime,
+terminal, and OS crates belong to adapters and apps; `getrandom` is the single
+OS-backed exception because it only reads the system CSPRNG. The check covers
+direct dependencies, so adding an external crate to a core crate is always a
+visible, reviewed change to `CORE_POLICY`.
 
 `cargo xtask architecture` enforces these rules; `cargo xtask verify` runs it
 first.

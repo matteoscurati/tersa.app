@@ -44,9 +44,10 @@ Unknown crates or paths: ask the lead.
 
 ## Layering rules (`cargo xtask architecture`)
 
-- Core crates depend only on the core crates allowed by `CORE_POLICY` in
-  `xtask/src/main.rs`, declare `#![forbid(unsafe_code)]`, and never depend on
-  I/O or OS crates (`tokio`, `reqwest`, `rusqlite`, `keyring`, `ratatui`, ...).
+- Core crates declare `#![forbid(unsafe_code)]` and depend only on the core
+  and external crates allowlisted for them in `CORE_POLICY`
+  (`xtask/src/main.rs`); I/O, runtime, terminal, and OS crates are never
+  allowlisted.
 - Adapters may depend on core crates and other adapters, never on apps.
 - Nothing depends on `apps/` or `xtask`.
 

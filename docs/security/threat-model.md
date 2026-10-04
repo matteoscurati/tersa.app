@@ -55,14 +55,15 @@ unlock, passphrase, or Google credentials.
 | OAuth interception or callback forgery | Authorization Code with PKCE S256, exact state and redirect validation, IPv4 loopback listener bound to an ephemeral port, single-use session | Rust loopback listener is planned (T1) |
 | Token or key disclosure on a stolen device | Root key in OS keyring or passphrase-wrapped; refresh tokens inside SQLCipher; owner-only file modes | Planned (T1). Keyring items are readable by same-user code once unlocked |
 | Same-user malware | None beyond OS keyring prompts on macOS | **Accepted residual** (ADR 0031): no process isolation between token and root key; Linux Secret Service has no per-app ACL. Passphrase mode narrows at-rest exposure only |
-| Terminal escape injection (ANSI/OSC/DCS, title or clipboard writes, cursor tricks) | All provider-derived strings pass a sanitizer that strips C0 except newline/tab, C1, ESC, DEL; TUI renders only the sanitized type; fuzzing | Planned (T2) |
-| Bidirectional-text and homoglyph spoofing | Bidi override and isolate characters removed; sender address shown alongside display name | Homoglyphs remain a residual |
+| Terminal escape injection (ANSI/OSC/DCS, title or clipboard writes, cursor tricks) | All provider-derived strings pass a sanitizer that strips C0 except newline/tab, C1, ESC, DEL; TUI renders only the sanitized type; tersa itself never emits OSC 8, OSC 52, or title sequences; fuzzing | Planned (T2) |
+| Bidirectional-text, invisible-character, and homoglyph spoofing | Bidi embeddings, overrides, isolates, and marks; zero-width and invisible formatting characters; and Tag-block characters are removed; sender address shown alongside display name | Homoglyphs and confusable scripts remain a residual |
 | Malicious HTML, tracking pixels | HTML converted to text with size and depth limits; no remote resource is ever fetched; links listed and opened only on explicit keypress after showing the URL | Planned (T2) |
 | Malicious attachment or decompression bomb | Fetch on demand, size limits, sanitized filenames, never auto-opened | Planned (T5–T6) |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, client-generated Message-ID, reconciliation after ambiguous outcomes | Planned (T4–T5) |
 | Cross-account access | `(account_id, gmail_id)` identity, per-account database and key | Planned (T3) |
 | Composition temp-file exposure | Owner-only directory, removal after editor exit | Plaintext exists on disk while the editor runs; editor swap/backup files are outside tersa's control |
 | Dependency or release compromise | `Cargo.lock`, `cargo deny`, `cargo audit`, DCO, review, published checksums | Upstream compromise and reproducibility gaps remain |
+| Stale vendored OpenSSL on Linux | Linux binaries statically link `openssl-src`; `cargo audit` on every PR; an OpenSSL advisory triggers a dependency bump and a new release | Users stay exposed until they update tersa; the OS cannot patch it |
 
 ## Explicit exclusions
 
