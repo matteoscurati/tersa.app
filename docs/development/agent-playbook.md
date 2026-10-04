@@ -32,8 +32,10 @@ Unknown crates or paths: ask the lead.
 | `crates/platform` | `tersa-platform` | core |
 | `crates/application` | `tersa-application` | core |
 | `crates/presentation` | `tersa-presentation` | core |
+| `crates/keys` | `tersa-keys` | core |
 | `adapters/gmail-rest` | `tersa-gmail-rest` | adapter |
 | `adapters/keychain-macos` | `tersa-keychain-macos` | adapter (replaced in T1) |
+| `adapters/vault` | `tersa-vault` | adapter |
 | `adapters/oauth-sync-macos` | `tersa-oauth-sync-macos` | adapter (becomes `sync-runtime` in T1) |
 | `adapters/store-sqlcipher` | `tersa-store-sqlcipher` | adapter |
 | `adapters/token-broker-core` | `tersa-token-broker-core` | adapter (in-process token service in T1) |

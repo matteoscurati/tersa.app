@@ -32,11 +32,23 @@ struct CorePolicy {
 
 /// Every crate under `crates/` must be listed here before it builds in CI.
 /// Adding an external dependency to a core crate is a reviewed policy change.
-const CORE_POLICY: [CorePolicy; 4] = [
+const CORE_POLICY: [CorePolicy; 5] = [
     CorePolicy {
         name: "tersa-domain",
         workspace: &[],
         external: &[],
+    },
+    CorePolicy {
+        name: "tersa-keys",
+        workspace: &["tersa-domain"],
+        external: &[
+            "argon2",
+            "chacha20poly1305",
+            "getrandom",
+            "hkdf",
+            "sha2",
+            "zeroize",
+        ],
     },
     CorePolicy {
         name: "tersa-platform",
