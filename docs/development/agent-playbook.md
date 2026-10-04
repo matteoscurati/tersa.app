@@ -29,17 +29,15 @@ Unknown crates or paths: ask the lead.
 | Path | Package | Layer |
 |------|---------|-------|
 | `crates/domain` | `tersa-domain` | core |
-| `crates/platform` | `tersa-platform` | core |
 | `crates/application` | `tersa-application` | core |
 | `crates/presentation` | `tersa-presentation` | core |
 | `crates/keys` | `tersa-keys` | core |
 | `adapters/gmail-rest` | `tersa-gmail-rest` | adapter |
-| `adapters/keychain-macos` | `tersa-keychain-macos` | adapter (replaced in T1) |
-| `adapters/vault` | `tersa-vault` | adapter |
-| `adapters/oauth-sync-macos` | `tersa-oauth-sync-macos` | adapter (becomes `sync-runtime` in T1) |
 | `adapters/store-sqlcipher` | `tersa-store-sqlcipher` | adapter |
-| `adapters/token-broker-core` | `tersa-token-broker-core` | adapter (in-process token service in T1) |
-| `apps/cli-macos` | `tersa-cli-macos` | app (absorbed into `apps/tersa` in T1) |
+| `adapters/vault` | `tersa-vault` | adapter |
+| `adapters/token-broker-core` | `tersa-token-broker-core` | adapter |
+| `adapters/sync-runtime` | `tersa-sync-runtime` | adapter |
+| `apps/tersa` | `tersa` | app |
 | `xtask` | `xtask` | tool |
 
 ## Layering rules (`cargo xtask architecture`)

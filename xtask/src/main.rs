@@ -21,10 +21,9 @@ type TaskResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 ///
 /// Core crates hold domain types, ports, and pure policy. Every new crate
 /// under `crates/` must be listed here before it can build in CI.
-const CORE_POLICY: [(&str, &[&str]); 5] = [
+const CORE_POLICY: [(&str, &[&str]); 4] = [
     ("tersa-domain", &[]),
     ("tersa-keys", &["tersa-domain"]),
-    ("tersa-platform", &["tersa-domain"]),
     ("tersa-application", &["tersa-domain"]),
     ("tersa-presentation", &["tersa-domain", "tersa-application"]),
 ];
