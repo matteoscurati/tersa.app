@@ -3,8 +3,8 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 [package]
-name = "tersa-store-sqlcipher-macos"
-description = "macOS-only account-scoped SQLCipher mailbox store for tersa.app"
+name = "tersa-store-sqlcipher"
+description = "Account-scoped SQLCipher mailbox store for tersa"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,10 +17,14 @@ publish = false
 tersa-application = { workspace = true }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
 rusqlite = { workspace = true, default-features = false, features = ["bundled-sqlcipher"] }
 rustix.workspace = true
 zeroize.workspace = true
+
+# macOS links SQLCipher against CommonCrypto; Linux builds a static OpenSSL so
+# release binaries do not depend on the host's libcrypto.
+[target.'cfg(target_os = "linux")'.dependencies]
+rusqlite = { workspace = true, default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [lints]
 workspace = true

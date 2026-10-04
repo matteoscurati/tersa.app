@@ -63,6 +63,7 @@ unlock, passphrase, or Google credentials.
 | Cross-account access | `(account_id, gmail_id)` identity, per-account database and key | Planned (T3) |
 | Composition temp-file exposure | Owner-only directory, removal after editor exit | Plaintext exists on disk while the editor runs; editor swap/backup files are outside tersa's control |
 | Dependency or release compromise | `Cargo.lock`, `cargo deny`, `cargo audit`, DCO, review, published checksums | Upstream compromise and reproducibility gaps remain |
+| Stale vendored OpenSSL on Linux | Linux binaries statically link `openssl-src`; `cargo audit` on every PR; an OpenSSL advisory triggers a dependency bump and a new release | Users stay exposed until they update tersa; the OS cannot patch it |
 
 ## Explicit exclusions
 

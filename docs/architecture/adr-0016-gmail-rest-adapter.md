@@ -1,6 +1,7 @@
 # ADR 0016: Gmail REST mailbox adapter
 
 - Status: Accepted
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): `tersa-gmail-rest-macos` is now the portable `tersa-gmail-rest` (macOS and Linux); macOS-only target gates no longer apply
 - Date: 2026-07-16
 
 ## Context

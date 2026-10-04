@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "adapters/gmail-rest-macos",
+    "adapters/gmail-rest",
     "adapters/keychain-macos",
     "adapters/oauth-sync-macos",
-    "adapters/store-sqlcipher-macos",
+    "adapters/store-sqlcipher",
     "adapters/token-broker-core",
     "apps/cli-macos",
     "crates/application",

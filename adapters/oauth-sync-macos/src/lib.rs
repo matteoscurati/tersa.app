@@ -12,7 +12,7 @@
 //! this crate only consumes the broker's short-lived access-token replies via
 //! `GmailSession::from_broker_token`, re-validating the reply's subject at
 //! that trust boundary. The default build therefore compiles NO refresh-token
-//! Keychain access: it drives the `tersa-gmail-rest-macos` read adapter and
+//! Keychain access: it drives the `tersa-gmail-rest` read adapter and
 //! reconciles through the validated `SQLCipher` write path on a pinned
 //! current-thread `tokio` runtime, and nothing more.
 //!
@@ -24,7 +24,7 @@
 //! with no default features.
 //!
 //! It is the only macOS crate besides the Gmail adapter that reaches the
-//! network (reqwest, transitively through `tersa-gmail-rest-macos`); the
+//! network (reqwest, transitively through `tersa-gmail-rest`); the
 //! retrieval-only CLI never depends on it, so the CLI stays network-free.
 //!
 //! 3d-2 landed the account-identity gate and the gated bounded sync over the
@@ -64,7 +64,7 @@ use tersa_application::token::{
 #[cfg(target_os = "macos")]
 use tersa_application::token::{AccountSubject, BrokerSubjectError};
 #[cfg(target_os = "macos")]
-use tersa_gmail_rest_macos::GmailMailbox;
+use tersa_gmail_rest::GmailMailbox;
 #[cfg(all(target_os = "macos", any(feature = "legacy-token-lifecycle", test)))]
 use tersa_keychain_macos::oauth_token::{RefreshTokenError, RefreshTokenStore};
 #[cfg(target_os = "macos")]
