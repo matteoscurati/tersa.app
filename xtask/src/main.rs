@@ -373,13 +373,20 @@ fn preflight(class_raw: &str, package: Option<&str>) -> TaskResult {
 /// Classifies a package by the first component of its manifest path relative
 /// to the workspace root, so the checkout location cannot affect the result.
 fn package_layer(package: &Package, workspace_root: &Utf8Path) -> Option<Layer> {
-    let relative = package.manifest_path.strip_prefix(workspace_root).ok()?;
-    let mut components = relative.components().map(|component| component.as_str());
-    match (components.next(), components.next(), components.next()) {
-        (Some("crates"), Some(_), Some("Cargo.toml")) => Some(Layer::Core),
-        (Some("adapters"), Some(_), Some("Cargo.toml")) => Some(Layer::Adapter),
-        (Some("apps"), Some(_), Some("Cargo.toml")) => Some(Layer::App),
-        (Some("xtask"), Some("Cargo.toml"), None) => Some(Layer::Tool),
+    layer_for(package.manifest_path.strip_prefix(workspace_root).ok()?)
+}
+
+/// Classifies a manifest path relative to the workspace root.
+fn layer_for(relative: &Utf8Path) -> Option<Layer> {
+    let components = relative
+        .components()
+        .map(|component| component.as_str())
+        .collect::<Vec<_>>();
+    match components.as_slice() {
+        ["crates", _, "Cargo.toml"] => Some(Layer::Core),
+        ["adapters", _, "Cargo.toml"] => Some(Layer::Adapter),
+        ["apps", _, "Cargo.toml"] => Some(Layer::App),
+        ["xtask", "Cargo.toml"] => Some(Layer::Tool),
         _ => None,
     }
 }
@@ -528,7 +535,23 @@ fn core_unsafe_violation(package: &Package) -> TaskResult<Option<String>> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{CrateFacts, Layer, PreflightClass, layering_violations, parse_preflight_class};
+    use cargo_metadata::camino::Utf8Path;
+
+    use super::{
+        CrateFacts, Layer, PreflightClass, layer_for, layering_violations, parse_preflight_class,
+    };
+
+    #[test]
+    fn classifies_layers_from_workspace_relative_paths() {
+        let layer = |path: &str| layer_for(Utf8Path::new(path));
+        assert_eq!(layer("crates/domain/Cargo.toml"), Some(Layer::Core));
+        assert_eq!(layer("adapters/vault/Cargo.toml"), Some(Layer::Adapter));
+        assert_eq!(layer("apps/tersa/Cargo.toml"), Some(Layer::App));
+        assert_eq!(layer("xtask/Cargo.toml"), Some(Layer::Tool));
+        assert_eq!(layer("crates/a/b/Cargo.toml"), None);
+        assert_eq!(layer("tools/x/Cargo.toml"), None);
+        assert_eq!(layer("Cargo.toml"), None);
+    }
 
     fn facts<'a>(
         name: &'a str,

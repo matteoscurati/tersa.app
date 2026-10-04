@@ -1654,6 +1654,8 @@ mod store {
     /// `lchmod` and only honors that flag through `fchmodat2` (kernel 6.6+), so
     /// the inode is pinned with `O_PATH | O_NOFOLLOW`, rejected if it is a
     /// symlink, and changed through its `/proc/self/fd` entry, as glibc does.
+    /// On Linux this needs `/proc` mounted; without it, normalization fails
+    /// closed as a storage error (relevant to minimal containers).
     #[cfg(not(target_os = "linux"))]
     fn chmod_no_follow_at(parent: &OwnedFd, name: &OsStr, mode: Mode) -> rustix::io::Result<()> {
         fs::chmodat(parent, name, mode, AtFlags::SYMLINK_NOFOLLOW)
