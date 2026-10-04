@@ -20,7 +20,7 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -447,6 +447,15 @@ impl SecretSlot for FileSlot {
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
             .open(&temporary)
             .map_err(|error| file_error(&error))?;
+        // The creation mode is filtered by the umask and can only lose bits;
+        // normalize the descriptor and confirm before any secret is written.
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| file_error(&error))?;
+        let metadata = file.metadata().map_err(|error| file_error(&error))?;
+        require_owner_only(&metadata)?;
+        if metadata.mode() & 0o777 != 0o600 {
+            return Err(VaultError::UnsafeFile);
+        }
         file.write_all(&content)
             .map_err(|error| file_error(&error))?;
         file.sync_all().map_err(|error| file_error(&error))?;
