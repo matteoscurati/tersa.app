@@ -61,10 +61,8 @@ deny = [
     { crate = "wry" },
     # Retired M0 storage/search/blob diagnostic third-party packages.
     { crate = "tantivy" },
-    { crate = "chacha20poly1305" },
-    # Retired M0 MIME/hostile-HTML diagnostic third-party packages.
-    { crate = "ammonia" },
-    { crate = "mail-parser" },
+    # chacha20poly1305, ammonia, and mail-parser were retired M0 diagnostic
+    # dependencies; ADR 0031 re-allows them for product use.
 ]
 
 [licenses]

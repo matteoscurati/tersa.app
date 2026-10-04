@@ -5,8 +5,9 @@ must minimize disclosure and avoid real user data.
 
 ## Supported versions
 
-The project is in M0 and has no supported public release. After the first
-release, this file will list supported versions and security update windows.
+The project is in early development and has no supported public release. After
+the first release, this file will list supported versions and security update
+windows.
 
 ## Reporting a vulnerability
 
