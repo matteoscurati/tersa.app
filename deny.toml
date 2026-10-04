@@ -1,11 +1,12 @@
 [graph]
-# tersa.app ships Apple binaries only. Filtering the graph prevents unrelated
-# Linux, Android, and Windows backend packages locked by portable crates from
-# being treated as shipped dependencies.
+# tersa ships a terminal binary for macOS and Linux only (ADR 0031). Filtering
+# the graph prevents unrelated Windows, Android, and iOS backend packages locked
+# by portable crates from being treated as shipped dependencies.
 targets = [
     "aarch64-apple-darwin",
-    "aarch64-apple-ios",
-    "aarch64-apple-ios-sim",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
 ]
 
 [advisories]

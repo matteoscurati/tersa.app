@@ -2,13 +2,12 @@
 extend-exclude = [
     "Cargo.lock",
     "LICENSE",
-    "apple/licenses/THIRD_PARTY_NOTICES-*.txt",
+    "licenses/*.txt",
 ]
 
 [default.extend-words]
 Gmail = "Gmail"
 PKCE = "PKCE"
-Slint = "Slint"
+ratatui = "ratatui"
 tersa = "tersa"
-WKWebView = "WKWebView"
 WRONLY = "WRONLY"
