@@ -63,7 +63,9 @@ pub fn new_passphrase() -> io::Result<Zeroizing<String>> {
 
 fn read_secret(tty: &File) -> io::Result<Zeroizing<String>> {
     let mut reader = tty;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(64));
+    // Full capacity up front: growth would reallocate and leave unwiped
+    // copies of the typed prefix in freed memory.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PASSPHRASE));
     let mut byte = [0_u8; 1];
     loop {
         if reader.read(&mut byte)? == 0 {
