@@ -26,10 +26,10 @@ must wait until affected users have a reasonable remediation path.
 ## Scope
 
 Reports involving OAuth, local encryption, key handling, MIME or HTML parsing,
-attachment processing, Apple platform bridges, supply-chain integrity, or data
-isolation are especially valuable. Reports based only on the declared absence
-of a backend, reliable iOS push, or guaranteed offline scheduling are product
-limitations rather than vulnerabilities.
+attachment processing, terminal escape-sequence injection, keyring or
+passphrase handling, supply-chain integrity, or data isolation are especially
+valuable. Reports based only on the declared absence of a backend or of
+server-side scheduling are product limitations rather than vulnerabilities.
 
 The current [threat model](docs/security/threat-model.md) and
 [security data flow](docs/security/data-flow.md) describe the assets, trust

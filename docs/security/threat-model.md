@@ -2,97 +2,80 @@
 
 ## Scope and security objective
 
-tersa.app is a consumer/prosumer Gmail client, not a regulated archive or
-e-discovery system. The objective is to prevent mailbox content, credentials,
-cryptographic material, and behavioral metadata from leaving their intended
-trust boundary without explicit user action. A diagnostic pass is not a
-production-security claim.
+tersa is a terminal Gmail client for macOS and Linux
+([ADR 0031](../architecture/adr-0031-tui-only-pivot.md)). It is a
+consumer/prosumer tool, not a regulated archive or e-discovery system. The
+objective is to keep mailbox content, credentials, cryptographic material, and
+behavioral metadata inside their intended trust boundary unless the user acts
+explicitly.
 
 ## Protected assets
 
 | Asset | Required protection |
 |---|---|
-| OAuth authorization codes, refresh tokens, and AI provider keys | Short lifetime where applicable; device-only Keychain storage; never logs, process arguments, or repository files |
-| Gmail messages, headers, addresses, labels, drafts, and local intent | Authenticated transport; encrypted local persistence; account isolation; bounded retention |
-| Root and derived encryption keys | CSPRNG generation; device-only Data Protection Keychain storage; domain-separated derivation; no export or diagnostics |
-| SQLCipher databases, WAL/journals, blobs, thumbnails, and search indexes | Application encryption at rest; controlled temporary storage; integrity checks; crypto-erasure |
-| MIME, HTML, inline resources, and attachments | Immediate plain-text-only UI containment; future bounded parsing, typed sanitized output, isolated content worker, deny-by-default rendering, and no automatic remote fetch. Current lightweight MIME extraction is not the approved security boundary |
-| Exports, clipboard data, and notifications | Explicit user declassification; minimum disclosure; no claim of encryption after export |
-| Logs, crash reports, and CI evidence | Aggregate and redacted; no content, queries, secrets, paths, or stable user identifiers |
-| Release artifacts and dependency graph | Reproducible inputs where practical; signed distribution; notarization; SBOM and advisory review |
+| OAuth authorization codes, refresh tokens, and access tokens | PKCE; refresh tokens only inside the encrypted account database; access tokens in memory only; never in logs, process arguments, or repository files |
+| Gmail messages, headers, addresses, labels, drafts, and pending actions | TLS to Google; encrypted local persistence; per-account isolation; bounded retention |
+| Root and derived encryption keys | CSPRNG generation; OS keyring or passphrase-wrapped storage; HKDF domain separation; zeroization; no export or diagnostics |
+| SQLCipher databases, WAL/journals, cached bodies, and attachments | Encryption at rest; owner-only file modes; integrity checks; crypto-erasure on account removal |
+| Rendered text in the terminal | Sanitized against terminal control sequences before display |
+| Composition temp files | Owner-only directory under the data directory; removed after the editor exits |
+| Logs and crash output | No content, addresses, queries, tokens, or stable user identifiers |
+| Release artifacts and dependency graph | Locked dependencies; license and advisory review; checksums published with releases |
 
 ## Trust boundaries
 
-1. The browser and Google OAuth/Gmail services are external trusted services;
-   authorization responses and Gmail payloads remain untrusted input until
-   protocol validation succeeds.
-2. The Apple operating system, Keychain, protected-data state, WebKit, and
-   signing services are platform boundaries, not components controlled by the
-   project.
-3. The token-broker XPC is the sole refresh-token authority in the macOS source
-   architecture. The main app owns the loopback listener and receives a
-   short-lived access token for bounded sync. Production team provisioning and
-   signed wrong-group denial evidence remain open.
-4. The shared Rust core owns domain invariants. Platform adapters own only
-   unavoidable OS capabilities and may not leak Apple or UI types inward.
-5. Each account database and blob namespace is an isolation boundary. The
-   interim macOS CLI composition may receive only the envelope-only
-   `MailboxReader`; UI, future CLI mutations, and future MCP access must go
-   through authorized application use cases rather than widening direct store
-   authority.
-6. The current presentation layer performs lightweight MIME text extraction,
-   and the bridge may serialize raw HTML. The Swift UI ignores raw HTML and has
-   no WebKit surface. A future parser, `SafeHtml`, render surface, attachment
-   decoder, export, log, or evidence flow crosses into a narrower
-   representation and requires its own approval.
+1. Google OAuth and the Gmail API are external trusted services; their
+   responses remain untrusted input until protocol validation succeeds.
+2. The operating system, its keyring service, the terminal emulator, the
+   user's `$EDITOR`, and the system browser are platform boundaries outside
+   the project's control.
+3. The Rust core owns domain invariants. Adapters own OS capabilities and may
+   not leak OS types into core crates (enforced by `cargo xtask architecture`).
+4. Each account database is an isolation boundary; unified views read through
+   application use cases, never across account keys.
+5. Provider content crosses into a narrower representation before display:
+   sanitized text only. No HTML engine and no remote fetch exist.
 
 ## Attacker capabilities
 
-In scope are a remote sender crafting malicious MIME, HTML, images, links, or
-attachments; a local unprivileged process racing loopback OAuth or inspecting
-world-readable files; a stolen powered-off or locked device; a malicious or
-compromised dependency; malformed Gmail history and retry outcomes; a prompt
-injection embedded in email if AI is later enabled; and a tampered build or
-evidence artifact. The model also includes accidental disclosure by logs,
-exports, caches, screenshots, notifications, or reviewer evidence.
+In scope: a remote sender crafting malicious MIME, HTML, links, filenames, or
+attachments, including terminal escape and bidirectional-text payloads; a local
+unprivileged process from another user, or one racing the loopback OAuth
+listener; a stolen powered-off device; a malicious or compromised dependency;
+malformed Gmail history and ambiguous send outcomes; accidental disclosure by
+logs or temp files.
 
-The attacker may control email bytes, timing, network failure, redirect input,
-and files selected for import. They do not initially possess the user's device
-passcode, Google credentials, signing identity, or an authorized local process.
+The attacker does not initially hold the user's login session, keyring
+unlock, passphrase, or Google credentials.
 
 ## Threats, controls, and residual risk
 
-| Threat | Required controls | Residual risk or open gate |
+| Threat | Controls | Residual risk / status |
 |---|---|---|
-| OAuth interception, callback forgery, or token disclosure | Authorization Code with PKCE S256, exact state and redirect validation, literal loopback binding on macOS, token-broker XPC, refresh token in a broker-only device Keychain group, bounded access-token lifetime in main-app memory | Source cutover and real Google exchange/refresh/revoke are implemented; production group provisioning, signed process isolation, physical-device lifecycle, and Google verification remain open |
-| Device theft and local file inspection | SQLCipher, persistent encrypted WAL, strict envelope-only read capability, chunked blob AEAD, macOS Data Protection Keychain root key with device-only accessibility, fixed App Group profile layout, locked product bootstrap, encrypted index/temp policy, key-first wipe | A running unlocked or compromised process can access plaintext in memory; signed cross-target Keychain interoperability remains PR 33b evidence after the deterministic PR 33a.5 source slice, while pathname SQLite and mutable final names retain the documented same-user race residuals |
-| Malicious MIME/HTML and tracking pixels | Current UI decodes only plain text/preview and contains no WebKit or HTML toggle; `xtask` denies WebKit/raw-HTML UI surfaces. Future controls require size/depth/part limits, typed sanitized output, isolated parsing, deny-by-default rendering, and blocked remote images | Raw HTML is still stored/extracted and serialized across the bridge before Swift ignores it; the current extraction is not a hardened parser. Parser/worker implementation, future renderer zero-days, and signed containment evidence remain open |
-| Malicious attachment or decompression bomb | On-demand fetch, byte/ratio/time/memory limits, no macro execution, sandboxed short-lived worker when needed | Complex production parsers and sandbox evidence are not implemented |
-| Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, stable RFC Message-ID, server reconciliation after ambiguous timeout | Production sync/outbox is not implemented |
-| Cross-account or cross-surface access | `(account_id, gmail_id)` identity, per-account storage/key namespace, application authorization boundary, future single-writer host on macOS | Production repositories and IPC authorization remain open |
-| Dependency or release compromise | Locked dependencies, license/advisory checks, target reachability, SBOM, checksum verification, DCO, exact-head review, signed and notarized distribution | Unknown upstream compromise and reproducibility gaps remain |
-| Diagnostic, crash, clipboard, export, or notification leak | Redacted types, synthetic fixtures, aggregate evidence, explicit export boundary, minimum notification content, opt-in crash reporting | User-approved exports and OS-level observation are outside encrypted local storage |
-| Future AI prompt injection or data exfiltration | Boundary remains closed; future per-operation consent, hostile-data delimiting, no autonomous tools, provider policy review | No AI feature is implemented or approved |
-| Future MCP client misuse | Boundary remains closed; future per-client grants, stdio default, pagination, dry-run and two-phase send | No MCP feature is implemented or approved |
-| OpenPGP misuse or downgrade | Boundary remains closed; future policy layer, interoperability suite, trust UX, fuzzing, independent audit | No OpenPGP feature is implemented or approved |
+| OAuth interception or callback forgery | Authorization Code with PKCE S256, exact state and redirect validation, IPv4 loopback listener bound to an ephemeral port, single-use session | Rust loopback listener is planned (T1) |
+| Token or key disclosure on a stolen device | Root key in OS keyring or passphrase-wrapped; refresh tokens inside SQLCipher; owner-only file modes | Planned (T1). Keyring items are readable by same-user code once unlocked |
+| Same-user malware | None beyond OS keyring prompts on macOS | **Accepted residual** (ADR 0031): no process isolation between token and root key; Linux Secret Service has no per-app ACL. Passphrase mode narrows at-rest exposure only |
+| Terminal escape injection (ANSI/OSC/DCS, title or clipboard writes, cursor tricks) | All provider-derived strings pass a sanitizer that strips C0 except newline/tab, C1, ESC, DEL; TUI renders only the sanitized type; fuzzing | Planned (T2) |
+| Bidirectional-text and homoglyph spoofing | Bidi override and isolate characters removed; sender address shown alongside display name | Homoglyphs remain a residual |
+| Malicious HTML, tracking pixels | HTML converted to text with size and depth limits; no remote resource is ever fetched; links listed and opened only on explicit keypress after showing the URL | Planned (T2) |
+| Malicious attachment or decompression bomb | Fetch on demand, size limits, sanitized filenames, never auto-opened | Planned (T5–T6) |
+| Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, client-generated Message-ID, reconciliation after ambiguous outcomes | Planned (T4–T5) |
+| Cross-account access | `(account_id, gmail_id)` identity, per-account database and key | Planned (T3) |
+| Composition temp-file exposure | Owner-only directory, removal after editor exit | Plaintext exists on disk while the editor runs; editor swap/backup files are outside tersa's control |
+| Dependency or release compromise | `Cargo.lock`, `cargo deny`, `cargo audit`, DCO, review, published checksums | Upstream compromise and reproducibility gaps remain |
 
 ## Explicit exclusions
 
-The initial model does not claim protection on a jailbroken/root-compromised
-device, against privileged malware while the user has unlocked content, or
-against advanced hardware attacks on a running device. It does not protect the
-Google account after Google credentials are compromised, provide metadata
-anonymity, satisfy regulated-retention regimes, or keep a user-selected export
-encrypted after it crosses the application boundary.
+No protection is claimed against root/privileged malware, a compromised user
+session while tersa is unlocked, a compromised terminal emulator or editor,
+or hardware attacks on a running machine. tersa does not protect the Google
+account after Google credentials are compromised, provide metadata anonymity,
+or keep user-saved attachments encrypted.
 
-Future AI, MCP, OpenPGP, relay, attachment-worker, and cross-device preference
-sync are unopened boundaries. Each requires an accepted data-flow update,
-abuse analysis, retention policy, and independent security review before code
-may move into a production path.
+AI, MCP, OpenPGP, and relay features are closed boundaries; each requires a
+data-flow update and security review before code may reach them.
 
 ## Review triggers
 
-Revisit this model when a new plaintext or persistence surface is added,
-network egress changes, the temporary HTML deny policy is relaxed, a production
-parser/renderer or content worker is adopted, CLI/MCP/AI/OpenPGP becomes
-reachable, Apple entitlements change, or the optional relay is designed.
+Revisit this model when a persistence surface, network egress path, renderer,
+external process invocation, or secret-storage mode is added or changed.

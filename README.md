@@ -1,49 +1,37 @@
-# tersa.app
+# tersa
 
-tersa.app is a privacy-first, open-source Gmail client for iOS and macOS.
+tersa is a privacy-first, open-source Gmail client for the terminal, for
+macOS and Linux.
 
-The project is currently in early product development on the macOS-first path.
-It is not yet usable as a complete email client and has no published application
-builds.
-
-The repository contains the shared Rust core, Apple bridge, and product
-surfaces. The M0 diagnostic program is retired; a short
-[historical summary](docs/history/m0-summary.md) and preserved ADRs record what
-it learned.
+It is in early development and not yet usable as an email client. There are
+no published builds.
 
 ## Product boundaries
 
-- iOS 18 or later and macOS 15 or later on Apple Silicon
-- a shared Rust core with minimal Apple platform adapters
-- Gmail through the official Gmail API
-- encrypted local persistence and no project-operated backend
-- honest platform limits: no reliable background push on iOS and no guaranteed
-  send-later scheduling while a device is unavailable
+- one Rust binary with a full-screen terminal UI
+- macOS and Linux (x86_64 and aarch64)
+- Gmail through the official Gmail API, with your own Google OAuth client
+- encrypted local storage, with keys held by the OS keyring or a passphrase
+- no project-operated backend
+- message content rendered as sanitized text; no remote content is fetched
 
 ## Project status
 
-See the [roadmap](docs/roadmap.md) for the milestone sequence and MVP
-exclusions. The accepted
-[product constraints](docs/architecture/adr-0006-product-constraints.md) remain
-in force. See the [threat model](docs/security/threat-model.md) and
-[security data flow](docs/security/data-flow.md) for the current security
-boundaries. Physical-device and signed-distribution closure follows the
-[Apple physical-device and distribution protocol](docs/release/apple-distribution.md).
-macOS UI and release acceptance are defined by the
-[macOS acceptance protocol](docs/quality/macos-acceptance.md) and the
-[macOS performance harness](docs/quality/macos-performance.md).
+See the [roadmap](docs/roadmap.md) and
+[ADR 0031](docs/architecture/adr-0031-tui-only-pivot.md), which moved tersa
+from a native Apple client to a terminal client. Security boundaries are in
+the [threat model](docs/security/threat-model.md) and
+[data flow](docs/security/data-flow.md).
 
 ## Development
 
-The workspace pins Rust 1.91.1. Run its baseline verification suite with:
+The workspace pins Rust 1.91.1. Run the verification suite with:
 
 ```sh
 cargo xtask verify
 ```
 
-See [Development](docs/development.md) and
-[Dependency rules](docs/architecture/dependency-rules.md) for the contributor
-workflow.
+See [Development](docs/development.md) for the contributor workflow.
 
 ## Contributing and security
 

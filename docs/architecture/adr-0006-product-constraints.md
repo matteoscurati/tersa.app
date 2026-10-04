@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted. Durable product constraints A3, A4, A5, and A9 remain in force.
+Accepted. Amended by [ADR 0031](adr-0031-tui-only-pivot.md): platforms are
+macOS and Linux terminals; A5 and A9 Apple-specific clauses no longer apply. Durable product constraints A3, A4, A5, and A9 remain in force.
 The M0/Slint/Dioxus diagnostic gate program and toolkit-isolation machinery
 described historically below are retired by
 [ADR-0025](adr-0025-retire-m0-diagnostic-program.md). The former live gate
