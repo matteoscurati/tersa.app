@@ -4,10 +4,12 @@
 
 //! IPv4 loopback listener for the OAuth redirect (RFC 8252 §7.3).
 //!
-//! Binds `127.0.0.1` on an ephemeral port, serves exactly one callback on the
-//! root path, and hands its full URL to the token service, which validates
-//! state and code. Requests for any other path get a 404 and do not end the
-//! wait. The listener never echoes request content back to the browser.
+//! Binds `127.0.0.1` on an ephemeral port and waits for the one request to the
+//! root path whose `state` matches the pending authorization; it then hands
+//! that full URL to the token service, which validates state and code again.
+//! Any other request, including a guessed or forged callback from another
+//! local process, gets a 404 and does not end the wait, so it cannot consume
+//! the session. The listener never echoes request content back.
 
 use core::fmt;
 use std::io;
@@ -19,7 +21,7 @@ use tokio::net::TcpListener;
 
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 const MAX_CONNECTIONS: usize = 32;
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const DONE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>tersa</title>\
 <p>Sign-in finished. You can close this tab and return to the terminal.</p>";
 
@@ -79,21 +81,25 @@ impl Loopback {
         format!("http://127.0.0.1:{}/", self.port)
     }
 
-    /// Waits up to `deadline` for a request to the root path and returns its
-    /// full URL.
+    /// Waits up to `deadline` for a request to the root path carrying
+    /// `expected_state` and returns its full URL.
     ///
     /// # Errors
     ///
     /// Returns [`LoopbackError::TimedOut`] after `deadline`,
     /// [`LoopbackError::TooManyConnections`] after too many stray requests, or
     /// [`LoopbackError::Io`] when accepting fails.
-    pub async fn wait_for_callback(self, deadline: Duration) -> Result<String, LoopbackError> {
-        tokio::time::timeout(deadline, self.serve())
+    pub async fn wait_for_callback(
+        self,
+        deadline: Duration,
+        expected_state: &str,
+    ) -> Result<String, LoopbackError> {
+        tokio::time::timeout(deadline, self.serve(expected_state))
             .await
             .map_err(|_elapsed| LoopbackError::TimedOut)?
     }
 
-    async fn serve(self) -> Result<String, LoopbackError> {
+    async fn serve(self, expected_state: &str) -> Result<String, LoopbackError> {
         for _ in 0..MAX_CONNECTIONS {
             let (mut stream, peer) = self
                 .listener
@@ -111,7 +117,7 @@ impl Loopback {
                     .await;
                 continue;
             };
-            if target == "/" || target.starts_with("/?") {
+            if is_matching_callback(&target, expected_state) {
                 let _ = stream
                     .write_all(response(200, "OK", DONE_PAGE).as_bytes())
                     .await;
@@ -143,6 +149,18 @@ async fn read_request_target(stream: &mut tokio::net::TcpStream) -> io::Result<O
     Ok(parse_request_target(&head))
 }
 
+/// Whether `target` is the root path with exactly one `state` parameter equal
+/// to `expected`.
+fn is_matching_callback(target: &str, expected: &str) -> bool {
+    let Some(query) = target.strip_prefix("/?") else {
+        return false;
+    };
+    let mut states = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(name, _value)| name == "state")
+        .map(|(_name, value)| value);
+    matches!((states.next(), states.next()), (Some(state), None) if state == expected)
+}
+
 fn parse_request_target(head: &[u8]) -> Option<String> {
     let line_end = head.windows(2).position(|window| window == b"\r\n")?;
     let line = std::str::from_utf8(&head[..line_end]).ok()?;
@@ -172,7 +190,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    use super::{Loopback, LoopbackError, parse_request_target};
+    use super::{Loopback, LoopbackError, is_matching_callback, parse_request_target};
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -209,6 +227,17 @@ mod tests {
     }
 
     #[test]
+    fn matches_only_the_expected_state() {
+        assert!(is_matching_callback("/?code=a&state=s1", "s1"));
+        assert!(is_matching_callback("/?state=s%2F1&code=a", "s/1"));
+        assert!(!is_matching_callback("/?code=a&state=other", "s1"));
+        assert!(!is_matching_callback("/?code=a", "s1"));
+        assert!(!is_matching_callback("/?state=s1&state=s1", "s1"));
+        assert!(!is_matching_callback("/x?state=s1", "s1"));
+        assert!(!is_matching_callback("/", "s1"));
+    }
+
+    #[test]
     fn returns_the_callback_after_ignoring_other_paths() {
         runtime().block_on(async {
             let loopback = Loopback::bind().await.expect("bind");
@@ -218,10 +247,20 @@ mod tests {
                 .trim_end_matches('/')
                 .parse()
                 .expect("port");
-            let waiter = tokio::spawn(loopback.wait_for_callback(Duration::from_secs(5)));
+            let waiter = tokio::spawn(async move {
+                loopback
+                    .wait_for_callback(Duration::from_secs(5), "xyz")
+                    .await
+            });
 
             assert!(
                 request(port, "/favicon.ico")
+                    .await
+                    .starts_with("HTTP/1.1 404")
+            );
+            // A forged callback with the wrong state does not end the wait.
+            assert!(
+                request(port, "/?code=evil&state=guess")
                     .await
                     .starts_with("HTTP/1.1 404")
             );
@@ -242,7 +281,9 @@ mod tests {
         runtime().block_on(async {
             let loopback = Loopback::bind().await.expect("bind");
             assert!(matches!(
-                loopback.wait_for_callback(Duration::from_millis(50)).await,
+                loopback
+                    .wait_for_callback(Duration::from_millis(50), "state")
+                    .await,
                 Err(LoopbackError::TimedOut)
             ));
         });

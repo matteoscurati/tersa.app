@@ -21,6 +21,9 @@ pub use flows::{
     AddedAccount, FlowError, OAuthClient, Revocation, Runtime, SIGN_IN_TIMEOUT, default_sync_policy,
 };
 pub use gate::{GatedSyncError, gated_sync};
-pub use installation::{Installation, InstallationError, InstallationHasher, InstallationTokens};
+pub use installation::{
+    Installation, InstallationError, InstallationHasher, InstallationLock, InstallationTokens,
+    LockError, has_local_data,
+};
 pub use loopback::{Loopback, LoopbackError};
 pub use session::{GmailSession, GmailSessionError};

@@ -201,9 +201,15 @@ impl Runtime {
             .broker
             .begin_authorization(&loopback.redirect_uri())
             .map_err(FlowError::Token)?;
+        let expected_state = pending
+            .authorization_url()
+            .query_pairs()
+            .find(|(name, _value)| name == "state")
+            .map(|(_name, value)| value.into_owned())
+            .ok_or(FlowError::Configuration)?;
         open_browser(pending.authorization_url().as_str());
         let callback = loopback
-            .wait_for_callback(SIGN_IN_TIMEOUT)
+            .wait_for_callback(SIGN_IN_TIMEOUT, &expected_state)
             .await
             .map_err(FlowError::Loopback)?;
         let token = self

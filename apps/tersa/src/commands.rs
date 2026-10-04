@@ -11,7 +11,7 @@ use tersa_application::mailbox::{AccountId, MailboxReader, StoreLimit};
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
-use tersa_sync_runtime::{Installation, Revocation, Runtime};
+use tersa_sync_runtime::{Installation, InstallationLock, Revocation, Runtime, has_local_data};
 use tersa_vault::{SlotKind, Vault, VaultError, VaultState};
 
 use crate::config::{Config, Paths};
@@ -40,9 +40,34 @@ fn open_vault(context: &Context) -> Result<Vault, String> {
     })
 }
 
+/// Takes the exclusive installation lock for the rest of the command.
+fn lock(context: &Context) -> Result<InstallationLock, String> {
+    InstallationLock::acquire(&context.paths.data_dir).map_err(|error| error.to_string())
+}
+
+fn missing_key_message(context: &Context, vault: &Vault) -> String {
+    let location = match vault.kind() {
+        SlotKind::Keyring => "the system keyring",
+        SlotKind::File => "the passphrase-protected key file",
+    };
+    format!(
+        "encrypted data exists in {dir}, but its key is not in {location}.\n\
+         - If the system keyring is temporarily unavailable (for example over SSH \
+         without a Secret Service session), make it available and retry; set \
+         `[vault] backend = \"keyring\"` to stop falling back to a key file.\n\
+         - If the key was deleted, this data cannot be decrypted: move {dir} \
+         aside and run `tersa account add` again.",
+        dir = context.paths.data_dir.display()
+    )
+}
+
 fn unlock(context: &Context, create: Create) -> Result<Option<Arc<Installation>>, String> {
     let vault = open_vault(context)?;
     let root = match vault.state().map_err(|error| error.to_string())? {
+        // Never mint a new root key over data that needs the old one.
+        VaultState::Empty if has_local_data(&context.paths.data_dir) => {
+            return Err(missing_key_message(context, &vault));
+        }
         VaultState::Empty if create == Create::Forbidden => return Ok(None),
         VaultState::Empty => {
             let passphrase = if vault.kind() == SlotKind::File || context.config.passphrase {
@@ -140,6 +165,7 @@ fn open_browser(url: &str) {
 pub fn account_add(context: &Context) -> Result<(), String> {
     // Fail on a missing OAuth client before creating any key material.
     context.config.oauth_client(&context.paths.config_file())?;
+    let _lock = lock(context)?;
     let installation = unlock(context, Create::Allowed)?
         .ok_or_else(|| "could not initialize local storage".to_owned())?;
     let runtime = runtime(context, installation)?;
@@ -162,6 +188,7 @@ pub fn account_add(context: &Context) -> Result<(), String> {
 }
 
 pub fn account_list(context: &Context) -> Result<(), String> {
+    let _lock = lock(context)?;
     let Some(installation) = unlock(context, Create::Forbidden)? else {
         println!("No accounts yet. Run `tersa account add`.");
         return Ok(());
@@ -177,6 +204,7 @@ pub fn account_list(context: &Context) -> Result<(), String> {
 }
 
 pub fn account_remove(context: &Context, raw: &str) -> Result<(), String> {
+    let _lock = lock(context)?;
     let installation = require_installation(context)?;
     let account = resolve_account(&installation, raw)?;
     let runtime = runtime(context, installation)?;
@@ -194,6 +222,7 @@ pub fn account_remove(context: &Context, raw: &str) -> Result<(), String> {
 }
 
 pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
+    let _lock = lock(context)?;
     let installation = require_installation(context)?;
     let accounts = match raw {
         Some(raw) => vec![resolve_account(&installation, raw)?],
@@ -226,6 +255,7 @@ pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
 }
 
 pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), String> {
+    let _lock = lock(context)?;
     let installation = require_installation(context)?;
     let account = match raw {
         Some(raw) => resolve_account(&installation, raw)?,

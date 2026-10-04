@@ -5,15 +5,23 @@
 //! Passphrase prompts on the controlling terminal with echo disabled.
 //!
 //! Passphrases are read only from `/dev/tty`, never from arguments or the
-//! environment, where other processes could observe them.
+//! environment, where other processes could observe them. While reading, the
+//! terminal is in non-canonical mode with echo and signal keys off, so Ctrl-C
+//! arrives as a byte that cancels the prompt and the original settings are
+//! always restored. Bytes go straight into zeroizing storage; no intermediate
+//! buffer keeps a copy.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 
-use rustix::termios::{self, LocalModes, OptionalActions};
-use zeroize::Zeroizing;
+use rustix::termios::{self, LocalModes, OptionalActions, SpecialCodeIndex};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_PASSPHRASE: usize = 1024;
+const CTRL_C: u8 = 0x03;
+const CTRL_D: u8 = 0x04;
+const BACKSPACE: u8 = 0x08;
+const DELETE: u8 = 0x7f;
 
 /// Reads one passphrase from the terminal without echo.
 pub fn passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
@@ -23,14 +31,18 @@ pub fn passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
 
     let original = termios::tcgetattr(&tty)?;
     let mut silent = original.clone();
-    silent.local_modes.remove(LocalModes::ECHO);
-    silent.local_modes.insert(LocalModes::ECHONL);
+    silent
+        .local_modes
+        .remove(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG);
+    silent.special_codes[SpecialCodeIndex::VMIN] = 1;
+    silent.special_codes[SpecialCodeIndex::VTIME] = 0;
     termios::tcsetattr(&tty, OptionalActions::Flush, &silent)?;
-    let read = read_line(&tty);
+    let read = read_secret(&tty);
     let restored = termios::tcsetattr(&tty, OptionalActions::Flush, &original);
-    let line = read?;
+    let _ = tty.write_all(b"\n");
+    let secret = read?;
     restored?;
-    Ok(line)
+    Ok(secret)
 }
 
 /// Asks for a new passphrase twice and requires a match.
@@ -49,16 +61,45 @@ pub fn new_passphrase() -> io::Result<Zeroizing<String>> {
     }
 }
 
-fn read_line(tty: &File) -> io::Result<Zeroizing<String>> {
-    let mut reader =
-        BufReader::new(tty).take(u64::try_from(MAX_PASSPHRASE + 2).unwrap_or(u64::MAX));
-    let mut line = Zeroizing::new(String::new());
-    reader.read_line(&mut line)?;
-    if line.len() > MAX_PASSPHRASE + 1 {
-        return Err(io::Error::other("the passphrase is too long"));
+fn read_secret(tty: &File) -> io::Result<Zeroizing<String>> {
+    let mut reader = tty;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(64));
+    let mut byte = [0_u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            break;
+        }
+        match byte[0] {
+            b'\r' | b'\n' => break,
+            CTRL_C => return Err(cancelled()),
+            CTRL_D if bytes.is_empty() => return Err(cancelled()),
+            BACKSPACE | DELETE => {
+                // Drop one whole UTF-8 character.
+                while let Some(removed) = bytes.pop() {
+                    if removed & 0xc0 != 0x80 {
+                        break;
+                    }
+                }
+            }
+            other => {
+                if bytes.len() >= MAX_PASSPHRASE {
+                    byte.zeroize();
+                    return Err(io::Error::other("the passphrase is too long"));
+                }
+                bytes.push(other);
+            }
+        }
     }
-    while line.ends_with(['\n', '\r']) {
-        line.pop();
+    byte.zeroize();
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(text) => Ok(Zeroizing::new(text)),
+        Err(error) => {
+            error.into_bytes().zeroize();
+            Err(io::Error::other("the passphrase is not valid UTF-8"))
+        }
     }
-    Ok(line)
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
 }

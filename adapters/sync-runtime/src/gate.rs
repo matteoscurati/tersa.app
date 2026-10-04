@@ -143,8 +143,10 @@ where
 /// (each call builds its own [`SyncCoordinator`], whose single-flight set is
 /// per-call, not shared), so two overlapping cycles could interleave a stale
 /// record over a committed one and let two accounts' mail coexist. Enforcement is
-/// NOT provided here: it belongs to the caller (the runtime serializes cycles per
-/// account with one whole-cycle lock) plus an
+/// NOT provided here: it belongs to the caller (the app holds an exclusive
+/// [`InstallationLock`](crate::InstallationLock) for the whole command and runs
+/// one flow at a time; a future in-process concurrent caller must add a
+/// per-account cycle lock) plus an
 /// in-transaction identity fence that re-checks the recorded hash inside every
 /// mailbox-write transaction. Callers without that discipline break the invariant.
 ///

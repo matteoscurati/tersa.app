@@ -1705,6 +1705,7 @@ dependencies = [
  "tersa-store-sqlcipher",
  "tersa-token-broker-core",
  "tokio",
+ "url",
  "zeroize",
 ]
 

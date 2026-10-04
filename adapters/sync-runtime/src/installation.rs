@@ -14,7 +14,7 @@
 
 use core::fmt;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 const REGISTRY_FILE: &str = "registry.sqlite3";
 const ACCOUNTS_DIR: &str = "accounts";
 const MAIL_FILE: &str = "mail.sqlite3";
+const LOCK_FILE: &str = ".lock";
 
 /// Installation failures. Variants carry no account data.
 #[derive(Debug)]
@@ -93,6 +94,77 @@ pub struct Installation {
 impl fmt::Debug for Installation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Installation([REDACTED])")
+    }
+}
+
+/// Whether `data_dir` already holds an installation's encrypted data.
+///
+/// Used to refuse minting a new root key over data that needs the old one.
+#[must_use]
+pub fn has_local_data(data_dir: &Path) -> bool {
+    fs::symlink_metadata(data_dir.join(REGISTRY_FILE)).is_ok()
+}
+
+/// An exclusive, advisory lock over one data directory.
+///
+/// Only one tersa process may use an installation at a time: the token
+/// service's single-flight permits, account allocation, and the identity
+/// gate's whole-cycle serialization are all in-process. Hold the lock for
+/// the whole command; it is released when dropped or when the process exits.
+#[derive(Debug)]
+pub struct InstallationLock {
+    _file: fs::File,
+}
+
+/// Why the installation lock could not be taken.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum LockError {
+    /// Another process holds the lock.
+    Busy,
+    /// The data directory or lock file is unusable.
+    Directory,
+}
+
+impl fmt::Display for LockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("another tersa process is using this data directory"),
+            Self::Directory => formatter.write_str("the data directory is unusable"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+impl InstallationLock {
+    /// Takes the lock for `data_dir`, creating the owner-only directory and
+    /// lock file if needed, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockError::Busy`] when another process holds it.
+    pub fn acquire(data_dir: &Path) -> Result<Self, LockError> {
+        ensure_private_dir(data_dir).map_err(|_error| LockError::Directory)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(data_dir.join(LOCK_FILE))
+            .map_err(|_error| LockError::Directory)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                if error == rustix::io::Errno::WOULDBLOCK {
+                    LockError::Busy
+                } else {
+                    LockError::Directory
+                }
+            },
+        )?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -165,9 +237,12 @@ impl Installation {
         self.open_store_unchecked(account)
     }
 
-    /// Removes an account's registry entry and deletes its local data.
+    /// Deletes an account's local data, then its registry entry.
     ///
-    /// Provider revocation is the caller's job and must happen first.
+    /// Data goes first so a failed deletion leaves the account registered and
+    /// the removal can be retried; a registered account whose directory is
+    /// already gone removes cleanly. Provider revocation is the caller's job
+    /// and must happen first.
     ///
     /// # Errors
     ///
@@ -177,15 +252,16 @@ impl Installation {
             .allocation
             .lock()
             .map_err(|_poison| InstallationError::Directory)?;
-        if !self.registry.remove(account)? {
+        if !self.registry.accounts()?.contains(account) {
             return Err(InstallationError::UnknownAccount);
         }
-        let directory = self.account_dir(account);
-        match fs::remove_dir_all(&directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_error) => Err(InstallationError::Directory),
+        match fs::remove_dir_all(self.account_dir(account)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_error) => return Err(InstallationError::Directory),
         }
+        self.registry.remove(account)?;
+        Ok(())
     }
 
     fn account_dir(&self, account: &AccountId) -> PathBuf {
@@ -226,7 +302,8 @@ impl Installation {
         let account = new_account_id()?;
         // Create the store and bind its subject before registering, so a crash
         // leaves at worst an unregistered directory, never a registered
-        // account without a database.
+        // account without a database. The installation lock excludes other
+        // processes, so only a crash can interrupt this sequence.
         let store = self.open_store_unchecked(&account)?;
         store.store_broker_subject(&account, subject.as_str())?;
         drop(store);
@@ -366,7 +443,10 @@ mod tests {
     use tersa_token_broker_core::{RefreshTokenStore, RefreshTokenStoreError, ValidatedSubject};
     use zeroize::Zeroizing;
 
-    use super::{Installation, InstallationError, InstallationTokens};
+    use super::{
+        Installation, InstallationError, InstallationLock, InstallationTokens, LockError,
+        has_local_data,
+    };
 
     struct TempDir(PathBuf);
 
@@ -454,6 +534,26 @@ mod tests {
         let reopened = Installation::open(&dir.0, root()).expect("reopen");
         assert_eq!(reopened.accounts().expect("list").len(), 1);
         assert!(Installation::open(&dir.0, RootKey::from_bytes(Zeroizing::new([8; 32]))).is_err());
+    }
+
+    #[test]
+    fn the_installation_lock_is_exclusive() {
+        let dir = TempDir::new("lock");
+        let held = InstallationLock::acquire(&dir.0).expect("first lock");
+        assert!(matches!(
+            InstallationLock::acquire(&dir.0),
+            Err(LockError::Busy)
+        ));
+        drop(held);
+        InstallationLock::acquire(&dir.0).expect("lock after release");
+    }
+
+    #[test]
+    fn local_data_is_detected_once_the_registry_exists() {
+        let dir = TempDir::new("local-data");
+        assert!(!has_local_data(&dir.0));
+        drop(Installation::open(&dir.0, root()).expect("open"));
+        assert!(has_local_data(&dir.0));
     }
 
     #[test]
