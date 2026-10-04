@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("check-dco.py")
@@ -83,6 +84,24 @@ class DcoTests(unittest.TestCase):
     def test_signer_name_is_trimmed_like_the_rust_checker(self) -> None:
         log = record("abc123", "Ada", "ada@example.test", ["Ada   <ada@example.test>"])
         self.assertEqual(MODULE.unsigned_commits(log), [])
+
+
+class GitLogTests(unittest.TestCase):
+    def run_git_log(self, **kwargs: bool) -> list[str]:
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            MODULE.git_log("base", "head", **kwargs)
+        return run.call_args.args[0]
+
+    def test_merges_are_included_by_default(self) -> None:
+        command = self.run_git_log()
+        self.assertNotIn("--no-merges", command)
+        self.assertEqual(command[-1], "base..head")
+
+    def test_no_merges_is_passed_before_the_range(self) -> None:
+        command = self.run_git_log(no_merges=True)
+        self.assertIn("--no-merges", command)
+        self.assertLess(command.index("--no-merges"), command.index("base..head"))
 
 
 if __name__ == "__main__":
