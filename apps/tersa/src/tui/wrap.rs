@@ -38,6 +38,26 @@ pub fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Wraps `text` to `columns` display columns at any character, for text
+/// without natural break points such as web addresses.
+pub fn wrap_chars(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let added = char_width(character);
+        if used + added > columns && used > 0 {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        line.push(character);
+        used += added;
+    }
+    lines.push(line);
+    lines
+}
+
 /// Wraps `text` to `columns` display columns, breaking at spaces when it
 /// can and inside words when it must. Tabs expand to the next tab stop and
 /// leading indentation is kept.
@@ -45,9 +65,40 @@ pub fn wrap(text: &str, columns: usize) -> Vec<String> {
     let columns = columns.max(1);
     let mut lines = Vec::new();
     for source in text.split('\n') {
-        wrap_line(source, columns, &mut lines);
+        let (prefix, continuation) = line_prefix(source);
+        let prefix_width = width(prefix);
+        if prefix.is_empty() || prefix_width * 2 > columns {
+            wrap_line(source, columns, &mut lines);
+            continue;
+        }
+        // Quote marks and list bullets carry over to continuation lines.
+        let mut parts = Vec::new();
+        wrap_line(&source[prefix.len()..], columns - prefix_width, &mut parts);
+        for (row, part) in parts.into_iter().enumerate() {
+            let lead = if row == 0 {
+                prefix
+            } else {
+                continuation.as_str()
+            };
+            lines.push(format!("{lead}{part}"));
+        }
     }
     lines
+}
+
+/// Splits a line's leading quote marks, indentation, and bullet from its
+/// text, and returns what continuation lines should start with instead.
+fn line_prefix(line: &str) -> (&str, String) {
+    let mut rest = line;
+    while let Some(after) = rest.strip_prefix("> ") {
+        rest = after;
+    }
+    let quotes = &line[..line.len() - rest.len()];
+    let after_indent = rest.trim_start_matches(' ');
+    let after_bullet = after_indent.strip_prefix("• ").unwrap_or(after_indent);
+    let prefix = &line[..line.len() - after_bullet.len()];
+    let hanging = width(&prefix[quotes.len()..]);
+    (prefix, format!("{quotes}{}", " ".repeat(hanging)))
 }
 
 fn wrap_line(source: &str, columns: usize, lines: &mut Vec<String>) {
@@ -123,7 +174,32 @@ fn push_char(
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, width, wrap};
+    use super::{truncate, width, wrap, wrap_chars};
+
+    #[test]
+    fn quotes_and_bullets_continue_on_wrapped_lines() {
+        assert_eq!(wrap("> > one two three", 11), ["> > one two", "> > three"]);
+        assert_eq!(
+            wrap("  • alpha beta gamma", 14),
+            ["  • alpha beta", "    gamma"]
+        );
+        assert_eq!(wrap("> • xx yy", 8), ["> • xx", ">   yy"]);
+        assert_eq!(
+            wrap("> • xx yy", 6),
+            ["> • xx", "yy"],
+            "too narrow to indent"
+        );
+        assert_eq!(wrap(">", 10), [">"]);
+    }
+
+    #[test]
+    fn character_wrap_ignores_spaces() {
+        assert_eq!(
+            wrap_chars("https://e.com/abc", 8),
+            ["https://", "e.com/ab", "c"]
+        );
+        assert_eq!(wrap_chars("", 4), [""]);
+    }
 
     #[test]
     fn wraps_at_spaces_and_inside_long_words() {
@@ -132,7 +208,7 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 10), ["a", "", "b"]);
         assert_eq!(
             wrap("  indented text here", 10),
-            ["  indented", "text here"]
+            ["  indented", "  text", "  here"]
         );
     }
 
