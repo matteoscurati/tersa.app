@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+mail-parser.workspace = true
 tersa-application = { path = "../application", version = "=0.0.0" }
 tersa-domain = { path = "../domain", version = "=0.0.0" }
 
