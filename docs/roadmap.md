@@ -8,16 +8,22 @@ Every milestone ships as reviewed pull requests that pass `cargo xtask verify`
 on Linux and macOS. A failed milestone check changes the plan; it is not
 accepted as temporary debt.
 
+T1 through T7 are validated manually on macOS only. Linux keeps full CI
+coverage on every pull request, but real-consent runs, Linux release binaries,
+and Linux packaging are deferred to T8 so that the product is finished on one
+platform first.
+
 | Milestone | Scope | Done when |
 |---|---|---|
 | T0 — Pivot | ADR 0031; Apple sources, FFI crates, and Apple CI removed; minimal `xtask`; docs rewritten | Workspace verifies on Linux and macOS without `apple/` |
-| T1 — Portable foundation | Adapters made portable and renamed; TLS and SQLCipher crypto from the OS on macOS and from one static vendored OpenSSL on Linux; `crates/keys`; `adapters/vault` (keyring, optional passphrase, passphrase-only fallback); XDG paths; Rust loopback OAuth; in-process token service; BYO OAuth client config | `tersa account add` completes real Google consent on macOS, Linux desktop, and headless Linux |
+| T1 — Portable foundation | Adapters made portable and renamed; TLS and SQLCipher crypto from the OS on macOS and from one static vendored OpenSSL on Linux; `crates/keys`; `adapters/vault` (keyring, optional passphrase, passphrase-only fallback); XDG paths; Rust loopback OAuth; in-process token service; BYO OAuth client config | `tersa account add` and `tersa inbox` work against a real Google account on macOS |
 | T2 — Read-only TUI | `ratatui` shell; paged inbox; thread view; sanitized text; HTML to text; search; offline reopen; background sync with status; first performance harness | Hostile fixtures render safely; budgets measured in the PR |
 | T3 — Multi-account | Encrypted registry; add, remove, reset; per-account sync workers; unified inbox | Two real accounts sync and display without cross-account leakage |
 | T4 — Triage | `history.list` incremental sync; archive, read state, labels, trash, undo with pending actions | Offline actions reconcile after reconnect |
 | T5 — Composition | `$EDITOR` flow; MIME building; local-first drafts synced to Gmail; reply, forward, attachments; idempotent outbox | Killing tersa mid-send never produces a duplicate |
 | T6 — Cache and lock | Encrypted cache budget and eviction; `:lock` and idle lock | Budget holds under a large mailbox |
-| T7 — Distribution | Release workflow for macOS and Linux (x86_64, aarch64); Homebrew tap | `brew install` works from a clean machine |
+| T7 — macOS distribution | Release workflow for macOS (aarch64, x86_64); Homebrew tap; release-signing decision for stable Keychain access | `brew install` works from a clean Mac |
+| T8 — Linux | Real consent on a Secret Service desktop and on headless Linux with the passphrase-only vault; Linux release binaries (x86_64, aarch64) with the vendored OpenSSL; Homebrew on Linux formula; OpenSSL advisory rebuild procedure | `brew install` and `tersa account add` work on a clean Linux desktop and a headless host |
 
 ## Initial performance budgets
 

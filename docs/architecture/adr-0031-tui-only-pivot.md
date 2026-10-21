@@ -153,7 +153,11 @@ ADR changes the budget.
 | T4 | Triage with history sync and pending actions. |
 | T5 | Composition, drafts, and the idempotent outbox. |
 | T6 | Encrypted cache budget, eviction, and lock. |
-| T7 | Release workflow and Homebrew tap. |
+| T7 | macOS release workflow, Homebrew tap, and release signing. |
+| T8 | Linux validation with real consent (desktop and headless), Linux release binaries, and Homebrew on Linux. |
+
+T1 through T7 are validated manually on macOS; Linux keeps CI coverage on
+every pull request and gets its manual validation and packaging in T8.
 
 ## Consequences
 
