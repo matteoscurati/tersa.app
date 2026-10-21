@@ -4,8 +4,7 @@
 
 - macOS or a current Linux distribution (x86_64 or aarch64)
 - Rust 1.91.1, installed automatically through `rust-toolchain.toml`
-- Optional: `cargo-deny`, `cargo-audit`, `cargo-hack`, and `typos` to run the
-  CI policy checks locally
+- Optional: `cargo-deny` and `typos` to run the CI policy checks locally
 
 ## Verification
 
@@ -16,9 +15,20 @@ cargo xtask verify
 ```
 
 It runs the layering check, `cargo fmt --check`, Clippy with warnings denied,
-tests, doc tests, and rustdoc with warnings denied. CI runs it on Linux and
-macOS and additionally runs `cargo deny check`, `cargo audit`,
-`cargo hack check --feature-powerset`, `typos`, and DCO validation.
+a default-feature check, tests, doc tests, and rustdoc with warnings denied.
+
+CI is kept fast and cheap on purpose. It runs only for pull requests into
+`main` and pushes to `main`, so a stacked pull request is checked on its first
+push after it targets `main`; draft pull requests fail the gate until they are
+ready for review. On Linux it runs DCO validation, `typos`,
+`cargo deny --locked check`, and `cargo xtask verify` with a dependency cache
+that only `main` writes; on macOS it runs `cargo xtask verify` for pull
+requests only. Changes that touch only documentation skip both builds and
+`cargo deny` (`scripts/ci-needs-build.sh`); DCO and `typos` still run.
+
+`cargo xtask` runs with `--locked`, locally too. After changing a dependency,
+update `Cargo.lock` first (for example with `cargo check` or
+`cargo update --workspace`).
 
 Scoped loops while iterating (see the
 [agent playbook](development/agent-playbook.md)):

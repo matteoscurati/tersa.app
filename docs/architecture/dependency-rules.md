@@ -37,6 +37,6 @@ first.
 `deny.toml` restricts the shipped graph to the macOS and Linux targets,
 allows only OSI-approved licenses (ADR 0006 A4), denies yanked crates and
 wildcard versions, and keeps retired UI runtimes out of the graph.
-`cargo audit` runs on every pull request. A new production dependency needs a
-justification in its pull request: why it is needed, its license, and its
-maintenance status.
+`cargo deny check` also applies the RustSec advisory database on every pull
+request that changes code. A new production dependency needs a justification in its pull
+request: why it is needed, its license, and its maintenance status.

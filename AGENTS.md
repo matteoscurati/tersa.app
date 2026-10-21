@@ -23,7 +23,7 @@ class’s paths. Run the **minimum** loop for the class; run full
 | `presentation` | `crates/presentation/**` | `cargo xtask preflight presentation` | store, secrets, Gmail adapters |
 | `adapter-rust` | one `adapters/<name>/**` | `cargo xtask preflight adapter --package <crate>` | other adapters, apps |
 | `tui` | `apps/**` | `cargo xtask preflight tui` | core crates, adapters, `xtask/**` |
-| `policy-xtask` | `xtask/**`, CI, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then full `verify` | product features in the same PR |
+| `policy-xtask` | `xtask/**`, CI, `scripts/**`, `.cargo/**`, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then full `verify` | product features in the same PR |
 | `docs-only` | `docs/**`, markdown | none (`typos` if installed) | code |
 
 Full map, anti-patterns, and ADR pointers:
@@ -46,6 +46,21 @@ Full map, anti-patterns, and ADR pointers:
 3. Commands run  
 4. Residual risks  
 5. Explicit non-claims  
+
+## CI budget
+
+CI must stay fast and cheap; treat that as a requirement, not a preference.
+
+- Keep `.github/workflows/ci.yml` to one Linux job, one macOS job, and the
+  `CI gate`. Do not add jobs, matrix entries, runners, scheduled runs, or
+  heavyweight tools without an explicit user decision.
+- Run expensive work only where it adds signal: macOS runs on pull requests
+  only, documentation-only changes skip builds, and only `main` writes caches.
+- Prefer one tool per concern (for example `cargo deny` for advisories, not
+  also `cargo audit`), and run local checks before pushing instead of using CI
+  as the first test run.
+- A change that makes CI slower or more expensive must say so, with numbers,
+  in its pull request.
 
 ## Implementation lanes
 
