@@ -48,8 +48,12 @@ fn sender_name(from: &str) -> &str {
 pub enum Body {
     /// The full cached message.
     Rendered(Box<RenderedMessage>),
-    /// Only the envelope is cached; the body arrives with a later sync.
+    /// Only the envelope is cached, and no download is possible.
     NotCached,
+    /// The full message is being downloaded.
+    Downloading,
+    /// Downloading the full message failed, with a message for the reader.
+    DownloadFailed(String),
     /// Reading the cached message failed.
     Failed,
 }
@@ -228,6 +232,36 @@ impl App {
         });
     }
 
+    /// Marks the open message as downloading.
+    pub fn downloading(&mut self, index: usize) {
+        if let Screen::Message(view) = &mut self.screen
+            && view.index == index
+        {
+            view.body = Body::Downloading;
+            view.layout = None;
+            self.repaint = true;
+        }
+    }
+
+    /// Takes a finished download. It is shown only if that message is still
+    /// open; it is cached either way.
+    pub fn downloaded(&mut self, index: usize, result: Result<Vec<u8>, String>) {
+        let open = matches!(&self.screen, Screen::Message(view) if view.index == index);
+        if !open {
+            return;
+        }
+        match result {
+            Ok(raw) => self.show_message(index, Ok(Some(raw))),
+            Err(error) => {
+                if let Screen::Message(view) = &mut self.screen {
+                    view.body = Body::DownloadFailed(error);
+                    view.layout = None;
+                    self.repaint = true;
+                }
+            }
+        }
+    }
+
     fn toggle_format(&mut self) {
         let Screen::Message(view) = &mut self.screen else {
             return;
@@ -366,6 +400,33 @@ mod tests {
         assert!(matches!(app.screen, Screen::Inbox));
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn downloads_land_only_on_the_message_still_open() {
+        let mut app = app(2);
+        app.show_message(0, Ok(None));
+        app.downloading(0);
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
+        );
+        app.downloaded(1, Ok(b"Subject: other\r\n\r\nx".to_vec()));
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
+        );
+        app.downloaded(0, Ok(b"Subject: s\r\n\r\nfull body".to_vec()));
+        let Screen::Message(view) = &app.screen else {
+            panic!("message screen");
+        };
+        let Body::Rendered(rendered) = &view.body else {
+            panic!("rendered");
+        };
+        assert_eq!(rendered.body.as_str(), "full body");
+        app.show_message(1, Ok(None));
+        app.downloaded(1, Err("offline".to_owned()));
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(&view.body, Body::DownloadFailed(error) if error == "offline"))
+        );
     }
 
     #[test]

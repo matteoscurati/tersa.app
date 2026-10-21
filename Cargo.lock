@@ -2331,6 +2331,7 @@ dependencies = [
  "rustix",
  "sha2",
  "tersa-application",
+ "tersa-domain",
  "tersa-gmail-rest",
  "tersa-keys",
  "tersa-store-sqlcipher",

@@ -11,9 +11,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use tersa_presentation::message::{BodyFormat, RenderedMessage};
+use tersa_presentation::terminal::SafeText;
 
 use super::app::{App, Body, MessageView, Row, Screen};
-use super::wrap::{truncate, width, wrap};
+use super::wrap::{truncate, width, wrap, wrap_chars};
 use crate::dates;
 
 /// One drawn line; message layouts are cached as these.
@@ -186,7 +187,7 @@ fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<S
     let mut lines = Vec::new();
     match &view.body {
         Body::Rendered(rendered) => rendered_lines(rendered, row, columns, &mut lines),
-        Body::NotCached | Body::Failed => {
+        Body::NotCached | Body::Downloading | Body::DownloadFailed(_) | Body::Failed => {
             if let Some(row) = row {
                 push_wrapped(&mut lines, row.subject.as_str(), columns, bold());
                 header(&mut lines, "From", row.sender.as_str(), columns);
@@ -198,13 +199,18 @@ fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<S
                 );
             }
             lines.push(rule(columns));
-            let note = if matches!(view.body, Body::Failed) {
-                "This message could not be read from the local cache."
-            } else {
-                "The full message is not downloaded yet; it arrives with a later sync. \
-                 Gmail's preview:"
+            let note = match &view.body {
+                Body::Failed => "This message could not be read from the local cache.".to_owned(),
+                Body::Downloading => "Downloading the full message… Gmail's preview:".to_owned(),
+                Body::DownloadFailed(error) => format!(
+                    "The full message could not be downloaded: {}. Gmail's preview:",
+                    SafeText::single_line(error).as_str()
+                ),
+                _ => "The full message is not downloaded yet; it arrives with a later sync. \
+                      Gmail's preview:"
+                    .to_owned(),
             };
-            push_wrapped(&mut lines, note, columns, dim());
+            push_wrapped(&mut lines, &note, columns, dim());
             if let Some(row) = row {
                 lines.push(Line::raw(""));
                 push_wrapped(&mut lines, row.preview.as_str(), columns, Style::new());
@@ -252,13 +258,22 @@ fn rendered_lines(
     if !rendered.links.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled("Links", bold()));
+        let indent = format!("[{}] ", rendered.links.len()).len();
         for (number, link) in rendered.links.iter().enumerate() {
-            push_wrapped(
-                lines,
-                &format!("[{}] {}", number + 1, link.as_str()),
-                columns,
-                dim(),
-            );
+            // Addresses have no good break points: wrap them by character,
+            // indented under their reference number.
+            let lead = format!("{:<indent$}", format!("[{}]", number + 1));
+            for (row, part) in wrap_chars(link.as_str(), columns.saturating_sub(indent).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if row == 0 {
+                    lead.clone()
+                } else {
+                    " ".repeat(indent)
+                };
+                lines.push(Line::from(vec![Span::raw(lead), Span::styled(part, dim())]));
+            }
         }
     }
     if !rendered.attachments.is_empty() {

@@ -12,8 +12,10 @@ mod app;
 mod view;
 mod wrap;
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -33,30 +35,97 @@ pub trait MailSource {
     fn message(&self, index: usize) -> Result<Option<Vec<u8>>, ()>;
 }
 
+/// Downloads full messages; runs on its own thread so the interface stays
+/// responsive while the network is slow.
+pub trait Fetcher: Send + 'static {
+    /// Downloads, caches, and returns the raw message for the row at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a short reason for the reader.
+    fn fetch(&mut self, index: usize) -> Result<Vec<u8>, String>;
+}
+
+/// How often the loop checks for finished downloads while idle.
+const TICK: Duration = Duration::from_millis(100);
+
 /// Runs the interface until the user quits.
 ///
 /// # Errors
 ///
 /// Returns a message when standard input or output is not a terminal, or the
 /// terminal fails.
-pub fn run(account: SafeText, rows: Vec<Row>, source: &dyn MailSource) -> Result<(), String> {
+pub fn run(
+    account: SafeText,
+    rows: Vec<Row>,
+    source: &dyn MailSource,
+    fetcher: Option<Box<dyn Fetcher>>,
+) -> Result<(), String> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned());
     }
     let mut app = App::new(account, rows);
+    let downloads = fetcher.map(Downloads::start);
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = ratatui::try_init().map_err(terminal_error)?;
-    let result = event_loop(&mut terminal, &mut app, source);
+    let result = event_loop(&mut terminal, &mut app, source, downloads);
     ratatui::restore();
     result
+}
+
+/// The download thread's channels. Dropping it ends the thread after its
+/// current download; the process does not wait for it.
+struct Downloads {
+    requests: Sender<usize>,
+    results: Receiver<(usize, Result<Vec<u8>, String>)>,
+    in_flight: HashSet<usize>,
+}
+
+impl Downloads {
+    fn start(mut fetcher: Box<dyn Fetcher>) -> Self {
+        let (requests, incoming) = mpsc::channel::<usize>();
+        let (outgoing, results) = mpsc::channel();
+        std::thread::spawn(move || {
+            for index in incoming {
+                let result = fetcher.fetch(index);
+                if outgoing.send((index, result)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            results,
+            in_flight: HashSet::new(),
+        }
+    }
+
+    /// Asks for `index`; returns false when the thread is gone.
+    fn request(&mut self, index: usize) -> bool {
+        if self.in_flight.contains(&index) {
+            return true;
+        }
+        let sent = self.requests.send(index).is_ok();
+        if sent {
+            self.in_flight.insert(index);
+        }
+        sent
+    }
 }
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     source: &dyn MailSource,
+    mut downloads: Option<Downloads>,
 ) -> Result<(), String> {
     loop {
+        if let Some(downloads) = &mut downloads {
+            while let Ok((index, result)) = downloads.results.try_recv() {
+                downloads.in_flight.remove(&index);
+                app.downloaded(index, result);
+            }
+        }
         let now = now_millis();
         if std::mem::take(&mut app.repaint) {
             // Repaint every cell when the screen changes, so any drift
@@ -69,13 +138,24 @@ fn event_loop(
         if app.quit {
             return Ok(());
         }
+        if !event::poll(TICK).map_err(terminal_error)? {
+            continue;
+        }
         if let Event::Key(key) = event::read().map_err(terminal_error)? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
             if let Some(Request::OpenMessage(index)) = app.key(key) {
                 let raw = source.message(index);
+                let missing = matches!(raw, Ok(None));
                 app.show_message(index, raw);
+                if missing
+                    && downloads
+                        .as_mut()
+                        .is_some_and(|downloads| downloads.request(index))
+                {
+                    app.downloading(index);
+                }
             }
         }
     }

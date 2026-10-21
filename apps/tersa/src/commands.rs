@@ -397,7 +397,44 @@ pub fn tui(context: &Context) -> Result<(), String> {
             .map(|envelope| envelope.message_id().clone())
             .collect(),
     };
-    crate::tui::run(SafeText::single_line(account.as_str()), rows, &source)
+    // Downloads need the OAuth client; without it the interface still reads
+    // the cache.
+    let fetcher = runtime(context, Arc::clone(&locked.installation))
+        .ok()
+        .and_then(|runtime| {
+            Some(Box::new(StoreFetcher {
+                runtime,
+                executor: self::executor().ok()?,
+                account: account.clone(),
+                ids: source.ids.clone(),
+            }) as Box<dyn crate::tui::Fetcher>)
+        });
+    crate::tui::run(
+        SafeText::single_line(account.as_str()),
+        rows,
+        &source,
+        fetcher,
+    )
+}
+
+/// Downloads full messages for the interface through the identity gate.
+struct StoreFetcher {
+    runtime: Runtime,
+    executor: tokio::runtime::Runtime,
+    account: AccountId,
+    ids: Vec<MessageId>,
+}
+
+impl crate::tui::Fetcher for StoreFetcher {
+    fn fetch(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        let id = self
+            .ids
+            .get(index)
+            .ok_or_else(|| "unknown message".to_owned())?;
+        self.executor
+            .block_on(self.runtime.fetch_message(&self.account, id))
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Reads cached messages for the interface from one account's store.
