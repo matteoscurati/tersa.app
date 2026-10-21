@@ -22,6 +22,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tersa_domain::mailbox::AccountId;
 use zeroize::{Zeroize, Zeroizing};
@@ -216,6 +217,23 @@ pub fn account_identity_hash(
     Ok(*result?.as_bytes())
 }
 
+/// Computes the registry dedup tag of an OAuth subject.
+///
+/// HMAC-SHA256 keyed by the [`InstallationKeyPurpose::RegistrySubjectDedupV1`]
+/// key: equal subjects give equal tags on this installation only, and the
+/// tag reveals nothing about the subject without the root key.
+///
+/// # Errors
+///
+/// Never fails for a valid root key; the `Result` mirrors the derivations.
+pub fn registry_dedup_tag(root: &RootKey, subject: &[u8]) -> Result<[u8; KEY_LEN], KeyError> {
+    let key = derive_installation_key(root, InstallationKeyPurpose::RegistrySubjectDedupV1)?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes())
+        .map_err(|_error| KeyError::InputTooLong)?;
+    mac.update(subject);
+    Ok(mac.finalize().into_bytes().into())
+}
+
 fn account_info(account: &AccountId, purpose: &[u8]) -> Result<Vec<u8>, KeyError> {
     let account = account.as_str().as_bytes();
     let mut info = Vec::with_capacity(ACCOUNT_PREFIX.len() + 4 + account.len() + purpose.len());
@@ -402,7 +420,7 @@ mod tests {
     use super::{
         AccountKeyPurpose, InstallationKeyPurpose, KdfParams, KeyError, RootKey, WRAPPED_LEN,
         account_identity_hash, account_info, derive_account_key, derive_installation_key,
-        unwrap_root_key, wrap_root_key,
+        registry_dedup_tag, unwrap_root_key, wrap_root_key,
     };
 
     // Cheap parameters keep the tests fast; production uses DEFAULT.
@@ -479,6 +497,20 @@ mod tests {
         assert_eq!(
             outputs[0],
             "f176fddf4500f948f47a5ec7e9a1e26867d0d9f24ccebe1390f21c3d1693aaef"
+        );
+    }
+
+    #[test]
+    fn dedup_tag_matches_an_independent_hmac() {
+        // HMAC-SHA256(HKDF(root, installation dedup purpose), "subject"),
+        // computed independently with Python hmac/hashlib.
+        assert_eq!(
+            hex(&registry_dedup_tag(&root(), b"subject").expect("tag")),
+            "ea367e0233fbe54e1c1aff844700d93d005af750d1bc1c774185bec098dc9461"
+        );
+        assert_ne!(
+            registry_dedup_tag(&root(), b"a").expect("tag"),
+            registry_dedup_tag(&root(), b"b").expect("tag")
         );
     }
 

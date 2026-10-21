@@ -8,6 +8,7 @@
 
 /// UI-neutral mailbox view models projected from metadata documents.
 pub mod mailbox;
+pub mod terminal;
 
 /// Returns the protocol version expected by platform presentation adapters.
 ///

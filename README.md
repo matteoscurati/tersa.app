@@ -15,6 +15,30 @@ no published builds.
 - no project-operated backend
 - message content rendered as sanitized text; no remote content is fetched
 
+## Trying it
+
+tersa has no releases yet. From a checkout:
+
+1. In Google Cloud Console, create a project, enable the Gmail API, and create
+   an OAuth client of type **Desktop app**. Add yourself as a test user.
+2. Put the client in `~/.config/tersa/config.toml`:
+
+   ```toml
+   [google]
+   client_id = "….apps.googleusercontent.com"
+   client_secret = "…"
+
+   # Optional. "auto" uses the system keyring and falls back to a
+   # passphrase-protected key file; set passphrase = true to require a
+   # passphrase even with a keyring.
+   [vault]
+   backend = "auto"
+   passphrase = false
+   ```
+
+3. Run `cargo run -p tersa -- account add`, then `… -- inbox`. `tersa doctor`
+   shows where files live and what is configured.
+
 ## Project status
 
 See the [roadmap](docs/roadmap.md) and

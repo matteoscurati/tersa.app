@@ -26,11 +26,11 @@ flowchart LR
 
 | Flow | Data | Controls | Status |
 |---|---|---|---|
-| OAuth | Client ID/secret from user config, PKCE verifier, state, code, tokens | Loopback redirect, exact state check, PKCE S256, `id_token` audience/issuer/subject validation, identity gate | PKCE, token lifecycle, identity gate implemented in `tersa-application`; Rust loopback planned (T1) |
+| OAuth | Client ID/secret from user config, PKCE verifier, state, code, tokens | Loopback redirect, exact state check, PKCE S256, `id_token` audience/issuer/subject validation, identity gate | Implemented: PKCE, token lifecycle, identity gate (`tersa-application`), in-process token service (`tersa-token-broker-core`), IPv4 loopback listener and account flows (`tersa-sync-runtime`) |
 | Gmail sync | IDs, labels, headers, bounded raw bodies | Official Gmail REST API, bounded pages and bodies, encrypted reconciliation | Bounded snapshot sync implemented; history sync, mutations, drafts, outbox planned (T4–T5) |
-| Key hierarchy | Root key, HKDF-derived registry/account/dedup keys | OS keyring or Argon2id + XChaCha20-Poly1305 wrapped slot; owner-only, no-follow key file; zeroization | `tersa-keys` (derivation, wrapping) and `tersa-vault` (keyring and file slots) implemented; wiring into the app planned (T1c) |
-| Structured storage | Envelopes, bodies, refresh tokens, pending actions, drafts; registry of `(AccountId, dedup tag)` | Per-account SQLCipher, separate SQLCipher registry, exact schema validation, owner-only modes | Account store with refresh-token column and the registry implemented in `tersa-store-sqlcipher`; wiring planned (T1d), unified views (T3) |
-| Display | Headers, bodies, labels, filenames | Sanitizer strips control and bidi characters; HTML to text with limits; no remote fetch | Lightweight MIME text extraction implemented; sanitizer and HTML to text planned (T2) |
+| Key hierarchy | Root key, HKDF-derived registry/account/dedup keys | OS keyring or Argon2id + XChaCha20-Poly1305 wrapped slot; owner-only, no-follow key file; zeroization | Implemented in `tersa-keys` and `tersa-vault`, used by `tersa` |
+| Structured storage | Envelopes, bodies, refresh tokens, pending actions, drafts; registry of `(AccountId, dedup tag)` | Per-account SQLCipher, separate SQLCipher registry, exact schema validation, owner-only modes | Implemented (`tersa-store-sqlcipher`, used by `tersa-sync-runtime`); unified views planned (T3) |
+| Display | Headers, bodies, labels, filenames | Sanitizer strips control and bidi characters; HTML to text with limits; no remote fetch | `SafeText` sanitizer implemented and used by `tersa inbox`; HTML to text and the TUI planned (T2) |
 | Composition | Draft plaintext | `$EDITOR` on an owner-only temp file removed afterwards; local-first draft in SQLCipher | Planned (T5) |
 | Attachments | Attachment bytes | On-demand fetch, size limits, sanitized names, saved only on request, never auto-opened | Planned (T5–T6) |
 | Logs | Counts, durations, error classes | No content, addresses, queries, tokens, or stable IDs | Redacted error types implemented |

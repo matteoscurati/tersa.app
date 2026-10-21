@@ -1,0 +1,33 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-sync-runtime"
+description = "In-process account runtime for tersa: OAuth loopback, token service, identity gate, bounded sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+url.workspace = true
+sha2.workspace = true
+tersa-application.workspace = true
+tersa-gmail-rest = { path = "../gmail-rest", version = "=0.0.0" }
+tersa-keys.workspace = true
+tersa-store-sqlcipher = { path = "../store-sqlcipher", version = "=0.0.0" }
+tersa-token-broker-core = { path = "../token-broker-core", version = "=0.0.0" }
+tokio = { workspace = true, features = ["io-util"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tersa-application = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
