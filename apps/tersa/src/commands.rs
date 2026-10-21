@@ -45,17 +45,20 @@ fn lock(context: &Context) -> Result<InstallationLock, String> {
     InstallationLock::acquire(&context.paths.data_dir).map_err(|error| error.to_string())
 }
 
-/// Takes the lock only when the data directory exists, so commands that
-/// cannot create an installation leave a fresh machine untouched. `account
-/// add` creates the directory and lock file before anything else, so a
-/// concurrent command always finds the lock.
+/// Takes the lock for a command that cannot create an installation, or
+/// returns `None` when the data directory does not exist. Callers then stop
+/// before reading the vault: the keyring entry is shared by every data
+/// directory, so a key may exist although this directory does not, and
+/// opening it here would create an installation without the lock. Any other
+/// error goes through [`lock`] and fails closed.
 fn lock_existing(context: &Context) -> Result<Option<InstallationLock>, String> {
-    if std::fs::symlink_metadata(&context.paths.data_dir).is_ok() {
-        lock(context).map(Some)
-    } else {
-        Ok(None)
+    match std::fs::symlink_metadata(&context.paths.data_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => lock(context).map(Some),
     }
 }
+
+const NO_ACCOUNTS: &str = "no accounts yet; run `tersa account add`";
 
 fn missing_key_message(context: &Context, vault: &Vault) -> String {
     let location = match vault.kind() {
@@ -67,6 +70,8 @@ fn missing_key_message(context: &Context, vault: &Vault) -> String {
          - If the system keyring is temporarily unavailable (for example over SSH \
          without a Secret Service session), make it available and retry; set \
          `[vault] backend = \"keyring\"` to stop falling back to a key file.\n\
+         - If the key was created in a passphrase-protected key file (for example \
+         on a host without a keyring), set `[vault] backend = \"file\"`.\n\
          - If the key was deleted, this data cannot be decrypted: move {dir} \
          aside and run `tersa account add` again.",
         dir = context.paths.data_dir.display()
@@ -142,9 +147,31 @@ fn unlock_with_passphrase(vault: &Vault) -> Result<RootKey, String> {
     Err("too many wrong passphrases".to_owned())
 }
 
-fn require_installation(context: &Context) -> Result<Arc<Installation>, String> {
-    unlock(context, Create::Forbidden)?
-        .ok_or_else(|| "no accounts yet; run `tersa account add`".to_owned())
+/// Opens an existing installation under its lock, for commands that cannot
+/// create one. Together with `account add`, which locks first, this is the
+/// only way to reach [`unlock`], so no command opens an installation without
+/// holding the lock.
+fn open_existing(context: &Context) -> Result<Option<Locked>, String> {
+    let Some(lock) = lock_existing(context)? else {
+        return Ok(None);
+    };
+    Ok(
+        unlock(context, Create::Forbidden)?.map(|installation| Locked {
+            installation,
+            _lock: lock,
+        }),
+    )
+}
+
+/// An open installation and the lock that guards it. Fields drop in
+/// declaration order, so the lock is released last.
+struct Locked {
+    installation: Arc<Installation>,
+    _lock: InstallationLock,
+}
+
+fn require_installation(context: &Context) -> Result<Locked, String> {
+    open_existing(context)?.ok_or_else(|| NO_ACCOUNTS.to_owned())
 }
 
 fn runtime(context: &Context, installation: Arc<Installation>) -> Result<Runtime, String> {
@@ -225,12 +252,14 @@ pub fn account_add(context: &Context) -> Result<(), String> {
 }
 
 pub fn account_list(context: &Context) -> Result<(), String> {
-    let _lock = lock_existing(context)?;
-    let Some(installation) = unlock(context, Create::Forbidden)? else {
+    let Some(locked) = open_existing(context)? else {
         println!("No accounts yet. Run `tersa account add`.");
         return Ok(());
     };
-    let accounts = installation.accounts().map_err(|error| error.to_string())?;
+    let accounts = locked
+        .installation
+        .accounts()
+        .map_err(|error| error.to_string())?;
     if accounts.is_empty() {
         println!("No accounts yet. Run `tersa account add`.");
     }
@@ -241,8 +270,8 @@ pub fn account_list(context: &Context) -> Result<(), String> {
 }
 
 pub fn account_remove(context: &Context, raw: &str) -> Result<(), String> {
-    let _lock = lock_existing(context)?;
-    let installation = require_installation(context)?;
+    let locked = require_installation(context)?;
+    let installation = Arc::clone(&locked.installation);
     let account = resolve_account(&installation, raw)?;
     let runtime = runtime(context, installation)?;
     let revocation = executor()?
@@ -259,8 +288,8 @@ pub fn account_remove(context: &Context, raw: &str) -> Result<(), String> {
 }
 
 pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
-    let _lock = lock_existing(context)?;
-    let installation = require_installation(context)?;
+    let locked = require_installation(context)?;
+    let installation = Arc::clone(&locked.installation);
     let accounts = match raw {
         Some(raw) => vec![resolve_account(&installation, raw)?],
         None => installation.accounts().map_err(|error| error.to_string())?,
@@ -292,8 +321,8 @@ pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
 }
 
 pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), String> {
-    let _lock = lock_existing(context)?;
-    let installation = require_installation(context)?;
+    let locked = require_installation(context)?;
+    let installation = Arc::clone(&locked.installation);
     let account = match raw {
         Some(raw) => resolve_account(&installation, raw)?,
         None => installation
@@ -301,7 +330,7 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
-            .ok_or_else(|| "no accounts yet; run `tersa account add`".to_owned())?,
+            .ok_or_else(|| NO_ACCOUNTS.to_owned())?,
     };
     let store = installation
         .open_store(&account)
@@ -365,6 +394,11 @@ pub fn doctor(context: &Context) {
                 SlotKind::File => "passphrase-protected key file",
             };
             let state = match vault.state() {
+                Ok(VaultState::Empty) if has_local_data(&context.paths.data_dir) => {
+                    "key missing, but encrypted data exists; run `tersa account list` \
+                     for recovery steps"
+                        .to_owned()
+                }
                 Ok(VaultState::Empty) => "no key yet".to_owned(),
                 Ok(VaultState::Unprotected) => "key present".to_owned(),
                 Ok(VaultState::PassphraseProtected) => {
@@ -380,35 +414,68 @@ pub fn doctor(context: &Context) {
 
 #[cfg(test)]
 mod tests {
-    use tersa_vault::VaultState;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Create, UnlockPlan, plan_unlock};
+    use tersa_vault::{BackendChoice, VaultState};
+
+    use super::{
+        Context, Create, NO_ACCOUNTS, UnlockPlan, account_list, account_remove, inbox, plan_unlock,
+        sync,
+    };
+    use crate::config::{Config, Paths};
 
     #[test]
     fn a_key_is_minted_only_on_a_truly_fresh_installation() {
-        for create in [Create::Allowed, Create::Forbidden] {
-            assert_eq!(
-                plan_unlock(VaultState::Empty, true, create),
-                UnlockPlan::RefuseMissingKey
-            );
+        for state in [
+            VaultState::Empty,
+            VaultState::Unprotected,
+            VaultState::PassphraseProtected,
+        ] {
+            for data in [false, true] {
+                for create in [Create::Allowed, Create::Forbidden] {
+                    let expected = match state {
+                        VaultState::Empty if data => UnlockPlan::RefuseMissingKey,
+                        VaultState::Empty if create == Create::Forbidden => UnlockPlan::NothingYet,
+                        VaultState::Empty => UnlockPlan::CreateKey,
+                        VaultState::Unprotected => UnlockPlan::Unlock,
+                        VaultState::PassphraseProtected => UnlockPlan::UnlockWithPassphrase,
+                    };
+                    let plan = plan_unlock(state, data, create);
+                    assert_eq!(plan, expected);
+                    assert_eq!(
+                        plan == UnlockPlan::CreateKey,
+                        state == VaultState::Empty && !data && create == Create::Allowed
+                    );
+                }
+            }
         }
-        assert_eq!(
-            plan_unlock(VaultState::Empty, false, Create::Forbidden),
-            UnlockPlan::NothingYet
-        );
-        assert_eq!(
-            plan_unlock(VaultState::Empty, false, Create::Allowed),
-            UnlockPlan::CreateKey
-        );
-        for data in [false, true] {
-            assert_eq!(
-                plan_unlock(VaultState::Unprotected, data, Create::Allowed),
-                UnlockPlan::Unlock
-            );
-            assert_eq!(
-                plan_unlock(VaultState::PassphraseProtected, data, Create::Forbidden),
-                UnlockPlan::UnlockWithPassphrase
-            );
-        }
+    }
+
+    #[test]
+    fn commands_that_cannot_create_leave_a_missing_data_dir_absent() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("tersa-absent-{}-{nanos}", std::process::id()));
+        let data_dir: PathBuf = root.join("data");
+        let mut config = Config::load(&root.join("config.toml")).expect("config");
+        config.backend = BackendChoice::File;
+        let context = Context {
+            paths: Paths {
+                config_dir: root.clone(),
+                data_dir: data_dir.clone(),
+            },
+            config,
+        };
+
+        assert_eq!(account_list(&context), Ok(()));
+        let refused = Err(NO_ACCOUNTS.to_owned());
+        assert_eq!(account_remove(&context, "acct_"), refused);
+        assert_eq!(sync(&context, None), refused);
+        assert_eq!(inbox(&context, None, 10), refused);
+        assert!(std::fs::symlink_metadata(&root).is_err());
     }
 }
