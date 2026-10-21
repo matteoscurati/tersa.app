@@ -11,7 +11,8 @@ accepted as temporary debt.
 T1 through T7 are validated manually on macOS only. Linux keeps full CI
 coverage on every pull request, but real-consent runs, Linux release binaries,
 and Linux packaging are deferred to T8 so that the product is finished on one
-platform first.
+platform first. T8 also revisits the `deny.toml` ignores for the zbus 5
+unmaintained notices (RUSTSEC-2026-0370, -0371, -0372).
 
 | Milestone | Scope | Done when |
 |---|---|---|
