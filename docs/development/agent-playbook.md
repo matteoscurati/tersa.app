@@ -21,7 +21,7 @@ Unknown crates or paths: ask the lead.
 | `presentation` | `crates/presentation/**` | `cargo xtask preflight presentation` | the sanitized-text contract changes |
 | `adapter-rust` | exactly one `adapters/<name>/**` | `cargo xtask preflight adapter --package <crate>` | `Cargo.toml` or `deny.toml` changes |
 | `tui` | `apps/**` | `cargo xtask preflight tui` | a core or adapter API is needed |
-| `policy-xtask` | `xtask/**`, `.github/**`, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then `verify` | always high scrutiny |
+| `policy-xtask` | `xtask/**`, `.github/**`, `scripts/**`, `.cargo/**`, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then `verify` | always high scrutiny |
 | `docs-only` | `docs/**`, root `*.md` | none | n/a |
 
 ## Workspace packages

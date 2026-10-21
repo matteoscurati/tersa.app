@@ -1,8 +1,10 @@
 name: CI
 
 # Kept deliberately small: CI must stay fast and cheap (see AGENTS.md).
-# Pull requests into main and pushes to main only; stacked pull requests get
-# CI once they target main. Documentation-only changes skip the Rust build.
+# Pull requests into main and pushes to main only; a stacked pull request
+# gets CI on its first push after it targets main. Documentation-only changes
+# skip the Rust build. Draft pull requests fail the gate instead of skipping
+# it, so a stale skipped result can never satisfy the required check.
 
 on:
   pull_request:
@@ -39,19 +41,25 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.after }}
         run: |
+          build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")
+          case "$build" in true | false) ;; *) exit 1 ;; esac
           {
             echo "base=$BASE"
             echo "head=$HEAD"
-            echo "build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")"
+            echo "build=$build"
           } >> "$GITHUB_OUTPUT"
       # Pushes check without merge commits: GitHub-created merges carry no
       # sign-off, and every authored commit they bring in is still checked.
       - name: Check DCO sign-offs
         if: ${{ github.event_name == 'pull_request' || github.event.before != '0000000000000000000000000000000000000000' }}
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+          HEAD: ${{ steps.range.outputs.head }}
+          MERGES: ${{ github.event_name == 'push' && '--no-merges' || '' }}
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_dco.py
-          python3 scripts/check-dco.py ${{ github.event_name == 'push' && '--no-merges' || '' }} \
-            "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+          # shellcheck disable=SC2086 # MERGES is empty or a single flag.
+          python3 scripts/check-dco.py $MERGES "$BASE" "$HEAD"
       - name: Install policy tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
@@ -59,16 +67,16 @@ jobs:
       - name: Check spelling
         run: typos
       - name: Install pinned Rust toolchain
-        if: steps.range.outputs.build == 'true'
+        if: steps.range.outputs.build != 'false'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           # Only main writes the dependency cache; pull requests restore it.
           cache-save-if: ${{ github.event_name == 'push' }}
       - name: Check dependencies (advisories, licenses, sources, bans)
-        if: steps.range.outputs.build == 'true'
-        run: cargo deny check
+        if: steps.range.outputs.build != 'false'
+        run: cargo deny --locked check
       - name: Run verification
-        if: steps.range.outputs.build == 'true'
+        if: steps.range.outputs.build != 'false'
         run: cargo xtask verify
 
   # macOS runs only on pull requests: main receives only up-to-date pull
@@ -88,20 +96,23 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: echo "build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")" >> "$GITHUB_OUTPUT"
+        run: |
+          build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")
+          case "$build" in true | false) ;; *) exit 1 ;; esac
+          echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Install pinned Rust toolchain
-        if: steps.range.outputs.build == 'true'
+        if: steps.range.outputs.build != 'false'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
       - name: Run verification
-        if: steps.range.outputs.build == 'true'
+        if: steps.range.outputs.build != 'false'
         run: cargo xtask verify
 
   ci_gate:
     name: CI gate
     needs: [linux, macos]
-    if: ${{ always() && (github.event_name == 'push' || !github.event.pull_request.draft) }}
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -110,7 +121,12 @@ jobs:
           LINUX: ${{ needs.linux.result }}
           MACOS: ${{ needs.macos.result }}
           EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
         run: |
-          echo "linux=$LINUX macos=$MACOS" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "linux=$LINUX macos=$MACOS draft=$DRAFT" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$DRAFT" = true ]; then
+            echo "Draft pull requests are not validated; mark it ready for review."
+            exit 1
+          fi
           test "$LINUX" = success
           test "$MACOS" = success || { test "$EVENT" = push && test "$MACOS" = skipped; }

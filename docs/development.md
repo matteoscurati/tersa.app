@@ -18,8 +18,9 @@ It runs the layering check, `cargo fmt --check`, Clippy with warnings denied,
 a default-feature check, tests, doc tests, and rustdoc with warnings denied.
 
 CI is kept fast and cheap on purpose. It runs only for pull requests into
-`main` and pushes to `main`, so stacked pull requests are checked once they
-target `main`. On Linux it runs DCO validation, `typos`, `cargo deny check`,
+`main` and pushes to `main`, so a stacked pull request is checked on its first
+push after it targets `main`; draft pull requests fail the gate until they are
+ready for review. On Linux it runs DCO validation, `typos`, `cargo deny check`,
 and `cargo xtask verify` with a dependency cache that only `main` writes; on
 macOS it runs `cargo xtask verify` for pull requests only. Changes that touch
 only documentation skip both builds (`scripts/ci-needs-build.sh`).

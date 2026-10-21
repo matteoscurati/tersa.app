@@ -274,11 +274,11 @@ fn verify() -> TaskResult {
             "warnings",
         ]),
     )?;
-    // Tests and Clippy enable every feature; this keeps the production
-    // feature set (no test-only features) compiling too.
+    // Tests and Clippy enable every feature; this checks exactly what ships,
+    // the `tersa` binary with its production feature set.
     run_command(
         "default-feature check",
-        cargo(&["check", "--locked", "--workspace"]),
+        cargo(&["check", "--locked", "--package", "tersa"]),
     )?;
     run_command(
         "tests",
