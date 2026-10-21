@@ -6,10 +6,8 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0027: Gmail modify, History, and mailbox commands
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-29
-- Owner intent: Approved; implementation is blocked pending independent
-  architecture/security review and the prerequisite slices below.
 
 ## Context
 
@@ -64,8 +62,11 @@ guards have already changed.
 `AccountCapability::Modify` requests only `openid` and
 `https://www.googleapis.com/auth/gmail.modify`. The product does not request
 `gmail.send`, `mail.google.com`, or permanent-delete scope. `gmail.modify` is
-the sole beta capability for read, compose, send, label, archive, trash, spam,
-and other approved mailbox changes.
+the sole beta provider capability for reads and the closed mailbox-command set
+approved by this ADR: label, archive, trash, spam, and other non-permanent-delete
+commands. Although the provider scope can authorize broader operations, this ADR
+exposes no draft, compose, or send transport; those remain downstream to ADR
+0028 and its own prerequisites.
 
 An existing read-only grant remains installed and usable until a new modify
 grant has passed broker validation for the same account subject. Only then may
