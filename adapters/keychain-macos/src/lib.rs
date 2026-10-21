@@ -164,9 +164,9 @@ impl SecretKey {
     }
 
     #[cfg(target_os = "macos")]
-    fn into_database_key(mut self) -> tersa_store_sqlcipher_macos::DatabaseKey {
+    fn into_database_key(mut self) -> tersa_store_sqlcipher::DatabaseKey {
         let protected = std::mem::replace(&mut self.0, Zeroizing::new([0; 32]));
-        tersa_store_sqlcipher_macos::DatabaseKey::from_zeroizing(protected)
+        tersa_store_sqlcipher::DatabaseKey::from_zeroizing(protected)
     }
 }
 
@@ -472,7 +472,7 @@ impl RootKeyBackend for ProductionBackend {
 #[cfg(target_os = "macos")]
 pub fn open_default_read_only_mailbox(
     account: &AccountId,
-) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
+) -> Result<tersa_store_sqlcipher::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
     let backend = ProductionBackend::new().map_err(|_error| ReadOnlyMailboxOpenError::KeyAccess)?;
     let locator = ProductionContainerLocator::new()
         .map_err(|_error| ReadOnlyMailboxOpenError::ProfileUnavailable)?;
@@ -484,7 +484,7 @@ fn open_read_only_mailbox(
     retriever: &impl RootKeyRetriever,
     locator: &impl ContainerLocator,
     account: &AccountId,
-) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
+) -> Result<tersa_store_sqlcipher::SqlCipherMailboxReader, ReadOnlyMailboxOpenError> {
     let root = retriever
         .copy()
         .map_err(|_error| ReadOnlyMailboxOpenError::KeyAccess)?
@@ -498,16 +498,16 @@ fn open_read_only_mailbox(
     drop(root);
     let path = account_database_path(locator, account)
         .map_err(|_error| ReadOnlyMailboxOpenError::ProfileUnavailable)?;
-    tersa_store_sqlcipher_macos::SqlCipherMailboxReader::open_read_only_classified(
+    tersa_store_sqlcipher::SqlCipherMailboxReader::open_read_only_classified(
         account.clone(),
         path,
         key.into_database_key(),
     )
     .map_err(|failure| match failure {
-        tersa_store_sqlcipher_macos::ReadOnlyMailboxOpenFailure::Storage => {
+        tersa_store_sqlcipher::ReadOnlyMailboxOpenFailure::Storage => {
             ReadOnlyMailboxOpenError::ProfileUnavailable
         }
-        tersa_store_sqlcipher_macos::ReadOnlyMailboxOpenFailure::Corrupted => {
+        tersa_store_sqlcipher::ReadOnlyMailboxOpenFailure::Corrupted => {
             ReadOnlyMailboxOpenError::MailboxCorrupted
         }
     })
@@ -532,7 +532,7 @@ fn open_read_only_mailbox(
 #[cfg(target_os = "macos")]
 pub fn open_default_mailbox_store(
     account: &AccountId,
-) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxStore, MailboxStoreOpenError> {
+) -> Result<tersa_store_sqlcipher::SqlCipherMailboxStore, MailboxStoreOpenError> {
     let backend = ProductionBackend::new().map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
     let locator = ProductionContainerLocator::new()
         .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
@@ -544,7 +544,7 @@ fn open_mailbox_store(
     retriever: &impl RootKeyRetriever,
     locator: &impl ContainerLocator,
     account: &AccountId,
-) -> Result<tersa_store_sqlcipher_macos::SqlCipherMailboxStore, MailboxStoreOpenError> {
+) -> Result<tersa_store_sqlcipher::SqlCipherMailboxStore, MailboxStoreOpenError> {
     let root = retriever
         .copy()
         .map_err(|_error| MailboxStoreOpenError::KeyAccess)?
@@ -558,7 +558,7 @@ fn open_mailbox_store(
     drop(root);
     let path = account_database_path(locator, account)
         .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
-    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+    tersa_store_sqlcipher::SqlCipherMailboxStore::open(
         account.clone(),
         path,
         key.into_database_key(),
@@ -590,7 +590,7 @@ fn open_mailbox_store(
 #[cfg(target_os = "macos")]
 pub fn open_default_mailbox_store_if_present(
     account: &AccountId,
-) -> Result<Option<tersa_store_sqlcipher_macos::SqlCipherMailboxStore>, MailboxStoreOpenError> {
+) -> Result<Option<tersa_store_sqlcipher::SqlCipherMailboxStore>, MailboxStoreOpenError> {
     let backend = ProductionBackend::new().map_err(|_error| MailboxStoreOpenError::KeyAccess)?;
     let locator = ProductionContainerLocator::new()
         .map_err(|_error| MailboxStoreOpenError::ProfileUnavailable)?;
@@ -602,7 +602,7 @@ fn open_mailbox_store_if_present(
     retriever: &impl RootKeyRetriever,
     locator: &impl ContainerLocator,
     account: &AccountId,
-) -> Result<Option<tersa_store_sqlcipher_macos::SqlCipherMailboxStore>, MailboxStoreOpenError> {
+) -> Result<Option<tersa_store_sqlcipher::SqlCipherMailboxStore>, MailboxStoreOpenError> {
     // Presence-check the database path BEFORE touching the root key. Root-key
     // access is required only to OPEN an existing database; a never-connected
     // account has no database file, and disconnecting one must be a no-op
@@ -631,7 +631,7 @@ fn open_mailbox_store_if_present(
     // `open_existing` re-checks presence itself, so a file that vanishes
     // between the stat above and here is still a clean `Ok(None)` (a purge
     // no-op), never a spurious failure.
-    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open_existing(
+    tersa_store_sqlcipher::SqlCipherMailboxStore::open_existing(
         account.clone(),
         path,
         key.into_database_key(),
@@ -743,7 +743,7 @@ fn bootstrap_default_account(account: &AccountId) -> ProductBootstrapStatus {
         &locator,
         deadline,
         |account, path, key| {
-            tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(account, path, key)
+            tersa_store_sqlcipher::SqlCipherMailboxStore::open(account, path, key)
                 .map(|_store| ())
                 .map_err(|_error| ())
         },
@@ -760,11 +760,7 @@ fn bootstrap_default_account_with_dependencies(
     backend: &impl RootKeyBackend,
     locator: &impl ContainerLocator,
     deadline: Instant,
-    open_store: impl FnOnce(
-        AccountId,
-        PathBuf,
-        tersa_store_sqlcipher_macos::DatabaseKey,
-    ) -> Result<(), ()>,
+    open_store: impl FnOnce(AccountId, PathBuf, tersa_store_sqlcipher::DatabaseKey) -> Result<(), ()>,
 ) -> ProductBootstrapStatus {
     let Ok(container) = locator.container() else {
         return ProductBootstrapStatus::Unavailable;
@@ -3711,9 +3707,8 @@ mod tests {
             &FakeLocator(Ok(container)),
             Instant::now() + Duration::from_secs(5),
             |account, path, key| {
-                let store =
-                    tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(account, path, key)
-                        .map_err(|_error| ())?;
+                let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(account, path, key)
+                    .map_err(|_error| ())?;
                 std::fs::write(&entered, b"entered").unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !Path::new(&release).exists() && Instant::now() < deadline {
@@ -4495,7 +4490,7 @@ mod tests {
             AccountKeyPurpose::SqlCipherAccountDatabaseV1,
         )
         .unwrap();
-        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
             derived.into_database_key(),
@@ -4551,7 +4546,7 @@ mod tests {
             AccountKeyPurpose::SqlCipherAccountDatabaseV1,
         )
         .unwrap();
-        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
             derived.into_database_key(),
@@ -4582,7 +4577,7 @@ mod tests {
             AccountKeyPurpose::SqlCipherAccountDatabaseV1,
         )
         .unwrap();
-        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
             derived.into_database_key(),
@@ -4627,7 +4622,7 @@ mod tests {
             AccountKeyPurpose::SqlCipherAccountDatabaseV1,
         )
         .unwrap();
-        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
             derived.into_database_key(),
@@ -4696,7 +4691,7 @@ mod tests {
             AccountKeyPurpose::SqlCipherAccountDatabaseV1,
         )
         .unwrap();
-        let store = tersa_store_sqlcipher_macos::SqlCipherMailboxStore::open(
+        let store = tersa_store_sqlcipher::SqlCipherMailboxStore::open(
             account.clone(),
             profile.database_path(&account),
             derived.into_database_key(),

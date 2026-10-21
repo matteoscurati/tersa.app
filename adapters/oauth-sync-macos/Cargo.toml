@@ -40,9 +40,9 @@ tersa-application = { path = "../../crates/application", version = "=0.0.0", fea
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-tersa-gmail-rest-macos = { path = "../gmail-rest-macos", version = "=0.0.0" }
+tersa-gmail-rest = { path = "../gmail-rest", version = "=0.0.0" }
 tersa-keychain-macos = { path = "../keychain-macos", version = "=0.0.0" }
-tersa-store-sqlcipher-macos = { path = "../store-sqlcipher-macos", version = "=0.0.0" }
+tersa-store-sqlcipher = { path = "../store-sqlcipher", version = "=0.0.0" }
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

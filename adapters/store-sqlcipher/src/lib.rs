@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Provides an account-scoped `SQLCipher` mailbox store for macOS.
+//! Provides an account-scoped `SQLCipher` mailbox store.
 //!
 //! This adapter has synchronous database internals and lazy runtime-free
 //! futures. Callers must poll it on a bounded blocking executor rather than a
@@ -12,8 +12,7 @@
 
 #![deny(unsafe_code)]
 
-#[cfg(target_os = "macos")]
-mod macos {
+mod store {
     use std::collections::HashSet;
     use std::ffi::{OsStr, OsString};
     use std::fmt;
@@ -121,7 +120,7 @@ mod macos {
     ///
     /// ```compile_fail
     /// use tersa_application::mailbox::MailboxStore;
-    /// use tersa_store_sqlcipher_macos::SqlCipherMailboxReader;
+    /// use tersa_store_sqlcipher::SqlCipherMailboxReader;
     ///
     /// fn require_store<T: MailboxStore>() {}
     /// require_store::<SqlCipherMailboxReader>();
@@ -1040,7 +1039,7 @@ mod macos {
         device: u64,
         inode: u64,
         owner: u32,
-        mode: u16,
+        mode: fs::RawMode,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1048,7 +1047,7 @@ mod macos {
         device: u64,
         inode: u64,
         owner: u32,
-        mode: u16,
+        mode: fs::RawMode,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1095,7 +1094,7 @@ mod macos {
         }
     }
 
-    const OWNER_ONLY_FILE_MODE: u16 = 0o600;
+    const OWNER_ONLY_FILE_MODE: fs::RawMode = 0o600;
 
     /// Testable boundaries around fresh-leaf claiming, migration, and cleanup.
     ///
@@ -1195,12 +1194,12 @@ mod macos {
                 &self.parent,
                 &self.names[0],
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from(OWNER_ONLY_FILE_MODE),
+                Mode::from_raw_mode(OWNER_ONLY_FILE_MODE),
             )
             .map_err(|_error| OpenFailure::Storage)?;
             // O_CREAT's mode is filtered by umask.  This descriptor is still
             // exclusively ours, so normalize before exact-mode validation.
-            fs::fchmod(&descriptor, Mode::from(OWNER_ONLY_FILE_MODE))
+            fs::fchmod(&descriptor, Mode::from_raw_mode(OWNER_ONLY_FILE_MODE))
                 .map_err(|_error| OpenFailure::Storage)?;
             let identity = restrictive_regular_identity(
                 &fs::fstat(&descriptor).map_err(|_error| OpenFailure::Storage)?,
@@ -1281,11 +1280,10 @@ mod macos {
                         // restrictive umask. Normalize through the retained
                         // parent before opening, then bind the descriptor to
                         // this pre-chmod identity and normalize it again.
-                        fs::chmodat(
+                        chmod_no_follow_at(
                             &self.parent,
                             name,
-                            Mode::from(OWNER_ONLY_FILE_MODE),
-                            AtFlags::SYMLINK_NOFOLLOW,
+                            Mode::from_raw_mode(OWNER_ONLY_FILE_MODE),
                         )
                         .map_err(|_error| OpenFailure::Storage)?;
                     }
@@ -1304,7 +1302,7 @@ mod macos {
                         return Err(OpenFailure::Storage);
                     }
                     hook(WriterHook::NormalizeAfterOpen(index), canonical_path)?;
-                    fs::fchmod(&descriptor, Mode::from(OWNER_ONLY_FILE_MODE))
+                    fs::fchmod(&descriptor, Mode::from_raw_mode(OWNER_ONLY_FILE_MODE))
                         .map_err(|_error| OpenFailure::Storage)?;
                     let normalized_descriptor = restrictive_regular_identity(
                         &fs::fstat(&descriptor).map_err(|_error| OpenFailure::Storage)?,
@@ -1464,7 +1462,7 @@ mod macos {
             return Err(OpenFailure::Storage);
         }
         Ok(FileIdentity {
-            device: u64::try_from(stat.st_dev).map_err(|_error| OpenFailure::Storage)?,
+            device: device_number(stat.st_dev)?,
             inode: stat.st_ino,
             owner: stat.st_uid,
             mode: Mode::from_raw_mode(stat.st_mode).as_raw_mode(),
@@ -1548,6 +1546,35 @@ mod macos {
             .ok_or(OpenFailure::Storage)
     }
 
+    /// Changes the mode of `name` under `parent` without following a symlink.
+    ///
+    /// macOS supports `fchmodat(AT_SYMLINK_NOFOLLOW)` directly. Linux has no
+    /// `lchmod` and only honors that flag through `fchmodat2` (kernel 6.6+), so
+    /// the inode is pinned with `O_PATH | O_NOFOLLOW`, rejected if it is a
+    /// symlink, and changed through its `/proc/self/fd` entry, as glibc does.
+    /// On Linux this needs `/proc` mounted; without it, normalization fails
+    /// closed as a storage error (relevant to minimal containers).
+    #[cfg(not(target_os = "linux"))]
+    fn chmod_no_follow_at(parent: &OwnedFd, name: &OsStr, mode: Mode) -> rustix::io::Result<()> {
+        fs::chmodat(parent, name, mode, AtFlags::SYMLINK_NOFOLLOW)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_no_follow_at(parent: &OwnedFd, name: &OsStr, mode: Mode) -> rustix::io::Result<()> {
+        use rustix::fd::AsRawFd;
+
+        let pinned = fs::openat(
+            parent,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        if FileType::from_raw_mode(fs::fstat(&pinned)?.st_mode) == FileType::Symlink {
+            return Err(rustix::io::Errno::LOOP);
+        }
+        fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()), mode)
+    }
+
     fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
@@ -1572,13 +1599,8 @@ mod macos {
                     )?;
                     let setup = (|| {
                         hook(RecoveryHook::AfterDirectoryCreate, &path)?;
-                        fs::chmodat(
-                            &leaf.parent,
-                            &name,
-                            Mode::from_raw_mode(0o700),
-                            AtFlags::SYMLINK_NOFOLLOW,
-                        )
-                        .map_err(|_error| OpenFailure::Storage)?;
+                        chmod_no_follow_at(&leaf.parent, &name, Mode::from_raw_mode(0o700))
+                            .map_err(|_error| OpenFailure::Storage)?;
                         let normalized =
                             recovery_directory_identity(&leaf.parent, &name, leaf.parent_owner)?;
                         if !same_directory_object(initial, normalized) {
@@ -1682,7 +1704,7 @@ mod macos {
             return Err(OpenFailure::Storage);
         }
         Ok(DirectoryIdentity {
-            device: u64::try_from(stat.st_dev).map_err(|_error| OpenFailure::Storage)?,
+            device: device_number(stat.st_dev)?,
             inode: stat.st_ino,
             owner: stat.st_uid,
             mode,
@@ -2000,12 +2022,17 @@ mod macos {
             .ok_or(OpenFailure::Storage)
     }
 
+    /// Widens a platform `dev_t` (`i32` on macOS, `u64` on Linux) to `u64`.
+    fn device_number<T: TryInto<u64>>(raw: T) -> Result<u64, OpenFailure> {
+        raw.try_into().map_err(|_error| OpenFailure::Storage)
+    }
+
     fn identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
         FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
             owner: metadata.uid(),
-            mode: u16::try_from(metadata.mode() & 0o7777).unwrap_or_default(),
+            mode: fs::RawMode::try_from(metadata.mode() & 0o7777).unwrap_or_default(),
         }
     }
 
@@ -3071,7 +3098,7 @@ mod macos {
         /// The external harness runs this ignored test once as warm-up and five
         /// more times as recorded samples; ordinary verification only compiles it.
         #[test]
-        #[ignore = "run through apple/scripts/capture-macos-performance.sh"]
+        #[ignore = "performance measurement; run explicitly with --ignored"]
         fn performance_harness_sample() {
             let (database, store) = open("performance-harness");
             record_fence(&store);
@@ -3125,7 +3152,7 @@ mod macos {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "macos::tests::wal_resident_first_migration_crash_child",
+                    "store::tests::wal_resident_first_migration_crash_child",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -3166,7 +3193,7 @@ mod macos {
                 .arg(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "macos::tests::restrictive_umask_existing_store_child",
+                    "store::tests::restrictive_umask_existing_store_child",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -3189,7 +3216,7 @@ mod macos {
                 .arg(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "macos::tests::restrictive_umask_existing_store_child",
+                    "store::tests::restrictive_umask_existing_store_child",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -3236,11 +3263,7 @@ mod macos {
 
         fn write_restrictive(path: &Path, bytes: &[u8]) {
             fs::write(path, bytes).unwrap();
-            fs::set_permissions(
-                path,
-                fs::Permissions::from_mode(u32::from(OWNER_ONLY_FILE_MODE)),
-            )
-            .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
 
         fn leave_foreign_hot_journal(database: &TestDatabase) {
@@ -3260,7 +3283,7 @@ mod macos {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "macos::tests::foreign_hot_journal_child",
+                    "store::tests::foreign_hot_journal_child",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -3330,11 +3353,7 @@ mod macos {
 
             let existing_empty = TestDatabase::new("existing empty ?#%");
             fs::File::create(existing_empty.path()).unwrap();
-            fs::set_permissions(
-                existing_empty.path(),
-                fs::Permissions::from_mode(u32::from(OWNER_ONLY_FILE_MODE)),
-            )
-            .unwrap();
+            fs::set_permissions(existing_empty.path(), fs::Permissions::from_mode(0o600)).unwrap();
             let existing_store =
                 SqlCipherMailboxStore::open(account(), existing_empty.path(), key(7)).unwrap();
             assert_eq!(
@@ -3363,11 +3382,8 @@ mod macos {
 
             let empty_with_sidecar = TestDatabase::new("empty-with-sidecar");
             fs::File::create(empty_with_sidecar.path()).unwrap();
-            fs::set_permissions(
-                empty_with_sidecar.path(),
-                fs::Permissions::from_mode(u32::from(OWNER_ONLY_FILE_MODE)),
-            )
-            .unwrap();
+            fs::set_permissions(empty_with_sidecar.path(), fs::Permissions::from_mode(0o600))
+                .unwrap();
             let mut journal_name = empty_with_sidecar.path().as_os_str().to_os_string();
             journal_name.push("-journal");
             let existing_journal_path = PathBuf::from(journal_name);
@@ -3570,11 +3586,7 @@ mod macos {
 
             let database = TestDatabase::new("canonical-main-without-sidecars");
             fs::copy(source.path(), database.path()).unwrap();
-            fs::set_permissions(
-                database.path(),
-                fs::Permissions::from_mode(OWNER_ONLY_FILE_MODE.into()),
-            )
-            .unwrap();
+            fs::set_permissions(database.path(), fs::Permissions::from_mode(0o600)).unwrap();
             assert!(!wal_path(&database).exists());
             assert!(!shm_path(&database).exists());
 
@@ -3601,11 +3613,7 @@ mod macos {
 
             let database = TestDatabase::new("canonical-main-empty-wal");
             fs::copy(source.path(), database.path()).unwrap();
-            fs::set_permissions(
-                database.path(),
-                fs::Permissions::from_mode(OWNER_ONLY_FILE_MODE.into()),
-            )
-            .unwrap();
+            fs::set_permissions(database.path(), fs::Permissions::from_mode(0o600)).unwrap();
             let canonical_path = canonical_database_path(database.path()).unwrap();
             let main_only = LeafGuard::open(&canonical_path).unwrap();
             assert_eq!(
@@ -4091,7 +4099,7 @@ mod macos {
                     .arg(&executable)
                     .args([
                         "--exact",
-                        "macos::tests::restrictive_umask_store_child",
+                        "store::tests::restrictive_umask_store_child",
                         "--ignored",
                         "--nocapture",
                     ])
@@ -4114,7 +4122,7 @@ mod macos {
                 .arg(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "macos::tests::restrictive_umask_sidecar_refusal_child",
+                    "store::tests::restrictive_umask_sidecar_refusal_child",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -6479,7 +6487,6 @@ mod macos {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub use macos::{
+pub use store::{
     DatabaseKey, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader, SqlCipherMailboxStore,
 };

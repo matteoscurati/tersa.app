@@ -1,6 +1,6 @@
 [package]
-name = "tersa-gmail-rest-macos"
-description = "macOS-only read-only Gmail REST mailbox adapter and OAuth token transport for tersa.app"
+name = "tersa-gmail-rest"
+description = "Gmail REST mailbox adapter and OAuth token transport for tersa"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,10 +16,14 @@ serde_json.workspace = true
 tersa-application = { workspace = true }
 tersa-domain = { path = "../../crates/domain", version = "=0.0.0" }
 url.workspace = true
+reqwest.workspace = true
 zeroize.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-reqwest.workspace = true
+# macOS uses Security.framework through native-tls; Linux builds a static
+# OpenSSL, shared with SQLCipher, so release binaries do not depend on the
+# host's libssl.
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { workspace = true, features = ["native-tls-vendored"] }
 
 [lints]
 workspace = true

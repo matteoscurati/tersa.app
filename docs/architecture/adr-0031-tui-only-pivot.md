@@ -71,6 +71,20 @@ Same-user code that can read the keyring item, or capture the passphrase, can
 decrypt local data. Linux Secret Service has no per-application access
 control. These residuals replace the ADR 0024 process-isolation claim.
 
+### TLS and native crypto
+
+- macOS uses the system TLS (Security.framework through `native-tls`) and
+  CommonCrypto for SQLCipher.
+- Linux release binaries statically link one vendored OpenSSL, shared by
+  `reqwest` (`native-tls-vendored`) and SQLCipher
+  (`bundled-sqlcipher-vendored-openssl`), so they do not depend on the host's
+  libssl or libcrypto. rustls was considered and rejected because SQLCipher
+  needs OpenSSL on Linux anyway; one crypto library keeps the binary smaller.
+- Consequence: the vendored OpenSSL receives no operating-system security
+  updates. Every OpenSSL advisory that affects the linked version requires
+  bumping `openssl-src` and publishing new Linux binaries; `cargo audit` and
+  release checks must track it.
+
 ### Hostile content in a terminal
 
 - Every provider-derived string is sanitized before it reaches the terminal.
@@ -110,6 +124,8 @@ control. These residuals replace the ADR 0024 process-isolation claim.
 | --- | --- |
 | 0013 macOS-first phasing | Superseded. |
 | 0014 macOS production dependency boundaries | Superseded by the layering rules above and `cargo deny`. |
+| 0016 Gmail REST adapter | Amended: renamed `tersa-gmail-rest` and made portable (macOS and Linux). |
+| 0017 production macOS account store | Amended: renamed `tersa-store-sqlcipher` and made portable (macOS and Linux). |
 | 0019 macOS key provisioning and read-only CLI | Amended: HKDF framing retained; Keychain access groups, App Group layout, and CLI authority split superseded. |
 | 0020 macOS production UI toolkit | Superseded. |
 | 0021 macOS UI vertical slice | Superseded. |
@@ -144,8 +160,9 @@ ADR changes the budget.
 - `apple/`, the Apple bridge, the mailbox-sync and token-broker FFI crates,
   Apple CI lanes, macOS acceptance and distribution protocols, and their
   evidence are removed. They remain available at the `pre-tui-pivot` tag.
-- The `-macos` adapters stay in the workspace until T1 makes them portable
-  and renames them.
+- The Gmail and SQLCipher adapters are renamed and made portable in T1a;
+  `tersa-keychain-macos`, `tersa-oauth-sync-macos`, and `tersa-cli-macos`
+  remain macOS-only until T1d replaces them.
 - PR 33b, Apple signing campaigns, and the Phase 1 item 7 and item 8 gates are
   closed as not applicable.
 - On macOS, keyring access control is tied to the binary's code signature.
