@@ -7,6 +7,7 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0023: Step 3 — production OAuth and bounded Gmail sync
 
 - Status: Accepted
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-07-20
 - Implemented: 2026-08-01
 

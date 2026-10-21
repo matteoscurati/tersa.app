@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Describe the user need, not private mailbox content. The MVP has no backend and does not promise reliable iOS push or guaranteed scheduling.
+        Describe the user need, not private mailbox content. The MVP has no backend and does not promise server-side scheduling.
   - type: textarea
     id: problem
     attributes:

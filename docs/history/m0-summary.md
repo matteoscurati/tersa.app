@@ -9,9 +9,13 @@ The product path is the SwiftUI/AppKit macOS client, shared Rust core, Apple
 bridge, production SQLCipher store, and the OAuth/token-broker surfaces governed
 by the accepted ADRs. Active product quality and release work uses:
 
-- [macOS acceptance protocol](../quality/macos-acceptance.md)
-- [macOS performance harness](../quality/macos-performance.md)
-- [Apple physical-device and distribution protocol](../release/apple-distribution.md)
+- macOS acceptance protocol
+- macOS performance harness
+- Apple physical-device and distribution protocol
+
+These protocols were removed by the terminal-only pivot
+([ADR 0031](../architecture/adr-0031-tui-only-pivot.md)) and remain available at
+the `pre-tui-pivot` tag.
 
 ## What M0 learned
 
@@ -78,7 +82,7 @@ Native SwiftUI was selected and a product vertical slice exists
 development-signed evidence snapshots did not close release or accessibility
 gates. Active non-gate development capture for accessibility and App Sandbox
 lives in
-[macOS UI development evidence](../quality/macos-ui-dev-evidence.md). Use the
+macOS UI development evidence (removed at `pre-tui-pivot`). Use the
 active quality and release protocols above for current acceptance work.
 
 ## Retirement

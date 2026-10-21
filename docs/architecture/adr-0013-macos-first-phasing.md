@@ -1,6 +1,6 @@
 # ADR 0013: macOS-first product phasing
 
-- Status: Accepted
+- Status: Superseded by [ADR 0031](adr-0031-tui-only-pivot.md)
 - Date: 2026-07-16
 - Amended: 2026-07-18
 

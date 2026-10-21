@@ -40,9 +40,8 @@ body:
     attributes:
       label: Platform
       options:
-        - iOS
         - macOS
-        - CLI
+        - Linux
         - Core or build tooling
     validations:
       required: true

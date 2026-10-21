@@ -7,6 +7,12 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0022: performance as a primary constraint
 
 - Status: Accepted
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
+
+> Performance stays a primary constraint, but the active budgets are the TUI
+> budgets in ADR 0031. The macOS acceptance protocol, performance harness, and
+> Apple distribution protocol linked below were removed at the
+> `pre-tui-pivot` tag; those links are historical.
 - Date: 2026-07-19
 
 ## Context

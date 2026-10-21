@@ -7,6 +7,7 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0029: SafeHtml, native rendering, and rich composition
 
 - Status: Accepted
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-08-29
 
 ## Context

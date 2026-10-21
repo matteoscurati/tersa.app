@@ -6,7 +6,7 @@ before merge but whose squash transport made the Git trailer unparsable.
 
 An entry does not waive DCO. It preserves the author's certification in the
 repository and links to the matching public attestation. New merges must use a
-parseable `Signed-off-by` trailer and pass `cargo xtask dco HEAD^ HEAD`.
+parseable `Signed-off-by` trailer and pass `python3 scripts/check-dco.py HEAD^ HEAD`.
 
 ## 2026-07-15 — PR #20
 

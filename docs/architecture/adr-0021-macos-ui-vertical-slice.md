@@ -6,7 +6,7 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0021: macOS UI vertical slice
 
-- Status: Accepted
+- Status: Superseded by [ADR 0031](adr-0031-tui-only-pivot.md)
 - Date: 2026-07-18
 
 ## Context
