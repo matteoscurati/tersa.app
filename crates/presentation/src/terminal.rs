@@ -15,8 +15,13 @@
 //! - bidirectional embeddings, overrides, and isolates (U+202A–U+202E,
 //!   U+2066–U+2069) and marks (U+200E, U+200F, U+061C), used to reorder
 //!   displayed text;
-//! - zero-width and invisible formatting characters (U+200B–U+200D, U+2060,
-//!   U+FEFF) and the Tag block (U+E0000–U+E007F), used to hide content.
+//! - zero-width and invisible formatting characters (U+200B–U+200D,
+//!   U+2060–U+2064, U+FEFF, the soft hyphen U+00AD, the combining grapheme
+//!   joiner U+034F, Hangul and Mongolian fillers and selectors) and the Tag
+//!   block (U+E0000–U+E007F), used to hide content or pad previews;
+//! - variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF). They switch emoji
+//!   presentation, which terminals and width tables disagree on, so keeping
+//!   them misaligns the screen.
 
 use std::fmt;
 
@@ -64,18 +69,28 @@ impl fmt::Display for SafeText {
     }
 }
 
-const fn is_allowed(character: char) -> bool {
+/// Whether `character` survives sanitizing.
+pub(crate) const fn is_allowed(character: char) -> bool {
     !matches!(
         character,
         '\u{0}'..='\u{1f}'
             | '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
+            | '\u{34f}'
             | '\u{61c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{ffa0}'
             | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
     )
 }
 
@@ -108,6 +123,16 @@ mod tests {
     fn strips_bidi_marks_and_invisible_characters() {
         let hostile = "a\u{200e}b\u{200f}c\u{61c}d\u{200b}e\u{200d}f\u{2060}g\u{feff}h\u{e0041}i";
         assert_eq!(SafeText::single_line(hostile).as_str(), "abcdefghi");
+    }
+
+    #[test]
+    fn strips_padding_fillers_and_variation_selectors() {
+        let padded = "a\u{34f}\u{ad}b\u{3164}c\u{fe0f}d\u{e0100}e\u{2063}f";
+        assert_eq!(SafeText::single_line(padded).as_str(), "abcdef");
+        assert_eq!(
+            SafeText::single_line("\u{2764}\u{fe0f}").as_str(),
+            "\u{2764}"
+        );
     }
 
     #[test]

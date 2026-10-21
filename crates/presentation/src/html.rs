@@ -12,6 +12,8 @@
 //! The output is plain, unsanitized text; callers wrap it in
 //! [`crate::terminal::SafeText`] before it reaches a terminal.
 
+use crate::terminal::is_allowed;
+
 /// The largest HTML input converted; the rest is dropped with a marker.
 pub const MAX_HTML_INPUT: usize = 2 * 1024 * 1024;
 /// The largest text output produced.
@@ -105,6 +107,7 @@ fn is_hidden_container(name: &str) -> bool {
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools, reason = "independent writer flags")]
 struct Writer {
     out: String,
     links: Vec<String>,
@@ -117,10 +120,13 @@ struct Writer {
     list_depth: usize,
     quote_depth: usize,
     pre_depth: usize,
-    /// The open link's reference index, if it gets a number.
-    open_link: Option<usize>,
+    /// The open link's target, numbered only if it gets visible text.
+    open_link: Option<String>,
     /// Where the open link's text starts in `out`.
     link_text_start: usize,
+    /// Set after a hidden element had no closing tag, so later hidden
+    /// elements are shown rather than searched for again (keeps it linear).
+    hiding_disabled: bool,
     full: bool,
 }
 
@@ -161,13 +167,29 @@ impl Writer {
         if !closing && is_hidden_container(&name) {
             return skip_container(rest, &name);
         }
-        self.tag(&name, closing, &body[name_end..]);
+        let attributes = &body[name_end..];
+        if !closing && !self.hiding_disabled && is_hidden_by_markup(attributes) {
+            if is_void(&name) || tag.ends_with('/') {
+                return rest;
+            }
+            match skip_element(rest, &name) {
+                Some(after) => return after,
+                None => self.hiding_disabled = true,
+            }
+        }
+        self.tag(&name, closing, attributes);
         rest
     }
 
     fn tag(&mut self, name: &str, closing: bool, attributes: &str) {
         match (name, closing) {
-            ("br", _) => self.line_break(1),
+            ("br", _) => {
+                // Consecutive breaks add up to one blank line.
+                if self.started {
+                    self.pending_breaks = (self.pending_breaks + 1).min(2);
+                }
+                self.pending_space = false;
+            }
             ("hr", false) => {
                 self.line_break(1);
                 self.push_text_raw("──────────");
@@ -229,6 +251,25 @@ impl Writer {
         if !is_displayable_link(&target) {
             return;
         }
+        self.open_link = Some(target);
+        self.link_text_start = self.out.len();
+    }
+
+    /// Numbers the open link if it showed text other than its own address.
+    /// Image-only links get no number, so references stay consecutive.
+    fn close_link(&mut self) {
+        let Some(target) = self.open_link.take() else {
+            return;
+        };
+        let shown = self.out[self.link_text_start..].trim();
+        let bare = target
+            .strip_prefix("mailto:")
+            .or_else(|| target.strip_prefix("https://"))
+            .or_else(|| target.strip_prefix("http://"))
+            .unwrap_or(&target);
+        if shown.is_empty() || shown == target || shown == bare {
+            return;
+        }
         let index = match self.links.iter().position(|known| *known == target) {
             Some(index) => index,
             None if self.links.len() < MAX_LINKS => {
@@ -237,24 +278,6 @@ impl Writer {
             }
             None => return,
         };
-        self.open_link = Some(index);
-        self.link_text_start = self.out.len();
-    }
-
-    fn close_link(&mut self) {
-        let Some(index) = self.open_link.take() else {
-            return;
-        };
-        let shown = self.out[self.link_text_start..].trim();
-        let target = &self.links[index];
-        let bare = target
-            .strip_prefix("mailto:")
-            .or_else(|| target.strip_prefix("https://"))
-            .or_else(|| target.strip_prefix("http://"))
-            .unwrap_or(target);
-        if shown.is_empty() || shown == target || shown == bare {
-            return;
-        }
         self.pending_space = false;
         self.push_text_raw(&format!(" [{}]", index + 1));
     }
@@ -274,7 +297,8 @@ impl Writer {
             if index > 0 {
                 self.pending_space = true;
             }
-            if word.is_empty() {
+            // Preheader padding (`&#847;&zwnj;` runs) is invisible on screen.
+            if !word.chars().any(is_visible) {
                 continue;
             }
             if self.pending_space
@@ -396,8 +420,107 @@ fn skip_container<'a>(input: &'a str, name: &str) -> &'a str {
     ""
 }
 
+/// Whether the element's own markup hides it: a `hidden` attribute or an
+/// inline style with `display: none`, `visibility: hidden`, or Outlook's
+/// `mso-hide: all`. Newsletters hide preview padding this way.
+fn is_hidden_by_markup(attributes: &str) -> bool {
+    if attributes.is_empty() {
+        return false;
+    }
+    if has_attribute(attributes, "hidden") {
+        return true;
+    }
+    let Some(style) = attribute(attributes, "style") else {
+        return false;
+    };
+    let compact: String = style
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    compact.contains("display:none")
+        || compact.contains("visibility:hidden")
+        || compact.contains("mso-hide:all")
+}
+
+fn is_void(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Skips a hidden element's content through its matching closing tag,
+/// counting nested elements of the same name. Returns `None` when it is
+/// never closed.
+fn skip_element<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let name = name.as_bytes();
+    let bytes = input.as_bytes();
+    let mut depth = 1_usize;
+    let mut from = 0;
+    while let Some(offset) = input[from..].find('<') {
+        let at = from + offset;
+        let (closing, start) = if bytes.get(at + 1) == Some(&b'/') {
+            (true, at + 2)
+        } else {
+            (false, at + 1)
+        };
+        let matches = bytes.len() >= start + name.len()
+            && bytes[start..start + name.len()].eq_ignore_ascii_case(name)
+            && bytes
+                .get(start + name.len())
+                .is_none_or(|&next| next == b'>' || next == b'/' || next.is_ascii_whitespace());
+        from = at + 1;
+        if !matches {
+            continue;
+        }
+        let end = input[at..].find('>').map(|end| at + end)?;
+        if closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&input[end + 1..]);
+            }
+        } else if bytes[end - 1] != b'/' {
+            depth += 1;
+        }
+        from = end + 1;
+    }
+    None
+}
+
+/// An attribute as written in a tag.
+enum Attribute<'a> {
+    Absent,
+    /// Present without a value, as in `<span hidden>`.
+    Bare,
+    Value(&'a str),
+}
+
+fn has_attribute(attributes: &str, wanted: &str) -> bool {
+    !matches!(find_attribute(attributes, wanted), Attribute::Absent)
+}
+
 /// Returns the raw value of attribute `wanted` from a tag's attribute text.
 fn attribute<'a>(attributes: &'a str, wanted: &str) -> Option<&'a str> {
+    match find_attribute(attributes, wanted) {
+        Attribute::Value(value) => Some(value),
+        Attribute::Absent | Attribute::Bare => None,
+    }
+}
+
+fn find_attribute<'a>(attributes: &'a str, wanted: &str) -> Attribute<'a> {
     let bytes = attributes.as_bytes();
     let mut at = 0;
     while at < bytes.len() {
@@ -439,13 +562,13 @@ fn attribute<'a>(attributes: &'a str, wanted: &str) -> Option<&'a str> {
             }
         }
         if name.eq_ignore_ascii_case(wanted) {
-            return value;
+            return value.map_or(Attribute::Bare, Attribute::Value);
         }
         if name.is_empty() {
             at += 1;
         }
     }
-    None
+    Attribute::Absent
 }
 
 fn is_displayable_link(target: &str) -> bool {
@@ -458,8 +581,10 @@ fn is_displayable_link(target: &str) -> bool {
         || lowered.starts_with("mailto:")
 }
 
-/// Decodes character references. Unknown names are kept as written.
-fn decode_entities(input: &str) -> String {
+/// Decodes HTML character references, as found in HTML text and in Gmail's
+/// message previews. Unknown names are kept as written.
+#[must_use]
+pub fn decode_entities(input: &str) -> String {
     if !input.contains('&') {
         return input.to_owned();
     }
@@ -620,23 +745,27 @@ fn decode_reference(reference: &str) -> Option<char> {
         .map(|&(_, character)| character)
 }
 
+/// Whether `character` shows something on screen.
+fn is_visible(character: char) -> bool {
+    !character.is_whitespace() && is_allowed(character)
+}
+
 /// Trims trailing spaces and keeps at most one blank line in a row.
 fn collapse_blank_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut blank_run = 0;
     for line in text.split('\n') {
         let line = line.trim_end();
-        if line.is_empty()
-            || line
-                .chars()
-                .all(|character| character == '>' || character == ' ')
+        if line
+            .chars()
+            .any(|character| character != '>' && is_visible(character))
         {
+            blank_run = 0;
+        } else {
             blank_run += 1;
             if blank_run > 1 || out.is_empty() {
                 continue;
             }
-        } else {
-            blank_run = 0;
         }
         out.push_str(line);
         out.push('\n');
@@ -708,7 +837,7 @@ mod tests {
              <a href=\"https://e.com\">e.com</a> <a href=\"data:text/html,hi\">d</a> <a>none</a>",
         );
         assert_eq!(converted.text, "x https://e.com e.com d none");
-        assert_eq!(converted.links, ["https://e.com"]);
+        assert!(converted.links.is_empty());
     }
 
     #[test]
@@ -769,6 +898,54 @@ mod tests {
         let long_tag = format!("<a {}>", "x".repeat(super::MAX_TAG_LEN * 4)).repeat(20);
         let _ = html_to_text(&long_tag);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn consecutive_breaks_make_one_blank_line() {
+        assert_eq!(text("a<br>b"), "a\nb");
+        assert_eq!(text("a<br><br>b"), "a\n\nb");
+        assert_eq!(text("a<br><br><br><br>b"), "a\n\nb");
+        assert_eq!(text("<p>a<br></p><p>b</p>"), "a\n\nb");
+    }
+
+    #[test]
+    fn image_only_links_take_no_number() {
+        let converted = html_to_text(
+            "<a href=\"https://e.com/1\"><img src=\"x\"></a> \
+             <a href=\"https://e.com/2\">text</a> <a href=\"https://e.com/3\"> </a>",
+        );
+        assert_eq!(converted.text, "text [1]");
+        assert_eq!(converted.links, ["https://e.com/2"]);
+    }
+
+    #[test]
+    fn hidden_elements_and_preheader_padding_are_dropped() {
+        assert_eq!(
+            text(
+                "<div style=\"display: none; max-height:0\">pre <div>inner</div> tail</div>\
+                 <p>shown</p>"
+            ),
+            "shown"
+        );
+        assert_eq!(
+            text("<span hidden>x</span>y<img style=\"display:none\">z"),
+            "yz"
+        );
+        assert_eq!(text("<td style=\"mso-hide:all\">o</td>v"), "v");
+        assert_eq!(
+            text("<p>Hi</p><div>&#847; &zwnj; &nbsp; &#847;&shy;</div><p>There</p>"),
+            "Hi\n\nThere"
+        );
+        assert_eq!(text("<p style=\"font-family: hidden\">kept</p>"), "kept");
+        assert_eq!(text("<p title=\"a hidden b\">kept</p>"), "kept");
+    }
+
+    #[test]
+    fn an_unclosed_hidden_element_does_not_swallow_the_message() {
+        assert_eq!(
+            text("<div style=\"display:none\">never closed<p>body</p>"),
+            "never closed\n\nbody"
+        );
     }
 
     /// A cheap, deterministic stand-in for fuzzing: random soups of HTML
