@@ -6,6 +6,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tersa_application::mailbox::MessageEnvelope;
+use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
 
@@ -24,7 +25,8 @@ impl Row {
         Self {
             sender: SafeText::single_line(sender_name(envelope.from().as_str())),
             subject: SafeText::single_line(envelope.subject().as_str()),
-            preview: SafeText::single_line(envelope.preview().as_str()),
+            // Gmail's previews arrive HTML-escaped (`&#39;`, `&amp;`).
+            preview: SafeText::single_line(&decode_entities(envelope.preview().as_str())),
             received_at_millis: envelope.received_at().as_millis(),
             unread: envelope.is_unread(),
         }
@@ -81,6 +83,7 @@ pub enum Request {
 
 /// The whole interface state.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools, reason = "independent interface flags")]
 pub struct App {
     pub account: SafeText,
     pub rows: Vec<Row>,
@@ -95,6 +98,8 @@ pub struct App {
     pub page: usize,
     pending_g: bool,
     pub preference: BodyPreference,
+    /// Set when the screen changes, so the next draw repaints every cell.
+    pub repaint: bool,
 }
 
 impl App {
@@ -110,7 +115,10 @@ impl App {
             quit: false,
             page: 10,
             pending_g: false,
-            preference: BodyPreference::Plain,
+            // Converted HTML reads better than many newsletters' plain parts,
+            // and its links are numbered rather than inlined.
+            preference: BodyPreference::Html,
+            repaint: false,
         }
     }
 
@@ -177,6 +185,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('q' | 'h') | KeyCode::Esc | KeyCode::Left => {
                         self.screen = Screen::Inbox;
+                        self.repaint = true;
                         None
                     }
                     KeyCode::Char('n') if view.index + 1 < self.rows.len() => {
@@ -208,6 +217,7 @@ impl App {
             Err(()) => (Body::Failed, None),
         };
         self.selected = index;
+        self.repaint = true;
         self.screen = Screen::Message(MessageView {
             index,
             body,
@@ -239,6 +249,7 @@ impl App {
             view.scroll = 0;
             view.layout = None;
             self.preference = next;
+            self.repaint = true;
         }
     }
 }
@@ -292,6 +303,24 @@ mod tests {
             SafeText::single_line("acct"),
             (0..rows).map(|index| row(&format!("s{index}"))).collect(),
         )
+    }
+
+    #[test]
+    fn previews_are_unescaped_then_sanitized() {
+        let envelope = tersa_application::mailbox::MessageEnvelope::new(
+            tersa_application::mailbox::MessageId::new("m").expect("id"),
+            tersa_application::mailbox::ThreadId::new("t").expect("thread"),
+            tersa_application::mailbox::HeaderText::new("A <a@example.com>").expect("from"),
+            tersa_application::mailbox::HeaderText::new("s").expect("subject"),
+            tersa_application::mailbox::HeaderText::new("I don&#39;t &amp; &#27;[2J")
+                .expect("preview"),
+            tersa_application::mailbox::UnixTimestampMillis::new(0).expect("time"),
+            false,
+        );
+        assert_eq!(
+            Row::from_envelope(&envelope).preview.as_str(),
+            "I don't & [2J"
+        );
     }
 
     #[test]
@@ -354,14 +383,18 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
 <p>html body</p>\r\n--b--\r\n";
         let mut app = app(1);
         app.show_message(0, Ok(Some(raw.to_vec())));
+        let body = |app: &App| {
+            let Screen::Message(view) = &app.screen else {
+                panic!("message screen");
+            };
+            let Body::Rendered(rendered) = &view.body else {
+                panic!("rendered");
+            };
+            rendered.body.as_str().to_owned()
+        };
+        assert_eq!(body(&app), "html body", "HTML is the default");
         press(&mut app, KeyCode::Char('H'));
-        let Screen::Message(view) = &app.screen else {
-            panic!("message screen");
-        };
-        let Body::Rendered(rendered) = &view.body else {
-            panic!("rendered");
-        };
-        assert_eq!(rendered.body.as_str(), "html body");
+        assert_eq!(body(&app), "plain body");
     }
 
     #[test]

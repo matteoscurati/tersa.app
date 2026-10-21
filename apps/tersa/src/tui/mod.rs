@@ -58,6 +58,11 @@ fn event_loop(
 ) -> Result<(), String> {
     loop {
         let now = now_millis();
+        if std::mem::take(&mut app.repaint) {
+            // Repaint every cell when the screen changes, so any drift
+            // between the terminal and ratatui's model cannot linger.
+            terminal.clear().map_err(terminal_error)?;
+        }
         terminal
             .draw(|frame| view::draw(frame, app, now))
             .map_err(terminal_error)?;
