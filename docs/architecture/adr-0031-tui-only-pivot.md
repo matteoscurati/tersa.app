@@ -147,7 +147,7 @@ ADR changes the budget.
 | Milestone | Scope |
 | --- | --- |
 | T0 | This ADR; removal of Apple sources, FFI crates, and Apple CI; minimal `xtask`. |
-| T1 | Portable adapters, `crates/keys`, `adapters/secrets`, Rust loopback OAuth, in-process token service, `tersa account add`. |
+| T1 | Portable adapters, `crates/keys`, `adapters/vault`, Rust loopback OAuth, in-process token service, `tersa account add`. |
 | T2 | Read-only TUI: inbox, thread, search, offline reopen, background sync, sanitizer, HTML to text. |
 | T3 | Multi-account registry and unified inbox. |
 | T4 | Triage with history sync and pending actions. |

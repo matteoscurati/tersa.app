@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "tersa-keys"
+description = "Installation root key, purpose-separated key derivation, and passphrase wrapping for tersa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+argon2.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+tersa-domain = { path = "../domain", version = "=0.0.0" }
+zeroize.workspace = true
+
+[lints]
+workspace = true
