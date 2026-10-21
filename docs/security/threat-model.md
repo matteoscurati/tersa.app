@@ -52,8 +52,8 @@ unlock, passphrase, or Google credentials.
 
 | Threat | Controls | Residual risk / status |
 |---|---|---|
-| OAuth interception or callback forgery | Authorization Code with PKCE S256, exact state and redirect validation, IPv4 loopback listener bound to an ephemeral port, single-use session | Rust loopback listener is planned (T1) |
-| Token or key disclosure on a stolen device | Root key in OS keyring or passphrase-wrapped; refresh tokens inside SQLCipher; owner-only file modes | Planned (T1). Keyring items are readable by same-user code once unlocked |
+| OAuth interception or callback forgery | Authorization Code with PKCE S256, exact state and redirect validation, IPv4 loopback listener bound to an ephemeral port, single-use session | Implemented (T1): the listener accepts only the matching `state` |
+| Token or key disclosure on a stolen device | Root key in OS keyring or passphrase-wrapped; refresh tokens inside SQLCipher; owner-only file modes | Implemented (T1). Keyring items are readable by same-user code once unlocked |
 | Same-user malware | None beyond OS keyring prompts on macOS | **Accepted residual** (ADR 0031): no process isolation between token and root key; Linux Secret Service has no per-app ACL. Passphrase mode narrows at-rest exposure only |
 | Terminal escape injection (ANSI/OSC/DCS, title or clipboard writes, cursor tricks) | All provider-derived strings pass a sanitizer that strips C0 except newline/tab, C1, ESC, DEL; TUI renders only the sanitized type; tersa itself never emits OSC 8, OSC 52, or title sequences; fuzzing | Planned (T2) |
 | Bidirectional-text, invisible-character, and homoglyph spoofing | Bidi embeddings, overrides, isolates, and marks; zero-width and invisible formatting characters; and Tag-block characters are removed; sender address shown alongside display name | Homoglyphs and confusable scripts remain a residual |

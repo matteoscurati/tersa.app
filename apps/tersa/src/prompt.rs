@@ -66,9 +66,10 @@ fn read_secret(tty: &File) -> io::Result<Zeroizing<String>> {
     // Full capacity up front: growth would reallocate and leave unwiped
     // copies of the typed prefix in freed memory.
     let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PASSPHRASE));
-    let mut byte = [0_u8; 1];
+    // Wiped on every return path, including read errors.
+    let mut byte = Zeroizing::new([0_u8; 1]);
     loop {
-        if reader.read(&mut byte)? == 0 {
+        if reader.read(&mut *byte)? == 0 {
             break;
         }
         match byte[0] {
@@ -85,14 +86,13 @@ fn read_secret(tty: &File) -> io::Result<Zeroizing<String>> {
             }
             other => {
                 if bytes.len() >= MAX_PASSPHRASE {
-                    byte.zeroize();
                     return Err(io::Error::other("the passphrase is too long"));
                 }
                 bytes.push(other);
             }
         }
     }
-    byte.zeroize();
+    drop(byte);
     match String::from_utf8(std::mem::take(&mut *bytes)) {
         Ok(text) => Ok(Zeroizing::new(text)),
         Err(error) => {
