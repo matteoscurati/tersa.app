@@ -38,5 +38,5 @@ first.
 allows only OSI-approved licenses (ADR 0006 A4), denies yanked crates and
 wildcard versions, and keeps retired UI runtimes out of the graph.
 `cargo deny check` also applies the RustSec advisory database on every pull
-request. A new production dependency needs a justification in its pull
+request that changes code. A new production dependency needs a justification in its pull
 request: why it is needed, its license, and its maintenance status.

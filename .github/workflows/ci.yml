@@ -42,7 +42,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha || github.event.after }}
         run: |
           build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")
-          case "$build" in true | false) ;; *) exit 1 ;; esac
+          case "$build" in true | false) ;; *) echo "unexpected build selection: '$build'" >&2; exit 1 ;; esac
           {
             echo "base=$BASE"
             echo "head=$HEAD"
@@ -98,7 +98,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           build=$(scripts/ci-needs-build.sh "$BASE" "$HEAD")
-          case "$build" in true | false) ;; *) exit 1 ;; esac
+          case "$build" in true | false) ;; *) echo "unexpected build selection: '$build'" >&2; exit 1 ;; esac
           echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Install pinned Rust toolchain
         if: steps.range.outputs.build != 'false'

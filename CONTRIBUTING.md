@@ -98,7 +98,7 @@ the pull request. The baseline is `cargo xtask verify` (layering, format,
 Clippy, a default-feature check, tests, documentation), which CI runs on Linux
 and macOS, plus `cargo deny` (dependency policy and RustSec advisories),
 `typos`, and DCO, which CI runs on Linux. Documentation-only changes skip the
-builds; see [development](docs/development.md).
+builds and `cargo deny`; see [development](docs/development.md).
 
 The implementer cannot approve their own work. A pull request may merge only
 when required checks pass and an independent reviewer reports zero unresolved

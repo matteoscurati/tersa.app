@@ -2,7 +2,7 @@
 # Prints "true" when the commit range BASE..HEAD touches anything other than
 # documentation, so CI must build and test; prints "false" otherwise.
 # An unknown or all-zero base (a new branch) always builds. Any failure exits
-# non-zero, and the workflow builds on anything but an explicit "false".
+# non-zero, and the workflow fails on any output other than "true" or "false".
 set -eu
 
 base=${1:-}
@@ -27,8 +27,14 @@ fi
 # Paths that cannot affect the build, the tests, or the dependency checks.
 docs_only='^(docs/.*|[^/]*\.md|LICENSE|licenses/.*|_typos\.toml|\.github/(ISSUE_TEMPLATE/.*|pull_request_template\.md|CODEOWNERS))$'
 
-if printf '%s\n' "$files" | grep -Eqv "$docs_only"; then
-  echo true
-else
-  echo false
-fi
+# grep exits 0 when some path is not documentation, 1 when none is, and
+# above 1 on an error, which must not read as "documentation only".
+set +e
+printf '%s\n' "$files" | grep -Eqv "$docs_only"
+status=$?
+set -e
+case $status in
+  0) echo true ;;
+  1) echo false ;;
+  *) exit "$status" ;;
+esac

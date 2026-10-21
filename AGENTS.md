@@ -23,7 +23,7 @@ class’s paths. Run the **minimum** loop for the class; run full
 | `presentation` | `crates/presentation/**` | `cargo xtask preflight presentation` | store, secrets, Gmail adapters |
 | `adapter-rust` | one `adapters/<name>/**` | `cargo xtask preflight adapter --package <crate>` | other adapters, apps |
 | `tui` | `apps/**` | `cargo xtask preflight tui` | core crates, adapters, `xtask/**` |
-| `policy-xtask` | `xtask/**`, CI, `scripts/**`, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then full `verify` | product features in the same PR |
+| `policy-xtask` | `xtask/**`, CI, `scripts/**`, `.cargo/**`, `deny.toml`, `_typos.toml` | `cargo xtask preflight policy`, then full `verify` | product features in the same PR |
 | `docs-only` | `docs/**`, markdown | none (`typos` if installed) | code |
 
 Full map, anti-patterns, and ADR pointers:
