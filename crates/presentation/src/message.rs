@@ -171,11 +171,21 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
     }
 }
 
-/// Normalizes line endings, trims trailing spaces, and caps the size.
+/// Normalizes line endings, trims trailing spaces, keeps at most one blank
+/// line in a row, and caps the size.
 fn plain_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_PLAIN_OUTPUT));
+    let mut blank = true;
     for line in text.split('\n') {
         let line = line.trim_end();
+        if line.is_empty() {
+            if blank {
+                continue;
+            }
+            blank = true;
+        } else {
+            blank = false;
+        }
         if out.len() + line.len() + 1 > MAX_PLAIN_OUTPUT {
             out.push_str(TRUNCATED);
             break;
