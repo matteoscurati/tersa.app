@@ -17,7 +17,7 @@ unmaintained = "all"
 # zbus-secret-service-keyring-store still require zbus 5 and no patched release
 # exists. These are informational "unmaintained" notices, not vulnerabilities,
 # and they reach only the Linux Secret Service backend. Revisit no later than
-# T8 (Linux validation); keep .cargo/audit.toml in sync.
+# T8 (Linux validation).
 ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; no zbus 6 secret-service yet" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; no zbus 6 secret-service yet" },

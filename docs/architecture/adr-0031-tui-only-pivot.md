@@ -82,8 +82,8 @@ control. These residuals replace the ADR 0024 process-isolation claim.
   needs OpenSSL on Linux anyway; one crypto library keeps the binary smaller.
 - Consequence: the vendored OpenSSL receives no operating-system security
   updates. Every OpenSSL advisory that affects the linked version requires
-  bumping `openssl-src` and publishing new Linux binaries; `cargo audit` and
-  release checks must track it.
+  bumping `openssl-src` and publishing new Linux binaries; the RustSec
+  advisory check in `cargo deny` and release checks must track it.
 
 ### Hostile content in a terminal
 
@@ -107,14 +107,14 @@ control. These residuals replace the ADR 0024 process-isolation claim.
 ### Governance
 
 - `cargo xtask verify` (format, Clippy with warnings denied, tests, doc tests,
-  rustdoc, and a layering check) on Linux and macOS, plus `cargo deny`,
-  `cargo audit`, feature powerset checks, and `typos`, are the merge checks.
+  rustdoc, a default-feature check, and a layering check) on Linux and
+  macOS, plus `cargo deny` (including RustSec advisories) and `typos`, are
+  the merge checks. CI stays minimal: fast and cheap is a requirement.
 - The layering check enforces only durable rules: core crates under
   `crates/` forbid `unsafe` and depend only on the core and external crates
   allowlisted for each of them (computation crates only, plus `getrandom` for
   the system CSPRNG); nothing depends on `apps/` or `xtask`.
-- DCO sign-offs are checked on pull requests, in the merge queue, and on
-  pushes to `main`.
+- DCO sign-offs are checked on pull requests and on pushes to `main`.
 - ADRs are written only for decisions that change architecture, security
   boundaries, or the data model.
 

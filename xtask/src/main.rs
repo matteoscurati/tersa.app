@@ -274,6 +274,12 @@ fn verify() -> TaskResult {
             "warnings",
         ]),
     )?;
+    // Tests and Clippy enable every feature; this keeps the production
+    // feature set (no test-only features) compiling too.
+    run_command(
+        "default-feature check",
+        cargo(&["check", "--locked", "--workspace"]),
+    )?;
     run_command(
         "tests",
         cargo(&[
