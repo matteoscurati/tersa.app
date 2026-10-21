@@ -105,7 +105,15 @@ fn plan_unlock(state: VaultState, has_local_data: bool, create: Create) -> Unloc
     }
 }
 
-fn unlock(context: &Context, create: Create) -> Result<Option<Arc<Installation>>, String> {
+/// Unlocks the vault and opens the installation. The lock parameter is
+/// unused at run time: requiring it makes "unlock only while holding the
+/// installation lock" a compile-time rule, since only
+/// [`InstallationLock::acquire`] can produce one.
+fn unlock(
+    context: &Context,
+    _held: &InstallationLock,
+    create: Create,
+) -> Result<Option<Arc<Installation>>, String> {
     let vault = open_vault(context)?;
     let state = vault.state().map_err(|error| error.to_string())?;
     let root = match plan_unlock(state, has_local_data(&context.paths.data_dir), create) {
@@ -147,16 +155,15 @@ fn unlock_with_passphrase(vault: &Vault) -> Result<RootKey, String> {
     Err("too many wrong passphrases".to_owned())
 }
 
-/// Opens an existing installation under its lock, for commands that cannot
-/// create one. Together with `account add`, which locks first, this is the
-/// only way to reach [`unlock`], so no command opens an installation without
-/// holding the lock.
+/// Opens an existing installation under its lock, for commands that may not
+/// mint a root key. It returns `None` when there is no data directory or no
+/// key and no encrypted data yet.
 fn open_existing(context: &Context) -> Result<Option<Locked>, String> {
     let Some(lock) = lock_existing(context)? else {
         return Ok(None);
     };
     Ok(
-        unlock(context, Create::Forbidden)?.map(|installation| Locked {
+        unlock(context, &lock, Create::Forbidden)?.map(|installation| Locked {
             installation,
             _lock: lock,
         }),
@@ -229,8 +236,8 @@ fn open_browser(url: &str) {
 pub fn account_add(context: &Context) -> Result<(), String> {
     // Fail on a missing OAuth client before creating any key material.
     context.config.oauth_client(&context.paths.config_file())?;
-    let _lock = lock(context)?;
-    let installation = unlock(context, Create::Allowed)?
+    let lock = lock(context)?;
+    let installation = unlock(context, &lock, Create::Allowed)?
         .ok_or_else(|| "could not initialize local storage".to_owned())?;
     let runtime = runtime(context, installation)?;
     let added = executor()?
@@ -417,6 +424,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use tersa_sync_runtime::InstallationLock;
     use tersa_vault::{BackendChoice, VaultState};
 
     use super::{
@@ -477,5 +485,33 @@ mod tests {
         assert_eq!(sync(&context, None), refused);
         assert_eq!(inbox(&context, None, 10), refused);
         assert!(std::fs::symlink_metadata(&root).is_err());
+    }
+
+    #[test]
+    fn commands_refuse_while_another_process_holds_the_lock() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tersa-busy-{}-{nanos}", std::process::id()));
+        let data_dir = root.join("data");
+        let held = InstallationLock::acquire(&data_dir).expect("lock");
+        let mut config = Config::load(&root.join("config.toml")).expect("config");
+        config.backend = BackendChoice::File;
+        let context = Context {
+            paths: Paths {
+                config_dir: root.clone(),
+                data_dir,
+            },
+            config,
+        };
+
+        let busy = Err("another tersa process is using this data directory".to_owned());
+        assert_eq!(account_list(&context), busy);
+        assert_eq!(account_remove(&context, "acct_"), busy);
+        assert_eq!(sync(&context, None), busy);
+        assert_eq!(inbox(&context, None, 10), busy);
+        drop(held);
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
