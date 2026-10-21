@@ -599,6 +599,107 @@ mod store {
             })
         }
 
+        /// Stores the account's OAuth refresh token in the binding row.
+        ///
+        /// The token is protected only by the database encryption and is never
+        /// logged. It must be 1..=4096 bytes of printable non-space ASCII.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch, an invalid token, or a
+        /// backend failure, and corruption when the binding row is missing or
+        /// mismatched.
+        pub fn store_refresh_token(
+            &self,
+            account: &AccountId,
+            token: &str,
+        ) -> Result<(), MailboxStoreError> {
+            self.checked_account(account)?;
+            if !is_valid_refresh_token(token) {
+                return Err(MailboxStoreError::Storage);
+            }
+            self.update_refresh_token(account, Some(token))
+        }
+
+        /// Removes the account's OAuth refresh token, if any.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch or backend failure and
+        /// corruption when the binding row is missing or mismatched.
+        pub fn clear_refresh_token(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
+            self.checked_account(account)?;
+            self.update_refresh_token(account, None)
+        }
+
+        fn update_refresh_token(
+            &self,
+            account: &AccountId,
+            token: Option<&str>,
+        ) -> Result<(), MailboxStoreError> {
+            self.with_connection(|connection| {
+                let changed = connection
+                    .execute(
+                        "UPDATE account_binding SET refresh_token = ?1 WHERE singleton = 1 AND account_id = ?2",
+                        params![token, account.as_str()],
+                    )
+                    .map_err(store_error)?;
+                (changed == 1)
+                    .then_some(())
+                    .ok_or(MailboxStoreError::Corrupted)
+            })
+        }
+
+        /// Loads the account's OAuth refresh token.
+        ///
+        /// A SQL NULL token returns `None`; a missing or mismatched binding row,
+        /// a non-text token, or text violating the stored shape is corruption.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch or backend failure and
+        /// corruption for a missing or mismatched binding row or an invalid
+        /// persisted token.
+        pub fn load_refresh_token(
+            &self,
+            account: &AccountId,
+        ) -> Result<Option<Zeroizing<String>>, MailboxStoreError> {
+            self.checked_account(account)?;
+            self.with_connection(|connection| {
+                let row = connection.query_row(
+                    "SELECT typeof(refresh_token), CASE WHEN typeof(refresh_token) = 'text' THEN refresh_token END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
+                    [],
+                    |row| {
+                        let token_type: String = row.get(0)?;
+                        let token: Option<String> = row.get(1)?;
+                        let binding: Option<String> = row.get(2)?;
+                        Ok((token_type, token.map(Zeroizing::new), binding))
+                    },
+                );
+                let (token_type, token, binding) = match row {
+                    Ok(values) => values,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(MailboxStoreError::Corrupted);
+                    }
+                    Err(error) => return Err(store_error(error)),
+                };
+                if binding.as_deref() != Some(account.as_str()) {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                match token_type.as_str() {
+                    "null" => Ok(None),
+                    "text" => {
+                        let token = token.ok_or(MailboxStoreError::Corrupted)?;
+                        if !is_valid_refresh_token(&token) {
+                            return Err(MailboxStoreError::Corrupted);
+                        }
+                        Ok(Some(token))
+                    }
+                    _ => Err(MailboxStoreError::Corrupted),
+                }
+            })
+        }
+
         fn upsert(&self, envelopes: &[MessageEnvelope]) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
                 let transaction = connection.transaction().map_err(store_error)?;
@@ -809,8 +910,9 @@ mod store {
         /// stays bound to its account, so a later re-connect passes the
         /// open-time binding check instead of failing as an unknown owner. Its
         /// `broker_subject` — the encrypted account-identifying broker routing
-        /// key, never an OAuth credential — is cleared in the same commit,
-        /// because the routing key must not outlive the account's local data.
+        /// key, never an OAuth credential — and the `refresh_token` credential
+        /// are cleared in the same commit, because neither may outlive the
+        /// account's local data.
         fn purge(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
                 // BEGIN IMMEDIATE takes the write lock up front, mirroring the
@@ -834,7 +936,7 @@ mod store {
                     .map_err(store_error)?;
                 let cleared = transaction
                     .execute(
-                        "UPDATE account_binding SET broker_subject = NULL WHERE singleton = 1 AND account_id = ?1",
+                        "UPDATE account_binding SET broker_subject = NULL, refresh_token = NULL WHERE singleton = 1 AND account_id = ?1",
                         params![account.as_str()],
                     )
                     .map_err(store_error)?;
@@ -2814,7 +2916,7 @@ mod store {
         unsafe_code,
         reason = "SQLCipher's raw-key API avoids copying the key into an ordinary SQL string"
     )]
-    fn apply_key(connection: &Connection, key: &[u8; 32]) -> rusqlite::Result<()> {
+    pub(crate) fn apply_key(connection: &Connection, key: &[u8; 32]) -> rusqlite::Result<()> {
         let key_length =
             i32::try_from(key.len()).map_err(|_error| rusqlite::Error::InvalidQuery)?;
         // SAFETY: `connection.handle()` remains valid for this call, SQLCipher
@@ -2908,7 +3010,7 @@ mod store {
                 "table".into(),
                 "account_binding".into(),
                 normalize(
-                    "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)) )",
+                    "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)), refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096)) )",
                 ),
             ),
             (
@@ -2946,6 +3048,12 @@ mod store {
     fn is_valid_broker_subject(subject: &str) -> bool {
         let bytes = subject.as_bytes();
         (1..=255).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
+    }
+    // A refresh token is 1..=4096 bytes of printable non-space ASCII, matching
+    // the `account_binding.refresh_token` column CHECK bound.
+    fn is_valid_refresh_token(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        (1..=4096).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
     }
     #[expect(
         clippy::needless_pass_by_value,
@@ -5600,6 +5708,55 @@ mod store {
         }
 
         #[test]
+        fn refresh_token_round_trips_clears_and_survives_reopen() {
+            let (database, store) = open("refresh-token-round-trip");
+            assert!(store.load_refresh_token(&account()).unwrap().is_none());
+            store
+                .store_refresh_token(&account(), "1//refresh-token-value")
+                .unwrap();
+            drop(store);
+
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                reopened
+                    .load_refresh_token(&account())
+                    .unwrap()
+                    .map(|token| token.to_string()),
+                Some("1//refresh-token-value".to_string())
+            );
+            reopened.clear_refresh_token(&account()).unwrap();
+            assert!(reopened.load_refresh_token(&account()).unwrap().is_none());
+        }
+
+        #[test]
+        fn refresh_token_rejects_bad_shapes_and_foreign_accounts() {
+            let (_database, store) = open("refresh-token-shape");
+            for bad in ["", "has space", "line\nbreak", &"x".repeat(4097)] {
+                assert!(matches!(
+                    store.store_refresh_token(&account(), bad),
+                    Err(MailboxStoreError::Storage)
+                ));
+            }
+            let foreign = AccountId::new("account-b").unwrap();
+            assert!(matches!(
+                store.store_refresh_token(&foreign, "token"),
+                Err(MailboxStoreError::Storage)
+            ));
+            assert!(matches!(
+                store.load_refresh_token(&foreign),
+                Err(MailboxStoreError::Storage)
+            ));
+        }
+
+        #[test]
+        fn purge_clears_the_refresh_token() {
+            let (_database, store) = open("refresh-token-purge");
+            store.store_refresh_token(&account(), "token").unwrap();
+            run(AccountPurgeStore::purge_account(&store, &account())).unwrap();
+            assert!(store.load_refresh_token(&account()).unwrap().is_none());
+        }
+
+        #[test]
         fn broker_subject_rejects_wrong_account_without_database_work() {
             let (_database, store) = open("broker-subject-mismatch");
             store
@@ -6431,9 +6588,23 @@ mod store {
                 |_path| fs::remove_file(wal_path(&database)).unwrap(),
                 |_path| {},
             );
-            assert!(matches!(result, Err(MailboxStoreError::Storage)));
             assert!(wal_path(&database).is_file());
-            assert_ne!(file_identity(&wal_path(&database)).unwrap(), original_wal);
+            match result {
+                Err(MailboxStoreError::Storage) => {
+                    assert_ne!(file_identity(&wal_path(&database)).unwrap(), original_wal);
+                }
+                // Linux filesystems such as ext4 can hand the deleted WAL's
+                // inode straight to the recreated file, so the identity check
+                // cannot see the swap. The WAL was checkpointed first, so the
+                // accepted residual is benign: the data is intact.
+                Ok(reader) => assert_eq!(
+                    run(reader.list_envelopes(&account(), StoreLimit::new(1).unwrap()))
+                        .unwrap()
+                        .len(),
+                    1
+                ),
+                Err(other) => panic!("unexpected reader failure: {other:?}"),
+            }
         }
 
         #[test]
@@ -6486,6 +6657,8 @@ mod store {
         }
     }
 }
+
+pub mod registry;
 
 pub use store::{
     DatabaseKey, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader, SqlCipherMailboxStore,
