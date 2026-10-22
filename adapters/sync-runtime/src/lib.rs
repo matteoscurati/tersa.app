@@ -26,4 +26,4 @@ pub use installation::{
     LockError, has_local_data,
 };
 pub use loopback::{Loopback, LoopbackError};
-pub use session::{GmailSession, GmailSessionError};
+pub use session::{GmailSession, GmailSessionError, SharedSession};

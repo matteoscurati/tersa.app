@@ -2912,20 +2912,36 @@ mod store {
         }
     }
 
+    /// The length of `SQLCipher`'s raw-key literal: `x'`, 64 hex digits, `'`.
+    const RAW_KEY_LITERAL_LEN: usize = 2 + 64 + 1;
+
     #[expect(
         unsafe_code,
         reason = "SQLCipher's raw-key API avoids copying the key into an ordinary SQL string"
     )]
     pub(crate) fn apply_key(connection: &Connection, key: &[u8; 32]) -> rusqlite::Result<()> {
+        // The key is already 256 uniformly random bits from HKDF, so it is
+        // passed in SQLCipher's raw-key form, `x'<64 hex digits>'`. A plain
+        // 32-byte buffer would be treated as a passphrase and stretched with
+        // the default PBKDF2 (256,000 iterations) on every open, which costs
+        // more than the whole first-frame budget.
+        let mut literal = Zeroizing::new([0_u8; RAW_KEY_LITERAL_LEN]);
+        literal[0] = b'x';
+        literal[1] = b'\'';
+        for (index, byte) in key.iter().enumerate() {
+            literal[2 + 2 * index] = hex_digit(byte >> 4);
+            literal[3 + 2 * index] = hex_digit(byte & 0x0f);
+        }
+        literal[RAW_KEY_LITERAL_LEN - 1] = b'\'';
         let key_length =
-            i32::try_from(key.len()).map_err(|_error| rusqlite::Error::InvalidQuery)?;
+            i32::try_from(literal.len()).map_err(|_error| rusqlite::Error::InvalidQuery)?;
         // SAFETY: `connection.handle()` remains valid for this call, SQLCipher
         // copies exactly `key_length` bytes before returning, and the borrowed
-        // key buffer remains alive and immutable for the complete call.
+        // literal buffer remains alive and immutable for the complete call.
         let result = unsafe {
             rusqlite::ffi::sqlite3_key(
                 connection.handle(),
-                key.as_ptr().cast::<std::ffi::c_void>(),
+                literal.as_ptr().cast::<std::ffi::c_void>(),
                 key_length,
             )
         };
@@ -3199,6 +3215,35 @@ mod store {
                 UnixTimestampMillis::new(i64::from(index)).unwrap(),
                 index.is_multiple_of(3),
             )
+        }
+
+        #[test]
+        fn keys_are_applied_in_raw_form_without_key_stretching() {
+            let (database, store) = open("raw-key");
+            record_fence(&store);
+            drop(store);
+            let connection = raw_existing_connection(&database);
+            let hex: String = [7_u8; 32]
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect();
+            connection
+                .pragma_update(None, "key", format!("x'{hex}'"))
+                .unwrap();
+            let tables: i64 = connection
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                .unwrap();
+            assert!(tables > 0, "the raw-form key opens the database");
+
+            let stretched = raw_existing_connection(&database);
+            stretched.pragma_update(None, "key", hex).unwrap();
+            assert!(
+                stretched
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row
+                        .get::<_, i64>(0))
+                    .is_err(),
+                "the same bytes as a passphrase do not"
+            );
         }
 
         /// Emits one privacy-safe Step-4 performance sample over the production

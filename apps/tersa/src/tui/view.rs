@@ -22,6 +22,11 @@ pub type StyledLine = Line<'static>;
 
 const DATE_WIDTH: usize = 6;
 
+/// At most this many wrapped lines of one message are laid out, which keeps
+/// a pathological body (half a megabyte of one-character lines) to a few
+/// megabytes of layout.
+const MAX_MESSAGE_LINES: usize = 20_000;
+
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
@@ -274,6 +279,15 @@ fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<S
             }
         }
     }
+    if lines.len() > MAX_MESSAGE_LINES {
+        lines.truncate(MAX_MESSAGE_LINES);
+    }
+    if lines.len() == MAX_MESSAGE_LINES {
+        lines.push(Line::styled(
+            "[… the rest of this message is too long to show]",
+            dim(),
+        ));
+    }
     lines
 }
 
@@ -370,9 +384,11 @@ fn header(lines: &mut Vec<StyledLine>, label: &str, value: &str, columns: usize)
 }
 
 fn push_wrapped(lines: &mut Vec<StyledLine>, text: &str, columns: usize, style: Style) {
+    let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
     lines.extend(
         wrap(text, columns)
             .into_iter()
+            .take(room)
             .map(|line| Line::styled(line, style)),
     );
 }
@@ -585,5 +601,85 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
             " /rstuvwxyz ",
             "room for the cursor"
         );
+    }
+
+    #[test]
+    fn a_huge_message_is_laid_out_up_to_a_bound() {
+        let mut raw = b"Subject: long\r\n\r\n".to_vec();
+        raw.extend(b"x\n".repeat(200_000));
+        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
+        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+        let _ = screen(&mut app, 40, 5);
+        let crate::tui::app::Screen::Message(view) = &app.screen else {
+            panic!("message screen");
+        };
+        let lines = &view.layout.as_ref().expect("laid out").1;
+        assert_eq!(lines.len(), 20_001);
+        assert!(lines[20_000].to_string().contains("too long to show"));
+    }
+
+    fn assert_no_controls(lines: &[String]) {
+        for line in lines {
+            assert!(
+                !line.chars().any(|character| character.is_control()
+                    || ('\u{202a}'..='\u{202e}').contains(&character)
+                    || ('\u{2066}'..='\u{2069}').contains(&character)),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_message_parts_never_reach_the_screen_as_controls() {
+        let raw = "From: =?utf-8?q?Evil=1B]52;c;eA=3D=3D=07?= <e@example.com>\r\n\
+To: \u{1b}[2Jvictim@example.com\r\nCc: \u{202e}cc@example.com\r\n\
+Subject: \u{1b}]0;title\u{7}hi\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n\
+<p>body &#27;[31m red &#x9b;1m <a href=\"https://e.com/&#27;]8;;x\">link</a></p>\r\n\
+--b\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r\nxx\r\n--b--\r\n";
+        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "b", true)]);
+        app.show_message(
+            MessageId::new("m").expect("id"),
+            Ok(Some(raw.as_bytes().to_vec())),
+        );
+        let lines = screen(&mut app, 60, 30);
+        assert!(lines.join("\n").contains("Attachments"), "{lines:?}");
+        assert_no_controls(&lines);
+
+        app.show_message(MessageId::new("m").expect("id"), Ok(None));
+        app.downloaded(
+            MessageId::new("m").expect("id"),
+            Err("\u{1b}]52;c;eA==\u{7}\u{202e}offline".to_owned()),
+        );
+        let lines = screen(&mut app, 60, 12);
+        assert!(lines.join("\n").contains("could not be downloaded"));
+        assert_no_controls(&lines);
+    }
+
+    #[test]
+    fn message_scrolling_is_clamped_to_the_last_page() {
+        let mut raw = b"Subject: long\r\n\r\n".to_vec();
+        for line in 0..100 {
+            raw.extend(format!("line {line}\n").as_bytes());
+        }
+        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
+        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+        let _ = screen(&mut app, 40, 12);
+        app.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        for _ in 0..5 {
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let lines = screen(&mut app, 40, 12);
+        assert!(lines[10].contains("line 99"), "{lines:?}");
+        app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        let lines = screen(&mut app, 40, 12);
+        assert!(
+            lines[10].contains("line 98"),
+            "one line up from the end: {lines:?}"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(screen(&mut app, 40, 12)[1].contains("long"));
     }
 }

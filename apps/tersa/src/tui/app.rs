@@ -119,8 +119,6 @@ pub enum Body {
 pub struct MessageView {
     pub id: MessageId,
     pub body: Body,
-    /// Raw bytes kept so the format can be switched without another read.
-    raw: Option<Vec<u8>>,
     pub preference: BodyPreference,
     pub scroll: usize,
     /// Wrapped lines for the last width drawn, rebuilt when the width changes.
@@ -160,6 +158,9 @@ pub struct Search {
 pub enum Request {
     /// Load the cached message with this identifier.
     OpenMessage(MessageId),
+    /// Read the open message again to show it in the other format; raw
+    /// messages can be large, so they are not kept in memory.
+    Reformat(MessageId),
     /// Sync the account now.
     Sync,
 }
@@ -355,10 +356,7 @@ impl App {
                     }
                     KeyCode::Char('n') => self.step(1),
                     KeyCode::Char('p') => self.step(-1),
-                    KeyCode::Char('H') => {
-                        self.toggle_format();
-                        None
-                    }
+                    KeyCode::Char('H') => self.toggle_format(),
                     _ => None,
                 }
             }
@@ -419,13 +417,10 @@ impl App {
 
     /// Shows the message `id` with its cached raw bytes, if any.
     pub fn show_message(&mut self, id: MessageId, raw: Result<Option<Vec<u8>>, ()>) {
-        let (body, raw) = match raw {
-            Ok(Some(raw)) => (
-                Body::Rendered(Box::new(render_message(&raw, self.preference))),
-                Some(raw),
-            ),
-            Ok(None) => (Body::NotCached, None),
-            Err(()) => (Body::Failed, None),
+        let body = match raw {
+            Ok(Some(raw)) => Body::Rendered(Box::new(render_message(&raw, self.preference))),
+            Ok(None) => Body::NotCached,
+            Err(()) => Body::Failed,
         };
         if let Some(position) = self.position_of(&id) {
             self.selected = position;
@@ -434,7 +429,6 @@ impl App {
         self.screen = Screen::Message(MessageView {
             id,
             body,
-            raw,
             preference: self.preference,
             scroll: 0,
             layout: None,
@@ -442,7 +436,15 @@ impl App {
     }
 
     fn is_open(&self, id: &MessageId) -> bool {
-        matches!(&self.screen, Screen::Message(view) if &view.id == id)
+        self.open_id() == Some(id)
+    }
+
+    /// The open message, if any.
+    pub fn open_id(&self) -> Option<&MessageId> {
+        match &self.screen {
+            Screen::Message(view) => Some(&view.id),
+            Screen::Inbox => None,
+        }
     }
 
     /// Marks the open message as downloading.
@@ -482,27 +484,35 @@ impl App {
         };
     }
 
-    fn toggle_format(&mut self) {
-        let Screen::Message(view) = &mut self.screen else {
-            return;
+    /// Asks to show the open message in its other format.
+    fn toggle_format(&mut self) -> Option<Request> {
+        let Screen::Message(view) = &self.screen else {
+            return None;
         };
         let Body::Rendered(rendered) = &view.body else {
-            return;
+            return None;
         };
         if !rendered.has_alternative {
             self.status = Some("This message has only one format.".to_owned());
-            return;
+            return None;
         }
-        let next = match rendered.format {
+        self.preference = match rendered.format {
             Some(BodyFormat::Html) => BodyPreference::Plain,
             _ => BodyPreference::Html,
         };
-        if let Some(raw) = &view.raw {
-            view.body = Body::Rendered(Box::new(render_message(raw, next)));
-            view.preference = next;
+        Some(Request::Reformat(view.id.clone()))
+    }
+
+    /// Shows the open message `id` again from `raw` in the preferred format.
+    pub fn reformat(&mut self, id: &MessageId, raw: &[u8]) {
+        let preference = self.preference;
+        if let Screen::Message(view) = &mut self.screen
+            && &view.id == id
+        {
+            view.body = Body::Rendered(Box::new(render_message(raw, preference)));
+            view.preference = preference;
             view.scroll = 0;
             view.layout = None;
-            self.preference = next;
             self.repaint = true;
         }
     }
@@ -687,8 +697,20 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
             rendered.body.as_str().to_owned()
         };
         assert_eq!(body(&app), "html body", "HTML is the default");
-        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('H')),
+            Some(Request::Reformat(id("m0")))
+        );
+        app.reformat(&id("m0"), raw);
         assert_eq!(body(&app), "plain body");
+        app.reformat(&id("other"), raw);
+        assert_eq!(body(&app), "plain body", "only the open message changes");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('H')),
+            Some(Request::Reformat(id("m0")))
+        );
+        app.reformat(&id("m0"), raw);
+        assert_eq!(body(&app), "html body");
     }
 
     #[test]

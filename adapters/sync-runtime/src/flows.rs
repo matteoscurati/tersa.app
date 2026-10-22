@@ -5,12 +5,16 @@
 //! Account flows: add (OAuth consent then first sync), sync, and remove.
 
 use core::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tersa_application::mailbox::{AccountId, MessageId, PageSize, StoreLimit};
+use tersa_application::identity::AccountProfile;
+use tersa_application::mailbox::{
+    AccountId, MessageId, PageSize, RemoteMailbox, RemoteMailboxError, StoreLimit,
+};
 use tersa_application::oauth::{MonotonicClock, SystemMonotonicClock, SystemWallClock};
-use tersa_application::sync::{SyncPolicy, SyncReport};
+use tersa_application::sync::{SyncFailureSource, SyncPolicy, SyncReport};
 use tersa_gmail_rest::GmailTokenTransport;
 use tersa_token_broker_core::{BrokerCore, BrokerError, BrokerToken, GetRandomEntropy};
 use zeroize::Zeroizing;
@@ -20,7 +24,7 @@ use crate::installation::{
     Installation, InstallationError, InstallationHasher, InstallationTokens,
 };
 use crate::loopback::{Loopback, LoopbackError};
-use crate::session::{GmailSession, GmailSessionError};
+use crate::session::{GmailSession, GmailSessionError, SharedSession};
 
 /// How long the browser sign-in may take.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -29,6 +33,8 @@ const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 /// about the length of one slow token request.
 const BUSY_WAIT: Duration = Duration::from_millis(100);
 const BUSY_RETRIES: u8 = 50;
+/// A cached access token is replaced this long before it expires.
+const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 
 type Broker = BrokerCore<
     GmailTokenTransport,
@@ -143,6 +149,9 @@ pub struct Runtime {
     installation: Arc<Installation>,
     broker: Broker,
     hasher: InstallationHasher,
+    /// One Gmail session per account, reused until shortly before its access
+    /// token expires.
+    sessions: Mutex<HashMap<AccountId, (SharedSession, Instant)>>,
 }
 
 impl fmt::Debug for Runtime {
@@ -177,6 +186,7 @@ impl Runtime {
             hasher: InstallationHasher(Arc::clone(&installation)),
             installation,
             broker,
+            sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -228,7 +238,14 @@ impl Runtime {
             .installation
             .account_for_subject(token.subject())?
             .ok_or(FlowError::UnknownAccount)?;
-        let first_sync = self.sync_with_token(&account, &token).await;
+        let first_sync = match GmailSession::new(
+            account.clone(),
+            token.access_token(),
+            Zeroizing::new(token.subject().to_owned()),
+        ) {
+            Ok(session) => self.sync_with_session(&account, session).await,
+            Err(error) => Err(FlowError::Session(error)),
+        };
         Ok(AddedAccount {
             already_present: before.contains(&account),
             account,
@@ -243,9 +260,15 @@ impl Runtime {
     /// Returns a [`FlowError`] for an unknown account, a token failure, or a
     /// gate or sync failure.
     pub async fn sync_account(&self, account: &AccountId) -> Result<SyncReport, FlowError> {
-        let subject = self.subject_of(account)?;
-        let token = self.access_token(&subject).await?;
-        self.sync_with_token(account, &token).await
+        let session = self.session(account).await?;
+        let result = self.sync_with_session(account, session).await;
+        if matches!(&result, Err(FlowError::Sync(GatedSyncError::Sync(failure)))
+            if failure.category()
+                == SyncFailureSource::Remote(RemoteMailboxError::AuthorizationRequired))
+        {
+            self.forget_session(account);
+        }
+        result
     }
 
     /// Refreshes an access token. The broker refreshes one account's token at
@@ -279,6 +302,7 @@ impl Runtime {
         // Deleting the stored token is part of the local removal; a failure
         // here is superseded by deleting the whole account directory.
         let _ = self.broker.delete_stored_tokens(&subject);
+        self.forget_session(account);
         self.installation.remove_account(account)?;
         Ok(revocation)
     }
@@ -295,19 +319,59 @@ impl Runtime {
         account: &AccountId,
         message_id: &MessageId,
     ) -> Result<Vec<u8>, FlowError> {
+        let session = self.session(account).await?;
+        let store = self.installation.open_store(account)?;
+        match gated_fetch(account, session, &self.hasher, store, message_id).await {
+            Ok(message) => Ok(message.content().as_bytes().to_vec()),
+            Err(error) => {
+                if matches!(
+                    error,
+                    GatedFetchError::Remote(RemoteMailboxError::AuthorizationRequired)
+                ) {
+                    self.forget_session(account);
+                }
+                Err(FlowError::Fetch(error))
+            }
+        }
+    }
+
+    /// The account's Gmail session, refreshing its access token only when
+    /// none is cached or the cached one is about to expire.
+    async fn session(&self, account: &AccountId) -> Result<SharedSession, FlowError> {
+        if let Some((session, until)) = self.sessions_lock().get(account)
+            && Instant::now() < *until
+        {
+            return Ok(session.clone());
+        }
         let subject = self.subject_of(account)?;
         let token = self.access_token(&subject).await?;
-        let session = GmailSession::new(
+        let lifetime = Duration::from_secs(token.expires_in_seconds()).saturating_sub(TOKEN_MARGIN);
+        let session = SharedSession::new(
+            GmailSession::new(
+                account.clone(),
+                token.access_token(),
+                Zeroizing::new(token.subject().to_owned()),
+            )
+            .map_err(FlowError::Session)?,
+        );
+        self.sessions_lock().insert(
             account.clone(),
-            token.access_token(),
-            Zeroizing::new(token.subject().to_owned()),
-        )
-        .map_err(FlowError::Session)?;
-        let store = self.installation.open_store(account)?;
-        let message = gated_fetch(account, session, &self.hasher, store, message_id)
-            .await
-            .map_err(FlowError::Fetch)?;
-        Ok(message.content().as_bytes().to_vec())
+            (session.clone(), Instant::now() + lifetime),
+        );
+        Ok(session)
+    }
+
+    fn forget_session(&self, account: &AccountId) {
+        self.sessions_lock().remove(account);
+    }
+
+    fn sessions_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<AccountId, (SharedSession, Instant)>> {
+        // The map holds no invariant a panic could break; recover it.
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn subject_of(&self, account: &AccountId) -> Result<Zeroizing<String>, FlowError> {
@@ -322,17 +386,11 @@ impl Runtime {
             .ok_or(FlowError::UnknownAccount)
     }
 
-    async fn sync_with_token(
+    async fn sync_with_session<S: AccountProfile + RemoteMailbox>(
         &self,
         account: &AccountId,
-        token: &BrokerToken,
+        session: S,
     ) -> Result<SyncReport, FlowError> {
-        let session = GmailSession::new(
-            account.clone(),
-            token.access_token(),
-            Zeroizing::new(token.subject().to_owned()),
-        )
-        .map_err(FlowError::Session)?;
         let store = self.installation.open_store(account)?;
         gated_sync(account, session, &self.hasher, store, default_sync_policy())
             .await

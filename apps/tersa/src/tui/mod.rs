@@ -16,7 +16,9 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
@@ -66,6 +68,13 @@ const TICK: Duration = Duration::from_millis(100);
 /// How often the account syncs on its own.
 const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
 
+/// How often an idle screen is redrawn anyway, so relative dates stay true.
+const REDRAW_EVERY: Duration = Duration::from_secs(30);
+
+/// Set by the panic hook. ratatui's hook restores the terminal on a panic in
+/// any thread, so the interface must not keep drawing after one.
+static PANICKED: AtomicBool = AtomicBool::new(false);
+
 /// Runs the interface until the user quits.
 ///
 /// # Errors
@@ -86,7 +95,19 @@ pub fn run(
     let mut app = App::new(account, rows);
     let worker = remote.map(Worker::start);
     // Installs a panic hook that restores the terminal before reporting.
-    let mut terminal = ratatui::try_init().map_err(terminal_error)?;
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            // Raw mode may be on even though the alternate screen failed.
+            ratatui::restore();
+            return Err(terminal_error(error));
+        }
+    };
+    let restore_terminal = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        PANICKED.store(true, Ordering::SeqCst);
+        restore_terminal(info);
+    }));
     let result = event_loop(&mut terminal, &mut app, source, worker);
     ratatui::restore();
     result
@@ -101,6 +122,9 @@ enum Job {
 /// A finished piece of network work.
 enum Done {
     Fetched(MessageId, Result<Vec<u8>, String>),
+    /// The message was no longer open when its turn came, so it was not
+    /// downloaded.
+    Skipped(MessageId),
     Synced(Result<(), String>),
 }
 
@@ -112,6 +136,8 @@ struct Worker {
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
     done: Receiver<Done>,
     fetching: HashSet<MessageId>,
+    /// The open message, read by queued downloads before they start.
+    open: Arc<Mutex<Option<MessageId>>>,
     syncing: bool,
     last_sync: Option<Instant>,
 }
@@ -123,6 +149,8 @@ impl Worker {
     fn start(remote: Box<dyn Remote>) -> Self {
         let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
+        let open = Arc::new(Mutex::new(None::<MessageId>));
+        let wanted = Arc::clone(&open);
         std::thread::spawn(move || {
             let Ok(executor) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -138,12 +166,22 @@ impl Worker {
                     let remote = Rc::clone(&remote);
                     let fetches = Rc::clone(&fetches);
                     let outgoing = outgoing.clone();
+                    let wanted = Arc::clone(&wanted);
                     tokio::task::spawn_local(async move {
                         let finished = match job {
                             Job::Fetch(id) => {
                                 let _turn = fetches.acquire().await;
-                                let result = remote.fetch(&id).await;
-                                Done::Fetched(id, result)
+                                let still_open = wanted
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .as_ref()
+                                    == Some(&id);
+                                if still_open {
+                                    let result = remote.fetch(&id).await;
+                                    Done::Fetched(id, result)
+                                } else {
+                                    Done::Skipped(id)
+                                }
                             }
                             Job::Sync => Done::Synced(remote.sync().await),
                         };
@@ -156,8 +194,17 @@ impl Worker {
             jobs,
             done,
             fetching: HashSet::new(),
+            open,
             syncing: false,
             last_sync: None,
+        }
+    }
+
+    /// Records which message is open, so stale downloads are skipped.
+    fn set_open(&self, id: Option<&MessageId>) {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if open.as_ref() != id {
+            *open = id.cloned();
         }
     }
 
@@ -200,43 +247,66 @@ fn event_loop(
     source: &dyn MailSource,
     mut worker: Option<Worker>,
 ) -> Result<(), String> {
+    let mut dirty = true;
+    let mut drawn = Instant::now();
     loop {
+        if PANICKED.load(Ordering::SeqCst) {
+            return Err("tersa stopped after an internal error".to_owned());
+        }
         let now = now_millis();
         if let Some(worker) = &mut worker {
-            finish_work(worker, app, source, now);
+            dirty |= finish_work(worker, app, source, now);
             if worker.sync_due() {
                 start_sync(worker, app, now);
+                dirty = true;
             }
+            worker.set_open(app.open_id());
         }
-        if std::mem::take(&mut app.repaint) {
-            // Repaint every cell when the screen changes, so any drift
-            // between the terminal and ratatui's model cannot linger.
-            terminal.clear().map_err(terminal_error)?;
+        if dirty || drawn.elapsed() >= REDRAW_EVERY {
+            if std::mem::take(&mut app.repaint) {
+                // Repaint every cell when the screen changes, so any drift
+                // between the terminal and ratatui's model cannot linger.
+                terminal.clear().map_err(terminal_error)?;
+            }
+            terminal
+                .draw(|frame| view::draw(frame, app, now))
+                .map_err(terminal_error)?;
+            dirty = false;
+            drawn = Instant::now();
         }
-        terminal
-            .draw(|frame| view::draw(frame, app, now))
-            .map_err(terminal_error)?;
         if app.quit {
             return Ok(());
         }
         if !event::poll(TICK).map_err(terminal_error)? {
             continue;
         }
-        let Event::Key(key) = event::read().map_err(terminal_error)? else {
-            continue;
+        let key = match event::read().map_err(terminal_error)? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Resize(..) => {
+                dirty = true;
+                continue;
+            }
+            _ => continue,
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        dirty = true;
         match app.key(key) {
             Some(Request::OpenMessage(id)) => {
                 let raw = source.message(&id);
                 let missing = matches!(raw, Ok(None));
                 app.show_message(id.clone(), raw);
-                if missing && worker.as_mut().is_some_and(|worker| worker.fetch(&id)) {
-                    app.downloading(&id);
+                if let Some(worker) = &mut worker
+                    && missing
+                {
+                    worker.set_open(Some(&id));
+                    if worker.fetch(&id) {
+                        app.downloading(&id);
+                    }
                 }
             }
+            Some(Request::Reformat(id)) => match source.message(&id) {
+                Ok(Some(raw)) => app.reformat(&id, &raw),
+                _ => app.status = Some("The message could not be read again.".to_owned()),
+            },
             Some(Request::Sync) => match &mut worker {
                 Some(worker) => start_sync(worker, app, now),
                 None => {
@@ -258,13 +328,22 @@ fn start_sync(worker: &mut Worker, app: &mut App, now: i64) {
     }
 }
 
-/// Applies finished downloads and syncs.
-fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now: i64) {
+/// Applies finished downloads and syncs; returns whether anything changed.
+fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now: i64) -> bool {
+    let mut changed = false;
     while let Ok(done) = worker.done.try_recv() {
+        changed = true;
         match done {
             Done::Fetched(id, result) => {
                 worker.fetching.remove(&id);
                 app.downloaded(id, result);
+            }
+            Done::Skipped(id) => {
+                worker.fetching.remove(&id);
+                // Reopened while its skipped job was finishing: ask again.
+                if app.open_id() == Some(&id) && !worker.fetch(&id) {
+                    app.downloaded(id, Err(WORKER_GONE.to_owned()));
+                }
             }
             Done::Synced(result) => {
                 worker.syncing = false;
@@ -283,6 +362,7 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
             }
         }
     }
+    changed
 }
 
 #[allow(clippy::needless_pass_by_value, reason = "used as a map_err adapter")]
@@ -353,10 +433,13 @@ mod tests {
         };
         assert!(worker.sync());
         assert!(worker.sync(), "a second request joins the running sync");
+        worker.set_open(Some(&id("a")));
         assert!(worker.fetch(&id("a")));
         assert!(worker.fetch(&id("a")), "a repeat is merged");
+        assert_eq!(next(), "fetch a");
+        worker.set_open(Some(&id("b")));
         assert!(worker.fetch(&id("b")));
-        assert_eq!([next(), next()], ["fetch a", "fetch b"]);
+        assert_eq!(next(), "fetch b");
         release.send(()).expect("release");
         assert_eq!(next(), "sync");
         let mut fetched = 0;
@@ -374,5 +457,38 @@ mod tests {
             "nothing ran twice"
         );
         assert!(!worker.sync_due(), "a sync was just asked for");
+    }
+
+    #[test]
+    fn downloads_for_messages_no_longer_open_are_skipped() {
+        let (log, entries) = mpsc::channel();
+        let mut worker = Worker::start(Box::new(Recorder {
+            log,
+            release: Mutex::new(None),
+        }));
+        worker.set_open(Some(&id("now")));
+        for stale in ["s1", "s2", "s3", "s4", "s5", "s6"] {
+            assert!(worker.fetch(&id(stale)));
+        }
+        assert!(worker.fetch(&id("now")));
+        assert_eq!(
+            entries
+                .recv_timeout(Duration::from_secs(5))
+                .expect("work finishes"),
+            "fetch now"
+        );
+        let mut skipped = 0;
+        for _ in 0..7 {
+            match worker.done.recv_timeout(Duration::from_secs(5)) {
+                Ok(Done::Skipped(_)) => skipped += 1,
+                Ok(Done::Fetched(id, Ok(_))) => assert_eq!(id.as_str(), "now"),
+                _ => panic!("unexpected result"),
+            }
+        }
+        assert_eq!(skipped, 6);
+        assert!(
+            entries.recv_timeout(Duration::from_millis(100)).is_err(),
+            "stale messages were never downloaded"
+        );
     }
 }
