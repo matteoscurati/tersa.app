@@ -169,15 +169,13 @@ impl Writer {
             return &input[1..];
         }
         if !closing && !self.hiding_disabled && is_hidden_container(&name) {
-            match skip_container(rest, &name) {
-                Some(after) => return after,
-                // Never closed: show its content rather than drop the rest of
-                // the message, and stop searching for later closings.
-                None => {
-                    self.hiding_disabled = true;
-                    return rest;
-                }
+            if let Some(after) = skip_container(rest, &name) {
+                return after;
             }
+            // Never closed: show its content rather than drop the rest of the
+            // message, and stop searching for later closings.
+            self.hiding_disabled = true;
+            return rest;
         }
         let attributes = &body[name_end..];
         if !closing && !self.hiding_disabled && is_hidden_by_markup(attributes) {
