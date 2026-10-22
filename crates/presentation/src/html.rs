@@ -124,8 +124,8 @@ struct Writer {
     open_link: Option<String>,
     /// Where the open link's text starts in `out`.
     link_text_start: usize,
-    /// Set after a hidden element had no closing tag, so later hidden
-    /// elements are shown rather than searched for again (keeps it linear).
+    /// Set after a hidden element or container had no closing tag, so later
+    /// ones are shown rather than searched for again (keeps it linear).
     hiding_disabled: bool,
     full: bool,
 }
@@ -134,6 +134,10 @@ impl Writer {
     /// Handles markup at the start of `input` and returns what follows it.
     fn markup<'a>(&mut self, input: &'a str) -> &'a str {
         if let Some(rest) = input.strip_prefix("<!--") {
+            // `<!-->` and `<!--->` are complete, empty comments.
+            if let Some(after) = rest.strip_prefix('>').or_else(|| rest.strip_prefix("->")) {
+                return after;
+            }
             return rest.find("-->").map_or("", |end| &rest[end + 3..]);
         }
         if input.starts_with("<!") || input.starts_with("<?") {
@@ -164,8 +168,16 @@ impl Writer {
             self.text("<");
             return &input[1..];
         }
-        if !closing && is_hidden_container(&name) {
-            return skip_container(rest, &name);
+        if !closing && !self.hiding_disabled && is_hidden_container(&name) {
+            match skip_container(rest, &name) {
+                Some(after) => return after,
+                // Never closed: show its content rather than drop the rest of
+                // the message, and stop searching for later closings.
+                None => {
+                    self.hiding_disabled = true;
+                    return rest;
+                }
+            }
         }
         let attributes = &body[name_end..];
         if !closing && !self.hiding_disabled && is_hidden_by_markup(attributes) {
@@ -404,20 +416,25 @@ fn scan_tag(input: &str) -> TagScan {
 }
 
 /// Skips a hidden element's content up to its closing tag, in one pass.
-fn skip_container<'a>(input: &'a str, name: &str) -> &'a str {
+fn skip_container<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     let mut from = 0;
-    while let Some(offset) = input[from..].find("</") {
+    while let Some(offset) = input[from..].find('<') {
         let at = from + offset;
-        let candidate = &input.as_bytes()[at + 2..];
-        if candidate.len() >= name.len()
-            && candidate[..name.len()].eq_ignore_ascii_case(name.as_bytes())
-        {
+        let candidate = &input.as_bytes()[at + 1..];
+        let closes = candidate.first() == Some(&b'/')
+            && candidate.len() > name.len()
+            && candidate[1..=name.len()].eq_ignore_ascii_case(name.as_bytes());
+        if closes {
             let after = &input[at..];
-            return after.find('>').map_or("", |end| &after[end + 1..]);
+            return Some(after.find('>').map_or("", |end| &after[end + 1..]));
         }
-        from = at + 2;
+        // `</head>` is optional: the body starts the visible content.
+        if name == "head" && candidate.len() >= 4 && candidate[..4].eq_ignore_ascii_case(b"body") {
+            return Some(&input[at..]);
+        }
+        from = at + 1;
     }
-    ""
+    None
 }
 
 /// Whether the element's own markup hides it: a `hidden` attribute or an
@@ -810,7 +827,7 @@ mod tests {
             "shown"
         );
         assert_eq!(text("<p>a</p><SCRIPT>x</SCRIPT><p>b</p>"), "a\n\nb");
-        assert_eq!(text("<style>never closed"), "");
+        assert_eq!(text("<style>never closed"), "never closed");
     }
 
     #[test]
@@ -1002,5 +1019,36 @@ mod tests {
             html
         });
         assert_eq!(html_to_text(&links).links.len(), MAX_LINKS);
+    }
+
+    #[test]
+    fn an_unclosed_head_or_container_does_not_swallow_the_message() {
+        assert_eq!(
+            html_to_text("<head><meta charset=utf-8><title>t</title><body>Hi").text,
+            "Hi"
+        );
+        assert_eq!(html_to_text("<HEAD><BODY><p>Hi</p>").text, "Hi");
+        assert_eq!(
+            html_to_text("<p>Hi</p><style>p { color: red }").text,
+            "Hi\n\np { color: red }"
+        );
+        assert_eq!(
+            html_to_text("<style>x</style><p>a</p><script>never closed<p>b</p>").text,
+            "a\n\nnever closed\n\nb"
+        );
+    }
+
+    #[test]
+    fn abruptly_closed_comments_are_empty() {
+        assert_eq!(html_to_text("<!-->Hi<!-- x -->!").text, "Hi!");
+        assert_eq!(html_to_text("<!--->Hi").text, "Hi");
+    }
+
+    #[test]
+    fn many_unclosed_containers_stay_linear() {
+        let html = "<script>".repeat(200_000);
+        let started = std::time::Instant::now();
+        let _ = html_to_text(&html);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

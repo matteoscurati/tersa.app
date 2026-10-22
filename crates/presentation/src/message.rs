@@ -187,6 +187,10 @@ fn plain_text(text: &str) -> String {
             blank = false;
         }
         if out.len() + line.len() + 1 > MAX_PLAIN_OUTPUT {
+            // Keep as much of the crossing line as fits, then the marker.
+            let room = MAX_PLAIN_OUTPUT.saturating_sub(out.len());
+            out.push_str(&line[..line.floor_char_boundary(room)]);
+            out.push('\n');
             out.push_str(TRUNCATED);
             break;
         }
@@ -228,7 +232,7 @@ fn addresses(header: Option<&Address<'_>>) -> SafeText {
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyFormat, BodyPreference, render_message};
+    use super::{BodyFormat, BodyPreference, MAX_PLAIN_OUTPUT, TRUNCATED, render_message};
 
     const ALTERNATIVE: &[u8] = b"From: =?utf-8?q?Ren=C3=A9e?= <renee@example.com>\r\n\
 To: a@example.com, \"B, Person\" <b@example.com>\r\n\
@@ -333,5 +337,94 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
         let debug = format!("{rendered:?}");
         assert!(!debug.contains("Caff"));
         assert!(!debug.contains("renee"));
+    }
+
+    #[test]
+    fn a_line_crossing_the_size_cap_is_kept_up_to_the_cap() {
+        let mut raw = b"Subject: s\r\nContent-Type: text/plain\r\n\r\n".to_vec();
+        raw.extend("é".repeat(300_000).as_bytes());
+        let rendered = render_message(&raw, BodyPreference::Plain);
+        let body = rendered.body.as_str();
+        assert!(body.ends_with(TRUNCATED));
+        assert!(body.len() > MAX_PLAIN_OUTPUT - 8, "{}", body.len());
+        assert!(body.len() <= MAX_PLAIN_OUTPUT + 2 + TRUNCATED.len());
+    }
+
+    /// A cheap, deterministic stand-in for fuzzing: random soups of MIME
+    /// fragments must never panic, and every rendered field must be free of
+    /// terminal controls.
+    #[test]
+    fn random_mime_soup_never_panics_or_leaks_controls() {
+        const FRAGMENTS: [&str; 26] = [
+            "\r\n",
+            "\r\n\r\n",
+            "Subject: ",
+            "From: ",
+            "To: ",
+            "Content-Type: multipart/mixed; boundary=b\r\n",
+            "Content-Type: multipart/alternative; boundary=\"b\"\r\n",
+            "Content-Type: text/html; charset=",
+            "Content-Type: text/plain; charset=utf-16\r\n",
+            "iso-2022-jp",
+            "Content-Transfer-Encoding: base64\r\n",
+            "Content-Transfer-Encoding: quoted-printable\r\n",
+            "Content-Disposition: attachment; filename=\"",
+            "--b\r\n",
+            "--b--\r\n",
+            "=?utf-8?b?",
+            "=?utf-8?q?=1B]52;",
+            "?=",
+            "=1B[2J",
+            "\u{1b}]8;;x\u{7}",
+            "\u{202e}",
+            "<a href=\"https://e.com/&#27;\">",
+            "&#x9b;",
+            "PHA+",
+            "é😀",
+            "\"",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for round in 0..1_500 {
+            let mut raw = String::new();
+            for _ in 0..48 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                raw.push_str(FRAGMENTS[usize::try_from(state % 26).expect("index")]);
+            }
+            let preference = if round % 2 == 0 {
+                BodyPreference::Html
+            } else {
+                BodyPreference::Plain
+            };
+            let rendered = render_message(raw.as_bytes(), preference);
+            let mut texts = vec![
+                &rendered.subject,
+                &rendered.from,
+                &rendered.to,
+                &rendered.cc,
+                &rendered.body,
+            ];
+            texts.extend(rendered.links.iter());
+            texts.extend(
+                rendered
+                    .attachments
+                    .iter()
+                    .map(|attachment| &attachment.name),
+            );
+            for text in texts {
+                assert!(
+                    !text
+                        .as_str()
+                        .chars()
+                        .any(|character| (character.is_control()
+                            && character != '\n'
+                            && character != '\t')
+                            || ('\u{202a}'..='\u{202e}').contains(&character)),
+                    "{:?}",
+                    text.as_str()
+                );
+            }
+        }
     }
 }
