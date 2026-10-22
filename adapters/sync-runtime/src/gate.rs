@@ -18,7 +18,9 @@ use tersa_application::mailbox::{
     AccountId, MailboxStore, MailboxStoreError, Message, MessageId, RemoteMailbox,
     RemoteMailboxError,
 };
-use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
+use tersa_application::sync::{
+    SyncCoordinator, SyncFailure, SyncFailureSource, SyncPolicy, SyncReport,
+};
 
 /// Reports why a gated sync stopped before or during the bounded sync.
 #[derive(Debug)]
@@ -34,8 +36,27 @@ impl fmt::Display for GatedSyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gate(_) => formatter.write_str("the account-identity gate blocked the sync"),
-            Self::Sync(_) => formatter.write_str("the bounded sync failed"),
+            Self::Sync(failure) => write!(formatter, "the sync failed: {}", sync_cause(*failure)),
         }
+    }
+}
+
+/// A content-free reason a reader can act on.
+fn sync_cause(failure: SyncFailure) -> &'static str {
+    match failure.category() {
+        SyncFailureSource::Remote(RemoteMailboxError::AuthorizationRequired) => {
+            "Gmail asks to sign in again"
+        }
+        SyncFailureSource::Remote(RemoteMailboxError::RateLimited) => {
+            "Gmail's rate limit was reached; it retries later"
+        }
+        SyncFailureSource::Remote(RemoteMailboxError::Transport) => "Gmail could not be reached",
+        SyncFailureSource::Remote(_) | SyncFailureSource::Protocol(_) => {
+            "Gmail's mailbox changed during the sync, or its reply was invalid"
+        }
+        SyncFailureSource::Store(_) => "the local cache could not be written",
+        SyncFailureSource::SingleFlight => "another sync is running",
+        SyncFailureSource::IdentityFenced => "the account identity changed",
     }
 }
 
@@ -870,5 +891,27 @@ mod tests {
             error,
             GatedFetchError::Remote(RemoteMailboxError::NotFound)
         ));
+    }
+
+    #[test]
+    fn sync_errors_name_a_content_free_cause() {
+        use tersa_application::sync::{SyncFailure, SyncFailureSource, SyncProtocolError};
+
+        let message =
+            |source| GatedSyncError::Sync(SyncFailure::from_source_for_test(source)).to_string();
+        assert_eq!(
+            message(SyncFailureSource::Remote(RemoteMailboxError::Transport)),
+            "the sync failed: Gmail could not be reached"
+        );
+        assert_eq!(
+            message(SyncFailureSource::Protocol(
+                SyncProtocolError::ConflictingDuplicate
+            )),
+            "the sync failed: Gmail's mailbox changed during the sync, or its reply was invalid"
+        );
+        assert_eq!(
+            message(SyncFailureSource::IdentityFenced),
+            "the sync failed: the account identity changed"
+        );
     }
 }

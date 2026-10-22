@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use tersa_presentation::message::{BodyFormat, RenderedMessage};
 use tersa_presentation::terminal::SafeText;
 
-use super::app::{App, Body, MessageView, Row, Screen};
+use super::app::{App, Body, MessageView, Row, Screen, SyncState};
 use super::wrap::{truncate, width, wrap, wrap_chars};
 use crate::dates;
 
@@ -39,12 +39,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
     ])
     .areas(frame.area());
     app.page = usize::from(main.height).max(1);
-    draw_top(frame, top, app);
+    draw_top(frame, top, app, now_millis);
     if matches!(app.screen, Screen::Inbox) {
         keep_selection_visible(app);
         draw_inbox(frame, main, app, now_millis);
     } else if let Screen::Message(view) = &mut app.screen {
-        let row = app.rows.get(view.index);
+        let row = app.rows.iter().find(|row| row.id == view.id);
         draw_message(frame, main, view, row, app.page);
     }
     draw_bottom(frame, bottom, app);
@@ -53,24 +53,57 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
     }
 }
 
-fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let count = match app.rows.len() {
-        1 => "1 message".to_owned(),
-        count => format!("{count} messages"),
+fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
+    let count = match (app.filtered(), app.rows.len()) {
+        (true, total) => format!("{} of {total} messages", app.shown.len()),
+        (false, 1) => "1 message".to_owned(),
+        (false, count) => format!("{count} messages"),
     };
-    let line = Line::from(vec![
+    let sync = match &app.sync {
+        SyncState::Idle => String::new(),
+        SyncState::Running => "syncing… ".to_owned(),
+        SyncState::Synced(at) => format!("synced {} ", dates::short(*at, now_millis)),
+        SyncState::Failed(error) => {
+            format!("sync failed: {} ", SafeText::single_line(error).as_str())
+        }
+    };
+    // The sync state sits at the right edge; the account name gives way.
+    let total = usize::from(area.width);
+    let sync = truncate(&sync, total.saturating_sub(width(" tersa  ") + 4));
+    let tail = format!("  ·  {count}");
+    let room = total.saturating_sub(width(" tersa  ") + width(&tail) + width(&sync) + 1);
+    let left = Line::from(vec![
         Span::styled(" tersa", bold()),
         Span::styled("  ", dim()),
-        Span::raw(app.account.as_str().to_owned()),
-        Span::styled(format!("  ·  {count}"), dim()),
+        Span::raw(truncate(app.account.as_str(), room)),
+        Span::styled(tail, dim()),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let sync_width = u16::try_from(width(&sync))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let [left_area, sync_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(sync_width)]).areas(area);
+    frame.render_widget(Paragraph::new(left), left_area);
+    frame.render_widget(Paragraph::new(Line::styled(sync, dim())), sync_area);
 }
 
 fn draw_bottom(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.search.editing {
+        let query = SafeText::single_line(&app.search.query);
+        let shown = truncate_start(query.as_str(), usize::from(area.width).saturating_sub(3));
+        let cursor = u16::try_from(width(&shown) + 2).unwrap_or(u16::MAX);
+        frame.render_widget(Paragraph::new(Line::raw(format!(" /{shown}"))), area);
+        if cursor < area.width {
+            frame.set_cursor_position((area.x + cursor, area.y));
+        }
+        return;
+    }
     let text = match (&app.status, &app.screen) {
         (Some(status), _) => status.clone(),
-        (None, Screen::Inbox) => "j/k move   enter open   q quit   ? help".to_owned(),
+        (None, Screen::Inbox) if app.filtered() => {
+            "j/k move   enter open   / search again   esc all messages   ? help".to_owned()
+        }
+        (None, Screen::Inbox) => "j/k move   enter open   / search   q quit   ? help".to_owned(),
         (None, Screen::Message(_)) => {
             "j/k scroll   n/p next/previous   H html/plain   q back   ? help".to_owned()
         }
@@ -88,27 +121,51 @@ fn keep_selection_visible(app: &mut App) {
     } else if app.selected >= app.list_offset + app.page {
         app.list_offset = app.selected + 1 - app.page;
     }
-    app.list_offset = app.list_offset.min(app.rows.len().saturating_sub(1));
+    app.list_offset = app.list_offset.min(app.shown.len().saturating_sub(1));
+}
+
+/// The end of `text` that fits in `columns`, so typing stays visible.
+fn truncate_start(text: &str, columns: usize) -> String {
+    let mut used = 0;
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        used += width(character.encode_utf8(&mut [0; 4]));
+        if used > columns {
+            break;
+        }
+        start = index;
+    }
+    text[start..].to_owned()
 }
 
 fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
-    if app.rows.is_empty() {
-        let lines = vec![
-            Line::raw(""),
-            Line::styled("  No cached mail yet.", bold()),
-            Line::styled("  Run `tersa sync` to download recent messages.", dim()),
-        ];
+    if app.shown.is_empty() {
+        let lines = if app.filtered() {
+            vec![
+                Line::raw(""),
+                Line::styled("  No messages match.", bold()),
+                Line::styled("  Esc shows every message.", dim()),
+            ]
+        } else if app.sync == SyncState::Running {
+            vec![
+                Line::raw(""),
+                Line::styled("  Downloading recent mail…", bold()),
+            ]
+        } else {
+            vec![
+                Line::raw(""),
+                Line::styled("  No cached mail yet.", bold()),
+                Line::styled("  Ctrl-r syncs recent messages.", dim()),
+            ]
+        };
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
     let total = usize::from(area.width);
-    let lines: Vec<Line<'_>> = app
-        .rows
-        .iter()
-        .enumerate()
-        .skip(app.list_offset)
+    let lines: Vec<Line<'_>> = (app.list_offset..app.shown.len())
         .take(usize::from(area.height))
-        .map(|(index, row)| inbox_line(row, index == app.selected, total, now_millis))
+        .filter_map(|position| Some((position, app.shown_row(position)?)))
+        .map(|(position, row)| inbox_line(row, position == app.selected, total, now_millis))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -335,12 +392,15 @@ fn human_size(bytes: usize) -> String {
     format!("{value} {}", UNITS[unit])
 }
 
-const HELP: [(&str, &str); 12] = [
+const HELP: [(&str, &str); 15] = [
     ("j / k, ↓ / ↑", "move or scroll"),
     ("gg / G", "first / last"),
     ("ctrl-d / ctrl-u", "half page down / up"),
     ("space / b", "page down / up"),
     ("enter, l", "open message"),
+    ("/", "search sender, subject, preview"),
+    ("esc", "show every message again"),
+    ("ctrl-r", "sync now (also every 5 minutes)"),
     ("n / p", "next / previous message"),
     ("H", "switch HTML / plain text"),
     ("q, h, esc", "back"),
@@ -381,10 +441,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use tersa_application::mailbox::MessageId;
     use tersa_presentation::terminal::SafeText;
 
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::draw;
-    use crate::tui::app::{App, Row};
+    use crate::tui::app::{App, Row, SyncState};
 
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -402,13 +465,7 @@ mod tests {
     }
 
     fn row(sender: &str, subject: &str, unread: bool) -> Row {
-        Row {
-            sender: SafeText::single_line(sender),
-            subject: SafeText::single_line(subject),
-            preview: SafeText::single_line("the preview"),
-            received_at_millis: 1_760_990_000_000,
-            unread,
-        }
+        Row::sample("m", sender, subject, unread)
     }
 
     #[test]
@@ -460,7 +517,7 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
             SafeText::single_line("acct"),
             vec![row("Ann", "Plans", true)],
         );
-        app.show_message(0, Ok(Some(raw.to_vec())));
+        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw.to_vec())));
         let lines = screen(&mut app, 50, 14);
         let text = lines.join("\n");
         assert!(text.contains("Plans"));
@@ -478,7 +535,55 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
             let _ = screen(&mut app, width, height);
             app.help = false;
         }
-        app.show_message(0, Ok(None));
+        app.show_message(MessageId::new("m").expect("id"), Ok(None));
         let _ = screen(&mut app, 3, 3);
+    }
+
+    #[test]
+    fn the_search_line_and_sync_state_are_drawn_safely() {
+        let mut app = App::new(
+            SafeText::single_line("acct"),
+            vec![row("Ann", "Lunch", true), row("Bob", "Report", false)],
+        );
+        app.sync = SyncState::Running;
+        let top = &screen(&mut app, 70, 4)[0];
+        assert!(top.contains("acct  ·  2 messages"));
+        assert!(top.ends_with("syncing… "), "{top:?}");
+        assert_eq!(
+            screen(&mut app, 34, 4)[0],
+            " tersa  …  ·  2 messages syncing… ",
+            "the account gives way to the sync state"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "rep".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let lines = screen(&mut app, 70, 4);
+        assert!(lines[0].contains("1 of 2 messages"));
+        assert!(lines[1].contains("Report"));
+        assert!(lines[3].starts_with(" /rep "));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(screen(&mut app, 70, 4)[2].contains("No messages match."));
+        app.sync = SyncState::Failed("\u{1b}]52;c;eA==\u{7}offline".to_owned());
+        let lines = screen(&mut app, 70, 4);
+        assert!(
+            lines[0].contains("sync failed: ]52;c;eA==offline"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_long_query_shows_its_end() {
+        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "b", true)]);
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "abcdefghijklmnopqrstuvwxyz".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            screen(&mut app, 12, 3)[2],
+            " /rstuvwxyz ",
+            "room for the cursor"
+        );
     }
 }

@@ -25,6 +25,10 @@ use crate::session::{GmailSession, GmailSessionError};
 /// How long the browser sign-in may take.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long a flow waits for another refresh of the same token, in total
+/// about the length of one slow token request.
+const BUSY_WAIT: Duration = Duration::from_millis(100);
+const BUSY_RETRIES: u8 = 50;
 
 type Broker = BrokerCore<
     GmailTokenTransport,
@@ -240,12 +244,23 @@ impl Runtime {
     /// gate or sync failure.
     pub async fn sync_account(&self, account: &AccountId) -> Result<SyncReport, FlowError> {
         let subject = self.subject_of(account)?;
-        let token = self
-            .broker
-            .refresh_access_token(&subject)
-            .await
-            .map_err(FlowError::Token)?;
+        let token = self.access_token(&subject).await?;
         self.sync_with_token(account, &token).await
+    }
+
+    /// Refreshes an access token. The broker refreshes one account's token at
+    /// a time, so a sync and a download that ask together take turns.
+    async fn access_token(&self, subject: &str) -> Result<BrokerToken, FlowError> {
+        let mut attempts = 0;
+        loop {
+            match self.broker.refresh_access_token(subject).await {
+                Err(BrokerError::Busy) if attempts < BUSY_RETRIES => {
+                    attempts += 1;
+                    tokio::time::sleep(BUSY_WAIT).await;
+                }
+                result => return result.map_err(FlowError::Token),
+            }
+        }
     }
 
     /// Revokes the grant at Google (best effort), then deletes the account's
@@ -281,11 +296,7 @@ impl Runtime {
         message_id: &MessageId,
     ) -> Result<Vec<u8>, FlowError> {
         let subject = self.subject_of(account)?;
-        let token = self
-            .broker
-            .refresh_access_token(&subject)
-            .await
-            .map_err(FlowError::Token)?;
+        let token = self.access_token(&subject).await?;
         let session = GmailSession::new(
             account.clone(),
             token.access_token(),
