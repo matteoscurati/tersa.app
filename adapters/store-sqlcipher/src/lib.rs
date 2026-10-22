@@ -3223,10 +3223,7 @@ mod store {
             record_fence(&store);
             drop(store);
             let connection = raw_existing_connection(&database);
-            let hex: String = [7_u8; 32]
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect();
+            let hex = "07".repeat(32);
             connection
                 .pragma_update(None, "key", format!("x'{hex}'"))
                 .unwrap();
