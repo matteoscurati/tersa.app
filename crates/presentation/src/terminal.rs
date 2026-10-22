@@ -21,7 +21,15 @@
 //!   block (U+E0000–U+E007F), used to hide content or pad previews;
 //! - variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF). They switch emoji
 //!   presentation, which terminals and width tables disagree on, so keeping
-//!   them misaligns the screen.
+//!   them misaligns the screen;
+//! - the rest of Unicode's default-ignorable code points that render as
+//!   nothing: U+2060–U+206F, U+FFF0–U+FFF8, U+1BCA0–U+1BCA3, U+1D173–U+1D17A,
+//!   and U+E0000–U+E0FFF.
+//!
+//! The line and paragraph separators U+2028 and U+2029 become ordinary line
+//! breaks, and a run of generic combining marks (diacritics stacked on one
+//! character, as in "zalgo" text) is cut to [`MAX_COMBINING_RUN`] so it cannot
+//! draw over neighboring lines.
 
 use std::fmt;
 
@@ -33,27 +41,20 @@ impl SafeText {
     /// Sanitizes multi-line text, keeping newlines and tabs.
     #[must_use]
     pub fn multi_line(input: &str) -> Self {
-        Self(
-            input
-                .chars()
-                .filter(|&character| matches!(character, '\n' | '\t') || is_allowed(character))
-                .collect(),
-        )
+        Self(sanitize(input, |character| match character {
+            '\n' | '\t' => Some(character),
+            '\u{2028}' | '\u{2029}' => Some('\n'),
+            _ => None,
+        }))
     }
 
-    /// Sanitizes text for a single line: newlines and tabs become spaces.
+    /// Sanitizes text for a single line: line breaks and tabs become spaces.
     #[must_use]
     pub fn single_line(input: &str) -> Self {
-        Self(
-            input
-                .chars()
-                .filter_map(|character| match character {
-                    '\n' | '\r' | '\t' => Some(' '),
-                    other if is_allowed(other) => Some(other),
-                    _ => None,
-                })
-                .collect(),
-        )
+        Self(sanitize(input, |character| match character {
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => Some(' '),
+            _ => None,
+        }))
     }
 
     /// The sanitized text.
@@ -67,6 +68,46 @@ impl fmt::Display for SafeText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// The most generic combining marks kept on one character.
+pub const MAX_COMBINING_RUN: usize = 4;
+
+/// Drops disallowed characters and long combining runs. `layout` maps the
+/// whitespace and separators a caller keeps or converts.
+fn sanitize(input: &str, layout: impl Fn(char) -> Option<char>) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut run = 0;
+    for character in input.chars() {
+        let kept = match layout(character) {
+            Some(replacement) => replacement,
+            None if is_allowed(character) => character,
+            None => continue,
+        };
+        if is_generic_combining(kept) {
+            run += 1;
+            if run > MAX_COMBINING_RUN {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        output.push(kept);
+    }
+    output
+}
+
+/// Combining marks from the script-neutral blocks that stack in "zalgo"
+/// text. Script-specific marks, which real words need, are left alone.
+const fn is_generic_combining(character: char) -> bool {
+    matches!(
+        character,
+        '\u{300}'..='\u{36f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+    )
 }
 
 /// Whether `character` survives sanitizing.
@@ -83,14 +124,16 @@ pub(crate) const fn is_allowed(character: char) -> bool {
             | '\u{180b}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{2060}'..='\u{206f}'
             | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
-            | '\u{e0000}'..='\u{e007f}'
-            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{fff0}'..='\u{fff8}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
     )
 }
 
@@ -109,6 +152,32 @@ mod tests {
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
         );
         assert_eq!(safe.as_str(), "a]52;c;ZXZpbA==b[2Jc31mde");
+    }
+
+    #[test]
+    fn strips_every_invisible_range_and_converts_separators() {
+        let hidden = "a\u{2065}\u{206a}\u{206f}\u{fff0}\u{fff8}\u{1bca0}\u{1d173}\u{e0080}\u{e01f0}\u{e0fff}b";
+        assert_eq!(SafeText::single_line(hidden).as_str(), "ab");
+        assert_eq!(
+            SafeText::single_line("a\u{2028}b\u{2029}c").as_str(),
+            "a b c"
+        );
+        assert_eq!(
+            SafeText::multi_line("a\u{2028}b\u{2029}c").as_str(),
+            "a\nb\nc"
+        );
+    }
+
+    #[test]
+    fn long_combining_runs_are_cut() {
+        let zalgo = format!("z{}a", "\u{301}".repeat(300));
+        let safe = SafeText::single_line(&zalgo);
+        assert_eq!(safe.as_str(), format!("z{}a", "\u{301}".repeat(4)));
+        assert_eq!(
+            SafeText::single_line("re\u{301}sume\u{301} na\u{ef}ve \u{928}\u{93f}").as_str(),
+            "re\u{301}sume\u{301} na\u{ef}ve \u{928}\u{93f}",
+            "ordinary accents and script marks are kept"
+        );
     }
 
     #[test]
