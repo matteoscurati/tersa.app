@@ -3243,6 +3243,32 @@ mod store {
             );
         }
 
+        #[test]
+        fn every_hex_digit_of_a_raw_key_round_trips() {
+            let database = TestDatabase::new("raw-key-digits");
+            let bytes: [u8; 32] =
+                std::array::from_fn(|index| u8::try_from(index * 17 % 256).unwrap());
+            let writer = Connection::open(database.path()).unwrap();
+            apply_key(&writer, &bytes).unwrap();
+            writer.execute_batch("CREATE TABLE t (x)").unwrap();
+            drop(writer);
+            let lower: String = bytes
+                .iter()
+                .flat_map(|byte| [byte >> 4, byte & 0x0f])
+                .map(|digit| char::from_digit(u32::from(digit), 16).unwrap())
+                .collect();
+            for literal in [lower.clone(), lower.to_uppercase()] {
+                let reader = Connection::open(database.path()).unwrap();
+                reader
+                    .pragma_update(None, "key", format!("x'{literal}'"))
+                    .unwrap();
+                let tables: i64 = reader
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(tables, 1, "{literal}");
+            }
+        }
+
         /// Emits one privacy-safe Step-4 performance sample over the production
         /// `SQLCipher` reader, metadata search, and fenced reconciliation paths.
         /// The external harness runs this ignored test once as warm-up and five

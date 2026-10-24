@@ -55,6 +55,13 @@ impl fmt::Display for InstallationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Directory => formatter.write_str("the data directory is unusable"),
+            // Development builds before T2c keyed databases differently and
+            // there is no migration: say how to start over.
+            Self::Registry(RegistryError::Corrupted) => formatter.write_str(
+                "the account registry cannot be read: it is damaged, the key is wrong, or it \
+                 was written by a development build before October 2026; move the data \
+                 directory aside (`tersa doctor` shows it) and add the account again",
+            ),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Store(_) => formatter.write_str("the account database failed"),
             Self::Key(error) => write!(formatter, "{error}"),
