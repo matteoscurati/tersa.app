@@ -6,6 +6,7 @@
 //! subject, both derived from a single access token.
 
 use core::fmt;
+use std::sync::Arc;
 
 use tersa_application::identity::AccountProfile;
 use tersa_application::mailbox::{
@@ -100,6 +101,43 @@ impl RemoteMailbox for GmailSession {
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
         self.mailbox.fetch_message(account, message_id)
+    }
+}
+
+/// A [`GmailSession`] shared by the flows of one runtime until its access
+/// token expires, so downloads reuse one token and one HTTPS connection pool.
+#[derive(Clone, Debug)]
+pub struct SharedSession(Arc<GmailSession>);
+
+impl SharedSession {
+    #[must_use]
+    pub fn new(session: GmailSession) -> Self {
+        Self(Arc::new(session))
+    }
+}
+
+impl AccountProfile for SharedSession {
+    fn subject(&self) -> &AccountSubject {
+        self.0.subject()
+    }
+}
+
+impl RemoteMailbox for SharedSession {
+    fn list_recent_envelopes<'a>(
+        &'a self,
+        account: &'a AccountId,
+        size: PageSize,
+        page_token: Option<&'a PageToken>,
+    ) -> BoxFuture<'a, Result<Page<MessageEnvelope>, RemoteMailboxError>> {
+        self.0.list_recent_envelopes(account, size, page_token)
+    }
+
+    fn fetch_message<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
+        self.0.fetch_message(account, message_id)
     }
 }
 
