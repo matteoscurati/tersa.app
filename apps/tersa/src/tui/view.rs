@@ -331,12 +331,17 @@ fn rendered_lines(
         lines.push(Line::styled("Links", bold()));
         let indent = format!("[{}] ", rendered.links.len()).len();
         for (number, link) in rendered.links.iter().enumerate() {
+            let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
+            if room == 0 {
+                break;
+            }
             // Addresses have no good break points: wrap them by character,
             // indented under their reference number.
             let lead = format!("{:<indent$}", format!("[{}]", number + 1));
-            for (row, part) in wrap_chars(link.as_str(), columns.saturating_sub(indent).max(1))
-                .into_iter()
-                .enumerate()
+            for (row, part) in
+                wrap_chars(link.as_str(), columns.saturating_sub(indent).max(1), room)
+                    .into_iter()
+                    .enumerate()
             {
                 let lead = if row == 0 {
                     lead.clone()
@@ -372,7 +377,8 @@ fn header(lines: &mut Vec<StyledLine>, label: &str, value: &str, columns: usize)
     }
     let prefix = format!("{label}: ");
     let indent = width(&prefix);
-    let wrapped = wrap(value, columns.saturating_sub(indent).max(1));
+    let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
+    let wrapped = wrap(value, columns.saturating_sub(indent).max(1), room);
     for (number, part) in wrapped.into_iter().enumerate() {
         let lead = if number == 0 {
             prefix.clone()
@@ -386,9 +392,8 @@ fn header(lines: &mut Vec<StyledLine>, label: &str, value: &str, columns: usize)
 fn push_wrapped(lines: &mut Vec<StyledLine>, text: &str, columns: usize, style: Style) {
     let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
     lines.extend(
-        wrap(text, columns)
+        wrap(text, columns, room)
             .into_iter()
-            .take(room)
             .map(|line| Line::styled(line, style)),
     );
 }
@@ -610,6 +615,29 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
         let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
         app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
         let _ = screen(&mut app, 40, 5);
+        let crate::tui::app::Screen::Message(view) = &app.screen else {
+            panic!("message screen");
+        };
+        let lines = &view.layout.as_ref().expect("laid out").1;
+        assert_eq!(lines.len(), 20_001);
+        assert!(lines[20_000].to_string().contains("too long to show"));
+    }
+
+    #[test]
+    fn many_long_links_in_a_narrow_pane_stay_within_the_bound() {
+        // 500 links of 2 KB at two columns would wrap to 512,000 lines.
+        let mut anchors = String::new();
+        for number in 0..500 {
+            anchors.push_str("<a href=\"https://e.com/");
+            anchors.push_str(&number.to_string());
+            anchors.push('/');
+            anchors.push_str(&"x".repeat(1990));
+            anchors.push_str("\">l</a> ");
+        }
+        let raw = format!("Subject: links\r\nContent-Type: text/html\r\n\r\n<p>{anchors}</p>");
+        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "links", true)]);
+        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw.into_bytes())));
+        let _ = screen(&mut app, 8, 5);
         let crate::tui::app::Screen::Message(view) = &app.screen else {
             panic!("message screen");
         };
