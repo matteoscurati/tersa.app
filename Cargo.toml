@@ -19,7 +19,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "MPL-2.0"
-repository = "https://github.com/matteoscurati/tersa.app"
+repository = "https://github.com/reasance/tersa.app"
 authors = ["tersa.app contributors"]
 
 [workspace.dependencies]
