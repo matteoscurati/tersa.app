@@ -45,6 +45,8 @@ tersa-domain = { path = "crates/domain", version = "=0.0.0" }
 tersa-keys = { path = "crates/keys", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "sync", "time"] }
+# Grapheme clusters, to cap the marks stacked on one character in SafeText.
+unicode-segmentation = "=1.13.3"
 url = "2.5.8"
 zeroize = "1.9.0"
 

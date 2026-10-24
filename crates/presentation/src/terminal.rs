@@ -27,11 +27,14 @@
 //!   and U+E0000–U+E0FFF.
 //!
 //! The line and paragraph separators U+2028 and U+2029 become ordinary line
-//! breaks, and a run of generic combining marks (diacritics stacked on one
-//! character, as in "zalgo" text) is cut to [`MAX_COMBINING_RUN`] so it cannot
-//! draw over neighboring lines.
+//! breaks. Marks stacked on one character, as in "zalgo" text, are capped so
+//! they cannot draw over neighboring lines: each grapheme cluster keeps at most
+//! [`MAX_COMBINING_RUN`] generic combining marks and [`MAX_GRAPHEME_CHARS`]
+//! code points in all.
 
 use std::fmt;
+
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Text that is safe to write to a terminal.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,26 +76,34 @@ impl fmt::Display for SafeText {
 /// The most generic combining marks kept on one character.
 pub const MAX_COMBINING_RUN: usize = 4;
 
-/// Drops disallowed characters and long combining runs. `layout` maps the
-/// whitespace and separators a caller keeps or converts.
+/// The most code points kept in one grapheme cluster. Real text stays well
+/// below it: an Indic conjunct with a vowel sign, or Hebrew with points and a
+/// cantillation mark, takes about seven.
+pub const MAX_GRAPHEME_CHARS: usize = 10;
+
+/// Drops disallowed characters and caps the marks on each character. `layout`
+/// maps the whitespace and separators a caller keeps or converts.
 fn sanitize(input: &str, layout: impl Fn(char) -> Option<char>) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut run = 0;
+    let mut kept = String::with_capacity(input.len());
     for character in input.chars() {
-        let kept = match layout(character) {
-            Some(replacement) => replacement,
-            None if is_allowed(character) => character,
-            None => continue,
-        };
-        if is_generic_combining(kept) {
-            run += 1;
-            if run > MAX_COMBINING_RUN {
-                continue;
-            }
-        } else {
-            run = 0;
+        match layout(character) {
+            Some(replacement) => kept.push(replacement),
+            None if is_allowed(character) => kept.push(character),
+            None => {}
         }
-        output.push(kept);
+    }
+    let mut output = String::with_capacity(kept.len());
+    for grapheme in kept.graphemes(true) {
+        let mut generic = 0;
+        for character in grapheme.chars().take(MAX_GRAPHEME_CHARS) {
+            if is_generic_combining(character) {
+                generic += 1;
+                if generic > MAX_COMBINING_RUN {
+                    continue;
+                }
+            }
+            output.push(character);
+        }
     }
     output
 }
@@ -139,7 +150,7 @@ pub(crate) const fn is_allowed(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SafeText;
+    use super::{MAX_GRAPHEME_CHARS, SafeText};
 
     #[test]
     fn strips_escape_sequences_and_controls() {
@@ -178,6 +189,30 @@ mod tests {
             "re\u{301}sume\u{301} na\u{ef}ve \u{928}\u{93f}",
             "ordinary accents and script marks are kept"
         );
+    }
+
+    #[test]
+    fn interleaved_script_marks_do_not_reset_the_cap() {
+        let hostile = format!("x{}y", "\u{301}\u{301}\u{301}\u{301}\u{5b0}".repeat(2000));
+        // The first ten code points hold eight generic marks; four survive.
+        assert_eq!(
+            SafeText::multi_line(&hostile).as_str(),
+            "x\u{301}\u{301}\u{301}\u{301}\u{5b0}y"
+        );
+        let only_script = format!("x{}", "\u{5b0}".repeat(500));
+        assert_eq!(
+            SafeText::single_line(&only_script).as_str().chars().count(),
+            MAX_GRAPHEME_CHARS
+        );
+        // Hebrew with points and cantillation, a Devanagari conjunct with a
+        // vowel sign, and a Thai syllable with two marks stay whole.
+        for real in [
+            "\u{5e9}\u{5c1}\u{5b8}\u{5c1}\u{591}\u{5dc}\u{5d5}\u{5b9}\u{5dd}",
+            "\u{915}\u{94d}\u{937}\u{94d}\u{92e}\u{94d}\u{92f}\u{93e}",
+            "\u{e01}\u{e34}\u{e48}",
+        ] {
+            assert_eq!(SafeText::single_line(real).as_str(), real);
+        }
     }
 
     #[test]
