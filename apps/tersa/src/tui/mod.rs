@@ -17,7 +17,7 @@ use std::io::IsTerminal;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -139,7 +139,9 @@ struct Worker {
     /// The open message, read by queued downloads before they start.
     open: Arc<Mutex<Option<MessageId>>>,
     syncing: bool,
-    last_sync: Option<Instant>,
+    /// When the last sync started, on both clocks: the monotonic clock stops
+    /// while the machine sleeps, the wall clock does not.
+    last_sync: Option<(Instant, SystemTime)>,
 }
 
 /// At most this many downloads run at once; more wait their turn.
@@ -156,21 +158,32 @@ impl Worker {
                 .enable_all()
                 .build()
             else {
-                // Dropping the channels reports every job as failed.
+                // Ending the thread disconnects the channels; the interface
+                // then fails the queued work.
                 return;
             };
             let remote: Rc<dyn Remote> = Rc::from(remote);
             let fetches = Rc::new(tokio::sync::Semaphore::new(PARALLEL_FETCHES));
+            // One more slot for the message being opened when older
+            // downloads fill the others.
+            let reserved = Rc::new(tokio::sync::Semaphore::new(1));
             tokio::task::LocalSet::new().block_on(&executor, async move {
                 while let Some(job) = incoming.recv().await {
                     let remote = Rc::clone(&remote);
                     let fetches = Rc::clone(&fetches);
+                    let reserved = Rc::clone(&reserved);
                     let outgoing = outgoing.clone();
                     let wanted = Arc::clone(&wanted);
                     tokio::task::spawn_local(async move {
                         let finished = match job {
                             Job::Fetch(id) => {
-                                let _turn = fetches.acquire().await;
+                                let _turn = match fetches.try_acquire() {
+                                    Ok(permit) => Ok(permit),
+                                    Err(_) => match reserved.try_acquire() {
+                                        Ok(permit) => Ok(permit),
+                                        Err(_) => fetches.acquire().await,
+                                    },
+                                };
                                 let still_open = wanted
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
@@ -223,7 +236,7 @@ impl Worker {
     /// Asks for a sync unless one is running; returns false when the thread
     /// is gone.
     fn sync(&mut self) -> bool {
-        self.last_sync = Some(Instant::now());
+        self.last_sync = Some((Instant::now(), SystemTime::now()));
         if self.syncing {
             return true;
         }
@@ -233,9 +246,10 @@ impl Worker {
 
     fn sync_due(&self) -> bool {
         !self.syncing
-            && self
-                .last_sync
-                .is_none_or(|last| last.elapsed() >= SYNC_EVERY)
+            && self.last_sync.is_none_or(|(monotonic, wall)| {
+                monotonic.elapsed() >= SYNC_EVERY
+                    || wall.elapsed().is_ok_and(|elapsed| elapsed >= SYNC_EVERY)
+            })
     }
 }
 
@@ -300,6 +314,8 @@ fn event_loop(
                     worker.set_open(Some(&id));
                     if worker.fetch(&id) {
                         app.downloading(&id);
+                    } else {
+                        app.downloaded(id, Err(WORKER_GONE.to_owned()));
                     }
                 }
             }
@@ -331,7 +347,16 @@ fn start_sync(worker: &mut Worker, app: &mut App, now: i64) {
 /// Applies finished downloads and syncs; returns whether anything changed.
 fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now: i64) -> bool {
     let mut changed = false;
-    while let Ok(done) = worker.done.try_recv() {
+    loop {
+        let done = match worker.done.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                // The network thread is gone: fail what it will never finish.
+                changed |= fail_pending(worker, app, now);
+                break;
+            }
+        };
         changed = true;
         match done {
             Done::Fetched(id, result) => {
@@ -365,6 +390,21 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
     changed
 }
 
+/// Fails the sync and downloads a stopped worker still owed; returns whether
+/// there were any.
+fn fail_pending(worker: &mut Worker, app: &mut App, now: i64) -> bool {
+    let mut changed = false;
+    if std::mem::take(&mut worker.syncing) {
+        app.synced(Err(WORKER_GONE.to_owned()), now);
+        changed = true;
+    }
+    for id in std::mem::take(&mut worker.fetching) {
+        app.downloaded(id, Err(WORKER_GONE.to_owned()));
+        changed = true;
+    }
+    changed
+}
+
 #[allow(clippy::needless_pass_by_value, reason = "used as a map_err adapter")]
 fn terminal_error(error: std::io::Error) -> String {
     format!("the terminal failed: {error}")
@@ -380,13 +420,18 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::collections::HashSet;
     use std::sync::mpsc::{self, Sender};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
 
     use tersa_application::mailbox::MessageId;
+    use tersa_presentation::terminal::SafeText;
 
-    use super::{Done, Pending, Remote, Worker};
+    use super::{
+        App, Done, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState, WORKER_GONE, Worker,
+        finish_work,
+    };
 
     /// Records the order work finishes in; syncs wait for the test.
     struct Recorder {
@@ -490,5 +535,103 @@ mod tests {
             entries.recv_timeout(Duration::from_millis(100)).is_err(),
             "stale messages were never downloaded"
         );
+    }
+
+    /// Downloads of ids starting with "slow" wait until the test opens the
+    /// gate.
+    struct Gated {
+        log: Sender<String>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Remote for Gated {
+        fn fetch<'a>(&'a self, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
+            Box::pin(async move {
+                let _ = self.log.send(format!("start {}", id.as_str()));
+                if id.as_str().starts_with("slow") {
+                    let _ = self.gate.acquire().await;
+                }
+                let _ = self.log.send(format!("fetch {}", id.as_str()));
+                Ok(Vec::new())
+            })
+        }
+
+        fn sync(&self) -> Pending<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn the_open_message_downloads_while_older_downloads_fill_every_slot() {
+        let (log, entries) = mpsc::channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut worker = Worker::start(Box::new(Gated {
+            log,
+            gate: Arc::clone(&gate),
+        }));
+        let next = || {
+            entries
+                .recv_timeout(Duration::from_secs(5))
+                .expect("work starts")
+        };
+        for slow in ["slow1", "slow2", "slow3", "slow4"] {
+            worker.set_open(Some(&id(slow)));
+            assert!(worker.fetch(&id(slow)));
+            assert_eq!(next(), format!("start {slow}"));
+        }
+        worker.set_open(Some(&id("now")));
+        assert!(worker.fetch(&id("now")));
+        assert_eq!(next(), "start now");
+        assert_eq!(next(), "fetch now", "it did not wait for the slow ones");
+        gate.add_permits(4);
+    }
+
+    struct Empty;
+
+    impl MailSource for Empty {
+        fn rows(&self) -> Result<Vec<Row>, ()> {
+            Ok(Vec::new())
+        }
+
+        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_stopped_worker_fails_the_work_it_owed() {
+        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, done) = mpsc::channel();
+        let mut worker = Worker {
+            jobs,
+            done,
+            fetching: HashSet::from([id("a")]),
+            open: Arc::new(Mutex::new(None)),
+            syncing: true,
+            last_sync: Some((Instant::now(), SystemTime::now())),
+        };
+        let mut app = App::new(SafeText::single_line("me@example.com"), Vec::new());
+        assert!(finish_work(&mut worker, &mut app, &Empty, 0));
+        assert!(matches!(&app.sync, SyncState::Failed(error) if error == WORKER_GONE));
+        assert!(!worker.syncing && worker.fetching.is_empty());
+        assert!(
+            !finish_work(&mut worker, &mut app, &Empty, 0),
+            "reported once"
+        );
+        assert!(!worker.sync(), "a new sync reports the stopped worker");
+    }
+
+    #[test]
+    fn a_sync_is_due_after_a_sleep_the_monotonic_clock_missed() {
+        let (log, _entries) = mpsc::channel();
+        let mut worker = Worker::start(Box::new(Recorder {
+            log,
+            release: Mutex::new(None),
+        }));
+        let before_sleep = SystemTime::now() - SYNC_EVERY - Duration::from_secs(1);
+        worker.last_sync = Some((Instant::now(), before_sleep));
+        assert!(worker.sync_due());
+        worker.last_sync = Some((Instant::now(), SystemTime::now()));
+        assert!(!worker.sync_due());
     }
 }

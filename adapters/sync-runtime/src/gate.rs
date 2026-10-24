@@ -32,6 +32,18 @@ pub enum GatedSyncError {
     Sync(SyncFailure),
 }
 
+impl GatedSyncError {
+    /// Why the sync failed, without the "sync failed" framing, for a status
+    /// line that already says so.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Gate(_) => "the account identity could not be checked",
+            Self::Sync(failure) => sync_cause(*failure),
+        }
+    }
+}
+
 impl fmt::Display for GatedSyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

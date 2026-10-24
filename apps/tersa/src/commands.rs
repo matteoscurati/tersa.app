@@ -11,7 +11,9 @@ use tersa_application::mailbox::{AccountId, MailboxReader, MessageId, StoreLimit
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
-use tersa_sync_runtime::{Installation, InstallationLock, Revocation, Runtime, has_local_data};
+use tersa_sync_runtime::{
+    FlowError, Installation, InstallationLock, Revocation, Runtime, has_local_data,
+};
 use tersa_vault::{SlotKind, Vault, VaultError, VaultState};
 
 use crate::config::{Config, Paths};
@@ -361,7 +363,7 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
     Ok(())
 }
 
-/// The most messages the interface loads; paging arrives with T2c.
+/// The most messages the interface loads; paging arrives with T2d.
 const TUI_MESSAGES: u16 = 500;
 
 /// Opens the full-screen interface on the first account's cached mail. The
@@ -420,7 +422,11 @@ impl crate::tui::Remote for Network {
                 .sync_account(&self.account)
                 .await
                 .map(|_report| ())
-                .map_err(|error| error.to_string())
+                // The status line already says the sync failed.
+                .map_err(|error| match error {
+                    FlowError::Sync(error) => error.reason().to_owned(),
+                    other => other.to_string(),
+                })
         })
     }
 }
