@@ -74,7 +74,7 @@ remain **Step 4**; Step 3 does not build that harness or assert a threshold.
 Step 3 is complete in source and in the owner-driven macOS live flow. The Rust
 engine and disconnect fence landed through PRs #66–#71, the Swift connect/sync/
 disconnect ladder through PRs #72–#75, and the live-run fixes through
-[PR #76](https://github.com/matteoscurati/tersa.app/pull/76). A Release/arm64
+[PR #76](https://github.com/reasance/tersa.app/pull/76). A Release/arm64
 build signed with an Apple Development identity retained the full committed App
 Sandbox, network, App Group, and Keychain entitlements; no reduced-entitlement
 variant was used.

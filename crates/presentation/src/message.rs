@@ -117,14 +117,12 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
     };
     let plain = message
         .text_bodies()
-        .find(|part| !part.is_text_html())
-        .and_then(MessagePart::text_contents)
-        .filter(|text| !text.trim().is_empty());
+        .filter(|part| !part.is_text_html())
+        .find_map(readable);
     let html = message
         .html_bodies()
-        .find(|part| part.is_text_html())
-        .and_then(MessagePart::text_contents)
-        .filter(|text| !text.trim().is_empty());
+        .filter(|part| part.is_text_html())
+        .find_map(readable);
     let chosen = match (preference, plain, html) {
         (BodyPreference::Html, _, Some(html)) | (BodyPreference::Plain, None, Some(html)) => {
             Some(BodyFormat::Html).zip(Some(html))
@@ -169,6 +167,13 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
             .collect(),
         attachments,
     }
+}
+
+/// A text part's non-blank content. The body lists also hold inline
+/// binaries (images, SVG source), and a first text part can be blank.
+fn readable<'a>(part: &'a MessagePart<'a>) -> Option<&'a str> {
+    part.text_contents()
+        .filter(|text| part.is_text() && !text.trim().is_empty())
 }
 
 /// Normalizes line endings, trims trailing spaces, keeps at most one blank
@@ -316,6 +321,31 @@ Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\naGVs
         assert_eq!(attachment.mime_type.as_str(), "application/pdf");
         assert_eq!(attachment.size, 5);
         assert!(!attachment.name.as_str().contains('\u{1b}'));
+    }
+
+    #[test]
+    fn inline_images_and_blank_parts_do_not_hide_the_text() {
+        let image_first = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: image/jpeg\r\nContent-Disposition: inline\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nHi\r\n--x--\r\n";
+        let rendered = render_message(image_first, BodyPreference::Plain);
+        assert_eq!(rendered.body.as_str(), "Hi");
+        assert_eq!(rendered.format, Some(BodyFormat::Plain));
+
+        let svg_first = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: image/svg+xml\r\nContent-Disposition: inline\r\n\r\n\
+<svg xmlns=\"http://www.w3.org/2000/svg\"/>\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nHi\r\n--x--\r\n";
+        let rendered = render_message(svg_first, BodyPreference::Html);
+        assert_eq!(rendered.body.as_str(), "Hi");
+        assert!(!rendered.has_alternative);
+
+        let blank_first = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\n  \r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nsecond\r\n--x--\r\n";
+        let rendered = render_message(blank_first, BodyPreference::Plain);
+        assert_eq!(rendered.body.as_str(), "second");
     }
 
     #[test]
