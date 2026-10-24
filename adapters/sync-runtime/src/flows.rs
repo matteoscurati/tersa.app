@@ -5,9 +5,8 @@
 //! Account flows: add (OAuth consent then first sync), sync, and remove.
 
 use core::fmt;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use tersa_application::identity::AccountProfile;
 use tersa_application::mailbox::{
@@ -25,6 +24,7 @@ use crate::installation::{
 };
 use crate::loopback::{Loopback, LoopbackError};
 use crate::session::{GmailSession, GmailSessionError, SharedSession};
+use crate::session_cache::{Origin, SessionCache, SystemCacheClock};
 
 /// How long the browser sign-in may take.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -151,7 +151,7 @@ pub struct Runtime {
     hasher: InstallationHasher,
     /// One Gmail session per account, reused until shortly before its access
     /// token expires.
-    sessions: Mutex<HashMap<AccountId, (SharedSession, Instant)>>,
+    sessions: SessionCache<SharedSession, SystemCacheClock>,
 }
 
 impl fmt::Debug for Runtime {
@@ -186,7 +186,7 @@ impl Runtime {
             hasher: InstallationHasher(Arc::clone(&installation)),
             installation,
             broker,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionCache::new(SystemCacheClock, TOKEN_MARGIN),
         })
     }
 
@@ -260,13 +260,32 @@ impl Runtime {
     /// Returns a [`FlowError`] for an unknown account, a token failure, or a
     /// gate or sync failure.
     pub async fn sync_account(&self, account: &AccountId) -> Result<SyncReport, FlowError> {
-        let session = self.session(account).await?;
-        let result = self.sync_with_session(account, session).await;
-        if matches!(&result, Err(FlowError::Sync(GatedSyncError::Sync(failure)))
-            if failure.category()
-                == SyncFailureSource::Remote(RemoteMailboxError::AuthorizationRequired))
-        {
-            self.forget_session(account);
+        self.with_session(account, |session| self.sync_with_session(account, session))
+            .await
+    }
+
+    /// Runs `work` with the account's session. When Gmail rejects a cached
+    /// access token (it can lapse early, for example across a sleep, or be
+    /// revoked), the session is forgotten and `work` runs once more with a
+    /// fresh token.
+    async fn with_session<R, F, Fut>(&self, account: &AccountId, work: F) -> Result<R, FlowError>
+    where
+        F: Fn(SharedSession) -> Fut,
+        Fut: Future<Output = Result<R, FlowError>>,
+    {
+        let (session, origin) = self.session(account).await?;
+        let result = work(session).await;
+        if !needs_authorization(&result) {
+            return result;
+        }
+        self.sessions.forget(account);
+        if origin == Origin::Fresh {
+            return result;
+        }
+        let (session, _origin) = self.session(account).await?;
+        let result = work(session).await;
+        if needs_authorization(&result) {
+            self.sessions.forget(account);
         }
         result
     }
@@ -302,7 +321,7 @@ impl Runtime {
         // Deleting the stored token is part of the local removal; a failure
         // here is superseded by deleting the whole account directory.
         let _ = self.broker.delete_stored_tokens(&subject);
-        self.forget_session(account);
+        self.sessions.forget(account);
         self.installation.remove_account(account)?;
         Ok(revocation)
     }
@@ -319,59 +338,35 @@ impl Runtime {
         account: &AccountId,
         message_id: &MessageId,
     ) -> Result<Vec<u8>, FlowError> {
-        let session = self.session(account).await?;
-        let store = self.installation.open_store(account)?;
-        match gated_fetch(account, session, &self.hasher, store, message_id).await {
-            Ok(message) => Ok(message.content().as_bytes().to_vec()),
-            Err(error) => {
-                if matches!(
-                    error,
-                    GatedFetchError::Remote(RemoteMailboxError::AuthorizationRequired)
-                ) {
-                    self.forget_session(account);
-                }
-                Err(FlowError::Fetch(error))
-            }
-        }
+        self.with_session(account, |session| async move {
+            let store = self.installation.open_store(account)?;
+            gated_fetch(account, session, &self.hasher, store, message_id)
+                .await
+                .map(|message| message.content().as_bytes().to_vec())
+                .map_err(FlowError::Fetch)
+        })
+        .await
     }
 
     /// The account's Gmail session, refreshing its access token only when
     /// none is cached or the cached one is about to expire.
-    async fn session(&self, account: &AccountId) -> Result<SharedSession, FlowError> {
-        if let Some((session, until)) = self.sessions_lock().get(account)
-            && Instant::now() < *until
-        {
-            return Ok(session.clone());
-        }
-        let subject = self.subject_of(account)?;
-        let token = self.access_token(&subject).await?;
-        let lifetime = Duration::from_secs(token.expires_in_seconds()).saturating_sub(TOKEN_MARGIN);
-        let session = SharedSession::new(
-            GmailSession::new(
-                account.clone(),
-                token.access_token(),
-                Zeroizing::new(token.subject().to_owned()),
-            )
-            .map_err(FlowError::Session)?,
-        );
-        self.sessions_lock().insert(
-            account.clone(),
-            (session.clone(), Instant::now() + lifetime),
-        );
-        Ok(session)
-    }
-
-    fn forget_session(&self, account: &AccountId) {
-        self.sessions_lock().remove(account);
-    }
-
-    fn sessions_lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<AccountId, (SharedSession, Instant)>> {
-        // The map holds no invariant a panic could break; recover it.
+    async fn session(&self, account: &AccountId) -> Result<(SharedSession, Origin), FlowError> {
         self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_refresh(account, || async {
+                let subject = self.subject_of(account)?;
+                let token = self.access_token(&subject).await?;
+                let session = GmailSession::new(
+                    account.clone(),
+                    token.access_token(),
+                    Zeroizing::new(token.subject().to_owned()),
+                )
+                .map_err(FlowError::Session)?;
+                Ok((
+                    SharedSession::new(session),
+                    Duration::from_secs(token.expires_in_seconds()),
+                ))
+            })
+            .await
     }
 
     fn subject_of(&self, account: &AccountId) -> Result<Zeroizing<String>, FlowError> {
@@ -398,6 +393,20 @@ impl Runtime {
     }
 }
 
+/// Whether Gmail rejected the access token.
+fn needs_authorization<R>(result: &Result<R, FlowError>) -> bool {
+    match result {
+        Err(FlowError::Sync(GatedSyncError::Sync(failure))) => {
+            failure.category()
+                == SyncFailureSource::Remote(RemoteMailboxError::AuthorizationRequired)
+        }
+        Err(FlowError::Fetch(GatedFetchError::Remote(
+            RemoteMailboxError::AuthorizationRequired,
+        ))) => true,
+        _ => false,
+    }
+}
+
 /// The bounded recent-snapshot policy: 4 pages of 25, keep 100 envelopes,
 /// cache 25 full bodies.
 ///
@@ -415,10 +424,38 @@ pub fn default_sync_policy() -> SyncPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::default_sync_policy;
+    use tersa_application::mailbox::RemoteMailboxError;
+    use tersa_application::sync::{SyncFailure, SyncFailureSource};
+
+    use super::{FlowError, default_sync_policy, needs_authorization};
+    use crate::gate::{GatedFetchError, GatedSyncError};
 
     #[test]
     fn the_default_policy_is_valid() {
         let _policy = default_sync_policy();
+    }
+
+    #[test]
+    fn only_a_rejected_token_retries_with_a_fresh_one() {
+        let sync = |source| {
+            Err::<(), _>(FlowError::Sync(GatedSyncError::Sync(
+                SyncFailure::from_source_for_test(source),
+            )))
+        };
+        let fetch = |error| Err::<(), _>(FlowError::Fetch(GatedFetchError::Remote(error)));
+        assert!(needs_authorization(&sync(SyncFailureSource::Remote(
+            RemoteMailboxError::AuthorizationRequired
+        ))));
+        assert!(needs_authorization(&fetch(
+            RemoteMailboxError::AuthorizationRequired
+        )));
+        assert!(!needs_authorization(&sync(SyncFailureSource::Remote(
+            RemoteMailboxError::Transport
+        ))));
+        assert!(!needs_authorization(&fetch(RemoteMailboxError::Transport)));
+        assert!(!needs_authorization(&Err::<(), _>(
+            FlowError::UnknownAccount
+        )));
+        assert!(!needs_authorization(&Ok(())));
     }
 }
