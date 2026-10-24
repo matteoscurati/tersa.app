@@ -2,35 +2,24 @@
 **/target/
 **/*.rs.bk
 
-# Apple and Xcode
+# Operating system
 .DS_Store
-apple/Tersa.xcodeproj/
-apple/build/
-DerivedData/
-*.xcuserstate
-*.xcuserdata/
-xcuserdata/
-*.xccheckout
-*.moved-aside
-*.ipa
-*.dSYM/
-*.dSYM.zip
 
-# Local configuration and secrets
+# Local configuration, secrets, and mail data (never commit these)
 .env
 .env.*
 !.env.example
 *.p12
-*.mobileprovision
 *.key
 *.pem
 secrets/
-local.xcconfig
-GoogleService-Info.plist
+*.sqlite3
+*.sqlite3-*
 
-# Diagnostics and local tooling
+# Diagnostics, review scratch, and local tooling
 diagnostics/
 coverage/
+*.log
 .idea/
 .vscode/
 *.swp

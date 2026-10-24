@@ -16,7 +16,7 @@ public issue, discussion, or pull request for an active vulnerability.
 
 Include only the minimum reproduction details needed. Use synthetic data and
 redact paths, account identifiers, email content, OAuth tokens, API keys,
-Keychain material, encryption keys, and private diagnostic bundles. Do not send
+keyring material, encryption keys, and private diagnostic bundles. Do not send
 secrets to maintainers; describe how they can reproduce the issue with their
 own test credentials.
 

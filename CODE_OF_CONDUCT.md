@@ -52,8 +52,8 @@ officially represents the community in public spaces.
 ## Enforcement
 
 Report abusive, harassing, or otherwise unacceptable behavior privately to the
-repository owner through the contact options at
-<https://github.com/matteoscurati>. All complaints will be reviewed promptly
+project maintainer, [@matteoscurati](https://github.com/matteoscurati),
+through the contact options on that profile. All complaints will be reviewed promptly
 and fairly. Community leaders must respect the reporter's privacy and security.
 
 ## Enforcement guidelines
