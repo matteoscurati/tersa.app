@@ -59,7 +59,7 @@ const CORE_POLICY: [CorePolicy; 4] = [
     CorePolicy {
         name: "tersa-presentation",
         workspace: &["tersa-domain", "tersa-application"],
-        external: &["mail-parser"],
+        external: &["mail-parser", "unicode-segmentation"],
     },
 ];
 
